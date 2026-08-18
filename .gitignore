@@ -1,0 +1,39 @@
+# secrets — never commit
+.env
+.env.*
+!.env.example
+*.key
+keypair*.json
+wallet*.json
+secrets/
+
+# rust
+target/
+**/*.rs.bk
+
+# node
+node_modules/
+.next/
+dist/
+build/
+*.tsbuildinfo
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# data
+*.db
+*.db-wal
+*.db-shm
+data/
+logs/
+*.parquet
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
