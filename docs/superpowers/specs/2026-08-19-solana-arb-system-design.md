@@ -206,3 +206,95 @@ to stop and keep the instrument. That is a successful project, not a failed one.
 
 None block phases 0–2, which is the bulk of the work. Assumptions taken meanwhile:
 Rust core, $0 infra, paper-only.
+
+---
+
+# Revisions after research (2026-08-19)
+
+Research completed after the draft above. Five findings changed the design.
+
+## R1. Half the market is structurally unmodellable — and that is fine
+
+Prop AMMs (HumidiFi, BisonFi, SolFi, ZeroFi, Obric, Tessera, GoonFi) are ~40–65% of
+Jupiter-routed volume and publish **no IDL, SDK, or docs**. We cannot quote them
+off-chain without reverse-engineering BPF.
+
+**Design response:** do not try. Phase-1 venue set is the open AMMs only — Raydium v4 +
+CPMM, Orca Whirlpools, Meteora DLMM, PumpSwap. This is not a compromise; the deepest,
+most contested flow lives behind those closed venues, and it is flow we were never going
+to win. Three independent findings (tip asymmetry, infra cost, venue opacity) now point
+at the same place: the open long tail.
+
+## R2. Jupiter cannot be the scanner's quote source
+
+Keyless is **0.5 RPS**; free-with-key is 1 RPS; limits are per *organisation*, not per
+key. Jupiter also **rejects circular routes** (`inputMint == outputMint`) — Metis is a
+DAG search, not a cycle finder.
+
+**Design response:** the scanner quotes **locally** from cached account state, which was
+already the plan but is now mandatory rather than an optimisation. Jupiter is demoted to
+three narrow roles: cross-checking our math, reaching prop-AMM liquidity we cannot model,
+and execution routing. Arb legs must be stitched from two quotes with disjoint
+`dexes` sets.
+
+## R3. The on-chain program moves from "phase 3 nice-to-have" to load-bearing
+
+Two independent reasons converged:
+
+1. **It is the only honest profit check.** A transfer fee or transfer hook can make
+   off-chain math wrong in ways that are invisible until execution. Only an on-chain
+   assertion on *actual post-transfer balances* cannot be lied to.
+2. **It is the best available security control.** Hardcoding the profit destination to a
+   **cold address inside the program** means a stolen hot key costs the gas float, not
+   the profits. Nearly free to implement, and it caps the worst case.
+
+It also preserves the free-failure property: without an on-chain revert, a mispriced arb
+lands and loses money instead of reverting for free.
+
+Reference implementation to follow: `buffalojoec/arb-program` (Anza engineer) — copy the
+pattern, not the pinned versions.
+
+## R4. Build environment is WSL2, not Windows
+
+MSVC build tools are absent (`link.exe` not found), and Git Bash's coreutils `link`
+shadows it confusingly. WSL2 Ubuntu 24.04 has gcc 13.3 / ld 2.42, 16 cores, 11 GB RAM —
+and the Solana on-chain toolchain is Linux-native regardless. Building in WSL also
+matches the Linux VPS this would deploy to.
+
+`CARGO_TARGET_DIR` must point at the WSL filesystem; writing `target/` across the 9p
+`/mnt/d` boundary is roughly an order of magnitude slower.
+
+## R5. Tier-0 measurement has a known bias that must be reported, not hidden
+
+Plain `accountSubscribe` WebSocket runs hundreds of ms behind, **coalesces rapid updates
+so intermediate states are missed entirely**, and degrades past a few hundred
+subscriptions. gRPC is single-digit-to-low-tens of ms.
+
+This biases paper results in *both* directions: we miss opportunities that existed
+(understating edge), and we may credit ourselves with races we'd have lost (overstating
+it).
+
+**Design response:** the dashboard must separate two distinct questions and never merge
+them into one number:
+
+- **"Did an opportunity exist?"** — from our (lagged, coalesced) view of state.
+- **"Would we have won it?"** — modelled against observed competition: did someone else
+  take it in the same or next slot, and at what tip?
+
+Reporting a single "paper P&L" without that split would be self-deception, and the entire
+point of phase 2 is to avoid exactly that.
+
+## Consequent changes to phasing
+
+| Phase | Change |
+|---|---|
+| 1 | Venue set fixed: Raydium v4/CPMM, Orca, Meteora DLMM, PumpSwap. Raydium v4 **must** read vault token accounts, not `AmmInfo`, for reserves. |
+| 2 | Dashboard reports "existed" vs "would have won" separately. Token-2022 screening with **deny-unknown-extension** allowlist. |
+| 3 | On-chain profit-or-revert program with **hardcoded cold profit destination**. Tested via LiteSVM → Mollusk (CU) → surfpool (mainnet fork) → `simulateTransaction` → live. |
+
+## Testing stack (adopted)
+
+LiteSVM for math and multi-instruction flows (inject real mainnet account bytes) →
+Mollusk for CU benchmarking (compute regressions cause landing failures) → surfpool for
+mainnet-fork integration → `simulateTransaction` with `replaceRecentBlockhash` as the
+final pre-send gate → on-chain revert as the actual safety net.
