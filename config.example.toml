@@ -1,0 +1,17 @@
+# Copy to config.toml and edit. config.toml is gitignored.
+#
+# "paper" = detect and record only, never sign or send. This is the default and
+# should stay that way until the measured edge justifies otherwise.
+# "live"  = real transactions. ALSO requires CRYPTOBOT_ALLOW_LIVE=1 in the environment.
+mode = "paper"
+
+# Public mainnet WebSocket. Rate-limited and lags by hundreds of ms; see
+# docs/research/03-dex-landscape.md for what that does to measurement accuracy.
+rpc_ws_url = "wss://api.mainnet-beta.solana.com"
+
+# Minimum gross profit to record an opportunity as actionable. 1_000_000 lamports
+# = 0.001 SOL, about $0.077 at $76.97/SOL.
+min_profit_lamports = 1000000
+
+# Hard ceiling per trade. 20_000_000 lamports = 0.02 SOL, about $1.54.
+max_position_lamports = 20000000

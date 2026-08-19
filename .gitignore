@@ -37,3 +37,4 @@ logs/
 Thumbs.db
 .idea/
 .vscode/
+config.toml

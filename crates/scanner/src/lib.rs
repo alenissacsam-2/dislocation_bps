@@ -1,1 +1,4 @@
-//! Placeholder — see docs/superpowers/specs/ for the design.
+//! Opportunity detection: maintains pool state and tests candidate cycles.
+
+pub mod cycles;
+pub mod store;
