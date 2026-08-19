@@ -61,6 +61,16 @@ pub type FeeBps = u32;
 
 const BPS_DENOM: u128 = 10_000;
 
+use ruint::aliases::U256;
+
+/// Widen to 256 bits. Every product of more than two pool-scale quantities must go
+/// through this: `u128` overflows at pools above roughly 43 USDC, which is every
+/// pool that actually exists.
+#[inline]
+fn u256(x: u128) -> U256 {
+    U256::from(x)
+}
+
 /// Output of a constant-product swap, given reserves and a fee.
 ///
 /// `reserve_in` and `reserve_out` are the pool's current balances of the input and
@@ -113,6 +123,9 @@ pub struct CycleReserves {
 /// Profitable iff `γa·γb·B·D > A·C`. Scaled by `BPS_DENOM²` to stay in integers.
 /// Used to reject the overwhelming majority of candidate cycles before spending a
 /// square root on them.
+///
+/// Computed in 256 bits: `γa·γb·B·D` is a product of four pool-scale quantities and
+/// overflows `u128` for pools of realistic size.
 #[must_use]
 pub fn is_profitable(r: &CycleReserves) -> bool {
     let (Some(ga), Some(gb)) = (
@@ -123,21 +136,9 @@ pub fn is_profitable(r: &CycleReserves) -> bool {
     };
 
     // lhs = γa·γb·B·D, rhs = A·C·BPS²
-    let lhs = ga
-        .checked_mul(gb)
-        .and_then(|g| g.checked_mul(r.a_out))
-        .and_then(|v| v.checked_mul(r.b_out));
-    let rhs = r
-        .a_in
-        .checked_mul(r.b_in)
-        .and_then(|v| v.checked_mul(BPS_DENOM))
-        .and_then(|v| v.checked_mul(BPS_DENOM));
-
-    match (lhs, rhs) {
-        (Some(l), Some(rr)) => l > rr,
-        // Overflow means reserves are absurd; treat as not profitable.
-        _ => false,
-    }
+    let lhs = u256(ga) * u256(gb) * u256(r.a_out) * u256(r.b_out);
+    let rhs = u256(r.a_in) * u256(r.b_in) * u256(BPS_DENOM) * u256(BPS_DENOM);
+    lhs > rhs
 }
 
 /// Closed-form optimal input size for a two-pool constant-product cycle.
@@ -157,37 +158,37 @@ pub fn optimal_input(r: &CycleReserves) -> Option<u128> {
     let ga = BPS_DENOM.checked_sub(u128::from(r.fee_a_bps))?;
     let gb = BPS_DENOM.checked_sub(u128::from(r.fee_b_bps))?;
 
-    // Work in units scaled by BPS_DENOM to keep γ integral.
-    //
-    // numerator = √(γa·γb·A·B·C·D) − A·C·BPS
-    // denominator = γa·(C·BPS + γb·B) / BPS  →  keep the BPS factors explicit.
+    // All intermediates are 256-bit. The radicand is a product of SIX pool-scale
+    // quantities, which overflows u128 once reserves exceed roughly 4.3e7 base units
+    // — i.e. about 43 USDC. Every real pool is far larger than that, so computing
+    // this in u128 silently returns None for the entire live market.
+    let radicand =
+        u256(ga) * u256(gb) * u256(r.a_in) * u256(r.a_out) * u256(r.b_in) * u256(r.b_out);
 
-    // radicand = γa·γb·A·B·C·D. This is the overflow-prone term: six multiplied
-    // reserves. u128 holds ~3.4e38; realistic reserves are <1e20 each, so we stage
-    // the multiplication and bail on overflow rather than wrapping.
-    let radicand = ga
-        .checked_mul(gb)?
-        .checked_mul(r.a_in)?
-        .checked_mul(r.a_out)?
-        .checked_mul(r.b_in)?
-        .checked_mul(r.b_out)?;
+    // Integer square root, truncating downward.
+    let root = radicand.root(2);
 
-    let root = radicand.isqrt();
-    let ac_scaled = r.a_in.checked_mul(r.b_in)?.checked_mul(BPS_DENOM)?;
+    let ac_scaled = u256(r.a_in) * u256(r.b_in) * u256(BPS_DENOM);
 
-    // is_profitable guaranteed root > ac_scaled up to isqrt truncation; guard anyway.
-    let numerator = root.checked_sub(ac_scaled)?;
+    // is_profitable implies root > ac_scaled up to sqrt truncation; guard anyway.
+    if root <= ac_scaled {
+        return None;
+    }
+    let numerator = root - ac_scaled;
 
     // denominator = γa·(C + γb·B), with the BPS factors kept explicit:
     //   γa·(C + γb·B) = ga·(C·BPS + gb·B) / BPS²
     // and the surrounding expression multiplies by BPS, so we carry
     // ga·(C·BPS + gb·B) here and apply the single remaining BPS below.
-    let denominator = ga.checked_mul(r.b_in.checked_mul(BPS_DENOM)?.checked_add(gb.checked_mul(r.a_out)?)?)?;
+    let denominator = u256(ga) * (u256(r.b_in) * u256(BPS_DENOM) + u256(gb) * u256(r.a_out));
 
-    if denominator == 0 {
+    if denominator == U256::ZERO {
         return None;
     }
-    let x = numerator.checked_mul(BPS_DENOM)? / denominator;
+    let x = numerator * u256(BPS_DENOM) / denominator;
+
+    // A size that does not fit u128 is not a size we can put in a transaction.
+    let x: u128 = x.try_into().ok()?;
     if x == 0 {
         None
     } else {
@@ -280,6 +281,59 @@ mod tests {
         assert_eq!(cp_swap_out(100, 100, 0, 25), None);
         // Fee >= 100% is nonsense and must not underflow.
         assert_eq!(cp_swap_out(100, 1000, 1000, 10_001), None);
+    }
+
+    /// Regression: `optimal_input` used to compute the six-way radicand in `u128`,
+    /// which overflows once reserves exceed roughly 4.3e7 base units — about 43 USDC.
+    /// Every pool on mainnet is orders of magnitude bigger, so the function returned
+    /// `None` for the entire live market while every small-number unit test passed.
+    /// These reserves are SOL/USDC at realistic depth.
+    #[test]
+    fn finds_opportunities_at_mainnet_pool_scale() {
+        // Venue 1: 1,800 SOL / 138,186 USDC  → SOL at 76.77
+        // Venue 2: 4,200 SOL / 335,412 USDC  → SOL at 79.86  (a ~4% dislocation)
+        let r = CycleReserves {
+            a_in: 138_186_000_000,     // USDC in (6 dp)
+            a_out: 1_800_000_000_000,  // SOL out (9 dp)
+            b_in: 4_200_000_000_000,   // SOL in
+            b_out: 335_412_000_000,    // USDC out
+            fee_a_bps: 25,
+            fee_b_bps: 25,
+        };
+        assert!(is_profitable(&r), "a 4% dislocation at real depth must be profitable");
+
+        let x = optimal_input(&r).expect("must size a mainnet-scale opportunity");
+        let profit = cycle_profit(&r, x).expect("optimal size must profit");
+        assert!(profit > 0);
+
+        // Nothing nearby may beat it.
+        for pct in [50u128, 80, 95, 105, 120, 200] {
+            if let Some(p) = cycle_profit(&r, x * pct / 100) {
+                assert!(p <= profit + 2, "size at {pct}% beat the optimum");
+            }
+        }
+    }
+
+    /// The capital-constrained case, which is the whole $5 question: taking less than
+    /// the optimal size must still profit, just proportionally less.
+    #[test]
+    fn undersized_trades_still_profit_proportionally() {
+        let r = CycleReserves {
+            a_in: 138_186_000_000,
+            a_out: 1_800_000_000_000,
+            b_in: 4_200_000_000_000,
+            b_out: 335_412_000_000,
+            fee_a_bps: 25,
+            fee_b_bps: 25,
+        };
+        let optimal = optimal_input(&r).unwrap();
+        let five_dollars = 4_800_000u128; // $4.80 in USDC base units
+
+        assert!(five_dollars < optimal, "at real depth $5 must be below the optimum");
+        let small = cycle_profit(&r, five_dollars).expect("a $4.80 trade must still profit");
+        let big = cycle_profit(&r, optimal).unwrap();
+        assert!(small < big, "capital cap must cost us profit");
+        assert!(small > 0);
     }
 
     #[test]

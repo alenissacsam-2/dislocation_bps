@@ -7,6 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 cb-core = { workspace = true }
+cb-server = { workspace = true }
+cb-scanner = { workspace = true }
+cb-ledger = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
