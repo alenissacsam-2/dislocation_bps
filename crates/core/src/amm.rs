@@ -270,7 +270,7 @@ mod tests {
         let x = optimal_input(&r).unwrap();
         let best = cycle_profit(&r, x).unwrap();
         assert!(cycle_profit(&r, x / 10).unwrap() < best);
-        assert!(cycle_profit(&r, x * 5).map_or(true, |p| p < best));
+        assert!(cycle_profit(&r, x * 5).is_none_or(|p| p < best));
     }
 
     #[test]
