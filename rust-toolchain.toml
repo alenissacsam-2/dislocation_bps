@@ -1,0 +1,6 @@
+# Build in WSL2 Ubuntu, not Windows: MSVC build tools are absent, and the Solana
+# on-chain toolchain (cargo-build-sbf, Anchor) is Linux-native anyway. Building in
+# WSL also matches the Linux VPS this would eventually deploy to.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

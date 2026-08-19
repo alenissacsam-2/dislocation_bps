@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/dex",
+    "crates/feed",
+    "crates/scanner",
+    "crates/evaluator",
+    "crates/executor",
+    "crates/ledger",
+    "crates/server",
+    "crates/bot",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# internal
+cb-core      = { path = "crates/core" }
+cb-dex       = { path = "crates/dex" }
+cb-feed      = { path = "crates/feed" }
+cb-scanner   = { path = "crates/scanner" }
+cb-evaluator = { path = "crates/evaluator" }
+cb-executor  = { path = "crates/executor" }
+cb-ledger    = { path = "crates/ledger" }
+cb-server    = { path = "crates/server" }
+
+# solana
+solana-sdk    = "4.1"
+solana-client = "4.2"
+
+# async
+tokio = { version = "1.53", features = ["full"] }
+futures = "0.3"
+
+# web
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+
+# data
+rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# util
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "6"
+figment = { version = "0.10", features = ["toml", "env"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

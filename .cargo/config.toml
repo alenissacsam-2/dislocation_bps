@@ -1,0 +1,4 @@
+# Keep build artifacts off the /mnt/d 9p mount when building from WSL — writing
+# target/ across the Windows filesystem boundary is roughly an order of magnitude
+# slower. Set CARGO_TARGET_DIR in the shell instead; documented in README.
+[build]

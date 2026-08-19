@@ -1,0 +1,11 @@
+[package]
+name = "cb-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cb-core = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
