@@ -7,7 +7,25 @@ edge exists — and can be switched into execution mode only once the data says 
 
 ## Status
 
-Phase 0 — scaffolding. Core AMM math implemented and verified (8/8 tests).
+Phase 1 in progress. 42 tests passing. Core arbitrage maths verified against
+mainnet-scale reserves. Live dashboard running against a simulated market.
+
+## Run it
+
+```bash
+wsl -d Ubuntu
+export CARGO_TARGET_DIR=$HOME/.cargo-target/cryptobot
+cd /mnt/d/Dev/Quant/cryptobot
+cargo run -p cb-bot
+```
+
+Then open <http://127.0.0.1:8787>. The bot binds `0.0.0.0` so the Windows host can
+reach the WSL listener — it has no authentication, so don't run it on an untrusted
+network.
+
+The market is currently **simulated**: pool reserves are synthetic, but they are priced
+by the exact `cb-core` maths that will run against mainnet. The dashboard labels this
+clearly. Nothing signs a transaction.
 
 ## Read this first
 

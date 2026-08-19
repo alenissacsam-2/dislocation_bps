@@ -53,7 +53,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let bus = EventBus::new();
-    let addr: SocketAddr = "127.0.0.1:8787".parse()?;
+    // Bind all interfaces: when running under WSL2, a 127.0.0.1 listener is not always
+    // reachable from the Windows host. This is a local research tool with no auth, so
+    // do not expose the machine to an untrusted network while it is running.
+    let addr: SocketAddr = "0.0.0.0:8787".parse()?;
 
     // The market loop. Note it holds no handle to the server and never awaits it:
     // the dashboard is a lossy observer and cannot stall this task.
