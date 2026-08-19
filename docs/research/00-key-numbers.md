@@ -107,3 +107,97 @@ gain on an uncontested win is ~$1.58 mean. **The per-attempt asymmetry is genuin
 favourable — roughly 1000:1.** What kills you is not the cost per attempt; it is the
 *hit rate* and the *infra bill*. That reframes the whole engineering problem: maximise
 the number of high-quality attempts per dollar of fixed cost.
+
+---
+
+## CORRECTION: failed attempts are FREE (Jito bundle atomicity)
+
+My cost-floor estimate above (~$0.0006 lost per failed attempt) is **wrong** for a
+correctly-built bundle bot. Verified against Jito docs:
+
+- "If any transaction in a bundle fails, none of the transactions in the bundle will be
+  committed to the chain." All-or-nothing.
+- If the bundle is not selected: **no transactions land, you pay nothing.**
+- The tip is only paid if the bundle lands. Best practice per Jito: put the tip transfer
+  **inside the same transaction** as the arb, so a failed arb pays no tip.
+
+**Therefore: a losing arbitrage attempt costs $0 in on-chain fees.** Base and priority
+fees are only charged for transactions that actually execute.
+
+### What this does to the economics
+
+This is the most important fact in the project, and it inverts the usual narrative
+("you'll bleed out on gas"). The correct model is:
+
+```
+profit = (wins × net_profit_per_win) − fixed_infrastructure_cost
+```
+
+Failed attempts do not appear in that equation at all. There is **no variable cost of
+being wrong**. The only real cost is the monthly infra bill.
+
+Consequences for the design:
+
+1. **Be maximally aggressive about attempting.** Since misses are free, the optimal
+   policy is to fire at every opportunity clearing a small profit threshold. Precision
+   matters far less than recall. A scanner that finds 10,000 marginal opportunities and
+   wins 50 beats one that finds 100 certain ones and wins 40.
+2. **The profit-or-revert guard must be ON-CHAIN**, not in the bot. The free-failure
+   property only holds if the transaction itself reverts when unprofitable. This is
+   exactly why serious searchers deploy their own arb program: it re-checks profit at
+   execution time against the *real* state and aborts. Off-chain checks against stale
+   state cannot give this guarantee.
+3. **The break-even question is the only question:** how many wins per month to cover
+   fixed infra? At the $1.58 mean, a $50/mo RPC bill needs ~32 mean-sized wins/month
+   (~1/day) to break even. That is a genuinely low bar — which is precisely why the
+   space is crowded and why the marginal opportunity is competed away.
+
+### Jito operational facts
+
+| Item | Value |
+|---|---|
+| Mainnet Block Engine | `https://mainnet.block-engine.jito.wtf` |
+| Regions | Amsterdam, Dublin, Frankfurt, London, NY, Salt Lake City, **Singapore**, **Tokyo** |
+| Max bundle size | 5 transactions |
+| Execution | sequential + atomic, same slot |
+| Tip accounts | 8 fixed addresses (pick at random per bundle to avoid contention) |
+
+**From India, Singapore is the nearest Block Engine region** (~50–70ms RTT vs ~120–150ms
+to Frankfurt). Region choice is the single cheapest latency win available.
+
+## Agave 4.2 — network changes landing RIGHT NOW (Aug 2026)
+
+Mainnet feature activation began **17 Aug 2026** — two days before this project started.
+Most tutorials and repos online predate these and are stale.
+
+| SIMD | Change | Detail | Impact on this project |
+|---|---|---|---|
+| **SIMD-0296** | Max tx size **1232 → 4096 bytes** | new tx `v1` format; `v0`/legacy still work | **Large.** More hops + more accounts per atomic arb. Address Lookup Tables stop being a hard requirement for multi-hop routes. Enables 3–4 hop cycles that previously did not fit. |
+| **SIMD-0525** | Slot time **400ms → 200ms** | four 50ms steps, each feature-gated; halts if skip rate rises | Halves the latency budget. Hurts remote/high-RTT operators → **reinforces coverage-over-latency thesis**. |
+| **SIMD-0437** | Rent constant **6960 → 696** lamports/byte (−90%) | SPL token account rent $0.159 → **$0.0159** | Cheap to create many ATAs → cheap to cover many long-tail tokens. **Directly subsidises the coverage strategy.** |
+| Alpenglow | ~150ms finality | feature-complete in 4.2, activates in **Agave 4.3, Oct 2026** | Watch, don't design around it yet. |
+
+Note SIMD-0437 and the coverage thesis reinforce each other: holding token accounts for
+hundreds of long-tail mints just became 10x cheaper, which is exactly the cost that
+previously made broad coverage impractical for a small operator.
+
+**Local toolchain is stale:** installed Solana CLI is 1.18.17. Needs upgrading to
+current Agave before any on-chain work.
+
+## Competitive benchmark: SolanaMevBot (commercial, closed-source)
+
+Useful as a yardstick for what a working product looks like.
+
+| Item | Value |
+|---|---|
+| Strategies | (a) Jupiter self-hosted-quote bot, (b) on-chain bot monitoring specific mints/pools with on-chain optimal-size calc |
+| Fee | **15% of successful arb profit**, after Jito tip; nothing if nothing lands |
+| Min hardware | 1 core / 4GB RAM (Jupiter bot); "basically any machine" (on-chain bot) |
+| Claim | "never lose on gas, only land profitable txs" — consistent with verified bundle atomicity |
+| Public data | Dune dashboard `dune.com/cetipo/solanamevbot-dashboard` (HTTP 500 on fetch; retry later) |
+
+Two takeaways: (1) the hardware bar is genuinely low, which corroborates that this is
+buildable on commodity kit; (2) a commercial operator charging 15% of profit implies the
+strategy does produce positive returns for at least some users — otherwise there would be
+no fee to collect. Their public per-user dashboard is the best available
+survivorship-corrected evidence and should be examined before going live.
