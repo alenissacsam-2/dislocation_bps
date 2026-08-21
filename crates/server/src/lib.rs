@@ -8,5 +8,5 @@
 pub mod events;
 pub mod routes;
 
-pub use events::{Event, EventBus};
+pub use events::{Event, EventBus, RouteRow};
 pub use routes::serve;

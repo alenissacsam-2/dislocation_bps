@@ -1,13 +1,18 @@
 //! Multi-hop cycles: chained quotes and numeric optimal sizing.
 //!
 //! The two-pool closed form in [`crate::amm`] does not extend cleanly past two hops,
-//! and it only applies to constant-product pools. This module takes the general route:
-//! evaluate the exact chained quote, and find the optimum by search.
+//! so this module takes the general route: evaluate the exact chained quote, and find
+//! the optimum by search. Slower than a closed form, but it works for any number of
+//! hops, and it cross-validates against the closed form on two.
 //!
-//! That is slower than a closed form but it is *correct for any pool type*, which
-//! matters because concentrated-liquidity (Orca, Raydium CLMM) and bin (Meteora DLMM)
-//! quotes are piecewise and have no global closed form at all. When those land, only
-//! [`Leg::quote`] changes; the search is unaffected.
+//! # One leg type, two pool families
+//!
+//! Every leg here is a constant-product leg. That is not a limitation: as
+//! [`crate::clmm`] shows, a concentrated-liquidity pool inside its current tick *is*
+//! a constant-product pool over virtual reserves `L/√P` and `L·√P`. Orca Whirlpool
+//! and Raydium CLMM legs arrive here already converted, carrying a [`Leg::max_in`]
+//! that says how much size the current tick can absorb before that equivalence
+//! stops holding.
 //!
 //! # Why search is safe here
 //!
@@ -15,30 +20,58 @@
 //! marginal output exceeds the marginal input, then falls once your own trade has
 //! moved the price against you. Ternary search converges on the maximum of a unimodal
 //! function, and each iteration discards a third of the interval.
+//!
+//! Feasibility — whether every leg stays inside its `max_in` — is **monotone** in
+//! size, since a bigger input produces a bigger amount at every downstream leg. So
+//! the search first binary-searches the largest feasible size, then ternary-searches
+//! inside it. Treating an infeasible size as "zero profit" instead would put a cliff
+//! in the middle of the interval and break the unimodality the search depends on.
 
-use crate::amm::{cp_swap_out, FeeBps};
+use crate::amm::{cp_swap_out, FeePpm};
 
 /// One hop of a cycle, oriented in the direction of travel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Leg {
-    /// Reserve of the token we spend on this hop.
+    /// Reserve of the token we spend on this hop. Virtual, for a CLMM leg.
     pub reserve_in: u128,
-    /// Reserve of the token we receive on this hop.
+    /// Reserve of the token we receive on this hop. Virtual, for a CLMM leg.
     pub reserve_out: u128,
-    pub fee_bps: FeeBps,
+    pub fee_ppm: FeePpm,
+    /// Largest input for which this leg's quote is exact.
+    ///
+    /// `u128::MAX` for a true constant-product pool, whose curve holds at any size.
+    /// For a concentrated-liquidity leg this is the depth of the current tick: past
+    /// it the pool's liquidity changes and the constant-product equivalence breaks,
+    /// so the quote is refused rather than extrapolated.
+    pub max_in: u128,
 }
 
 impl Leg {
+    /// A constant-product leg, exact at any size.
+    #[must_use]
+    pub fn cp(reserve_in: u128, reserve_out: u128, fee_ppm: FeePpm) -> Self {
+        Self { reserve_in, reserve_out, fee_ppm, max_in: u128::MAX }
+    }
+
+    /// A leg whose quote is only exact up to `max_in`.
+    #[must_use]
+    pub fn bounded(reserve_in: u128, reserve_out: u128, fee_ppm: FeePpm, max_in: u128) -> Self {
+        Self { reserve_in, reserve_out, fee_ppm, max_in }
+    }
+
     #[must_use]
     pub fn quote(&self, amount_in: u128) -> Option<u128> {
-        cp_swap_out(amount_in, self.reserve_in, self.reserve_out, self.fee_bps)
+        if amount_in > self.max_in {
+            return None;
+        }
+        cp_swap_out(amount_in, self.reserve_in, self.reserve_out, self.fee_ppm)
     }
 }
 
 /// Run `amount_in` through every leg in order. Returns the final output amount.
 ///
-/// Returns `None` if any leg fails (empty reserve, overflow, or a quote that would
-/// drain the pool).
+/// Returns `None` if any leg fails — empty reserve, overflow, a quote that would
+/// drain the pool, or a size past a leg's [`Leg::max_in`].
 #[must_use]
 pub fn chain_quote(legs: &[Leg], amount_in: u128) -> Option<u128> {
     let mut amount = amount_in;
@@ -64,34 +97,32 @@ pub fn cycle_profit(legs: &[Leg], amount_in: u128) -> Option<u128> {
 /// cycle is worth exploring iff `∏ (γᵢ · out_i / in_i) > 1`.
 ///
 /// Rearranged to avoid division and stay in integers:
-/// `∏ (γᵢ · out_i) > ∏ (in_i · BPS)`.
+/// `∏ (γᵢ · out_i) > ∏ (in_i · PPM)`.
 ///
-/// This is the same test the two-pool closed form uses, generalised to N hops. It is
-/// a *necessary* condition, and cheap enough to run on every candidate before paying
-/// for a search.
+/// This is a *necessary* condition and ignores `max_in`, deliberately: a cycle whose
+/// marginal rates lose money loses money at every size, but one that clears here may
+/// still turn out to be unsizeable. The sizing step is where that gets decided.
 #[must_use]
 pub fn is_profitable(legs: &[Leg]) -> bool {
     if legs.is_empty() {
         return false;
     }
-    // Accumulate as f64 in log space? No — precision matters and reserves are large.
-    // Instead accumulate the ratio as a rational, reducing each step to stay bounded.
+    // Accumulate the ratio as a rational, reducing each step to stay bounded.
     let mut num: u128 = 1; // ∏ γᵢ · out_i
-    let mut den: u128 = 1; // ∏ in_i · BPS
+    let mut den: u128 = 1; // ∏ in_i · PPM
 
     for leg in legs {
         if leg.reserve_in == 0 || leg.reserve_out == 0 {
             return false;
         }
-        let Some(gamma) = 10_000u128.checked_sub(u128::from(leg.fee_bps)) else {
+        let Some(gamma) = 1_000_000u128.checked_sub(u128::from(leg.fee_ppm)) else {
             return false;
         };
         let Some(n) = gamma.checked_mul(leg.reserve_out) else { return false };
-        let Some(d) = leg.reserve_in.checked_mul(10_000) else { return false };
+        let Some(d) = leg.reserve_in.checked_mul(1_000_000) else { return false };
 
         // Multiply into the running ratio, reducing by the gcd each step so the
         // accumulators cannot overflow across an arbitrary number of hops.
-        let (n, d) = (n, d);
         let g1 = gcd(num, d);
         let g2 = gcd(n, den);
         let Some(new_num) = (num / g1).checked_mul(n / g2) else { return false };
@@ -110,7 +141,6 @@ pub fn is_profitable(legs: &[Leg]) -> bool {
 /// This exists because "no opportunity found" is an uninformative result. Knowing the
 /// market sits at −3 bps tells you fees are the binding constraint and the venues are
 /// tightly arbitraged; −250 bps tells you the route is junk. Both are *measurements*.
-/// The paper-trading phase is meant to produce numbers, not silence.
 ///
 /// Uses `f64` deliberately: this is a reporting statistic, never a trade decision.
 /// Trade decisions go through [`is_profitable`] and [`optimal_input`], which are exact.
@@ -124,10 +154,24 @@ pub fn marginal_edge_bps(legs: &[Leg]) -> Option<f64> {
         if leg.reserve_in == 0 || leg.reserve_out == 0 {
             return None;
         }
-        let gamma = (10_000.0 - f64::from(leg.fee_bps)) / 10_000.0;
+        let gamma = (1_000_000.0 - f64::from(leg.fee_ppm)) / 1_000_000.0;
         ratio *= gamma * (leg.reserve_out as f64) / (leg.reserve_in as f64);
     }
     Some((ratio - 1.0) * 10_000.0)
+}
+
+/// Total fee cost of a route in basis points — what the edge has to beat.
+///
+/// `1 − ∏(1 − feeᵢ)`, in bps. Reported next to [`marginal_edge_bps`] so a negative
+/// edge decomposes into "the price dislocation was X, the fees were Y" instead of
+/// arriving as one number with no explanation.
+#[must_use]
+pub fn route_fee_bps(legs: &[Leg]) -> f64 {
+    let kept: f64 = legs
+        .iter()
+        .map(|l| (1_000_000.0 - f64::from(l.fee_ppm)) / 1_000_000.0)
+        .product();
+    (1.0 - kept) * 10_000.0
 }
 
 fn gcd(mut a: u128, mut b: u128) -> u128 {
@@ -139,17 +183,42 @@ fn gcd(mut a: u128, mut b: u128) -> u128 {
     a.max(1)
 }
 
-/// Largest input worth considering: you can never sensibly put in more than the
-/// first pool's input reserve, and going far past it only wastes search iterations.
+/// Largest input worth considering: never more than the first pool's input reserve,
+/// and never past the first leg's own exactness bound.
 #[must_use]
 pub fn search_ceiling(legs: &[Leg]) -> u128 {
-    legs.first().map_or(0, |l| l.reserve_in)
+    legs.first().map_or(0, |l| l.reserve_in.min(l.max_in))
+}
+
+/// Largest size at which every leg still quotes, at or below `hi`.
+///
+/// Feasibility is monotone in size, so this is a plain binary search. Returns 0 when
+/// even the smallest size fails.
+#[must_use]
+pub fn largest_feasible(legs: &[Leg], hi: u128) -> u128 {
+    if hi == 0 {
+        return 0;
+    }
+    if chain_quote(legs, hi).is_some() {
+        return hi;
+    }
+    let (mut lo, mut hi) = (0u128, hi);
+    // Invariant: `lo` is feasible or zero, `hi` is infeasible.
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if chain_quote(legs, mid).is_some() {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
 }
 
 /// Find the input size that maximises cycle profit, by ternary search.
 ///
 /// `max_in` caps the search — pass your available capital to get the best size you
-/// can *actually* trade, or [`search_ceiling`] for the unconstrained optimum.
+/// can *actually* trade, or [`u128::MAX`] for the unconstrained optimum.
 ///
 /// Returns `None` if no size in range profits.
 #[must_use]
@@ -157,8 +226,12 @@ pub fn optimal_input(legs: &[Leg], max_in: u128) -> Option<u128> {
     if legs.is_empty() || max_in == 0 || !is_profitable(legs) {
         return None;
     }
+    let ceiling = largest_feasible(legs, max_in.min(search_ceiling(legs)).max(1));
+    if ceiling == 0 {
+        return None;
+    }
     let mut lo: u128 = 1;
-    let mut hi: u128 = max_in.min(search_ceiling(legs)).max(1);
+    let mut hi: u128 = ceiling;
 
     // Each iteration removes a third of the interval; 200 is far more than enough to
     // converge on a u128 range, and the loop exits early once the interval is tiny.
@@ -195,8 +268,10 @@ mod tests {
     use super::*;
     use crate::amm::{optimal_input as closed_form, CycleReserves};
 
+    const FEE: FeePpm = 2500; // 25 bp, Raydium v4
+
     fn leg(r_in: u128, r_out: u128) -> Leg {
-        Leg { reserve_in: r_in, reserve_out: r_out, fee_bps: 25 }
+        Leg::cp(r_in, r_out, FEE)
     }
 
     #[test]
@@ -223,7 +298,8 @@ mod tests {
             (138_186_000_000, 1_800_000_000_000, 4_200_000_000_000, 335_412_000_000),
         ];
         for (a_in, a_out, b_in, b_out) in cases {
-            let cr = CycleReserves { a_in, a_out, b_in, b_out, fee_a_bps: 25, fee_b_bps: 25 };
+            let cr =
+                CycleReserves { a_in, a_out, b_in, b_out, fee_a_ppm: FEE, fee_b_ppm: FEE };
             let legs = [leg(a_in, a_out), leg(b_in, b_out)];
 
             assert_eq!(
@@ -271,7 +347,8 @@ mod tests {
 
     #[test]
     fn capital_cap_limits_the_size_returned() {
-        let legs = [leg(1_000_000, 1_050_000), leg(1_000_000, 1_050_000), leg(1_000_000, 1_050_000)];
+        let legs =
+            [leg(1_000_000, 1_050_000), leg(1_000_000, 1_050_000), leg(1_000_000, 1_050_000)];
         let unconstrained = optimal_input(&legs, u128::MAX).unwrap();
         let capped = optimal_input(&legs, unconstrained / 4).unwrap();
         assert!(capped <= unconstrained / 4, "must respect the cap");
@@ -282,8 +359,8 @@ mod tests {
     fn a_cycle_that_only_loses_returns_none() {
         // Heavy fees against a tiny edge.
         let legs = [
-            Leg { reserve_in: 1_000_000, reserve_out: 1_001_000, fee_bps: 300 },
-            Leg { reserve_in: 1_000_000, reserve_out: 1_001_000, fee_bps: 300 },
+            Leg::cp(1_000_000, 1_001_000, 30_000),
+            Leg::cp(1_000_000, 1_001_000, 30_000),
         ];
         assert!(!is_profitable(&legs));
         assert_eq!(optimal_input(&legs, u128::MAX), None);
@@ -335,6 +412,17 @@ mod tests {
         let legs = [leg(1_000_000, 1_000_000), leg(1_000_000, 1_000_000)];
         let edge = marginal_edge_bps(&legs).unwrap();
         assert!((edge + 49.94).abs() < 0.1, "expected about -49.94bps, got {edge}");
+        assert!((route_fee_bps(&legs) - 49.94).abs() < 0.1, "fee decomposition must match");
+    }
+
+    /// The reason parts-per-million exists in this codebase. Two 1 bp pools cost
+    /// 2 bps, not the 0 or 200 that a coarser unit would produce.
+    #[test]
+    fn one_basis_point_fee_tiers_survive_the_unit() {
+        let legs = [Leg::cp(1_000_000, 1_000_000, 100), Leg::cp(1_000_000, 1_000_000, 100)];
+        assert!((route_fee_bps(&legs) - 2.0).abs() < 0.001);
+        let edge = marginal_edge_bps(&legs).unwrap();
+        assert!((edge + 2.0).abs() < 0.01, "expected about -2bps, got {edge}");
     }
 
     #[test]
@@ -353,5 +441,58 @@ mod tests {
         ];
         assert!(is_profitable(&legs));
         assert!(optimal_input(&legs, u128::MAX).is_some());
+    }
+
+    // ---- bounded (concentrated-liquidity) legs ----
+
+    #[test]
+    fn a_bounded_leg_refuses_sizes_past_its_tick() {
+        let l = Leg::bounded(1_000_000, 1_050_000, 400, 1000);
+        assert!(l.quote(1000).is_some(), "at the bound must still quote");
+        assert_eq!(l.quote(1001), None, "past the bound must refuse, not extrapolate");
+    }
+
+    #[test]
+    fn sizing_stays_inside_the_tick_that_binds() {
+        // The unconstrained optimum is far larger than the second leg can absorb.
+        let unbounded =
+            [leg(10_000_000, 12_000_000), Leg::cp(10_000_000, 12_000_000, FEE)];
+        let want = optimal_input(&unbounded, u128::MAX).unwrap();
+        let mid = chain_quote(&unbounded[..1], want).unwrap();
+
+        // Now cap the second leg at a tenth of what the optimum would push through it.
+        let bounded = [unbounded[0], Leg::bounded(10_000_000, 12_000_000, FEE, mid / 10)];
+        let sized = optimal_input(&bounded, u128::MAX).expect("a smaller trade still profits");
+
+        assert!(sized < want, "the tick bound must reduce the size ({sized} !< {want})");
+        let mid_now = chain_quote(&bounded[..1], sized).unwrap();
+        assert!(mid_now <= mid / 10, "sizing must respect the downstream bound");
+        assert!(cycle_profit(&bounded, sized).unwrap() > 0);
+    }
+
+    #[test]
+    fn a_cycle_with_no_feasible_size_returns_none() {
+        // Profitable on paper, but the first tick holds nothing.
+        let legs = [Leg::bounded(1_000_000, 1_500_000, 400, 0), leg(1_000_000, 1_000_000)];
+        assert!(is_profitable(&legs), "marginal rates still clear");
+        assert_eq!(optimal_input(&legs, u128::MAX), None, "but nothing is tradable");
+    }
+
+    #[test]
+    fn largest_feasible_finds_the_exact_boundary() {
+        let legs = [Leg::bounded(1_000_000, 1_050_000, FEE, 777)];
+        assert_eq!(largest_feasible(&legs, 10_000), 777);
+        assert_eq!(largest_feasible(&legs, 100), 100, "already feasible means no search");
+        assert_eq!(largest_feasible(&legs, 0), 0);
+    }
+
+    /// A bounded leg deeper in the chain still binds, because the amount reaching it
+    /// grows with the size we put in at the front.
+    #[test]
+    fn feasibility_is_monotone_so_the_binary_search_is_valid() {
+        let legs = [leg(1_000_000, 1_050_000), Leg::bounded(1_000_000, 1_050_000, FEE, 5_000)];
+        let boundary = largest_feasible(&legs, 1_000_000);
+        assert!(chain_quote(&legs, boundary).is_some(), "the boundary itself must be feasible");
+        assert!(chain_quote(&legs, boundary + 1).is_none(), "one past it must not be");
     }
 }

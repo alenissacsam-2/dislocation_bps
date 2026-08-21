@@ -76,18 +76,22 @@ pub struct AmmInfo {
 }
 
 impl AmmInfo {
-    /// Swap fee in basis points, rounded up so we never *under*-estimate cost.
+    /// Swap fee in parts per million, rounded up so we never *under*-estimate cost.
     ///
     /// Rounding down here would make marginal cycles look profitable when they are
     /// not; rounding up only makes us skip trades that were barely worth taking.
+    /// Parts per million rather than basis points because the concentrated-liquidity
+    /// venues quote at 1 bp, and a unit that cannot tell 1 bp from 2 bp cannot tell a
+    /// profitable route from a losing one.
     #[must_use]
-    pub fn fee_bps(&self) -> u32 {
+    pub fn fee_ppm(&self) -> u32 {
+        const DEFAULT: u32 = 2500; // Raydium's standard 25 bp.
         if self.swap_fee_denominator == 0 {
-            return 25; // Raydium's standard rate; a zero denominator is corrupt data.
+            return DEFAULT; // A zero denominator is corrupt data, not a free pool.
         }
-        let num = u128::from(self.swap_fee_numerator) * 10_000;
+        let num = u128::from(self.swap_fee_numerator) * 1_000_000;
         let den = u128::from(self.swap_fee_denominator);
-        u32::try_from(num.div_ceil(den)).unwrap_or(25)
+        u32::try_from(num.div_ceil(den)).unwrap_or(DEFAULT)
     }
 }
 
@@ -150,16 +154,16 @@ pub fn to_pool_state(
         .checked_sub(info.quote_need_take_pnl)
         .ok_or_else(|| anyhow::anyhow!("quote vault below uncollected fees — torn read across slots"))?;
 
-    Ok(PoolState {
-        id: PoolId(address),
-        dex: Dex::RaydiumAmmV4,
-        mint_a: info.base_mint,
-        mint_b: info.quote_mint,
-        reserve_a: u128::from(base),
-        reserve_b: u128::from(quote),
-        fee_bps: info.fee_bps(),
+    Ok(PoolState::constant_product(
+        PoolId(address),
+        Dex::RaydiumAmmV4,
+        info.base_mint,
+        info.quote_mint,
+        u128::from(base),
+        u128::from(quote),
+        info.fee_ppm(),
         slot,
-    })
+    ))
 }
 
 #[cfg(test)]
@@ -237,7 +241,7 @@ mod tests {
         assert_eq!(to_b58(&info.quote_vault), "HLmqeL62xR1QoZ1HKKbXRrdN1p3phKpxRMb2VVopvBBz");
         assert_eq!(info.base_decimals, 9, "WSOL");
         assert_eq!(info.quote_decimals, 6, "USDC");
-        assert_eq!(info.fee_bps(), 25);
+        assert_eq!(info.fee_ppm(), 2500, "25 bp, carried as parts per million");
     }
 
     /// The PnL subtraction is the whole point of this module.
@@ -250,9 +254,9 @@ mod tests {
         let (base_raw, quote_raw) = (66_641_707_408_048u64, 5_934_861_275_575u64);
         let p = to_pool_state([7u8; 32], &info, base_raw, quote_raw, 42).unwrap();
 
-        assert_eq!(p.reserve_a, u128::from(base_raw - info.base_need_take_pnl));
-        assert_eq!(p.reserve_b, u128::from(quote_raw - info.quote_need_take_pnl));
-        assert!(p.reserve_a < u128::from(base_raw), "must be strictly less than raw");
+        assert_eq!(p.reserve_a(), u128::from(base_raw - info.base_need_take_pnl));
+        assert_eq!(p.reserve_b(), u128::from(quote_raw - info.quote_need_take_pnl));
+        assert!(p.reserve_a() < u128::from(base_raw), "must be strictly less than raw");
     }
 
     #[test]
@@ -260,8 +264,8 @@ mod tests {
         let info = decode_amm_info(&real_pool_account()).unwrap();
         let p = to_pool_state([7u8; 32], &info, 66_641_707_408_048, 5_934_861_275_575, 1).unwrap();
         // Adjust for 9 vs 6 decimals.
-        let sol = p.reserve_a as f64 / 1e9;
-        let usdc = p.reserve_b as f64 / 1e6;
+        let sol = p.reserve_a() as f64 / 1e9;
+        let usdc = p.reserve_b() as f64 / 1e6;
         let price = usdc / sol;
         assert!(
             (50.0..200.0).contains(&price),
@@ -300,18 +304,20 @@ mod tests {
     }
 
     #[test]
-    fn fee_bps_rounds_up_never_down() {
+    fn fee_ppm_rounds_up_never_down() {
         let mk = |num, den| AmmInfo {
             base_mint: [0; 32], quote_mint: [0; 32], base_vault: [0; 32], quote_vault: [0; 32],
             base_decimals: 9, quote_decimals: 6,
             base_need_take_pnl: 0, quote_need_take_pnl: 0,
             swap_fee_numerator: num, swap_fee_denominator: den,
         };
-        assert_eq!(mk(25, 10_000).fee_bps(), 25);
-        assert_eq!(mk(3, 1_000).fee_bps(), 30);
-        // 0.00251 -> 25.1bp must round to 26, not 25.
-        assert_eq!(mk(251, 100_000).fee_bps(), 26);
+        assert_eq!(mk(25, 10_000).fee_ppm(), 2500, "25/10000 is 25 bp = 2500 ppm");
+        assert_eq!(mk(3, 1_000).fee_ppm(), 3000, "30 bp");
+        // 25.1 bp is exactly representable in ppm — the unit change bought this.
+        assert_eq!(mk(251, 100_000).fee_ppm(), 2510);
+        // A rate that genuinely does not divide must round up, never down.
+        assert_eq!(mk(1, 3).fee_ppm(), 333_334);
         // Corrupt denominator falls back rather than dividing by zero.
-        assert_eq!(mk(25, 0).fee_bps(), 25);
+        assert_eq!(mk(25, 0).fee_ppm(), 2500);
     }
 }

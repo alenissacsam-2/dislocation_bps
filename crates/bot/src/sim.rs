@@ -63,7 +63,7 @@ struct Venue {
     reserve_a: u128,
     /// Reserve of the counter token (USDC side), in base units.
     reserve_b: u128,
-    fee_bps: u32,
+    fee_ppm: u32,
 }
 
 impl Venue {
@@ -94,7 +94,7 @@ impl Market {
             dex,
             reserve_a: (sol * 1e9) as u128,
             reserve_b: (sol * SOL_USD * 1e6) as u128,
-            fee_bps: fee,
+            fee_ppm: fee,
         };
         Self {
             rng: Rng::new(seed),
@@ -154,8 +154,8 @@ impl Market {
             a_out: buy.reserve_a,
             b_in: sell.reserve_a,
             b_out: sell.reserve_b,
-            fee_a_bps: buy.fee_bps,
-            fee_b_bps: sell.fee_bps,
+            fee_a_ppm: buy.fee_ppm,
+            fee_b_ppm: sell.fee_ppm,
         };
 
         let Some(optimal) = optimal_input(&reserves) else {
@@ -181,6 +181,9 @@ impl Market {
         let gross_usd = gross_units as f64 / 1e6;
 
         let spread_bps = ((sell.price() / buy.price()) - 1.0) * 10_000.0;
+        let fee_bps = (1.0
+            - (1.0 - f64::from(buy.fee_ppm) / 1e6) * (1.0 - f64::from(sell.fee_ppm) / 1e6))
+            * 10_000.0;
 
         // Contested opportunities are the big obvious ones on major pairs; those are
         // where competitors bid the tip up to most of the profit.
@@ -208,13 +211,17 @@ impl Market {
 
         bus.publish(Event::Opportunity {
             id,
-            pair: self.pair.to_string(),
-            dex_buy: buy.dex.to_string(),
-            dex_sell: sell.dex.to_string(),
-            spread_bps,
+            route: format!("{} -> {}", self.pair, self.pair),
+            venues: format!("{} - {}", buy.dex, sell.dex),
+            hops: 2,
+            edge_bps: spread_bps - fee_bps,
+            dislocation_bps: spread_bps,
+            fee_bps,
             optimal_size_usd: optimal_usd,
             capped_size_usd: capped_usd,
+            capital_reach_pct: if optimal_usd > 0.0 { 100.0 * capped_usd / optimal_usd } else { 100.0 },
             gross_profit_usd: gross_usd,
+            profit_at_optimal_usd: gross_usd * (optimal_usd / capped_usd.max(1e-9)),
             est_tip_usd,
             net_profit_usd: net_usd,
             contested,
@@ -270,6 +277,10 @@ impl Market {
             best_hops: 0,
             best_fee_bps: 0.0,
             cycles_evaluated: 0,
+            venues: self.venues.len(),
+            duplicate_pairs: 1,
+            cheapest_round_trip_bps: 50.0,
+            sweep_us: 0,
         });
     }
 }
@@ -339,7 +350,7 @@ mod tests {
             dex: "test",
             reserve_a: (100.0 * 1e9) as u128,
             reserve_b: (7697.0 * 1e6) as u128,
-            fee_bps: 25,
+            fee_ppm: 2500,
         };
         assert!((v.price() - 76.97).abs() < 0.01, "price was {}", v.price());
     }

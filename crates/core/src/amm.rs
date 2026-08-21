@@ -55,11 +55,16 @@
 //! `γa·γb·B·D > A·C`. That test is cheap and is used to reject candidates before
 //! doing any square root.
 
-/// Fee expressed in basis points (1 bp = 0.01%). Raydium v4 is 25 bp, most
-/// constant-product pools are 25–30 bp.
-pub type FeeBps = u32;
+/// Fee expressed in **parts per million** (1 ppm = 0.0001%; 100 ppm = 1 bp).
+///
+/// Parts per million, not basis points, because that is the native unit on chain:
+/// Orca Whirlpool's `fee_rate` and Raydium CLMM's `trade_fee_rate` are both stored
+/// this way. Rounding them into basis points would turn a 1 bp pool and a 1.5 bp pool
+/// into the same number, and at these fee tiers the difference between 1 and 2 bp is
+/// most of the edge we are hunting.
+pub type FeePpm = u32;
 
-const BPS_DENOM: u128 = 10_000;
+const PPM_DENOM: u128 = 1_000_000;
 
 use ruint::aliases::U256;
 
@@ -80,20 +85,28 @@ fn u256(x: u128) -> U256 {
 /// this runs in the hot path against untrusted on-chain data, some of which is
 /// adversarial.
 #[must_use]
-pub fn cp_swap_out(amount_in: u128, reserve_in: u128, reserve_out: u128, fee_bps: FeeBps) -> Option<u128> {
+pub fn cp_swap_out(amount_in: u128, reserve_in: u128, reserve_out: u128, fee_ppm: FeePpm) -> Option<u128> {
     if amount_in == 0 || reserve_in == 0 || reserve_out == 0 {
         return None;
     }
-    let gamma_num = BPS_DENOM.checked_sub(u128::from(fee_bps))?;
+    let gamma_num = PPM_DENOM.checked_sub(u128::from(fee_ppm))?;
 
     // amount_in_after_fee = amount_in · γ
-    let in_after_fee = amount_in.checked_mul(gamma_num)?;
+    // 256-bit throughout. `in_after_fee` carries a factor of 1e6, and multiplying
+    // that by an output reserve overflows u128 at concentrated-liquidity scale: a
+    // pool's virtual reserve can exceed 2^88, and 2^88 · 2^46 is already past u128.
+    // This is the same overflow that once made `optimal_input` return None for the
+    // entire live market, one function further down the call chain.
+    let in_after_fee = u256(amount_in).checked_mul(u256(gamma_num))?;
 
-    // out = (in·γ · reserve_out) / (reserve_in·BPS + in·γ)
-    let numerator = in_after_fee.checked_mul(reserve_out)?;
-    let denominator = reserve_in.checked_mul(BPS_DENOM)?.checked_add(in_after_fee)?;
+    // out = (in·γ · reserve_out) / (reserve_in·PPM + in·γ)
+    let numerator = in_after_fee.checked_mul(u256(reserve_out))?;
+    let denominator = u256(reserve_in).checked_mul(u256(PPM_DENOM))?.checked_add(in_after_fee)?;
+    if denominator == U256::ZERO {
+        return None;
+    }
 
-    let out = numerator / denominator;
+    let out: u128 = (numerator / denominator).try_into().ok()?;
 
     // Never allow draining the pool; a quote that claims the whole reserve is a
     // decode error, not an opportunity.
@@ -114,8 +127,8 @@ pub struct CycleReserves {
     pub b_in: u128,
     /// Pool B reserve of the token we get back (X).
     pub b_out: u128,
-    pub fee_a_bps: FeeBps,
-    pub fee_b_bps: FeeBps,
+    pub fee_a_ppm: FeePpm,
+    pub fee_b_ppm: FeePpm,
 }
 
 /// Cheap necessary condition for the cycle to be profitable at *any* size.
@@ -129,15 +142,15 @@ pub struct CycleReserves {
 #[must_use]
 pub fn is_profitable(r: &CycleReserves) -> bool {
     let (Some(ga), Some(gb)) = (
-        BPS_DENOM.checked_sub(u128::from(r.fee_a_bps)),
-        BPS_DENOM.checked_sub(u128::from(r.fee_b_bps)),
+        PPM_DENOM.checked_sub(u128::from(r.fee_a_ppm)),
+        PPM_DENOM.checked_sub(u128::from(r.fee_b_ppm)),
     ) else {
         return false;
     };
 
     // lhs = γa·γb·B·D, rhs = A·C·BPS²
     let lhs = u256(ga) * u256(gb) * u256(r.a_out) * u256(r.b_out);
-    let rhs = u256(r.a_in) * u256(r.b_in) * u256(BPS_DENOM) * u256(BPS_DENOM);
+    let rhs = u256(r.a_in) * u256(r.b_in) * u256(PPM_DENOM) * u256(PPM_DENOM);
     lhs > rhs
 }
 
@@ -155,8 +168,8 @@ pub fn optimal_input(r: &CycleReserves) -> Option<u128> {
     if !is_profitable(r) {
         return None;
     }
-    let ga = BPS_DENOM.checked_sub(u128::from(r.fee_a_bps))?;
-    let gb = BPS_DENOM.checked_sub(u128::from(r.fee_b_bps))?;
+    let ga = PPM_DENOM.checked_sub(u128::from(r.fee_a_ppm))?;
+    let gb = PPM_DENOM.checked_sub(u128::from(r.fee_b_ppm))?;
 
     // All intermediates are 256-bit. The radicand is a product of SIX pool-scale
     // quantities, which overflows u128 once reserves exceed roughly 4.3e7 base units
@@ -168,7 +181,7 @@ pub fn optimal_input(r: &CycleReserves) -> Option<u128> {
     // Integer square root, truncating downward.
     let root = radicand.root(2);
 
-    let ac_scaled = u256(r.a_in) * u256(r.b_in) * u256(BPS_DENOM);
+    let ac_scaled = u256(r.a_in) * u256(r.b_in) * u256(PPM_DENOM);
 
     // is_profitable implies root > ac_scaled up to sqrt truncation; guard anyway.
     if root <= ac_scaled {
@@ -180,12 +193,12 @@ pub fn optimal_input(r: &CycleReserves) -> Option<u128> {
     //   γa·(C + γb·B) = ga·(C·BPS + gb·B) / BPS²
     // and the surrounding expression multiplies by BPS, so we carry
     // ga·(C·BPS + gb·B) here and apply the single remaining BPS below.
-    let denominator = u256(ga) * (u256(r.b_in) * u256(BPS_DENOM) + u256(gb) * u256(r.a_out));
+    let denominator = u256(ga) * (u256(r.b_in) * u256(PPM_DENOM) + u256(gb) * u256(r.a_out));
 
     if denominator == U256::ZERO {
         return None;
     }
-    let x = numerator * u256(BPS_DENOM) / denominator;
+    let x = numerator * u256(PPM_DENOM) / denominator;
 
     // A size that does not fit u128 is not a size we can put in a transaction.
     let x: u128 = x.try_into().ok()?;
@@ -201,8 +214,8 @@ pub fn optimal_input(r: &CycleReserves) -> Option<u128> {
 /// Returns `None` if either leg fails or the cycle loses money.
 #[must_use]
 pub fn cycle_profit(r: &CycleReserves, amount_in: u128) -> Option<u128> {
-    let mid = cp_swap_out(amount_in, r.a_in, r.a_out, r.fee_a_bps)?;
-    let back = cp_swap_out(mid, r.b_in, r.b_out, r.fee_b_bps)?;
+    let mid = cp_swap_out(amount_in, r.a_in, r.a_out, r.fee_a_ppm)?;
+    let back = cp_swap_out(mid, r.b_in, r.b_out, r.fee_b_ppm)?;
     back.checked_sub(amount_in)
 }
 
@@ -211,17 +224,17 @@ mod tests {
     use super::*;
 
     fn cycle(a_in: u128, a_out: u128, b_in: u128, b_out: u128) -> CycleReserves {
-        CycleReserves { a_in, a_out, b_in, b_out, fee_a_bps: 25, fee_b_bps: 25 }
+        CycleReserves { a_in, a_out, b_in, b_out, fee_a_ppm: 2500, fee_b_ppm: 2500 }
     }
 
     #[test]
     fn swap_matches_hand_computed_value() {
-        // 1000 in, reserves 1_000_000 / 1_000_000, 25bp fee.
-        // in_after_fee = 1000 * 9975 = 9_975_000
-        // num = 9_975_000 * 1_000_000 = 9.975e12
-        // den = 1_000_000*10_000 + 9_975_000 = 10_009_975_000
-        // out = 9.975e12 / 1.0009975e10 = 996
-        assert_eq!(cp_swap_out(1000, 1_000_000, 1_000_000, 25), Some(996));
+        // 1000 in, reserves 1_000_000 / 1_000_000, 25 bp fee = 2500 ppm.
+        // in_after_fee = 1000 * 997_500 = 997_500_000
+        // num = 997_500_000 * 1_000_000 = 9.975e14
+        // den = 1_000_000*1_000_000 + 997_500_000 = 1_000_997_500_000
+        // out = 9.975e14 / 1.0009975e12 = 996
+        assert_eq!(cp_swap_out(1000, 1_000_000, 1_000_000, 2500), Some(996));
     }
 
     #[test]
@@ -276,11 +289,11 @@ mod tests {
 
     #[test]
     fn rejects_degenerate_inputs() {
-        assert_eq!(cp_swap_out(0, 100, 100, 25), None);
-        assert_eq!(cp_swap_out(100, 0, 100, 25), None);
-        assert_eq!(cp_swap_out(100, 100, 0, 25), None);
+        assert_eq!(cp_swap_out(0, 100, 100, 2500), None);
+        assert_eq!(cp_swap_out(100, 0, 100, 2500), None);
+        assert_eq!(cp_swap_out(100, 100, 0, 2500), None);
         // Fee >= 100% is nonsense and must not underflow.
-        assert_eq!(cp_swap_out(100, 1000, 1000, 10_001), None);
+        assert_eq!(cp_swap_out(100, 1000, 1000, 1_000_001), None);
     }
 
     /// Regression: `optimal_input` used to compute the six-way radicand in `u128`,
@@ -297,8 +310,8 @@ mod tests {
             a_out: 1_800_000_000_000,  // SOL out (9 dp)
             b_in: 4_200_000_000_000,   // SOL in
             b_out: 335_412_000_000,    // USDC out
-            fee_a_bps: 25,
-            fee_b_bps: 25,
+            fee_a_ppm: 2500,
+            fee_b_ppm: 2500,
         };
         assert!(is_profitable(&r), "a 4% dislocation at real depth must be profitable");
 
@@ -323,8 +336,8 @@ mod tests {
             a_out: 1_800_000_000_000,
             b_in: 4_200_000_000_000,
             b_out: 335_412_000_000,
-            fee_a_bps: 25,
-            fee_b_bps: 25,
+            fee_a_ppm: 2500,
+            fee_b_ppm: 2500,
         };
         let optimal = optimal_input(&r).unwrap();
         let five_dollars = 4_800_000u128; // $4.80 in USDC base units
@@ -344,8 +357,8 @@ mod tests {
             a_out: u128::MAX / 2,
             b_in: u128::MAX / 2,
             b_out: u128::MAX / 2,
-            fee_a_bps: 25,
-            fee_b_bps: 25,
+            fee_a_ppm: 2500,
+            fee_b_ppm: 2500,
         };
         let _ = is_profitable(&r);
         let _ = optimal_input(&r);
@@ -354,8 +367,8 @@ mod tests {
     #[test]
     fn zero_fee_pools_still_need_a_dislocation() {
         let mut r = cycle(1_000_000, 1_000_000, 1_000_000, 1_000_000);
-        r.fee_a_bps = 0;
-        r.fee_b_bps = 0;
+        r.fee_a_ppm = 0;
+        r.fee_b_ppm = 0;
         // With no fees and no dislocation, profit is exactly zero — not positive.
         assert!(!is_profitable(&r));
     }

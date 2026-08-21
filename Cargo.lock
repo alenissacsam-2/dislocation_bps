@@ -492,6 +492,7 @@ dependencies = [
  "cb-scanner",
  "cb-server",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -514,6 +515,7 @@ name = "cb-dex"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bs58",
  "cb-core",
  "thiserror",
 ]

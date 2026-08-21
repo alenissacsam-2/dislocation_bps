@@ -57,6 +57,37 @@ pub enum Event {
         best_fee_bps: f64,
         #[serde(default)]
         cycles_evaluated: u64,
+        /// Distinct venues contributing quotable pools right now.
+        #[serde(default)]
+        venues: usize,
+        /// Pairs quoted by more than one venue. These are where a two-hop round trip
+        /// exists at all, so the count is a direct measure of how much of the search
+        /// space is the cheap kind.
+        #[serde(default)]
+        duplicate_pairs: usize,
+        /// Cheapest complete round trip available anywhere in the universe, in bps.
+        /// The floor any opportunity has to clear.
+        #[serde(default)]
+        cheapest_round_trip_bps: f64,
+        /// How long the last full cycle sweep took.
+        #[serde(default)]
+        sweep_us: u64,
+    },
+
+    /// The current leaderboard of routes, ranked by how close they are to clearing.
+    ///
+    /// This is the instrument's primary output. A route that never clears still
+    /// reports *how far* it fell short and *why* — a wide price gap that fees ate is a
+    /// different finding from two venues that simply agree on the price, and only one
+    /// of them says anything about whether cheaper execution would help.
+    #[serde(rename_all = "camelCase")]
+    Routes {
+        rows: Vec<RouteRow>,
+        /// Cycles priced in this sweep.
+        evaluated: u64,
+        sweep_us: u64,
+        slot: u64,
+        ts_ms: u64,
     },
 
     /// A pool's reserves changed.
@@ -77,17 +108,30 @@ pub enum Event {
     #[serde(rename_all = "camelCase")]
     Opportunity {
         id: u64,
-        pair: String,
-        dex_buy: String,
-        dex_sell: String,
-        /// Net price dislocation between the two venues, in basis points.
-        spread_bps: f64,
+        /// Mints in travel order.
+        route: String,
+        /// Venue and fee tier per hop.
+        venues: String,
+        hops: usize,
+        /// Profit per unit at infinitesimal size, in bps.
+        edge_bps: f64,
+        /// Price gap between the venues before fees, in bps.
+        dislocation_bps: f64,
+        /// Cost of crossing those venues, in bps.
+        fee_bps: f64,
         /// Optimal size the maths wants, in USD.
         optimal_size_usd: f64,
         /// Size we could actually take given capital, in USD.
         capped_size_usd: f64,
+        /// What fraction of the available opportunity our capital reaches, as a
+        /// percentage. The single clearest statement of what $5 costs us.
+        capital_reach_pct: f64,
         /// Profit at the capped size, before tip and tax.
         gross_profit_usd: f64,
+        /// Profit the same cycle would yield with unlimited capital. The gap against
+        /// `gross_profit_usd` is what a $5 account costs, stated in dollars.
+        #[serde(default)]
+        profit_at_optimal_usd: f64,
         /// Estimated tip required to win this one.
         est_tip_usd: f64,
         /// Profit after tip. What actually reaches the wallet.
@@ -115,6 +159,27 @@ pub enum Event {
         reason: Option<String>,
         ts_ms: u64,
     },
+}
+
+/// One route on the leaderboard.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteRow {
+    /// Mints in travel order, e.g. `SOL -> USDC -> SOL`.
+    pub route: String,
+    /// Venue and fee tier for each hop, e.g. `ORCA 1bp - RAY-CL 2bp`.
+    pub venues: String,
+    pub hops: usize,
+    /// Profit per unit at infinitesimal size, in bps. Positive clears.
+    pub edge_bps: f64,
+    /// How far apart the venues' prices are, before fees.
+    pub dislocation_bps: f64,
+    /// What crossing those venues costs.
+    pub fee_bps: f64,
+    /// Largest trade the route can price exactly, in USD. Bounded by the tightest
+    /// concentrated-liquidity tick along the way.
+    pub depth_usd: f64,
+    pub slot: u64,
 }
 
 /// Broadcast bus. Cloning is cheap; every consumer gets its own receiver.
@@ -179,6 +244,10 @@ mod tests {
             best_hops: 0,
             best_fee_bps: 0.0,
             cycles_evaluated: 0,
+            venues: 0,
+            duplicate_pairs: 0,
+            cheapest_round_trip_bps: 0.0,
+            sweep_us: 0,
         }
     }
 

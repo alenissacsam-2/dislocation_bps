@@ -11,8 +11,8 @@ use cb_core::types::{Dex, PoolId, PoolState, Pubkey32};
 
 pub const PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
-/// PumpSwap's swap fee in basis points.
-pub const FEE_BPS: u32 = 25;
+/// PumpSwap's swap fee in parts per million (25 bp).
+pub const FEE_PPM: u32 = 2500;
 
 // Byte offsets into the Pool account, after the 8-byte Anchor discriminator.
 const OFF_DISCRIMINATOR: usize = 8;
@@ -42,16 +42,16 @@ pub fn decode(
         "pumpswap pool account too short: {} bytes, need at least {MIN_LEN}",
         data.len()
     );
-    Ok(PoolState {
-        id: PoolId(address),
-        dex: Dex::PumpSwap,
-        mint_a: read_pubkey(data, OFF_BASE_MINT),
-        mint_b: read_pubkey(data, OFF_QUOTE_MINT),
+    Ok(PoolState::constant_product(
+        PoolId(address),
+        Dex::PumpSwap,
+        read_pubkey(data, OFF_BASE_MINT),
+        read_pubkey(data, OFF_QUOTE_MINT),
         reserve_a,
         reserve_b,
-        fee_bps: FEE_BPS,
+        FEE_PPM,
         slot,
-    })
+    ))
 }
 
 #[cfg(test)]
@@ -76,10 +76,10 @@ mod tests {
         let p = decode([1u8; 32], &data, 5_000, 9_000, 99).unwrap();
         assert_eq!(p.mint_a, [11u8; 32]);
         assert_eq!(p.mint_b, [22u8; 32]);
-        assert_eq!(p.reserve_a, 5_000);
-        assert_eq!(p.reserve_b, 9_000);
+        assert_eq!(p.reserve_a(), 5_000);
+        assert_eq!(p.reserve_b(), 9_000);
         assert_eq!(p.dex, Dex::PumpSwap);
-        assert_eq!(p.fee_bps, FEE_BPS);
+        assert_eq!(p.fee_ppm, FEE_PPM);
         assert_eq!(p.slot, 99);
     }
 

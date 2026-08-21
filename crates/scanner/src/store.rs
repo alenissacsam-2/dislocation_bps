@@ -4,6 +4,7 @@
 //! `DashMap` gives per-shard locking, which is sufficient: writes are per-pool and
 //! readers mostly touch disjoint keys.
 
+use crate::snapshot::Snapshot;
 use cb_core::types::{PoolId, PoolState, Pubkey32};
 use dashmap::DashMap;
 
@@ -37,6 +38,17 @@ impl PoolStore {
     #[must_use]
     pub fn get(&self, id: &PoolId) -> Option<PoolState> {
         self.pools.get(id).map(|r| *r.value())
+    }
+
+    /// A consistent, indexed copy of the whole market.
+    ///
+    /// Every search pass takes one of these rather than walking the live map. It keeps
+    /// a pass from pricing a cycle out of two pool states that were never true at the
+    /// same moment, and it turns the per-step mint lookup from a full scan into a hash
+    /// lookup.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot::new(self.pools.iter().map(|r| *r.value()).collect())
     }
 
     /// Every pool that trades `mint`, in either position.
@@ -82,16 +94,16 @@ mod tests {
     use cb_core::types::{Dex, PoolId, PoolState};
 
     fn pool(id: u8, a: u8, b: u8, slot: u64) -> PoolState {
-        PoolState {
-            id: PoolId([id; 32]),
-            dex: Dex::PumpSwap,
-            mint_a: [a; 32],
-            mint_b: [b; 32],
-            reserve_a: 1_000,
-            reserve_b: 1_000,
-            fee_bps: 25,
+        PoolState::constant_product(
+            PoolId([id; 32]),
+            Dex::PumpSwap,
+            [a; 32],
+            [b; 32],
+            1_000,
+            1_000,
+            2500,
             slot,
-        }
+        )
     }
 
     #[test]

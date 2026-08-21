@@ -2,4 +2,5 @@
 
 pub mod cycles;
 pub mod multi;
+pub mod snapshot;
 pub mod store;

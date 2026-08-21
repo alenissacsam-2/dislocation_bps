@@ -50,8 +50,8 @@ pub fn find_two_pool_cycles(
             a_out: leg1.r_out,
             b_in: leg2.r_in,
             b_out: leg2.r_out,
-            fee_a_bps: updated.fee_bps,
-            fee_b_bps: other.fee_bps,
+            fee_a_ppm: updated.fee_ppm,
+            fee_b_ppm: other.fee_ppm,
         };
 
         let Some(amount_in) = optimal_input(&reserves) else {
@@ -90,16 +90,9 @@ mod tests {
     const QUOTE: [u8; 32] = [20; 32]; // the intermediate token
 
     fn pool(id: u8, ra: u128, rb: u128) -> PoolState {
-        PoolState {
-            id: PoolId([id; 32]),
-            dex: Dex::PumpSwap,
-            mint_a: BASE,
-            mint_b: QUOTE,
-            reserve_a: ra,
-            reserve_b: rb,
-            fee_bps: 25,
-            slot: 1,
-        }
+        PoolState::constant_product(
+            PoolId([id; 32]), Dex::PumpSwap, BASE, QUOTE, ra, rb, 2500, 1,
+        )
     }
 
     #[test]
@@ -159,16 +152,16 @@ mod tests {
         let s = PoolStore::new();
         let p1 = pool(1, 1_000_000, 1_000_000);
         s.upsert(p1);
-        s.upsert(PoolState {
-            id: PoolId([2; 32]),
-            dex: Dex::PumpSwap,
-            mint_a: QUOTE,
-            mint_b: [77; 32], // not BASE
-            reserve_a: 1_000_000,
-            reserve_b: 5_000_000,
-            fee_bps: 25,
-            slot: 1,
-        });
+        s.upsert(PoolState::constant_product(
+            PoolId([2; 32]),
+            Dex::PumpSwap,
+            QUOTE,
+            [77; 32], // not BASE
+            1_000_000,
+            5_000_000,
+            2500,
+            1,
+        ));
         assert!(find_two_pool_cycles(&s, &BASE, &p1, 0).is_empty());
     }
 

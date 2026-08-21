@@ -7,17 +7,48 @@
 //! See `docs/superpowers/specs/` for the design and `docs/research/` for the numbers.
 
 mod live;
+mod registry;
 mod sim;
 
 use cb_core::config::{Config, FeedSource, Mode};
 use cb_feed::WsFeed;
-use cb_server::{routes, Event, EventBus};
+use cb_server::{routes, Event, EventBus, RouteRow};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SLOT_MS: u64 = 200;
 const LISTEN: &str = "0.0.0.0:8787";
+
+/// How often the whole cycle graph is re-priced. Two sweeps per slot: fast enough
+/// that a measurement is never more than half a block stale, slow enough that the
+/// scan cost stays invisible.
+const SWEEP_INTERVAL: Duration = Duration::from_millis(200);
+
+/// How often token valuations are rebuilt from pool state. Only used for sizing, and
+/// a token's dollar value does not move meaningfully inside ten seconds.
+const USD_REFRESH: Duration = Duration::from_secs(10);
+
+/// Profit above which we assume a faster searcher has already seen the same cycle.
+const CONTESTED_USD: f64 = 0.01;
+/// Share of profit a contested cycle has to give up as a tip to win the bundle.
+const CONTESTED_TIP_SHARE: f64 = 0.60;
+/// Median Jito tip floor, in SOL.
+const JITO_TIP_FLOOR_SOL: f64 = 0.000_007_5;
+/// Solana base transaction fee, in SOL.
+const BASE_FEE_SOL: f64 = 0.000_005;
+
+/// What the last sweep saw, handed to the status heartbeat.
+#[derive(Debug, Clone, Default)]
+struct SweepSummary {
+    best: Option<live::EdgeRow>,
+    evaluated_total: u64,
+    sweep_us: u64,
+    pools_ready: usize,
+    venues: usize,
+    sol_price_usd: f64,
+    slot: u64,
+}
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -93,26 +124,51 @@ fn spawn_simulated(bus: EventBus) {
 }
 
 async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
+    let registry = registry::Registry::embedded()?;
+
+    // Report the universe before any data arrives, so the run's headline constraint
+    // is on the record even if the feed never connects.
+    let dupe_count = registry.duplicate_pairs().len();
+    let round_trips: Vec<(String, f64)> = registry.cheapest_round_trips();
+    let cheapest_bps = round_trips.first().map_or(f64::INFINITY, |(_, b)| *b);
+    tracing::info!(
+        "universe: {} pools, {} mints, ~{} subscriptions",
+        registry.pools.len(),
+        registry.mints.len(),
+        registry.subscription_estimate()
+    );
+    tracing::info!("{dupe_count} pairs are quoted by more than one venue — direct round trips");
+    for (pair, bps) in round_trips.iter().take(5) {
+        tracing::info!("  cheapest round trip  {pair:<16} {bps:>6.2} bps of fees");
+    }
+    for p in registry.pools.iter().take(4) {
+        tracing::info!(
+            "  deepest cheap pool   {:<16} {:>7} {:<8} ${:>12.0} tvl",
+            p.label,
+            p.dex.tag(),
+            live::fee_label(p.fee_ppm_hint),
+            p.tvl_usd
+        );
+    }
     tracing::info!("feed: LIVE mainnet via {}", cfg.rpc_ws_url);
 
-    let mut market = live::LiveMarket::bootstrap(&cfg.rpc_http_url).await?;
-    for (addr, label) in market.labels() {
-        tracing::info!("  watching {label:<10} {addr}");
-    }
+    let mut market = live::LiveMarket::bootstrap(&cfg.rpc_http_url, registry).await?;
+    tracing::info!(
+        "watching {} pools across {} venues; {} priceable at start",
+        market.pool_count(),
+        market.venue_count(),
+        market.ready_count()
+    );
 
     let feed = WsFeed::new(cfg.rpc_ws_url.clone());
     let stats = std::sync::Arc::clone(&feed.stats);
     let mut rx = feed.spawn(market.subscriptions.clone());
 
-    // Shared so the status heartbeat can report what the scanner is seeing.
-    let best_edge: std::sync::Arc<std::sync::Mutex<Option<live::BestEdge>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
-    let total_cycles = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let cycles_for_status = std::sync::Arc::clone(&total_cycles);
-    let edge_for_status = std::sync::Arc::clone(&best_edge);
+    // What the scanner last saw, for the status heartbeat to report. A plain mutex is
+    // fine: nothing holds it across an await.
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(SweepSummary::default()));
+    let shared_for_status = std::sync::Arc::clone(&shared);
 
-    // Status heartbeat. Reports feed health honestly — dropped updates are
-    // opportunities we could not even evaluate, so they belong on the dashboard.
     let status_bus = bus.clone();
     let status_stats = std::sync::Arc::clone(&stats);
     let started = std::time::Instant::now();
@@ -121,125 +177,163 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
         loop {
             t.tick().await;
             let (updates, reconnects, dropped, last_slot, _) = status_stats.snapshot();
-            let best = edge_for_status.lock().ok().and_then(|g| g.clone());
-            let cycles = cycles_for_status.load(Ordering::Relaxed);
             let last_ms = status_stats.last_update_ms.load(Ordering::Relaxed);
             let stale_for = if last_ms == 0 { u64::MAX } else { now_ms().saturating_sub(last_ms) };
-            let stalls = status_stats.stalls.load(Ordering::Relaxed);
-            let data_age_secs = if stale_for == u64::MAX { 0 } else { stale_for / 1000 };
+            let s = shared_for_status.lock().map(|g| g.clone()).unwrap_or_default();
+            let best = s.best.as_ref();
+
             status_bus.publish(Event::Status {
                 mode: "paper · live mainnet".into(),
                 // Consider the feed live only if something arrived in the last 30s.
                 connected: stale_for < 30_000,
-                slot: last_slot,
+                slot: last_slot.max(s.slot),
                 slot_lag: 0,
-                pools_tracked: 0,
-                sol_price_usd: 0.0,
+                pools_tracked: s.pools_ready,
+                sol_price_usd: s.sol_price_usd,
                 uptime_secs: started.elapsed().as_secs(),
                 updates,
                 dropped,
                 reconnects,
-                stalls,
-                data_age_secs,
-                best_edge_bps: best.as_ref().map_or(0.0, |b| b.edge_bps),
-                best_route: best.as_ref().map_or_else(String::new, |b| b.route.clone()),
-                best_hops: best.as_ref().map_or(0, |b| b.hops),
-                best_fee_bps: best.as_ref().map_or(0.0, |b| b.fee_bps),
-                cycles_evaluated: cycles,
+                stalls: status_stats.stalls.load(Ordering::Relaxed),
+                data_age_secs: if stale_for == u64::MAX { 0 } else { stale_for / 1000 },
+                best_edge_bps: best.map_or(0.0, |b| b.edge_bps),
+                best_route: best.map_or_else(String::new, |b| b.route.clone()),
+                best_hops: best.map_or(0, |b| b.hops),
+                best_fee_bps: best.map_or(0.0, |b| b.fee_bps),
+                cycles_evaluated: s.evaluated_total,
+                venues: s.venues,
+                duplicate_pairs: dupe_count,
+                cheapest_round_trip_bps: if cheapest_bps.is_finite() { cheapest_bps } else { 0.0 },
+                sweep_us: s.sweep_us,
             });
         }
     });
 
     let tradable_usd = cfg.tradable_usd();
     let max_hops = cfg.max_hops;
-    tracing::info!("capital: ${:.2} tradable, cycles up to {max_hops} hops", tradable_usd);
+    tracing::info!("capital: ${tradable_usd:.2} tradable, cycles up to {max_hops} hops");
 
     tokio::spawn(async move {
         let mut next_id: u64 = 1;
-        let mut cycles_seen: u64 = 0;
-        while let Some(update) = rx.recv().await {
-            let Some(changed) = market.apply(&update, &bus) else {
-                continue;
-            };
+        let mut evaluated_total: u64 = 0;
+        // The sweep is a full pass over the cycle graph, not a reaction to one pool.
+        // At this graph size it costs well under a millisecond, so running it on a
+        // timer is cheaper than reasoning about which updates could matter — and it
+        // has no blind spot for pools in the middle of a triangle.
+        let mut sweep_timer = tokio::time::interval(SWEEP_INTERVAL);
+        // Token valuations move slowly and are only used for sizing; rebuilding the
+        // index every sweep would be work spent on a number that has not changed.
+        let mut usd_timer = tokio::time::interval(USD_REFRESH);
 
-            // Record how close the market came, even when nothing clears. Silence is
-            // not a measurement; a number is.
-            if let Some(be) = market.best_edge(&changed, max_hops) {
-                cycles_seen += be.evaluated;
-                total_cycles.store(cycles_seen, Ordering::Relaxed);
-                if let Ok(mut g) = best_edge.lock() {
-                    // Report the *current* best, not an all-time high-water mark:
-                    // a stale record from ten minutes ago describes nothing useful.
-                    *g = Some(be);
+        loop {
+            tokio::select! {
+                received = rx.recv() => {
+                    match received {
+                        Some(update) => { market.apply(&update, &bus); }
+                        None => {
+                            tracing::error!("feed channel closed — no further updates");
+                            break;
+                        }
+                    }
                 }
-            }
+                _ = usd_timer.tick() => market.rebuild_usd_index(),
+                _ = sweep_timer.tick() => {
+                    let sweep = market.sweep(tradable_usd, max_hops);
+                    evaluated_total = evaluated_total.saturating_add(sweep.evaluated);
 
-            for opp in market.evaluate(&changed, tradable_usd, max_hops) {
-                let id = next_id;
-                next_id += 1;
+                    if let Ok(mut g) = shared.lock() {
+                        *g = SweepSummary {
+                            // Report the *current* best, not an all-time high-water
+                            // mark: a record from ten minutes ago describes nothing.
+                            best: sweep.best().cloned(),
+                            evaluated_total,
+                            sweep_us: sweep.duration_us,
+                            pools_ready: market.ready_count(),
+                            venues: market.venue_count(),
+                            sol_price_usd: market.sol_price_usd().unwrap_or(0.0),
+                            slot: sweep.slot,
+                        };
+                    }
 
-                // Uncontested cycles pay the tip floor; contested ones are bid up to
-                // most of the profit. A cycle worth more than a cent on a major pair
-                // will have been seen by faster searchers too.
-                let contested = opp.gross_profit_usd > 0.01;
-                let sol_price = market.sol_price_usd().unwrap_or(0.0);
-                let est_tip_usd = if contested {
-                    opp.gross_profit_usd * 0.60
-                } else {
-                    0.0000075 * sol_price // median Jito tip floor
-                };
-                let base_fee_usd = 0.000005 * sol_price;
-                let net = opp.gross_profit_usd - est_tip_usd - base_fee_usd;
+                    if !sweep.rows.is_empty() {
+                        bus.publish(Event::Routes {
+                            rows: sweep.rows.iter().map(RouteRow::from).collect(),
+                            evaluated: sweep.evaluated,
+                            sweep_us: sweep.duration_us,
+                            slot: sweep.slot,
+                            ts_ms: now_ms(),
+                        });
+                    }
 
-                let skipped = if net <= 0.0 {
-                    Some("net negative after tip".to_string())
-                } else if contested {
-                    Some("contested — would lose the race".to_string())
-                } else {
-                    None
-                };
+                    let sol_price = market.sol_price_usd().unwrap_or(0.0);
+                    for opp in sweep.opportunities {
+                        let id = next_id;
+                        next_id += 1;
 
-                bus.publish(Event::Opportunity {
-                    id,
-                    pair: format!("{} [{}]", opp.route, opp.venues),
-                    dex_buy: format!("{} hops", opp.hops),
-                    dex_sell: "Raydium v4".into(),
-                    // Report the capital cost directly: how much of the available
-                    // profit our $5 can actually reach.
-                    spread_bps: if opp.optimal_size_usd > 0.0 {
-                        100.0 * opp.size_usd / opp.optimal_size_usd
-                    } else {
-                        0.0
-                    },
-                    optimal_size_usd: opp.optimal_size_usd,
-                    capped_size_usd: opp.size_usd,
-                    gross_profit_usd: opp.gross_profit_usd,
-                    est_tip_usd,
-                    net_profit_usd: net,
-                    contested,
-                    skipped_reason: skipped.clone(),
-                    slot: opp.slot,
-                    ts_ms: now_ms(),
-                });
+                        // Uncontested cycles pay the tip floor; contested ones get bid
+                        // up to most of the profit. A cycle worth more than a cent on
+                        // a major pair will have been seen by faster searchers too.
+                        let contested = opp.gross_profit_usd > CONTESTED_USD;
+                        let est_tip_usd = if contested {
+                            opp.gross_profit_usd * CONTESTED_TIP_SHARE
+                        } else {
+                            JITO_TIP_FLOOR_SOL * sol_price
+                        };
+                        let base_fee_usd = BASE_FEE_SOL * sol_price;
+                        let net = opp.gross_profit_usd - est_tip_usd - base_fee_usd;
 
-                if skipped.is_none() {
-                    // Paper mode: record what would have happened, sign nothing.
-                    bus.publish(Event::Execution {
-                        id,
-                        opportunity_id: id,
-                        paper: true,
-                        landed: true,
-                        realised_usd: net,
-                        tip_paid_usd: est_tip_usd,
-                        latency_ms: 0,
-                        signature: None,
-                        reason: Some("paper — uncontested, assumed landed".into()),
-                        ts_ms: now_ms(),
-                    });
+                        let skipped = if net <= 0.0 {
+                            Some("net negative after tip".to_string())
+                        } else if contested {
+                            Some("contested — would lose the race".to_string())
+                        } else {
+                            None
+                        };
+
+                        bus.publish(Event::Opportunity {
+                            id,
+                            route: opp.route.clone(),
+                            venues: opp.venues.clone(),
+                            hops: opp.hops,
+                            edge_bps: opp.edge_bps,
+                            dislocation_bps: opp.edge_bps + opp.fee_bps,
+                            fee_bps: opp.fee_bps,
+                            optimal_size_usd: opp.optimal_size_usd,
+                            capped_size_usd: opp.size_usd,
+                            capital_reach_pct: if opp.optimal_size_usd > 0.0 {
+                                100.0 * opp.size_usd / opp.optimal_size_usd
+                            } else {
+                                100.0
+                            },
+                            gross_profit_usd: opp.gross_profit_usd,
+                            profit_at_optimal_usd: opp.profit_at_optimal_usd,
+                            est_tip_usd,
+                            net_profit_usd: net,
+                            contested,
+                            skipped_reason: skipped.clone(),
+                            slot: opp.slot,
+                            ts_ms: now_ms(),
+                        });
+
+                        if skipped.is_none() {
+                            // Paper mode: record what would have happened, sign nothing.
+                            bus.publish(Event::Execution {
+                                id,
+                                opportunity_id: id,
+                                paper: true,
+                                landed: true,
+                                realised_usd: net,
+                                tip_paid_usd: est_tip_usd,
+                                latency_ms: 0,
+                                signature: None,
+                                reason: Some("paper — uncontested, assumed landed".into()),
+                                ts_ms: now_ms(),
+                            });
+                        }
+                    }
                 }
             }
         }
-        tracing::error!("feed channel closed — no further updates");
     });
 
     Ok(())

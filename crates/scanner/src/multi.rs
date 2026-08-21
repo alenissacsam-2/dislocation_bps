@@ -1,14 +1,33 @@
 //! Multi-hop cycle discovery over the pool graph.
 //!
-//! Two-pool cycles need two venues quoting the *same* pair, which is rare among the
-//! majors. The cycles that actually exist there are **triangles** — SOL → USDC → RAY
-//! → SOL — where three pools that each trade a different pair close a loop.
+//! # What a cycle looks like once there are many venues
 //!
-//! Search is anchored on the pool that just changed: only cycles containing it can
-//! have become profitable, so we never re-scan the whole graph.
+//! With one venue per pair, the only closed loops are **triangles** — SOL → USDC →
+//! RAY → SOL — and each hop pays that venue's fee. Across four decoders and eighty-odd
+//! pools the graph looks different: the same pair is quoted several times over at
+//! different fee tiers, so the shortest loop is a **two-hop round trip between two
+//! venues on one pair**. SOL → USDC on a 1 bp pool and straight back on a 2 bp pool
+//! costs 3 bps of fees, where the same trip through Raydium AMM v4 twice costs 50.
+//!
+//! Both shapes fall out of the same search, which is why this module special-cases
+//! neither.
+//!
+//! # Anchored versus full search
+//!
+//! [`enumerate_cycles`] searches only cycles containing one named pool — cheap, and
+//! right when reacting to a single account update. But it can only find cycles whose
+//! changed pool touches the base mint, so a change to a pool in the *middle* of a
+//! triangle is invisible to it.
+//!
+//! [`enumerate_from_base`] searches every cycle from a base mint regardless of what
+//! changed. At this graph size a full sweep costs well under a millisecond, so the
+//! live path runs that on a short timer and never has to reason about which updates
+//! could have made which cycles profitable.
 
-use crate::store::PoolStore;
-use cb_core::path::{cycle_profit, is_profitable, marginal_edge_bps, optimal_input, Leg};
+use crate::snapshot::Snapshot;
+use cb_core::path::{
+    cycle_profit, is_profitable, marginal_edge_bps, optimal_input, route_fee_bps, Leg,
+};
 use cb_core::types::{PoolId, PoolState, Pubkey32};
 
 /// A closed loop of pools starting and ending in the same mint.
@@ -18,7 +37,7 @@ pub struct Cycle {
     pub pools: Vec<PoolId>,
     /// Mints visited, starting and ending with the base mint. Length is `pools + 1`.
     pub mints: Vec<Pubkey32>,
-    /// Reserves oriented in travel order.
+    /// Legs oriented in travel order.
     pub legs: Vec<Leg>,
 }
 
@@ -30,8 +49,14 @@ impl Cycle {
 
     /// Freshness is bounded by the stalest pool in the loop.
     #[must_use]
-    pub fn slot(&self, store: &PoolStore) -> u64 {
-        self.pools.iter().filter_map(|p| store.get(p)).map(|p| p.slot).min().unwrap_or(0)
+    pub fn slot(&self, snap: &Snapshot) -> u64 {
+        self.pools.iter().filter_map(|p| snap.get(p)).map(|p| p.slot).min().unwrap_or(0)
+    }
+
+    /// Total swap fee along the route, in bps.
+    #[must_use]
+    pub fn fee_bps(&self) -> f64 {
+        route_fee_bps(&self.legs)
     }
 }
 
@@ -62,28 +87,103 @@ pub struct SurveyedCycle {
     pub edge_bps: f64,
 }
 
+impl SurveyedCycle {
+    /// The edge with fees added back: how far apart the venues' prices actually are,
+    /// before paying to cross them.
+    ///
+    /// This is the number that says whether an opportunity *exists* and is merely too
+    /// expensive to take. Reporting only `edge_bps` conflates "these venues agree on
+    /// the price" with "these venues disagree by 40 bps and the fees are 75".
+    #[must_use]
+    pub fn dislocation_bps(&self) -> f64 {
+        self.edge_bps + self.cycle.fee_bps()
+    }
+}
+
+/// Every closed cycle of 2..=`max_hops` pools starting and ending at `base_mint`.
+///
+/// Unlike [`enumerate_cycles`] this is not anchored on a changed pool, so it finds
+/// cycles whose movement happened anywhere in the loop.
+#[must_use]
+pub fn enumerate_from_base(snap: &Snapshot, base_mint: &Pubkey32, max_hops: usize) -> Vec<Cycle> {
+    let mut found = Vec::new();
+    if max_hops < 2 {
+        return found;
+    }
+    for &i in snap.pools_trading(base_mint) {
+        let first = snap.at(i);
+        let Some(mid) = first.other_mint(base_mint) else { continue };
+        let Some(leg) = first.leg_for_input(base_mint) else { continue };
+        let mut path =
+            Path { pools: vec![first.id], mints: vec![*base_mint, mid], legs: vec![leg] };
+        collect(snap, base_mint, &mut path, max_hops, &mut found);
+    }
+    found
+}
+
+/// Every cycle from `base_mint`, priced for its marginal edge. Sorted best first.
+#[must_use]
+pub fn survey_from_base(
+    snap: &Snapshot,
+    base_mint: &Pubkey32,
+    max_hops: usize,
+) -> Vec<SurveyedCycle> {
+    let mut out: Vec<SurveyedCycle> = enumerate_from_base(snap, base_mint, max_hops)
+        .into_iter()
+        .filter_map(|c| {
+            marginal_edge_bps(&c.legs).map(|edge_bps| SurveyedCycle { cycle: c, edge_bps })
+        })
+        .collect();
+    out.sort_by(|a, b| b.edge_bps.total_cmp(&a.edge_bps));
+    out
+}
+
+/// Profitable cycles from `base_mint`, sized against `max_in`. Sorted by profit.
+#[must_use]
+pub fn find_from_base(
+    snap: &Snapshot,
+    base_mint: &Pubkey32,
+    max_hops: usize,
+    max_in: u128,
+) -> Vec<PricedCycle> {
+    if max_in == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<PricedCycle> = enumerate_from_base(snap, base_mint, max_hops)
+        .into_iter()
+        .filter_map(|c| price(&c, max_in))
+        .collect();
+    out.sort_by(|a, b| b.profit.cmp(&a.profit));
+    out
+}
+
 /// Enumerate every cycle through `updated`, profitable or not, with its edge.
 ///
 /// Sorted best-edge-first.
 #[must_use]
 pub fn survey_cycles(
-    store: &PoolStore,
+    snap: &Snapshot,
     base_mint: &Pubkey32,
     updated: &PoolState,
     max_hops: usize,
 ) -> Vec<SurveyedCycle> {
-    let mut out: Vec<SurveyedCycle> = enumerate_cycles(store, base_mint, updated, max_hops)
+    let mut out: Vec<SurveyedCycle> = enumerate_cycles(snap, base_mint, updated, max_hops)
         .into_iter()
-        .filter_map(|c| marginal_edge_bps(&c.legs).map(|edge_bps| SurveyedCycle { cycle: c, edge_bps }))
+        .filter_map(|c| {
+            marginal_edge_bps(&c.legs).map(|edge_bps| SurveyedCycle { cycle: c, edge_bps })
+        })
         .collect();
     out.sort_by(|a, b| b.edge_bps.total_cmp(&a.edge_bps));
     out
 }
 
 /// Every closed cycle of 2..=`max_hops` pools through `updated`, unpriced.
+///
+/// Only finds cycles in which `updated` itself trades the base mint. Use
+/// [`enumerate_from_base`] when that restriction matters.
 #[must_use]
 pub fn enumerate_cycles(
-    store: &PoolStore,
+    snap: &Snapshot,
     base_mint: &Pubkey32,
     updated: &PoolState,
     max_hops: usize,
@@ -93,23 +193,16 @@ pub fn enumerate_cycles(
         return found;
     }
     let Some(first_mid) = updated.other_mint(base_mint) else { return found };
-    let Some(first_res) = updated.reserves_for_input(base_mint) else { return found };
+    let Some(first_leg) = updated.leg_for_input(base_mint) else { return found };
 
-    let mut path = Path {
-        pools: vec![updated.id],
-        mints: vec![*base_mint, first_mid],
-        legs: vec![Leg {
-            reserve_in: first_res.r_in,
-            reserve_out: first_res.r_out,
-            fee_bps: updated.fee_bps,
-        }],
-    };
-    collect(store, base_mint, &mut path, max_hops, &mut found);
+    let mut path =
+        Path { pools: vec![updated.id], mints: vec![*base_mint, first_mid], legs: vec![first_leg] };
+    collect(snap, base_mint, &mut path, max_hops, &mut found);
     found
 }
 
 fn collect(
-    store: &PoolStore,
+    snap: &Snapshot,
     base_mint: &Pubkey32,
     path: &mut Path,
     max_hops: usize,
@@ -123,7 +216,8 @@ fn collect(
     if path.legs.len() >= max_hops {
         return;
     }
-    for next in store.pools_trading(&current) {
+    for &i in snap.pools_trading(&current) {
+        let next = snap.at(i);
         if path.pools.contains(&next.id) {
             continue;
         }
@@ -131,11 +225,11 @@ fn collect(
         if next_mint != *base_mint && path.mints.contains(&next_mint) {
             continue;
         }
-        let Some(res) = next.reserves_for_input(&current) else { continue };
+        let Some(leg) = next.leg_for_input(&current) else { continue };
         path.pools.push(next.id);
         path.mints.push(next_mint);
-        path.legs.push(Leg { reserve_in: res.r_in, reserve_out: res.r_out, fee_bps: next.fee_bps });
-        collect(store, base_mint, path, max_hops, out);
+        path.legs.push(leg);
+        collect(snap, base_mint, path, max_hops, out);
         path.pools.pop();
         path.mints.pop();
         path.legs.pop();
@@ -149,7 +243,7 @@ fn collect(
 /// profit, best first.
 #[must_use]
 pub fn find_cycles(
-    store: &PoolStore,
+    snap: &Snapshot,
     base_mint: &Pubkey32,
     updated: &PoolState,
     max_hops: usize,
@@ -159,7 +253,7 @@ pub fn find_cycles(
     if max_in == 0 {
         return out;
     }
-    for cycle in enumerate_cycles(store, base_mint, updated, max_hops) {
+    for cycle in enumerate_cycles(snap, base_mint, updated, max_hops) {
         if let Some(priced) = price(&cycle, max_in) {
             out.push(priced);
         }
@@ -210,34 +304,25 @@ mod tests {
     const WIF: [u8; 32] = [4; 32];
 
     fn pool(id: u8, a: [u8; 32], b: [u8; 32], ra: u128, rb: u128) -> PoolState {
-        PoolState {
-            id: PoolId([id; 32]),
-            dex: Dex::RaydiumAmmV4,
-            mint_a: a,
-            mint_b: b,
-            reserve_a: ra,
-            reserve_b: rb,
-            fee_bps: 25,
-            slot: 100,
-        }
+        PoolState::constant_product(PoolId([id; 32]), Dex::RaydiumAmmV4, a, b, ra, rb, 2500, 100)
+    }
+
+    fn fee_pool(id: u8, a: [u8; 32], b: [u8; 32], ra: u128, rb: u128, ppm: u32) -> PoolState {
+        PoolState::constant_product(PoolId([id; 32]), Dex::OrcaWhirlpool, a, b, ra, rb, ppm, 100)
     }
 
     /// SOL→USDC→RAY→SOL, with the RAY legs mispriced enough to profit.
-    fn triangle_store() -> (PoolStore, PoolState) {
-        let s = PoolStore::new();
+    fn triangle() -> (Snapshot, PoolState) {
         let p1 = pool(1, SOL, USDC, 1_000_000, 1_000_000); // SOL/USDC
         let p2 = pool(2, RAY, USDC, 1_000_000, 900_000); // RAY cheap in USDC
         let p3 = pool(3, RAY, SOL, 1_000_000, 1_200_000); // RAY dear in SOL
-        s.upsert(p1);
-        s.upsert(p2);
-        s.upsert(p3);
-        (s, p1)
+        (Snapshot::new(vec![p1, p2, p3]), p1)
     }
 
     #[test]
     fn finds_a_triangular_cycle() {
-        let (store, updated) = triangle_store();
-        let found = find_cycles(&store, &SOL, &updated, 3, u128::MAX);
+        let (snap, updated) = triangle();
+        let found = find_cycles(&snap, &SOL, &updated, 3, u128::MAX);
         assert!(!found.is_empty(), "a mispriced triangle must be found");
 
         let best = &found[0];
@@ -251,15 +336,15 @@ mod tests {
     #[test]
     fn max_hops_two_finds_nothing_in_a_triangle() {
         // Guards against the search silently taking shortcuts it should not.
-        let (store, updated) = triangle_store();
-        assert!(find_cycles(&store, &SOL, &updated, 2, u128::MAX).is_empty());
+        let (snap, updated) = triangle();
+        assert!(find_cycles(&snap, &SOL, &updated, 2, u128::MAX).is_empty());
     }
 
     #[test]
     fn capital_cap_reduces_size_but_keeps_profit_positive() {
-        let (store, updated) = triangle_store();
-        let uncapped = &find_cycles(&store, &SOL, &updated, 3, u128::MAX)[0];
-        let capped_list = find_cycles(&store, &SOL, &updated, 3, uncapped.optimal_in / 10);
+        let (snap, updated) = triangle();
+        let uncapped = &find_cycles(&snap, &SOL, &updated, 3, u128::MAX)[0];
+        let capped_list = find_cycles(&snap, &SOL, &updated, 3, uncapped.optimal_in / 10);
         let capped = &capped_list[0];
 
         assert!(capped.capped_in <= uncapped.optimal_in / 10);
@@ -273,8 +358,8 @@ mod tests {
 
     #[test]
     fn a_pool_is_never_used_twice_in_one_cycle() {
-        let (store, updated) = triangle_store();
-        for p in find_cycles(&store, &SOL, &updated, 4, u128::MAX) {
+        let (snap, updated) = triangle();
+        for p in find_cycles(&snap, &SOL, &updated, 4, u128::MAX) {
             let mut seen = p.cycle.pools.clone();
             seen.sort();
             let before = seen.len();
@@ -285,20 +370,23 @@ mod tests {
 
     #[test]
     fn balanced_triangle_yields_nothing() {
-        let s = PoolStore::new();
         let p1 = pool(1, SOL, USDC, 1_000_000, 1_000_000);
-        s.upsert(p1);
-        s.upsert(pool(2, RAY, USDC, 1_000_000, 1_000_000));
-        s.upsert(pool(3, RAY, SOL, 1_000_000, 1_000_000));
-        assert!(find_cycles(&s, &SOL, &p1, 3, u128::MAX).is_empty());
+        let snap = Snapshot::new(vec![
+            p1,
+            pool(2, RAY, USDC, 1_000_000, 1_000_000),
+            pool(3, RAY, SOL, 1_000_000, 1_000_000),
+        ]);
+        assert!(find_cycles(&snap, &SOL, &p1, 3, u128::MAX).is_empty());
     }
 
     #[test]
     fn ignores_pools_that_cannot_reach_the_base() {
         // A dead-end token hanging off the triangle must not produce a false cycle.
-        let (store, updated) = triangle_store();
-        store.upsert(pool(9, USDC, WIF, 1_000_000, 5_000_000));
-        for p in find_cycles(&store, &SOL, &updated, 4, u128::MAX) {
+        let (snap, updated) = triangle();
+        let mut pools = snap.pools().to_vec();
+        pools.push(pool(9, USDC, WIF, 1_000_000, 5_000_000));
+        let snap = Snapshot::new(pools);
+        for p in find_cycles(&snap, &SOL, &updated, 4, u128::MAX) {
             assert_eq!(p.cycle.mints.last(), Some(&SOL));
             assert!(!p.cycle.mints[1..p.cycle.mints.len() - 1].contains(&SOL));
         }
@@ -306,8 +394,8 @@ mod tests {
 
     #[test]
     fn results_are_sorted_best_first() {
-        let (store, updated) = triangle_store();
-        let found = find_cycles(&store, &SOL, &updated, 4, u128::MAX);
+        let (snap, updated) = triangle();
+        let found = find_cycles(&snap, &SOL, &updated, 4, u128::MAX);
         for w in found.windows(2) {
             assert!(w[0].profit >= w[1].profit, "results must be sorted by profit");
         }
@@ -315,9 +403,87 @@ mod tests {
 
     #[test]
     fn updated_pool_not_touching_base_yields_nothing() {
-        let (store, _) = triangle_store();
+        let (snap, _) = triangle();
         let unrelated = pool(9, USDC, WIF, 1_000_000, 5_000_000);
-        store.upsert(unrelated);
-        assert!(find_cycles(&store, &SOL, &unrelated, 3, u128::MAX).is_empty());
+        assert!(find_cycles(&snap, &SOL, &unrelated, 3, u128::MAX).is_empty());
+    }
+
+    // ---- full-graph search ----
+
+    /// The blind spot the anchored search has, and the reason `enumerate_from_base`
+    /// exists: when the middle pool of a triangle moves, the anchored search cannot
+    /// see the cycle at all, because that pool does not trade the base mint.
+    #[test]
+    fn a_full_sweep_finds_cycles_the_anchored_search_cannot() {
+        let (snap, _) = triangle();
+        let middle = *snap.get(&PoolId([2; 32])).unwrap(); // RAY/USDC — no SOL in it
+
+        assert!(
+            find_cycles(&snap, &SOL, &middle, 3, u128::MAX).is_empty(),
+            "anchored search is blind to a pool that does not touch the base mint"
+        );
+        assert!(
+            !find_from_base(&snap, &SOL, 3, u128::MAX).is_empty(),
+            "the full sweep must find it"
+        );
+    }
+
+    #[test]
+    fn full_sweep_and_anchored_search_agree_when_both_can_see_a_cycle() {
+        let (snap, updated) = triangle();
+        let anchored = find_cycles(&snap, &SOL, &updated, 3, u128::MAX);
+        let swept = find_from_base(&snap, &SOL, 3, u128::MAX);
+        assert_eq!(anchored[0].profit, swept[0].profit, "the same cycle must price the same");
+    }
+
+    /// The shape that only appears once several venues quote one pair: a two-hop
+    /// round trip. With a 1 bp and a 2 bp pool the whole loop costs 3 bps, so a
+    /// dislocation of 11 bps clears easily — the same trip across two 25 bp pools
+    /// would need 50 bps and never sees one.
+    #[test]
+    fn two_venues_on_one_pair_form_the_cheapest_possible_loop() {
+        let cheap = fee_pool(1, SOL, USDC, 1_000_000_000, 91_000_000, 100);
+        let dear = fee_pool(2, SOL, USDC, 1_000_000_000, 91_100_000, 200); // 11 bps higher
+        let snap = Snapshot::new(vec![cheap, dear]);
+
+        let found = find_from_base(&snap, &SOL, 2, u128::MAX);
+        assert!(!found.is_empty(), "an 11 bp gap must clear 3 bps of fees");
+        assert_eq!(found[0].cycle.hops(), 2);
+        assert!((found[0].cycle.fee_bps() - 3.0).abs() < 0.01, "1bp + 2bp = 3bps");
+
+        // The same dislocation across two 25 bp venues is unreachable.
+        let v4 = Snapshot::new(vec![
+            pool(3, SOL, USDC, 1_000_000_000, 91_000_000),
+            pool(4, SOL, USDC, 1_000_000_000, 91_100_000),
+        ]);
+        assert!(
+            find_from_base(&v4, &SOL, 2, u128::MAX).is_empty(),
+            "11 bps cannot pay for 50 bps of fees"
+        );
+    }
+
+    #[test]
+    fn dislocation_separates_the_price_gap_from_the_fee_cost() {
+        let snap = Snapshot::new(vec![
+            fee_pool(1, SOL, USDC, 1_000_000_000, 91_000_000, 100),
+            fee_pool(2, SOL, USDC, 1_000_000_000, 91_100_000, 200),
+        ]);
+
+        let best = &survey_from_base(&snap, &SOL, 2)[0];
+        assert!((best.cycle.fee_bps() - 3.0).abs() < 0.01);
+        assert!(
+            (best.dislocation_bps() - 10.99).abs() < 0.2,
+            "an 11 bp price gap must be reported as such, got {}",
+            best.dislocation_bps()
+        );
+        assert!((best.dislocation_bps() - best.cycle.fee_bps() - best.edge_bps).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_full_sweep_of_an_empty_market_is_harmless() {
+        let snap = Snapshot::default();
+        assert!(enumerate_from_base(&snap, &SOL, 3).is_empty());
+        assert!(survey_from_base(&snap, &SOL, 3).is_empty());
+        assert!(find_from_base(&snap, &SOL, 3, 1_000).is_empty());
     }
 }

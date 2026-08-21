@@ -18,6 +18,16 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// full minute of silence is not a quiet market — it is a broken connection.
 pub const MAX_SILENCE: Duration = Duration::from_secs(60);
 
+/// How many subscribe requests to send before yielding briefly.
+///
+/// Public RPC endpoints throttle bursts. Eighty-odd `accountSubscribe` calls fired
+/// back to back is exactly the shape of traffic that gets rate limited, and a
+/// rejected subscription is a pool that silently never updates for the whole run.
+pub const SUBSCRIBE_BATCH: usize = 16;
+
+/// Pause between subscribe batches.
+pub const SUBSCRIBE_PAUSE: Duration = Duration::from_millis(120);
+
 /// Whether a connection that has been silent for `silent` should be abandoned.
 ///
 /// Split out from the socket loop so the decision is testable without a network.
@@ -47,6 +57,11 @@ pub struct FeedStats {
     /// Connections abandoned because data stopped arriving while the socket stayed
     /// open. Distinct from `reconnects`, which counts all reconnects.
     pub stalls: AtomicU64,
+    /// Accounts the server confirmed a subscription for on the current connection.
+    pub subscribed: AtomicU64,
+    /// Accounts the server refused to subscribe to. Each one is a pool that will
+    /// never update, so it must be visible rather than inferred from silence.
+    pub subscribe_errors: AtomicU64,
 }
 
 impl FeedStats {
@@ -114,6 +129,9 @@ async fn run_once(
     let mut pending: std::collections::HashMap<u64, Pubkey32> = std::collections::HashMap::new();
     let mut subs: std::collections::HashMap<u64, Pubkey32> = std::collections::HashMap::new();
 
+    stats.subscribed.store(0, Ordering::Relaxed);
+    stats.subscribe_errors.store(0, Ordering::Relaxed);
+
     for (i, acct) in accounts.iter().enumerate() {
         let id = i as u64 + 1;
         let req = serde_json::json!({
@@ -124,6 +142,9 @@ async fn run_once(
         });
         socket.send(Message::Text(req.to_string().into())).await?;
         pending.insert(id, *acct);
+        if (i + 1) % SUBSCRIBE_BATCH == 0 {
+            tokio::time::sleep(SUBSCRIBE_PAUSE).await;
+        }
     }
 
     // A silently-dead socket is the dangerous failure mode: the peer stops sending but
@@ -185,13 +206,28 @@ async fn run_once(
         if let (Some(sub_id), Some(req_id)) = (v.get("result").and_then(|r| r.as_u64()), v.get("id").and_then(|i| i.as_u64())) {
             if let Some(pk) = pending.remove(&req_id) {
                 subs.insert(sub_id, pk);
+                stats.subscribed.fetch_add(1, Ordering::Relaxed);
             }
             continue;
         }
 
-        // An error response to one of our subscribe calls.
+        // An error response. If it carries the id of one of our subscribe calls, it
+        // means *that account* was refused — drop it and keep the connection. Tearing
+        // down a working feed of eighty pools because the eighty-first was rate
+        // limited would turn a partial outage into a total one, and the reconnect
+        // would hit the same limit again.
         if let Some(err) = v.get("error") {
-            return Err(anyhow!("rpc error: {err}"));
+            match v.get("id").and_then(|i| i.as_u64()).and_then(|id| pending.remove(&id)) {
+                Some(pk) => {
+                    stats.subscribe_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        "subscription refused for {}: {err}",
+                        bs58::encode(pk).into_string()
+                    );
+                    continue;
+                }
+                None => return Err(anyhow!("rpc error: {err}")),
+            }
         }
 
         if v.get("method").and_then(|m| m.as_str()) != Some("accountNotification") {
