@@ -6,6 +6,7 @@
 
 pub mod amm;
 pub mod config;
+pub mod path;
 pub mod types;
 
 /// Basis points, the unit fees are quoted in throughout.

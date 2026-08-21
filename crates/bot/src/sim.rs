@@ -260,6 +260,14 @@ impl Market {
             pools_tracked: self.venues.len(),
             sol_price_usd: SOL_USD,
             uptime_secs: self.started.elapsed().as_secs(),
+            updates: 0,
+            dropped: 0,
+            reconnects: 0,
+            best_edge_bps: 0.0,
+            best_route: String::new(),
+            best_hops: 0,
+            best_fee_bps: 0.0,
+            cycles_evaluated: 0,
         });
     }
 }

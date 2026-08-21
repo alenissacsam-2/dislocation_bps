@@ -28,6 +28,28 @@ pub enum Event {
         pools_tracked: usize,
         sol_price_usd: f64,
         uptime_secs: u64,
+        /// Feed health. Dropped updates are opportunities we could not evaluate.
+        #[serde(default)]
+        updates: u64,
+        #[serde(default)]
+        dropped: u64,
+        #[serde(default)]
+        reconnects: u64,
+        /// Best cycle edge currently visible, in bps. Negative means the market is
+        /// that far from profitable — the single most informative research number,
+        /// and the reason "found nothing" is not an acceptable output.
+        #[serde(default)]
+        best_edge_bps: f64,
+        #[serde(default)]
+        best_route: String,
+        #[serde(default)]
+        best_hops: usize,
+        /// Total fee cost of the best route, in bps. Compare against the edge to see
+        /// whether fees or price efficiency is the binding constraint.
+        #[serde(default)]
+        best_fee_bps: f64,
+        #[serde(default)]
+        cycles_evaluated: u64,
     },
 
     /// A pool's reserves changed.
@@ -140,6 +162,14 @@ mod tests {
             pools_tracked: 0,
             sol_price_usd: 76.97,
             uptime_secs: 0,
+            updates: 0,
+            dropped: 0,
+            reconnects: 0,
+            best_edge_bps: 0.0,
+            best_route: String::new(),
+            best_hops: 0,
+            best_fee_bps: 0.0,
+            cycles_evaluated: 0,
         }
     }
 
