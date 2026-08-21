@@ -10,9 +10,19 @@
 //! # Three things here can quietly cost money
 //!
 //! **Uncollected fees.** Like v4, the tradable reserve is the vault balance minus what
-//! the protocol has accrued but not withdrawn — here in *two* buckets per side,
-//! `protocol_fees` and `fund_fees`. Forgetting either overstates the reserve, which
-//! overstates the output, which turns a losing trade into one that looked profitable.
+//! has accrued to somebody but not been withdrawn. Here that is **three** buckets per
+//! side: `protocol_fees`, `fund_fees`, and `creator_fees`. Miss one and the reserve is
+//! overstated, which overstates the output, which turns a losing trade into one that
+//! looked profitable.
+//!
+//! The creator buckets are the trap. They were added after the original struct shipped,
+//! in space that used to be reserved padding, so a decoder written from the older
+//! layout reads them as zero — and is wrong only on pools that have actually accrued
+//! them. On the first pool this module was tested against, the missing 6.888 SOL moved
+//! the implied price by 65 bps, and the cycle search dutifully reported a standing
+//! arbitrage that had been there for hours. It had not been. Nothing about the number
+//! looked wrong; it took quoting the same swap through an independent router to expose
+//! it.
 //!
 //! **Token-2022.** Unlike v4, this program accepts Token-2022 mints, which can carry
 //! transfer fees and transfer hooks that skim a swap invisibly to constant-product
@@ -55,6 +65,12 @@ const OFF_PROTOCOL_FEES_0: usize = 341;
 const OFF_PROTOCOL_FEES_1: usize = 349;
 const OFF_FUND_FEES_0: usize = 357;
 const OFF_FUND_FEES_1: usize = 365;
+// After `recent_epoch` at 381 come `creator_fee_on: u8`, `enable_creator_fee: bool`
+// and six bytes of padding, then a **third** pair of fee buckets. These landed in what
+// used to be reserved padding, so a decoder written against the older layout reads
+// them as zero and silently overstates the reserve. See the module docs.
+const OFF_CREATOR_FEES_0: usize = 397;
+const OFF_CREATOR_FEES_1: usize = 405;
 
 /// Bit in `status` that disables swapping. Set means the pool will reject a trade.
 const STATUS_SWAP_DISABLED: u8 = 1 << 2;
@@ -90,18 +106,20 @@ pub struct CpmmPool {
     pub protocol_fees_1: u64,
     pub fund_fees_0: u64,
     pub fund_fees_1: u64,
+    pub creator_fees_0: u64,
+    pub creator_fees_1: u64,
 }
 
 impl CpmmPool {
     /// Everything owed out of vault 0 that is not tradable reserve.
     #[must_use]
     pub fn owed_0(&self) -> u64 {
-        self.protocol_fees_0.saturating_add(self.fund_fees_0)
+        self.protocol_fees_0.saturating_add(self.fund_fees_0).saturating_add(self.creator_fees_0)
     }
 
     #[must_use]
     pub fn owed_1(&self) -> u64 {
-        self.protocol_fees_1.saturating_add(self.fund_fees_1)
+        self.protocol_fees_1.saturating_add(self.fund_fees_1).saturating_add(self.creator_fees_1)
     }
 }
 
@@ -147,6 +165,8 @@ pub fn decode(data: &[u8]) -> Result<CpmmPool> {
         protocol_fees_1: u64_at(data, OFF_PROTOCOL_FEES_1),
         fund_fees_0: u64_at(data, OFF_FUND_FEES_0),
         fund_fees_1: u64_at(data, OFF_FUND_FEES_1),
+        creator_fees_0: u64_at(data, OFF_CREATOR_FEES_0),
+        creator_fees_1: u64_at(data, OFF_CREATOR_FEES_1),
     })
 }
 
@@ -206,7 +226,7 @@ fn bs58_expect(s: &str) -> Pubkey32 {
 mod tests {
     use super::*;
 
-    fn account(status: u8, prog: Pubkey32, decimals: (u8, u8), fees: [u64; 4]) -> Vec<u8> {
+    fn account(status: u8, prog: Pubkey32, decimals: (u8, u8), fees: [u64; 6]) -> Vec<u8> {
         let mut d = vec![0u8; POOL_LEN];
         d[OFF_AMM_CONFIG..OFF_AMM_CONFIG + 32].copy_from_slice(&[7u8; 32]);
         d[OFF_VAULT_0..OFF_VAULT_0 + 32].copy_from_slice(&[3u8; 32]);
@@ -222,12 +242,22 @@ mod tests {
         d[OFF_PROTOCOL_FEES_1..OFF_PROTOCOL_FEES_1 + 8].copy_from_slice(&fees[1].to_le_bytes());
         d[OFF_FUND_FEES_0..OFF_FUND_FEES_0 + 8].copy_from_slice(&fees[2].to_le_bytes());
         d[OFF_FUND_FEES_1..OFF_FUND_FEES_1 + 8].copy_from_slice(&fees[3].to_le_bytes());
+        d[OFF_CREATOR_FEES_0..OFF_CREATOR_FEES_0 + 8].copy_from_slice(&fees[4].to_le_bytes());
+        d[OFF_CREATOR_FEES_1..OFF_CREATOR_FEES_1 + 8].copy_from_slice(&fees[5].to_le_bytes());
         d
     }
 
-    /// The real mainnet pool's field values, captured 2026-08-21.
+    /// The real mainnet WSOL/ALNOOR pool, captured 2026-08-22.
+    ///
+    /// These exact numbers are the regression: read without the creator buckets, this
+    /// pool prices 65 bps away from where every other venue and every router puts it.
     fn live() -> Vec<u8> {
-        account(0, bs58_expect(SPL_TOKEN_PROGRAM), (9, 6), [2_595_021, 34_437_398, 55_276_153, 66_403_360])
+        account(
+            0,
+            bs58_expect(SPL_TOKEN_PROGRAM),
+            (9, 6),
+            [72_586, 112_411_388, 32_273_478, 356_658_004, 6_888_081_160, 0],
+        )
     }
 
     fn config(fee_ppm: u64) -> Vec<u8> {
@@ -244,8 +274,10 @@ mod tests {
         assert_eq!(p.mint_1, [2u8; 32]);
         assert_eq!(p.vault_0, [3u8; 32]);
         assert_eq!((p.decimals_0, p.decimals_1), (9, 6));
-        assert_eq!(p.protocol_fees_0, 2_595_021);
-        assert_eq!(p.fund_fees_1, 66_403_360);
+        assert_eq!(p.protocol_fees_0, 72_586);
+        assert_eq!(p.fund_fees_1, 356_658_004);
+        assert_eq!(p.creator_fees_0, 6_888_081_160, "the bucket the old layout missed");
+        assert_eq!(p.creator_fees_1, 0);
     }
 
     #[test]
@@ -254,20 +286,43 @@ mod tests {
         assert_eq!(decode_trade_fee_ppm(&config(100)).unwrap(), 100);
     }
 
-    /// The subtraction that makes this decoder worth writing. Both fee buckets come
-    /// out, not just the one that shares a name with Raydium v4's field.
+    /// The subtraction that makes this decoder worth writing. All three fee buckets
+    /// come out, not just the two that existed when the struct was first published.
     #[test]
-    fn reserves_exclude_both_fee_buckets() {
+    fn reserves_exclude_all_three_fee_buckets() {
         let p = decode(&live()).unwrap();
         let (v0, v1) = (10_000_000_000u64, 20_000_000_000u64);
         let ps = to_pool_state([9u8; 32], &p, v0, v1, 2500, 42).unwrap();
 
-        assert_eq!(ps.reserve_a(), u128::from(v0 - 2_595_021 - 55_276_153));
-        assert_eq!(ps.reserve_b(), u128::from(v1 - 34_437_398 - 66_403_360));
+        assert_eq!(ps.reserve_a(), u128::from(v0 - 72_586 - 32_273_478 - 6_888_081_160));
+        assert_eq!(ps.reserve_b(), u128::from(v1 - 112_411_388 - 356_658_004));
         assert!(ps.reserve_a() < u128::from(v0), "must be strictly less than the raw vault");
         assert_eq!(ps.dex, Dex::RaydiumCpmm);
         assert_eq!(ps.fee_ppm, 2500);
         assert_eq!(ps.slot, 42);
+    }
+
+    /// The regression, stated as a price rather than as a field offset.
+    ///
+    /// Real vault balances for WSOL/ALNOOR, captured with the pool account above. An
+    /// independent router quoted this pool's mid at 7.848 in both directions. Reading
+    /// only the protocol and fund buckets puts it at 7.797 — a 65 bps error, in the
+    /// direction that *invents* an arbitrage rather than hiding one.
+    #[test]
+    fn the_price_matches_what_an_independent_router_quotes() {
+        let p = decode(&live()).unwrap();
+        let (vault_0, vault_1) = (1_326_162_157_059u64, 10_353_978_949_932u64);
+        let ps = to_pool_state([9u8; 32], &p, vault_0, vault_1, 2500, 1).unwrap();
+
+        let price = ps.spot_price().expect("pool must price");
+        assert!((price - 7.848).abs() < 0.002, "priced at {price}, but it trades at 7.848");
+
+        // And the specific wrong answer this test exists to prevent.
+        let buggy =
+            (vault_1 - 112_411_388 - 356_658_004) as f64 / (vault_0 - 72_586 - 32_273_478) as f64;
+        assert!((buggy - 7.807).abs() < 0.002, "sanity: the old bug produced {buggy}");
+        let error_bps = (price / buggy - 1.0) * 10_000.0;
+        assert!(error_bps > 45.0, "the bug was worth {error_bps} bps of phantom edge");
     }
 
     #[test]
@@ -281,12 +336,12 @@ mod tests {
     /// Routing through one produces a cycle that reverts.
     #[test]
     fn pools_with_swaps_disabled_are_refused() {
-        let d = account(STATUS_SWAP_DISABLED, bs58_expect(SPL_TOKEN_PROGRAM), (9, 6), [0; 4]);
+        let d = account(STATUS_SWAP_DISABLED, bs58_expect(SPL_TOKEN_PROGRAM), (9, 6), [0; 6]);
         let err = decode(&d).unwrap_err().to_string();
         assert!(err.contains("swaps disabled"), "unexpected error: {err}");
 
         // Other status bits are not our problem — only the swap one.
-        assert!(decode(&account(0b11, bs58_expect(SPL_TOKEN_PROGRAM), (9, 6), [0; 4])).is_ok());
+        assert!(decode(&account(0b11, bs58_expect(SPL_TOKEN_PROGRAM), (9, 6), [0; 6])).is_ok());
     }
 
     /// This program, unlike Raydium v4, accepts Token-2022 mints. Those can carry a
@@ -294,7 +349,7 @@ mod tests {
     #[test]
     fn token_2022_mints_are_refused() {
         let t22 = bs58_expect("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
-        let err = decode(&account(0, t22, (9, 6), [0; 4])).unwrap_err().to_string();
+        let err = decode(&account(0, t22, (9, 6), [0; 6])).unwrap_err().to_string();
         assert!(err.contains("non-classic token mint"), "unexpected error: {err}");
     }
 

@@ -161,6 +161,31 @@ pub struct LiveOpportunity {
     pub slot: u64,
 }
 
+/// One pool, one direction, and what we claim it will pay — ready to be checked
+/// against an outside opinion.
+#[derive(Debug, Clone)]
+pub struct AuditProbe {
+    pub pair: String,
+    pub label: String,
+    pub venue: String,
+    pub from_b58: String,
+    pub to_b58: String,
+    pub amount_in: u128,
+    pub amount_out: u128,
+}
+
+/// What a reconciliation pass found.
+#[derive(Debug, Clone, Default)]
+pub struct ReconcileReport {
+    pub checked: usize,
+    /// Pools whose on-chain state differed from what the feed had delivered. A
+    /// persistently non-zero count means the WebSocket is dropping updates.
+    pub drifted: usize,
+    pub missing: usize,
+    pub undecodable: usize,
+    pub slot: u64,
+}
+
 /// The result of one full pass over the cycle graph.
 #[derive(Debug, Clone, Default)]
 pub struct Sweep {
@@ -180,6 +205,8 @@ impl Sweep {
 
 pub struct LiveMarket {
     pub registry: Registry,
+    rpc_http: String,
+    client: reqwest::Client,
     watches: HashMap<Pubkey32, Watch>,
     /// vault address -> (pool address, is_base_vault)
     vault_index: HashMap<Pubkey32, (Pubkey32, bool)>,
@@ -201,7 +228,7 @@ impl LiveMarket {
 
         let addresses: Vec<String> =
             registry.pools.iter().map(|p| bs58::encode(p.address).into_string()).collect();
-        let accounts = get_multiple_accounts(&client, rpc_http, &addresses).await?;
+        let (accounts, boot_slot) = get_multiple_accounts(&client, rpc_http, &addresses).await?;
 
         let mut watches: HashMap<Pubkey32, Watch> = HashMap::new();
         let mut vault_index = HashMap::new();
@@ -221,7 +248,7 @@ impl LiveMarket {
             let addr = entry.address;
 
             match entry.dex {
-                Dex::OrcaWhirlpool => match orca_whirlpool::to_pool_state(addr, data, 0) {
+                Dex::OrcaWhirlpool => match orca_whirlpool::to_pool_state(addr, data, boot_slot) {
                     Ok(ps) => {
                         store.upsert(ps);
                         watches.insert(
@@ -230,7 +257,7 @@ impl LiveMarket {
                                 label: entry.label.clone(),
                                 dex: entry.dex,
                                 venue: Venue::Whirlpool,
-                                slot: 0,
+                                slot: boot_slot,
                             },
                         );
                     }
@@ -247,7 +274,7 @@ impl LiveMarket {
                                 dex: entry.dex,
                                 // Filled in once the config resolves.
                                 venue: Venue::RaydiumClmm { trade_fee_ppm: u32::MAX },
-                                slot: 0,
+                                slot: boot_slot,
                             },
                         );
                     }
@@ -269,7 +296,7 @@ impl LiveMarket {
                                     base_amount: None,
                                     quote_amount: None,
                                 },
-                                slot: 0,
+                                slot: boot_slot,
                             },
                         );
                     }
@@ -295,7 +322,7 @@ impl LiveMarket {
                                     vault_0_amount: None,
                                     vault_1_amount: None,
                                 },
-                                slot: 0,
+                                slot: boot_slot,
                             },
                         );
                     }
@@ -310,7 +337,7 @@ impl LiveMarket {
         config_b58.dedup();
         let mut fee_by_config: HashMap<Pubkey32, u32> = HashMap::new();
         if !config_b58.is_empty() {
-            let configs = get_multiple_accounts(&client, rpc_http, &config_b58).await?;
+            let (configs, _) = get_multiple_accounts(&client, rpc_http, &config_b58).await?;
             for (b58, data) in config_b58.iter().zip(configs.iter()) {
                 let Some(data) = data else { continue };
                 match raydium_clmm::decode_trade_fee_ppm(data) {
@@ -327,7 +354,7 @@ impl LiveMarket {
                 failures.push(format!("{}: fee config unresolved", bs58::encode(addr).into_string()));
                 continue;
             };
-            match raydium_clmm::to_pool_state(addr, &data, fee, 0) {
+            match raydium_clmm::to_pool_state(addr, &data, fee, boot_slot) {
                 Ok(ps) => {
                     store.upsert(ps);
                     if let Some(w) = watches.get_mut(&addr) {
@@ -348,7 +375,7 @@ impl LiveMarket {
         cpmm_config_b58.sort();
         cpmm_config_b58.dedup();
         if !cpmm_config_b58.is_empty() {
-            let configs = get_multiple_accounts(&client, rpc_http, &cpmm_config_b58).await?;
+            let (configs, _) = get_multiple_accounts(&client, rpc_http, &cpmm_config_b58).await?;
             let mut fee_by_config: HashMap<Pubkey32, u32> = HashMap::new();
             for (b58, data) in cpmm_config_b58.iter().zip(configs.iter()) {
                 let Some(data) = data else { continue };
@@ -380,7 +407,7 @@ impl LiveMarket {
         // Seed vault balances so the constant-product pools are priceable before any
         // update arrives.
         if !vault_b58.is_empty() {
-            let vaults = get_multiple_accounts(&client, rpc_http, &vault_b58).await?;
+            let (vaults, _) = get_multiple_accounts(&client, rpc_http, &vault_b58).await?;
             for (b58, data) in vault_b58.iter().zip(vaults.iter()) {
                 let Some(data) = data else { continue };
                 let Ok(amount) = raydium_v4::decode_token_amount(data) else { continue };
@@ -405,8 +432,16 @@ impl LiveMarket {
         let mut subscriptions: Vec<Pubkey32> = watches.keys().copied().collect();
         subscriptions.extend(vault_index.keys().copied());
 
-        let mut market =
-            Self { registry, watches, vault_index, store, subscriptions, usd: HashMap::new() };
+        let mut market = Self {
+            registry,
+            rpc_http: rpc_http.to_string(),
+            client,
+            watches,
+            vault_index,
+            store,
+            subscriptions,
+            usd: HashMap::new(),
+        };
         market.rebuild_usd_index();
 
         tracing::info!(
@@ -540,6 +575,91 @@ impl LiveMarket {
         }
     }
 
+    /// Re-read every watched account over HTTP and fold it back into the store.
+    ///
+    /// # Why this is not paranoia
+    ///
+    /// For an AMM, *no update means no change*: the account only moves when someone
+    /// swaps it, so an old slot on a quiet pool is a correct price, not a stale one.
+    /// That is exactly what makes a silently dropped subscription so dangerous — it
+    /// looks identical to a pool nobody is trading, and there is no way to tell them
+    /// apart from the WebSocket stream alone.
+    ///
+    /// Re-reading the whole set on a timer settles it. Returns how many pools came
+    /// back different from what the feed had, which is a direct measurement of how
+    /// much the WebSocket is missing rather than an assumption about it.
+    pub async fn reconcile(&mut self) -> Result<ReconcileReport> {
+        let addresses: Vec<String> =
+            self.watches.keys().map(|k| bs58::encode(k).into_string()).collect();
+        if addresses.is_empty() {
+            return Ok(ReconcileReport::default());
+        }
+        let (accounts, slot) =
+            get_multiple_accounts(&self.client, &self.rpc_http, &addresses).await?;
+
+        // Vault balances first, so a constant-product pool is rebuilt from a coherent
+        // set rather than a fresh pool account against last week's vault.
+        let vault_b58: Vec<String> =
+            self.vault_index.keys().map(|k| bs58::encode(k).into_string()).collect();
+        if !vault_b58.is_empty() {
+            let (vaults, _) =
+                get_multiple_accounts(&self.client, &self.rpc_http, &vault_b58).await?;
+            for (b58, data) in vault_b58.iter().zip(vaults.iter()) {
+                let Some(data) = data else { continue };
+                let Ok(amount) = raydium_v4::decode_token_amount(data) else { continue };
+                let Ok(key) = pk(b58) else { continue };
+                let Some(&(pool, first)) = self.vault_index.get(&key) else { continue };
+                if let Some(w) = self.watches.get_mut(&pool) {
+                    w.slot = w.slot.max(slot);
+                    w.set_vault(first, amount);
+                }
+            }
+        }
+
+        let mut report = ReconcileReport { checked: addresses.len(), slot, ..Default::default() };
+        for (b58, data) in addresses.iter().zip(accounts.iter()) {
+            let Ok(addr) = pk(b58) else { continue };
+            let Some(data) = data else {
+                report.missing += 1;
+                continue;
+            };
+            let before = self.store.get(&PoolId(addr));
+            let Some(state) = self.decode_at(addr, data, slot) else {
+                report.undecodable += 1;
+                continue;
+            };
+            // Compare the priced state, not the slot: only a changed price matters.
+            let changed = before.is_none_or(|b| {
+                b.math != state.math || b.fee_ppm != state.fee_ppm
+            });
+            if changed {
+                report.drifted += 1;
+            }
+            self.store.upsert(state);
+        }
+        Ok(report)
+    }
+
+    /// Decode one watched account at `slot`, using whatever venue it belongs to.
+    fn decode_at(&mut self, addr: Pubkey32, data: &[u8], slot: u64) -> Option<PoolState> {
+        let w = self.watches.get_mut(&addr)?;
+        w.slot = w.slot.max(slot);
+        match &mut w.venue {
+            Venue::Whirlpool => orca_whirlpool::to_pool_state(addr, data, slot).ok(),
+            Venue::RaydiumClmm { trade_fee_ppm } => {
+                raydium_clmm::to_pool_state(addr, data, *trade_fee_ppm, slot).ok()
+            }
+            Venue::RaydiumV4 { info, .. } => {
+                *info = Box::new(raydium_v4::decode_amm_info(data).ok()?);
+                self.watches.get(&addr)?.vault_state(addr)
+            }
+            Venue::RaydiumCpmm { pool, .. } => {
+                *pool = Box::new(raydium_cpmm::decode(data).ok()?);
+                self.watches.get(&addr)?.vault_state(addr)
+            }
+        }
+    }
+
     /// Rebuild USD-per-whole-token by walking out from the stablecoin anchors.
     ///
     /// Each round prices any still-unvalued mint through whichever pool connecting it
@@ -646,6 +766,47 @@ impl LiveMarket {
             .join(" · ")
     }
 
+    /// One probe per pool per direction, sized at roughly `usd` of the input token.
+    ///
+    /// Each carries what *we* say the pool will pay, so an outside quote for the same
+    /// swap can be compared against it directly. See `verify` in the binary for why
+    /// the comparison is one-sided.
+    #[must_use]
+    pub fn audit_probes(&self, usd: f64) -> Vec<AuditProbe> {
+        let snap = self.store.snapshot();
+        let mut out = Vec::new();
+        for p in snap.pools() {
+            let label = self.watches.get(&p.id.0).map_or_else(String::new, |w| w.label.clone());
+            for (from, to) in [(p.mint_a, p.mint_b), (p.mint_b, p.mint_a)] {
+                let Some(per_unit) = self.usd_per_base_unit(&from) else { continue };
+                if per_unit <= 0.0 {
+                    continue;
+                }
+                let amount_in = (usd / per_unit) as u128;
+                if amount_in == 0 {
+                    continue;
+                }
+                let Some(leg) = p.leg_for_input(&from) else { continue };
+                let Some(amount_out) = leg.quote(amount_in) else { continue };
+                out.push(AuditProbe {
+                    pair: format!(
+                        "{}->{}",
+                        self.registry.symbol(&from),
+                        self.registry.symbol(&to)
+                    ),
+                    label: label.clone(),
+                    venue: format!("{} {}", p.dex.tag(), fee_label(p.fee_ppm)),
+                    from_b58: bs58::encode(from).into_string(),
+                    to_b58: bs58::encode(to).into_string(),
+                    amount_in,
+                    amount_out,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.pair.cmp(&b.pair).then_with(|| a.venue.cmp(&b.venue)));
+        out
+    }
+
     #[must_use]
     pub fn pool_count(&self) -> usize {
         self.watches.len()
@@ -678,18 +839,28 @@ pub fn fee_label(fee_ppm: u32) -> String {
     }
 }
 
-/// `getMultipleAccounts`, returning raw account data in request order.
+/// `getMultipleAccounts`, returning raw account data in request order plus the slot
+/// the RPC answered at.
+///
+/// The slot matters: a pool seeded at slot 0 looks infinitely stale forever, and any
+/// freshness check built on it is meaningless.
 async fn get_multiple_accounts(
     client: &reqwest::Client,
     url: &str,
     keys: &[String],
-) -> Result<Vec<Option<Vec<u8>>>> {
+) -> Result<(Vec<Option<Vec<u8>>>, u64)> {
     // The RPC caps this at 100 keys per call.
     let mut out = Vec::with_capacity(keys.len());
+    let mut context_slot = 0u64;
     for chunk in keys.chunks(100) {
+        // `processed`, to match the subscription. The default is `finalized`, which
+        // is ~13 slots behind — so a reconciliation read would routinely come back
+        // *older* than what the WebSocket had already delivered, and every one of
+        // those would be counted as the feed having drifted. The drift number is only
+        // worth having if both sides are looking at the same point in the chain.
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "getMultipleAccounts",
-            "params": [chunk, {"encoding": "base64"}]
+            "params": [chunk, {"encoding": "base64", "commitment": "processed"}]
         });
         let resp: serde_json::Value = client
             .post(url)
@@ -704,6 +875,12 @@ async fn get_multiple_accounts(
         if let Some(err) = resp.get("error") {
             anyhow::bail!("rpc error: {err}");
         }
+        if let Some(slot) =
+            resp.get("result").and_then(|r| r.get("context")).and_then(|c| c.get("slot")).and_then(serde_json::Value::as_u64)
+        {
+            context_slot = context_slot.max(slot);
+        }
+
         let values = resp
             .get("result")
             .and_then(|r| r.get("value"))
@@ -719,7 +896,7 @@ async fn get_multiple_accounts(
             out.push(data);
         }
     }
-    Ok(out)
+    Ok((out, context_slot))
 }
 
 fn decode_b64(s: &str) -> Option<Vec<u8>> {
@@ -761,6 +938,8 @@ mod tests {
         }
         let mut m = LiveMarket {
             registry: Registry::embedded().unwrap(),
+            rpc_http: String::new(),
+            client: reqwest::Client::new(),
             watches: HashMap::new(),
             vault_index: HashMap::new(),
             store,

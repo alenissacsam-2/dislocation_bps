@@ -38,6 +38,30 @@ const JITO_TIP_FLOOR_SOL: f64 = 0.000_007_5;
 /// Solana base transaction fee, in SOL.
 const BASE_FEE_SOL: f64 = 0.000_005;
 
+/// Where the measurement goes. The dashboard is a window; this is the record.
+const LEDGER_PATH: &str = "cryptobot.db";
+
+/// One sweep in this many is written to the ledger. Sweeps run at 5 Hz and the
+/// market does not change meaningfully between two of them, so sampling at 1 Hz
+/// keeps a day of running to ~86k rows while losing nothing a mean or a histogram
+/// would notice.
+const LEDGER_EVERY_N_SWEEPS: u32 = 5;
+
+/// How often every watched account is re-read over HTTP and folded back in.
+///
+/// For an AMM, no update means no change — so a silently dropped subscription is
+/// indistinguishable from a quiet pool by looking at the stream alone. Re-reading the
+/// whole set settles it, and the count of pools that came back different is a direct
+/// measurement of how much the WebSocket is missing.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(180);
+
+/// Detections of one route further apart than this are separate opportunities.
+///
+/// The sweep re-detects a standing gap five times a second, so consecutive detections
+/// of a live opportunity are about 0.2s apart. Two seconds is comfortably above that
+/// and comfortably below the time it takes for a closed gap to reopen.
+const EPISODE_GAP_SECS: f64 = 2.0;
+
 /// What the last sweep saw, handed to the status heartbeat.
 #[derive(Debug, Clone, Default)]
 struct SweepSummary {
@@ -48,6 +72,8 @@ struct SweepSummary {
     venues: usize,
     sol_price_usd: f64,
     slot: u64,
+    reconcile_drift: usize,
+    reconcile_checked: usize,
 }
 
 fn now_ms() -> u64 {
@@ -56,6 +82,18 @@ fn now_ms() -> u64 {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Reading the measurement should not require starting a feed, a socket, or a
+    // browser. `cb-bot --report [path]` prints what has been recorded and exits.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--verify") {
+        let cfg = Config::load("config.toml")?;
+        return verify(&cfg).await;
+    }
+    if args.iter().any(|a| a == "--report") {
+        let path = args.iter().position(|a| a == "--report").and_then(|i| args.get(i + 1));
+        return report(path.map_or(LEDGER_PATH, String::as_str));
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -205,6 +243,10 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                 duplicate_pairs: dupe_count,
                 cheapest_round_trip_bps: if cheapest_bps.is_finite() { cheapest_bps } else { 0.0 },
                 sweep_us: s.sweep_us,
+                subscribed: status_stats.subscribed.load(Ordering::Relaxed),
+                subscribe_errors: status_stats.subscribe_errors.load(Ordering::Relaxed),
+                reconcile_drift: s.reconcile_drift,
+                reconcile_checked: s.reconcile_checked,
             });
         }
     });
@@ -213,9 +255,24 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
     let max_hops = cfg.max_hops;
     tracing::info!("capital: ${tradable_usd:.2} tradable, cycles up to {max_hops} hops");
 
+    // A run that keeps no record measures nothing. Failing to open it is not fatal —
+    // the dashboard still works — but it is loud, because a silent loss of the
+    // measurement is the one failure that would waste the whole run.
+    let ledger = match cb_ledger::Ledger::open(LEDGER_PATH) {
+        Ok(l) => {
+            tracing::info!("recording measurements to {LEDGER_PATH} (cb-bot --report to read)");
+            Some(l)
+        }
+        Err(e) => {
+            tracing::error!("could not open {LEDGER_PATH}: {e:#} — this run will not be recorded");
+            None
+        }
+    };
+
     tokio::spawn(async move {
         let mut next_id: u64 = 1;
         let mut evaluated_total: u64 = 0;
+        let mut sweep_n: u32 = 0;
         // The sweep is a full pass over the cycle graph, not a reaction to one pool.
         // At this graph size it costs well under a millisecond, so running it on a
         // timer is cheaper than reasoning about which updates could matter — and it
@@ -224,6 +281,8 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
         // Token valuations move slowly and are only used for sizing; rebuilding the
         // index every sweep would be work spent on a number that has not changed.
         let mut usd_timer = tokio::time::interval(USD_REFRESH);
+        let mut reconcile_timer = tokio::time::interval(RECONCILE_INTERVAL);
+        let mut drift = (0usize, 0usize);
 
         loop {
             tokio::select! {
@@ -237,6 +296,30 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                     }
                 }
                 _ = usd_timer.tick() => market.rebuild_usd_index(),
+                _ = reconcile_timer.tick() => {
+                    // Blocks the other branches for a second or so. That is fine: the
+                    // update channel is bounded at 4096 and buffers far more than a
+                    // second of traffic, and trading on an unverified book is worse
+                    // than trading on a book that is one second late.
+                    match market.reconcile().await {
+                        Ok(r) => {
+                            drift = (r.drifted, r.checked);
+                            if r.drifted > 0 || r.missing > 0 || r.undecodable > 0 {
+                                tracing::warn!(
+                                    "reconcile at slot {}: {}/{} pools drifted from the feed, \
+                                     {} missing, {} undecodable",
+                                    r.slot, r.drifted, r.checked, r.missing, r.undecodable
+                                );
+                            } else {
+                                tracing::info!(
+                                    "reconcile at slot {}: all {} pools matched the feed",
+                                    r.slot, r.checked
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!("reconcile failed: {e:#}"),
+                    }
+                }
                 _ = sweep_timer.tick() => {
                     let sweep = market.sweep(tradable_usd, max_hops);
                     evaluated_total = evaluated_total.saturating_add(sweep.evaluated);
@@ -252,7 +335,33 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                             venues: market.venue_count(),
                             sol_price_usd: market.sol_price_usd().unwrap_or(0.0),
                             slot: sweep.slot,
+                            reconcile_drift: drift.0,
+                            reconcile_checked: drift.1,
                         };
+                    }
+
+                    sweep_n = sweep_n.wrapping_add(1);
+                    if let (Some(l), Some(best)) = (ledger.as_ref(), sweep.best()) {
+                        if sweep_n % LEDGER_EVERY_N_SWEEPS == 0 {
+                            let sample = cb_ledger::SweepSample {
+                                slot: sweep.slot,
+                                evaluated: sweep.evaluated,
+                                clearing: sweep.rows.iter().filter(|r| r.edge_bps > 0.0).count() as u64,
+                                best_edge_bps: best.edge_bps,
+                                best_dislocation_bps: best.dislocation_bps,
+                                best_fee_bps: best.fee_bps,
+                                best_route: best.route.clone(),
+                                best_venues: best.venues.clone(),
+                                best_hops: best.hops,
+                                best_depth_usd: best.depth_usd,
+                                sol_price_usd: market.sol_price_usd().unwrap_or(0.0),
+                                pools_ready: market.ready_count(),
+                                sweep_us: sweep.duration_us,
+                            };
+                            if let Err(e) = l.record_sweep(&sample) {
+                                tracing::warn!("could not record sweep: {e:#}");
+                            }
+                        }
                     }
 
                     if !sweep.rows.is_empty() {
@@ -289,6 +398,29 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                         } else {
                             None
                         };
+
+                        if let Some(l) = ledger.as_ref() {
+                            let rec = cb_ledger::FillRecord {
+                                slot: opp.slot,
+                                route: opp.route.clone(),
+                                venues: opp.venues.clone(),
+                                hops: opp.hops,
+                                edge_bps: opp.edge_bps,
+                                dislocation_bps: opp.edge_bps + opp.fee_bps,
+                                fee_bps: opp.fee_bps,
+                                size_usd: opp.size_usd,
+                                optimal_size_usd: opp.optimal_size_usd,
+                                gross_usd: opp.gross_profit_usd,
+                                profit_at_optimal_usd: opp.profit_at_optimal_usd,
+                                tip_usd: est_tip_usd,
+                                net_usd: net,
+                                taken: skipped.is_none(),
+                                skipped_reason: skipped.clone(),
+                            };
+                            if let Err(e) = l.record_fill(&rec) {
+                                tracing::warn!("could not record fill: {e:#}");
+                            }
+                        }
 
                         bus.publish(Event::Opportunity {
                             id,
@@ -337,4 +469,297 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+/// Buckets for the distance-to-profitable histogram, in bps.
+///
+/// Tight around zero because that is where the answer lives: at these fee tiers the
+/// market spends its time within a couple of basis points of breaking even, and a
+/// histogram with 10 bps buckets would show one tall bar and tell you nothing.
+const EDGE_BUCKETS: [f64; 11] =
+    [-1e9, -20.0, -10.0, -5.0, -2.0, -1.0, 0.0, 1.0, 2.0, 5.0, 1e9];
+
+/// Print what the run has measured, and stop.
+///
+/// Separate from the live loop on purpose: the measurement is the product, and it
+/// should be readable without starting a feed, a socket, or a browser.
+fn report(path: &str) -> anyhow::Result<()> {
+    let ledger = cb_ledger::Ledger::open(path)?;
+    let s = ledger.summary()?;
+
+    println!("\ncryptobot — measurement report");
+    println!("  ledger        {path}");
+    match (&s.first_at, &s.last_at) {
+        (Some(a), Some(b)) => println!("  window        {a} .. {b} UTC"),
+        _ => println!("  window        (no samples yet)"),
+    }
+    if s.samples == 0 {
+        println!("\nNothing recorded yet. Run the bot for a while first.\n");
+        return Ok(());
+    }
+
+    println!("\n  DISTANCE TO PROFITABLE      (best route in each sampled sweep)");
+    println!("    samples                   {}", s.samples);
+    println!("    mean edge                 {:>8.2} bps", s.mean_edge_bps);
+    println!("    best edge                 {:>8.2} bps", s.best_edge_bps);
+    println!("    mean price dislocation    {:>8.2} bps", s.mean_dislocation_bps);
+    println!("    widest dislocation        {:>8.2} bps", s.best_dislocation_bps);
+    println!("    mean fee wall             {:>8.2} bps", s.mean_fee_bps);
+    println!(
+        "    moments something cleared {:>8.2}%   ({} of {})",
+        s.clearing_rate() * 100.0,
+        s.clearing_samples,
+        s.samples
+    );
+
+    println!("\n  EDGE DISTRIBUTION");
+    let hist = ledger.edge_histogram(&EDGE_BUCKETS)?;
+    let peak = hist.iter().map(|(_, _, n)| *n).max().unwrap_or(1).max(1);
+    for (lo, hi, n) in &hist {
+        if *n == 0 {
+            continue;
+        }
+        let label = match (*lo, *hi) {
+            (l, _) if l <= -1e8 => format!("     below {:>6.0}", -20.0),
+            (_, h) if h >= 1e8 => format!("     above {:>6.1}", 5.0),
+            (l, h) => format!("  {l:>7.1} .. {h:>6.1}"),
+        };
+        let bar = "#".repeat(((*n as f64 / peak as f64) * 46.0).round() as usize);
+        println!("  {label}  {n:>7}  {bar}");
+    }
+
+    let hours = ledger.hours_observed()?.max(1e-9);
+    println!("\n  CYCLES THAT CLEARED THEIR OWN FEES");
+    println!("    observed for              {hours:.2} h");
+    let ep = ledger.episodes(EPISODE_GAP_SECS)?;
+    println!("    detections                {}   ({:.0}/h)", s.fills, s.fills as f64 / hours);
+    println!(
+        "    distinct opportunities    {}   ({:.1}/h)",
+        ep.count,
+        ep.count as f64 / hours
+    );
+    println!("    of those, we would take   {}", ep.taken);
+    println!(
+        "    detections per opportunity{:>8.0}   <- one standing gap, re-seen every sweep",
+        ep.inflation()
+    );
+    println!("    longest single episode    {} detections", ep.longest_detections);
+    println!();
+    println!(
+        "    net, counting each once   ${:.6}   (${:.4}/h)",
+        ep.total_net_usd,
+        ep.total_net_usd / hours
+    );
+    println!("    median opportunity        ${:.6}", ep.median_net_usd);
+    println!("    best opportunity          ${:.6}", ep.best_net_usd);
+    println!(
+        "    [summing every detection would say ${:.2}. It counts the same gap {:.0}",
+        s.realised_net_usd,
+        ep.inflation()
+    );
+    println!("     times over, and taking an arbitrage is what removes it. Not real.]");
+
+    let (top_route, share) = ledger.concentration()?;
+    if share > 0.0 {
+        println!(
+            "    from one route            {:.0}%  ({})",
+            share * 100.0,
+            top_route
+        );
+        if share > 0.4 {
+            println!(
+                "                              ^ every average above is mostly this pair"
+            );
+        }
+    }
+
+    let p = ledger.fill_percentiles()?;
+    println!("\n  WHAT ONE OPPORTUNITY IS WORTH");
+    println!("    {:<22} {:>12} {:>12} {:>12}", "", "median", "p90", "p99");
+    println!(
+        "    {:<22} {:>12} {:>12} {:>12}",
+        "at unlimited capital",
+        format!("${:.6}", p.at_optimal_p50),
+        format!("${:.6}", p.at_optimal_p90),
+        format!("${:.6}", p.at_optimal_p99)
+    );
+    println!(
+        "    {:<22} {:>12} {:>12} {:>12}",
+        "kept, after costs",
+        format!("${:.6}", p.taken_net_p50),
+        format!("${:.6}", p.taken_net_p90),
+        format!("${:.6}", p.taken_net_p99)
+    );
+    println!("    median size traded        ${:.2}", p.size_p50);
+    println!(
+        "    best seen, whole pie      ${:.6}   <- the ceiling, at any capital",
+        s.best_profit_at_optimal_usd
+    );
+
+    // The fixed cost of a transaction does not shrink with the trade, so below a
+    // certain account size every opportunity is negative regardless of how good the
+    // price is. Saying where that line falls is more useful than any average.
+    let fixed_cost = (JITO_TIP_FLOOR_SOL + BASE_FEE_SOL) * 200.0;
+    if p.taken_net_p50 > 0.0 && p.size_p50 > 0.0 {
+        let edge_frac = (p.taken_net_p50 + fixed_cost) / p.size_p50;
+        if edge_frac > 0.0 {
+            println!(
+                "\n  BREAK-EVEN CAPITAL        ${:.2}   at the median edge of {:.2} bps",
+                fixed_cost / edge_frac,
+                edge_frac * 10_000.0
+            );
+            println!(
+                "    Costs are per transaction, not per dollar: ~${fixed_cost:.4} of tip and"
+            );
+            println!("    base fee whatever the size. Below that line nothing clears.");
+        }
+    }
+
+    let routes = ledger.top_routes(8)?;
+    if !routes.is_empty() {
+        println!("\n  ROUTES THAT CLEARED MOST OFTEN");
+        println!("    {:<26} {:<28} {:>6} {:>9} {:>11}", "route", "venues", "times", "mean bps", "best net");
+        for r in routes {
+            println!(
+                "    {:<26} {:<28} {:>6} {:>9.2} ${:>10.6}",
+                truncate(&r.route, 26),
+                truncate(&r.venues, 28),
+                r.fills,
+                r.mean_edge_bps,
+                r.best_net_usd
+            );
+        }
+    }
+    println!();
+    Ok(())
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        s.chars().take(n.saturating_sub(1)).collect::<String>() + "…"
+    }
+}
+
+/// Tolerance before a disagreement with the router is called a fault, in bps.
+///
+/// Generous on purpose. Jupiter's quote is net of its own accounting and may be taken
+/// a slot or two from ours, so small differences are noise. The failure this is hunting
+/// is not subtle: the creator-fee bug it was built after was worth 52 bps.
+const VERIFY_TOLERANCE_BPS: f64 = 20.0;
+
+/// Pause between router requests. The public endpoint is rate limited and this is an
+/// audit, not a race.
+const VERIFY_PACE: Duration = Duration::from_millis(1200);
+
+/// Cross-check every decoded pool against an independent router.
+///
+/// # Why one-sided
+///
+/// Jupiter routes across these venues and more. So for any pair, the best output *it*
+/// can find should be at least as good as the best output *we* think one of our pools
+/// offers. If ours is materially better, we are not finding an edge nobody else can —
+/// we are decoding something wrong. That asymmetry is the whole test: being *worse*
+/// than the router is fine and expected (it knows venues we do not), being *better* is
+/// a bug.
+///
+/// This exists because a decoder that is wrong in the profitable direction produces
+/// numbers that look like success. A missing fee bucket in Raydium CP-Swap put one
+/// pool 52 bps off its true price, and the cycle search reported the difference as a
+/// standing arbitrage for four hours. Every internal consistency check passed, because
+/// the error was in the input, not the arithmetic. Only an outside opinion could catch
+/// it, so now there is one, on demand.
+async fn verify(cfg: &Config) -> anyhow::Result<()> {
+    let registry = registry::Registry::embedded()?;
+    println!("cryptobot — decoder audit against an independent router\n");
+    println!("  reading {} pools from chain...", registry.pools.len());
+
+    let mut market = live::LiveMarket::bootstrap(&cfg.rpc_http_url, registry).await?;
+    market.rebuild_usd_index();
+    let probes = market.audit_probes(5.0);
+    println!("  {} pool/direction pairs to check, ~{:.0}s\n", probes.len(),
+             probes.len() as f64 * VERIFY_PACE.as_secs_f64());
+
+    let client = reqwest::Client::new();
+    println!(
+        "  {:<18} {:<9} {:>14} {:>14} {:>9}  {}",
+        "pair", "venue", "ours", "router", "diff", "verdict"
+    );
+
+    let (mut checked, mut faults, mut skipped) = (0usize, 0usize, 0usize);
+    for p in probes {
+        tokio::time::sleep(VERIFY_PACE).await;
+        let theirs = match jupiter_quote(&client, &p.from_b58, &p.to_b58, p.amount_in).await {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                skipped += 1;
+                continue;
+            }
+            Err(e) => {
+                println!("  {:<18} {:<9} router error: {e:#}", p.pair, p.venue);
+                skipped += 1;
+                continue;
+            }
+        };
+        checked += 1;
+
+        // Positive means our quote claims more output than the router could find.
+        let diff_bps = if theirs > 0 {
+            (p.amount_out as f64 / theirs as f64 - 1.0) * 10_000.0
+        } else {
+            0.0
+        };
+        let fault = diff_bps > VERIFY_TOLERANCE_BPS;
+        if fault {
+            faults += 1;
+        }
+        let verdict = if fault {
+            "FAULT — we quote better than any router can route"
+        } else if diff_bps < -100.0 {
+            "ok (router found a venue we do not watch)"
+        } else {
+            "ok"
+        };
+        println!(
+            "  {:<18} {:<9} {:>14} {:>14} {:>+8.1}b  {verdict}",
+            truncate(&format!("{} {}", p.pair, p.label), 18),
+            p.venue,
+            p.amount_out,
+            theirs,
+            diff_bps
+        );
+    }
+
+    println!("\n  {checked} checked, {skipped} skipped, {faults} faults");
+    if faults == 0 {
+        println!("  No pool quotes better than the router can route. Decoders look honest.\n");
+    } else {
+        println!(
+            "  {faults} pool(s) claim an output nobody else can produce. That is a decode \n\
+             \x20 error, not an edge — do not trade on those routes until it is explained.\n"
+        );
+    }
+    Ok(())
+}
+
+/// Best output the router can find for a direct swap, or `None` if it has no route.
+async fn jupiter_quote(
+    client: &reqwest::Client,
+    from: &str,
+    to: &str,
+    amount_in: u128,
+) -> anyhow::Result<Option<u128>> {
+    let url = format!(
+        "https://lite-api.jup.ag/swap/v1/quote?inputMint={from}&outputMint={to}\
+         &amount={amount_in}&slippageBps=50&onlyDirectRoutes=true"
+    );
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let v: serde_json::Value = resp.json().await?;
+    Ok(v.get("outAmount")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| s.parse::<u128>().ok()))
 }

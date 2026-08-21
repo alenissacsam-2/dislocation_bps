@@ -281,6 +281,10 @@ impl Market {
             duplicate_pairs: 1,
             cheapest_round_trip_bps: 50.0,
             sweep_us: 0,
+            subscribed: 0,
+            subscribe_errors: 0,
+            reconcile_drift: 0,
+            reconcile_checked: 0,
         });
     }
 }

@@ -72,6 +72,20 @@ pub enum Event {
         /// How long the last full cycle sweep took.
         #[serde(default)]
         sweep_us: u64,
+        /// Accounts the RPC confirmed a subscription for, and refused. A refused
+        /// account is a pool that will never update, which looks exactly like a pool
+        /// nobody is trading — so it has to be counted rather than inferred.
+        #[serde(default)]
+        subscribed: u64,
+        #[serde(default)]
+        subscribe_errors: u64,
+        /// Pools whose on-chain state differed from what the feed had delivered, at
+        /// the last reconciliation. Persistently non-zero means the WebSocket is
+        /// dropping updates and every number here is worth less than it looks.
+        #[serde(default)]
+        reconcile_drift: usize,
+        #[serde(default)]
+        reconcile_checked: usize,
     },
 
     /// The current leaderboard of routes, ranked by how close they are to clearing.
@@ -248,6 +262,10 @@ mod tests {
             duplicate_pairs: 0,
             cheapest_round_trip_bps: 0.0,
             sweep_us: 0,
+            subscribed: 0,
+            subscribe_errors: 0,
+            reconcile_drift: 0,
+            reconcile_checked: 0,
         }
     }
 

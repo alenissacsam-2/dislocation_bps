@@ -38,3 +38,6 @@ Thumbs.db
 .idea/
 .vscode/
 config.toml
+cryptobot*.db
+cryptobot*.db-wal
+cryptobot*.db-shm
