@@ -263,6 +263,8 @@ impl Market {
             updates: 0,
             dropped: 0,
             reconnects: 0,
+            stalls: 0,
+            data_age_secs: 0,
             best_edge_bps: 0.0,
             best_route: String::new(),
             best_hops: 0,

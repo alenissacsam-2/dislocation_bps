@@ -125,6 +125,8 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
             let cycles = cycles_for_status.load(Ordering::Relaxed);
             let last_ms = status_stats.last_update_ms.load(Ordering::Relaxed);
             let stale_for = if last_ms == 0 { u64::MAX } else { now_ms().saturating_sub(last_ms) };
+            let stalls = status_stats.stalls.load(Ordering::Relaxed);
+            let data_age_secs = if stale_for == u64::MAX { 0 } else { stale_for / 1000 };
             status_bus.publish(Event::Status {
                 mode: "paper · live mainnet".into(),
                 // Consider the feed live only if something arrived in the last 30s.
@@ -137,6 +139,8 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                 updates,
                 dropped,
                 reconnects,
+                stalls,
+                data_age_secs,
                 best_edge_bps: best.as_ref().map_or(0.0, |b| b.edge_bps),
                 best_route: best.as_ref().map_or_else(String::new, |b| b.route.clone()),
                 best_hops: best.as_ref().map_or(0, |b| b.hops),

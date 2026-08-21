@@ -35,6 +35,13 @@ pub enum Event {
         dropped: u64,
         #[serde(default)]
         reconnects: u64,
+        /// Connections abandoned because data stopped while the socket stayed open.
+        #[serde(default)]
+        stalls: u64,
+        /// Seconds since the last account update. The honest freshness number:
+        /// everything else on the dashboard is only as current as this.
+        #[serde(default)]
+        data_age_secs: u64,
         /// Best cycle edge currently visible, in bps. Negative means the market is
         /// that far from profitable — the single most informative research number,
         /// and the reason "found nothing" is not an acceptable output.
@@ -165,6 +172,8 @@ mod tests {
             updates: 0,
             dropped: 0,
             reconnects: 0,
+            stalls: 0,
+            data_age_secs: 0,
             best_edge_bps: 0.0,
             best_route: String::new(),
             best_hops: 0,

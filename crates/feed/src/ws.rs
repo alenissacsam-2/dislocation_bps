@@ -10,6 +10,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+/// How long to wait on a read before probing the connection with a ping.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long account data may be absent before we declare the socket dead and
+/// reconnect. The watched set includes SOL/USDC, which trades continuously, so a
+/// full minute of silence is not a quiet market — it is a broken connection.
+pub const MAX_SILENCE: Duration = Duration::from_secs(60);
+
+/// Whether a connection that has been silent for `silent` should be abandoned.
+///
+/// Split out from the socket loop so the decision is testable without a network.
+#[must_use]
+pub fn is_dead(silent: Duration) -> bool {
+    silent > MAX_SILENCE
+}
+
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
@@ -28,6 +44,9 @@ pub struct FeedStats {
     pub last_slot: AtomicU64,
     pub last_update_ms: AtomicU64,
     pub parse_errors: AtomicU64,
+    /// Connections abandoned because data stopped arriving while the socket stayed
+    /// open. Distinct from `reconnects`, which counts all reconnects.
+    pub stalls: AtomicU64,
 }
 
 impl FeedStats {
@@ -107,8 +126,38 @@ async fn run_once(
         pending.insert(id, *acct);
     }
 
-    while let Some(msg) = socket.next().await {
-        let msg = msg?;
+    // A silently-dead socket is the dangerous failure mode: the peer stops sending but
+    // never closes, so `next()` blocks forever and the reconnect loop never runs. The
+    // bot keeps serving whatever prices it last saw. In paper mode that corrupts the
+    // measurement; in live mode it would trade on stale state.
+    //
+    // So: never block indefinitely. Probe with a ping when quiet, and give up entirely
+    // once data has been absent long enough that the connection cannot be healthy.
+    let mut last_data = std::time::Instant::now();
+
+    loop {
+        let next = match tokio::time::timeout(READ_TIMEOUT, socket.next()).await {
+            Ok(Some(m)) => m,
+            Ok(None) => return Ok(()), // stream ended cleanly
+            Err(_elapsed) => {
+                // Nothing arrived within the read window. Distinguish "quiet" from
+                // "dead": ping to keep intermediaries from reaping the connection,
+                // then bail if data has been absent past the tolerance.
+                let silent = last_data.elapsed();
+                if silent > MAX_SILENCE {
+                    stats.stalls.fetch_add(1, Ordering::Relaxed);
+                    return Err(anyhow!(
+                        "no account data for {}s — treating connection as dead",
+                        silent.as_secs()
+                    ));
+                }
+                tracing::debug!("feed quiet for {}s, pinging", silent.as_secs());
+                socket.send(Message::Ping(Vec::new().into())).await?;
+                continue;
+            }
+        };
+
+        let msg = next?;
         let text = match msg {
             Message::Text(t) => t.to_string(),
             Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
@@ -116,6 +165,10 @@ async fn run_once(
                 socket.send(Message::Pong(p)).await?;
                 continue;
             }
+            // A pong proves the socket is alive but carries no prices, so it must
+            // NOT reset the data-staleness clock. Otherwise our own keepalive would
+            // mask a feed that has stopped delivering account updates.
+            Message::Pong(_) => continue,
             Message::Close(_) => return Ok(()),
             _ => continue,
         };
@@ -173,6 +226,7 @@ async fn run_once(
             }
         };
 
+        last_data = std::time::Instant::now();
         stats.updates.fetch_add(1, Ordering::Relaxed);
         stats.last_slot.store(slot, Ordering::Relaxed);
         stats.last_update_ms.store(now_ms(), Ordering::Relaxed);
@@ -184,8 +238,6 @@ async fn run_once(
             stats.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
-
-    Ok(())
 }
 
 /// Standard base64 decode. Small enough not to justify a dependency.
@@ -253,6 +305,23 @@ mod tests {
             }
         }
         assert_eq!(base64_decode(&enc).unwrap(), input);
+    }
+
+    #[test]
+    fn silence_past_the_tolerance_is_treated_as_death() {
+        // The bug this guards: a socket that stays open but stops delivering data.
+        assert!(!is_dead(Duration::from_secs(0)));
+        assert!(!is_dead(Duration::from_secs(30)));
+        assert!(!is_dead(MAX_SILENCE));
+        assert!(is_dead(MAX_SILENCE + Duration::from_secs(1)));
+        assert!(is_dead(Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn read_timeout_is_shorter_than_the_silence_tolerance() {
+        // Otherwise we would declare the connection dead before ever probing it
+        // with a ping, and reconnect on merely-quiet markets.
+        assert!(READ_TIMEOUT < MAX_SILENCE, "must get at least one ping probe in first");
     }
 
     #[test]
