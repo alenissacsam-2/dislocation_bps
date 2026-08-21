@@ -578,7 +578,7 @@ fn report(path: &str) -> anyhow::Result<()> {
     println!("    {:<22} {:>12} {:>12} {:>12}", "", "median", "p90", "p99");
     println!(
         "    {:<22} {:>12} {:>12} {:>12}",
-        "at unlimited capital",
+        "the whole opportunity",
         format!("${:.6}", p.at_optimal_p50),
         format!("${:.6}", p.at_optimal_p90),
         format!("${:.6}", p.at_optimal_p99)
@@ -591,6 +591,12 @@ fn report(path: &str) -> anyhow::Result<()> {
         format!("${:.6}", p.taken_net_p99)
     );
     println!("    median size traded        ${:.2}", p.size_p50);
+    if p.at_optimal_p50 > 0.0 {
+        println!(
+            "    our capital reached       {:.0}% of the median opportunity",
+            100.0 * p.taken_net_p50 / p.at_optimal_p50
+        );
+    }
     println!(
         "    best seen, whole pie      ${:.6}   <- the ceiling, at any capital",
         s.best_profit_at_optimal_usd
@@ -599,7 +605,8 @@ fn report(path: &str) -> anyhow::Result<()> {
     // The fixed cost of a transaction does not shrink with the trade, so below a
     // certain account size every opportunity is negative regardless of how good the
     // price is. Saying where that line falls is more useful than any average.
-    let fixed_cost = (JITO_TIP_FLOOR_SOL + BASE_FEE_SOL) * 200.0;
+    let sol_price = ledger.median_sol_price()?;
+    let fixed_cost = (JITO_TIP_FLOOR_SOL + BASE_FEE_SOL) * sol_price;
     if p.taken_net_p50 > 0.0 && p.size_p50 > 0.0 {
         let edge_frac = (p.taken_net_p50 + fixed_cost) / p.size_p50;
         if edge_frac > 0.0 {

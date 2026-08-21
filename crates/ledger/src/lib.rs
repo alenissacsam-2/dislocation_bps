@@ -201,10 +201,13 @@ impl Ledger {
                 |r| r.get(0),
             )?)
         };
+        // Both rows over the *same* trades. Taking the optimum over every detection
+        // and the net over only the taken ones would put two different populations in
+        // adjacent rows, and the gap between them would measure nothing.
         Ok(FillPercentiles {
-            at_optimal_p50: p("profit_at_optimal_usd", "", 0.50)?,
-            at_optimal_p90: p("profit_at_optimal_usd", "", 0.90)?,
-            at_optimal_p99: p("profit_at_optimal_usd", "", 0.99)?,
+            at_optimal_p50: p("profit_at_optimal_usd", "WHERE taken = 1", 0.50)?,
+            at_optimal_p90: p("profit_at_optimal_usd", "WHERE taken = 1", 0.90)?,
+            at_optimal_p99: p("profit_at_optimal_usd", "WHERE taken = 1", 0.99)?,
             taken_net_p50: p("net_usd", "WHERE taken = 1", 0.50)?,
             taken_net_p90: p("net_usd", "WHERE taken = 1", 0.90)?,
             taken_net_p99: p("net_usd", "WHERE taken = 1", 0.99)?,
@@ -229,6 +232,28 @@ impl Ledger {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         Ok((route, n as f64 / total as f64))
+    }
+
+    /// Median SOL price across the run, from the recorded sweeps.
+    ///
+    /// Transaction costs are denominated in SOL, so quoting them in dollars needs a
+    /// price. Taking it from the ledger rather than a constant means a report stays
+    /// correct when read months later against a different market.
+    pub fn median_sol_price(&self) -> Result<f64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sweeps WHERE sol_price_usd > 0",
+            [],
+            |r| r.get(0),
+        )?;
+        if n == 0 {
+            return Ok(0.0);
+        }
+        Ok(self.conn.query_row(
+            "SELECT sol_price_usd FROM sweeps WHERE sol_price_usd > 0
+             ORDER BY sol_price_usd LIMIT 1 OFFSET ?1",
+            [(n - 1) / 2],
+            |r| r.get(0),
+        )?)
     }
 
     /// Hours spanned by the recorded sweeps, from the ledger's own timestamps.
@@ -673,6 +698,17 @@ mod tests {
 
     /// A headline average over a set dominated by one pair describes that pair.
     #[test]
+    fn sol_price_comes_from_the_run_not_a_constant() {
+        let l = Ledger::open_in_memory().unwrap();
+        for p in [80.0, 91.0, 120.0] {
+            let mut s = sweep(-1.0);
+            s.sol_price_usd = p;
+            l.record_sweep(&s).unwrap();
+        }
+        assert!((l.median_sol_price().unwrap() - 91.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn concentration_exposes_a_single_route_dominating_the_sample() {
         let l = Ledger::open_in_memory().unwrap();
         for _ in 0..90 {
@@ -760,6 +796,7 @@ mod tests {
         assert!(l.top_routes(5).unwrap().is_empty());
         assert_eq!(l.concentration().unwrap().1, 0.0);
         assert_eq!(l.episodes(2.0).unwrap().count, 0);
+        assert_eq!(l.median_sol_price().unwrap(), 0.0);
         assert_eq!(l.episodes(2.0).unwrap().inflation(), 0.0);
         assert_eq!(l.hours_observed().unwrap(), 0.0);
         assert_eq!(l.fill_percentiles().unwrap().taken_net_p50, 0.0);

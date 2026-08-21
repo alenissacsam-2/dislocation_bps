@@ -534,11 +534,13 @@ impl LiveMarket {
                     edge_bps: sc.edge_bps,
                     dislocation_bps: sc.dislocation_bps(),
                     fee_bps: sc.cycle.fee_bps(),
-                    depth_usd: sc
-                        .cycle
-                        .legs
-                        .first()
-                        .map_or(0.0, |l| l.max_in.min(u128::from(u64::MAX)) as f64 * usd_per_unit),
+                    // Largest input the route can price exactly, in dollars. A
+                    // constant-product leg is unbounded in principle, so it is capped
+                    // at the pool's own input reserve — an unbounded number rendered
+                    // as depth would read as infinite liquidity, which is not a thing.
+                    depth_usd: sc.cycle.legs.first().map_or(0.0, |l| {
+                        l.max_in.min(l.reserve_in) as f64 * usd_per_unit
+                    }),
                     slot: sc.cycle.slot(&snap),
                 });
             }
