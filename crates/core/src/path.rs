@@ -316,6 +316,163 @@ pub fn optimal_input(legs: &[Leg], max_in: u128) -> Option<u128> {
     best.map(|(x, _)| x)
 }
 
+/// Split `amount_in` across **parallel** legs to maximise total output.
+///
+/// Parallel means what the routing literature calls a hop group: several pools quoting
+/// the same pair in the same direction, so a trade may use any mixture of them. This is
+/// the opposite of [`chain_quote`], which runs one amount through legs in series.
+///
+/// # Why splitting beats picking the best pool
+///
+/// Output is concave in size on every leg, so the marginal rate a pool offers *falls*
+/// as you push more through it. Sending the whole trade to the pool with the best
+/// headline price therefore rides that pool down its own curve while better marginal
+/// prices sit unused next door. The optimum instead **equalises the marginal rate
+/// across every pool that receives anything** — the classic water-filling condition,
+/// and the same stationarity condition the CFMM-routing literature derives from convex
+/// duality. It is strictly better than any single-pool route whenever a second pool
+/// quotes the same pair at a comparable price, and never worse: with one pool, or with
+/// rivals priced far apart, it degenerates to exactly the single-pool answer.
+///
+/// This matters here specifically because cycle capacity is set by the *thinnest* leg.
+/// Splitting a hop across four pools raises that hop's usable depth toward the sum of
+/// theirs, which is the only lever that moves the depth ceiling — and depth, not
+/// capital, is what these cycles run out of.
+///
+/// # Method
+///
+/// For a constant-product leg with fee factor `γ`, output is `γ·x·Rout / (Rin + γ·x)`,
+/// whose derivative is `γ·Rin·Rout / (Rin + γ·x)²`. Setting that equal to a common
+/// marginal rate `λ` inverts in closed form:
+///
+/// ```text
+/// x(λ) = (√(γ·Rin·Rout / λ) − Rin) / γ
+/// ```
+///
+/// Each `x(λ)` is decreasing in `λ`, so the total is too, and a bisection on `λ` finds
+/// the allocation summing to `amount_in`. No iterative solver and no convex-program
+/// dependency — the general algorithms in the literature buy generality across pool
+/// types we do not have.
+///
+/// Returns allocations in the same order as `legs`, summing exactly to `amount_in`.
+/// `None` if the legs cannot absorb it — their `max_in` bounds sum to less than asked,
+/// which is a refusal to quote rather than an extrapolation past a tick.
+#[must_use]
+pub fn split_across(legs: &[Leg], amount_in: u128) -> Option<Vec<u128>> {
+    if legs.is_empty() {
+        return None;
+    }
+    if amount_in == 0 {
+        return Some(vec![0; legs.len()]);
+    }
+    if legs.len() == 1 {
+        return (amount_in <= legs[0].max_in).then(|| vec![amount_in]);
+    }
+
+    // Capacity check first: a group that cannot take the trade must refuse it, exactly
+    // as a single leg past its tick does.
+    let capacity: u128 = legs.iter().map(|l| l.max_in).fold(0u128, u128::saturating_add);
+    if capacity < amount_in {
+        return None;
+    }
+
+    let gamma = |l: &Leg| f64::from(1_000_000 - l.fee_ppm) / 1_000_000.0;
+    let usable = |l: &Leg| l.reserve_in > 0 && l.reserve_out > 0;
+
+    // Allocation to one leg at a common marginal rate.
+    let alloc_at = |l: &Leg, lambda: f64| -> f64 {
+        if !usable(l) || lambda <= 0.0 {
+            return 0.0;
+        }
+        let (g, rin, rout) = (gamma(l), l.reserve_in as f64, l.reserve_out as f64);
+        let x = ((g * rin * rout / lambda).sqrt() - rin) / g;
+        x.clamp(0.0, l.max_in.min(u128::from(u64::MAX)) as f64)
+    };
+
+    // At zero size a leg's marginal rate is γ·Rout/Rin. Above the best of those no leg
+    // takes anything, which brackets the search from the top.
+    let hi_start = legs
+        .iter()
+        .filter(|l| usable(l))
+        .map(|l| gamma(l) * (l.reserve_out as f64) / (l.reserve_in as f64))
+        .fold(0.0f64, f64::max);
+    if hi_start <= 0.0 {
+        return None;
+    }
+
+    let (mut lo, mut hi) = (0.0f64, hi_start);
+    let target = amount_in as f64;
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if mid <= 0.0 || !mid.is_finite() {
+            break;
+        }
+        let total: f64 = legs.iter().map(|l| alloc_at(l, mid)).sum();
+        // Total is decreasing in lambda: too much means the rate is set too low.
+        if total > target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if (hi - lo) <= f64::EPSILON * hi.max(1.0) {
+            break;
+        }
+    }
+
+    let lambda = 0.5 * (lo + hi);
+    let mut out: Vec<u128> = legs
+        .iter()
+        .map(|l| {
+            let x = alloc_at(l, lambda).floor();
+            if x <= 0.0 { 0 } else { (x as u128).min(l.max_in) }
+        })
+        .collect();
+
+    // Bisection lands near the target but rounding down loses a few base units, and an
+    // allocation that does not sum to the input is not a route. Hand the remainder to
+    // whichever leg still has both headroom and the best marginal rate.
+    let mut placed: u128 = out.iter().fold(0u128, |a, b| a.saturating_add(*b));
+    while placed < amount_in {
+        let short = amount_in - placed;
+        let best = legs
+            .iter()
+            .enumerate()
+            .filter(|(i, l)| usable(l) && out[*i] < l.max_in)
+            .max_by(|(i, a), (j, b)| {
+                let m = |l: &Leg, x: u128| {
+                    let (g, rin, rout) = (gamma(l), l.reserve_in as f64, l.reserve_out as f64);
+                    let d = rin + g * x as f64;
+                    if d <= 0.0 { 0.0 } else { g * rin * rout / (d * d) }
+                };
+                m(a, out[*i]).total_cmp(&m(b, out[*j]))
+            })
+            .map(|(i, _)| i)?;
+        let room = legs[best].max_in - out[best];
+        let give = short.min(room.max(1));
+        out[best] = out[best].saturating_add(give);
+        placed = placed.saturating_add(give);
+    }
+
+    Some(out)
+}
+
+/// Total output from splitting `amount_in` optimally across parallel `legs`.
+///
+/// Quotes each allocation exactly rather than trusting the float search, so the number
+/// returned is one a swap would actually produce.
+#[must_use]
+pub fn split_output(legs: &[Leg], amount_in: u128) -> Option<u128> {
+    let alloc = split_across(legs, amount_in)?;
+    let mut total: u128 = 0;
+    for (leg, amount) in legs.iter().zip(alloc) {
+        if amount == 0 {
+            continue;
+        }
+        total = total.checked_add(leg.quote(amount)?)?;
+    }
+    Some(total)
+}
+
 /// Profit this cycle would pay an account holding exactly `capital` base units.
 ///
 /// # Why this is measured rather than scaled from the optimum
@@ -667,6 +824,78 @@ mod tests {
         let small = profit_at_capital(&legs, 1_000);
         assert!(small > 0, "the cycle must profit at all for this to mean anything");
         assert_eq!(small, profit_at_capital(&legs, 1_000_000_000));
+    }
+
+    /// The property the whole idea rests on: two comparable pools beat either alone.
+    #[test]
+    fn splitting_beats_sending_everything_to_the_best_pool() {
+        // Same pair, near-identical prices — exactly the case our universe is full of.
+        let a = leg(1_000_000_000, 1_000_000_000);
+        let b = leg(900_000_000, 900_000_000);
+        let size = 50_000_000u128;
+
+        let split = split_output(&[a, b], size).expect("the group can absorb it");
+        let best_alone = a.quote(size).unwrap().max(b.quote(size).unwrap());
+        assert!(
+            split > best_alone,
+            "splitting produced {split}, the best single pool {best_alone}"
+        );
+    }
+
+    #[test]
+    fn one_pool_alone_is_unchanged_by_the_split_path() {
+        let a = leg(1_000_000_000, 1_050_000_000);
+        assert_eq!(split_output(&[a], 1_000_000), a.quote(1_000_000));
+    }
+
+    /// Degenerate case that must not silently misroute: when one pool is far better,
+    /// splitting should converge on it rather than sprinkling size into a bad price.
+    #[test]
+    fn a_far_worse_pool_receives_almost_nothing() {
+        let good = leg(1_000_000_000, 1_000_000_000);
+        let awful = leg(1_000_000_000, 10_000_000); // 100x worse rate
+        let alloc = split_across(&[good, awful], 1_000_000).unwrap();
+        assert_eq!(alloc.iter().sum::<u128>(), 1_000_000, "allocations must sum to the input");
+        assert!(alloc[0] > alloc[1] * 50, "got {alloc:?}");
+    }
+
+    #[test]
+    fn allocations_always_sum_to_the_input_exactly() {
+        // Rounding down per leg loses base units; the remainder has to go somewhere or
+        // the "route" quietly trades less than it was given.
+        let legs = [leg(1_000_000_000, 1_000_000_000), leg(700_000_000, 690_000_000), leg(3_000_000, 3_100_000)];
+        for size in [1u128, 7, 999, 1_000_000, 123_456_789] {
+            let alloc = split_across(&legs, size).unwrap();
+            assert_eq!(alloc.iter().sum::<u128>(), size, "size {size} gave {alloc:?}");
+        }
+    }
+
+    #[test]
+    fn a_split_never_pushes_a_leg_past_its_tick() {
+        let bounded = Leg::bounded(1_000_000_000, 1_000_000_000, FEE, 1_000);
+        let open = leg(1_000_000_000, 1_000_000_000);
+        let alloc = split_across(&[bounded, open], 500_000).unwrap();
+        assert!(alloc[0] <= 1_000, "bounded leg took {}", alloc[0]);
+        assert_eq!(alloc.iter().sum::<u128>(), 500_000);
+        assert!(split_output(&[bounded, open], 500_000).is_some(), "and it still quotes");
+    }
+
+    /// Splitting is what raises a hop's usable depth: a group refuses only what exceeds
+    /// the *sum* of its bounds, where any single pool would have refused far sooner.
+    #[test]
+    fn a_group_absorbs_what_no_single_pool_in_it_could() {
+        let a = Leg::bounded(1_000_000_000, 1_000_000_000, FEE, 1_000);
+        let b = Leg::bounded(1_000_000_000, 1_000_000_000, FEE, 1_000);
+        assert!(a.quote(1_500).is_none(), "neither pool alone can take this");
+        assert!(split_output(&[a, b], 1_500).is_some(), "together they can");
+        assert!(split_across(&[a, b], 2_001).is_none(), "but not past their combined bound");
+    }
+
+    #[test]
+    fn splitting_degenerate_input_does_not_panic() {
+        assert!(split_across(&[], 100).is_none());
+        assert_eq!(split_across(&[leg(1_000, 1_000)], 0).unwrap(), vec![0]);
+        assert!(split_output(&[leg(0, 100), leg(100, 0)], 50).is_none());
     }
 
     #[test]
