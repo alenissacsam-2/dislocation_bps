@@ -139,6 +139,8 @@
   .rung.ceiling .fill{background:color-mix(in srgb,var(--text-3) 40%,transparent)}
   .rung .val{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;font-size:11.5px}
   .rung .flat{color:var(--warn)}
+  .rungNote{margin-top:12px;font-size:11.5px;line-height:1.6;color:var(--text-2)}
+  .rungNote b{color:var(--text)}
   .empty{padding:26px 15px;text-align:center;color:var(--text-3);font-size:12.5px;line-height:1.6}
   footer{color:var(--text-3);font-size:11.5px;line-height:1.7;padding:0 4px}
   code{font-family:var(--mono);font-size:11.5px;color:var(--text-2)}
@@ -233,7 +235,9 @@
         <span class="note">the same opportunities, priced for each account size</span></h2>
       <div class="body">
         <div class="rungs" id="rungs"><div class="empty">Waiting for the first opportunity.</div></div>
-        <div class="legend" style="margin-top:11px;font-size:11px" id="rungNote"></div>
+        <!-- Deliberately not .legend: that is a flex row, which turns each inline tag
+             in this sentence into its own flex item and breaks the prose apart. -->
+        <div class="rungNote" id="rungNote"></div>
       </div>
     </section>
   </div>
