@@ -1,0 +1,679 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cryptobot</title>
+<style>
+  :root {
+    --bg:#0B0E11; --panel:#12171B; --panel-2:#171D22; --line:#232B32; --line-soft:#1A2126;
+    --text:#E6E9EC; --text-2:#9AA4AD; --text-3:#626C75;
+    --pos:#3DD68C; --neg:#F0616D; --warn:#E0A33E; --data:#4EC9E0; --data-2:#A78BFA; --accent:#F2994A;
+    --mono: ui-monospace,"Cascadia Mono","JetBrains Mono","SF Mono",Consolas,monospace;
+    --sans: system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg:#F4F5F6; --panel:#FFF; --panel-2:#F8F9FA; --line:#DFE3E7; --line-soft:#ECEFF1;
+      --text:#11161A; --text-2:#5A646D; --text-3:#8B959E;
+      --pos:#12925A; --neg:#CF3341; --warn:#B57812; --data:#0E7C96; --data-2:#6D46D9; --accent:#C2621B;
+    }
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;-webkit-font-smoothing:antialiased}
+  .num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+  header{display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:11px 20px;
+    background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}
+  .brand{display:flex;align-items:baseline;gap:9px}
+  .brand h1{font-size:15px;font-weight:650;letter-spacing:-.01em}
+  .brand .v{font-family:var(--mono);font-size:11px;color:var(--text-3)}
+  .pill{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
+    padding:4px 9px;border-radius:3px;font-weight:600;white-space:nowrap}
+  .pill.paper{color:var(--warn);background:color-mix(in srgb,var(--warn) 14%,transparent);border:1px solid color-mix(in srgb,var(--warn) 32%,transparent)}
+  .spacer{flex:1}
+  .stat{display:flex;flex-direction:column;gap:1px}
+  .stat .k{font-size:9.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--text-3);white-space:nowrap}
+  .stat .v{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:13px;font-weight:600}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--pos);display:inline-block;margin-right:6px}
+  .dot.on{animation:pulse 2s ease-in-out infinite}
+  .dot.off{background:var(--neg);animation:none}
+  @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.82)}}
+
+  main{padding:16px 20px 48px;display:flex;flex-direction:column;gap:14px;max-width:1560px;margin:0 auto}
+  .grid{display:grid;gap:14px}
+  @media(min-width:1100px){.split{grid-template-columns:1.35fr 1fr}.split-3{grid-template-columns:1fr 1fr 1fr}}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:6px;overflow:hidden}
+  .panel>h2{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-2);
+    padding:11px 15px;border-bottom:1px solid var(--line-soft);font-weight:600;display:flex;gap:9px;align-items:baseline;flex-wrap:wrap}
+  .panel>h2 .note{font-weight:400;letter-spacing:0;text-transform:none;color:var(--text-3);font-size:11.5px}
+  .body{padding:15px}
+
+  /* --- stall warning --- */
+  #stallWarn{display:none;background:color-mix(in srgb,var(--neg) 14%,var(--panel));
+    border:1px solid var(--neg);border-radius:6px;padding:12px 16px;color:var(--neg);font-weight:600;font-size:13px}
+  #stallWarn.on{display:block;animation:flash 1.6s ease-in-out infinite}
+  @keyframes flash{0%,100%{opacity:1}50%{opacity:.6}}
+
+  /* --- hero --- */
+  .hero{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:20px 22px}
+  .hero .lbl{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-3);margin-bottom:9px}
+  .hero .big{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:clamp(38px,7vw,60px);
+    font-weight:600;letter-spacing:-.03em;line-height:1;display:block;transition:color .4s}
+  .hero .sub{color:var(--text-2);font-size:13px;margin-top:9px;line-height:1.55;max-width:70ch}
+  .hero .route{font-family:var(--mono);color:var(--text);font-size:13px}
+  .heroWrap{display:grid;gap:22px}
+  @media(min-width:920px){.heroWrap{grid-template-columns:minmax(300px,1fr) 1.15fr;align-items:center}}
+
+  /* gap-vs-wall bar */
+  .gauge{display:flex;flex-direction:column;gap:7px}
+  .gauge .track{position:relative;height:34px;background:var(--panel-2);border:1px solid var(--line-soft);border-radius:4px;overflow:hidden}
+  .gauge .gap{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,
+      color-mix(in srgb,var(--data) 55%,transparent),color-mix(in srgb,var(--data) 22%,transparent));
+    transition:width .5s cubic-bezier(.22,1,.36,1)}
+  .gauge .wall{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--neg);
+    transition:left .5s cubic-bezier(.22,1,.36,1)}
+  .gauge .wall::after{content:attr(data-l);position:absolute;left:6px;top:50%;transform:translateY(-50%);
+    font-family:var(--mono);font-size:10.5px;color:var(--neg);white-space:nowrap}
+  .gauge .surplus{position:absolute;top:0;bottom:0;background:color-mix(in srgb,var(--pos) 40%,transparent);
+    transition:left .5s cubic-bezier(.22,1,.36,1),width .5s cubic-bezier(.22,1,.36,1)}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;font-size:11.5px;color:var(--text-2)}
+  .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+
+  /* --- leaderboard --- */
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th{text-align:left;font-size:9.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--text-3);
+    font-weight:600;padding:9px 12px;border-bottom:1px solid var(--line-soft);white-space:nowrap;position:sticky;top:0;background:var(--panel)}
+  td{padding:8px 12px;border-bottom:1px solid var(--line-soft);white-space:nowrap}
+  tbody tr{transition:background .3s}
+  /* Group headings inside the leaderboard. What can be traded is separated from what
+     is only a quoted rate, because ranking them together is what let a route with no
+     size behind it lead the board. */
+  tbody tr.grp td{padding:11px 10px 5px;font-size:10.5px;letter-spacing:.09em;
+    text-transform:uppercase;color:var(--text-3);border-bottom:1px solid var(--line)}
+  tbody tr.grp td b{color:var(--text-2);letter-spacing:.04em}
+  tbody tr.thin td{opacity:.62}
+  tbody tr.bump{animation:bump .6s ease-out}
+  @keyframes bump{from{background:color-mix(in srgb,var(--data) 18%,transparent)}to{background:transparent}}
+  .r{text-align:right}
+  .pos{color:var(--pos)} .neg{color:var(--neg)} .warnc{color:var(--warn)} .dim{color:var(--text-3)}
+  .tag{font-family:var(--mono);font-size:10px;padding:1.5px 5px;border-radius:3px;
+    background:var(--panel-2);border:1px solid var(--line-soft);color:var(--text-2)}
+  .scroll{max-height:360px;overflow:auto}
+  .scrollx{overflow-x:auto}
+
+  /* mini bar inside leaderboard rows */
+  .mini{position:relative;height:14px;min-width:110px;width:100%;background:var(--panel-2);border-radius:2px;overflow:hidden}
+  .mini .g{position:absolute;left:0;top:0;bottom:0;background:color-mix(in srgb,var(--data) 45%,transparent);transition:width .45s ease}
+  .mini .w{position:absolute;top:0;bottom:0;width:2px;background:var(--neg);transition:left .45s ease}
+  .mini .s{position:absolute;top:0;bottom:0;background:color-mix(in srgb,var(--pos) 55%,transparent);transition:left .45s ease,width .45s ease}
+
+  /* --- kpis --- */
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:1px;background:var(--line-soft)}
+  .kpi{background:var(--panel);padding:13px 15px}
+  .kpi .k{font-size:9.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--text-3)}
+  .kpi .v{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:19px;font-weight:600;margin-top:4px}
+  .kpi .n{font-size:11px;color:var(--text-3);margin-top:2px}
+
+  /* --- fee tier map --- */
+  .tiers{display:flex;flex-direction:column;gap:7px}
+  .tier{display:grid;grid-template-columns:52px 1fr 34px;gap:10px;align-items:center;font-size:12px}
+  .tier .bar{height:16px;background:var(--panel-2);border-radius:2px;overflow:hidden;display:flex}
+  .tier .seg{height:100%;transition:width .5s ease}
+  .tier .lbl{font-family:var(--mono);color:var(--text-2)}
+  .tier .n{font-family:var(--mono);text-align:right;color:var(--text-3);font-size:11px}
+
+  canvas{display:block;width:100%;height:230px}
+  .empty{padding:26px 15px;text-align:center;color:var(--text-3);font-size:12.5px;line-height:1.6}
+  footer{color:var(--text-3);font-size:11.5px;line-height:1.7;padding:0 4px}
+  code{font-family:var(--mono);font-size:11.5px;color:var(--text-2)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand"><h1>cryptobot</h1><span class="v">paper</span></div>
+  <span class="pill paper" id="mode">PAPER · NO KEYS LOADED</span>
+  <span class="stat"><span class="k">Feed</span><span class="v"><span class="dot off" id="dot"></span><span id="conn">connecting</span></span></span>
+  <div class="spacer"></div>
+  <span class="stat"><span class="k">SOL</span><span class="v num" id="sol">—</span></span>
+  <span class="stat"><span class="k">Pools</span><span class="v num" id="pools">—</span></span>
+  <span class="stat"><span class="k">Venues</span><span class="v num" id="venues">—</span></span>
+  <span class="stat"><span class="k">Slot</span><span class="v num" id="slot">—</span></span>
+  <span class="stat"><span class="k">Updates</span><span class="v num" id="updates">0</span></span>
+  <span class="stat"><span class="k">Dropped</span><span class="v num" id="dropped">0</span></span>
+  <span class="stat"><span class="k">Sweep</span><span class="v num" id="sweep">—</span></span>
+  <span class="stat"><span class="k">Subs</span><span class="v num" id="subs">—</span></span>
+  <span class="stat"><span class="k">Drift</span><span class="v num" id="drift">—</span></span>
+  <span class="stat"><span class="k">Uptime</span><span class="v num" id="uptime">0s</span></span>
+</header>
+
+<main>
+  <div id="stallWarn"></div>
+
+  <!-- HERO -->
+  <section class="hero">
+    <div class="heroWrap">
+      <div>
+        <div class="lbl">Distance to profitable <span class="note" style="text-transform:none;letter-spacing:0">at a size we could actually trade</span></div>
+        <span class="big num" id="edge">—</span>
+        <div class="sub" id="edgeSub">Waiting for the first sweep of the cycle graph.</div>
+      </div>
+      <div class="gauge">
+        <div class="track">
+          <div class="gap" id="gGap" style="width:0"></div>
+          <div class="surplus" id="gSurplus" style="left:0;width:0"></div>
+          <div class="wall" id="gWall" data-l="" style="left:0"></div>
+        </div>
+        <div class="legend">
+          <span><i style="background:color-mix(in srgb,var(--data) 55%,transparent)"></i>Price dislocation <b class="num" id="gGapV">—</b></span>
+          <span><i style="background:var(--neg)"></i>Fee wall <b class="num" id="gWallV">—</b></span>
+          <span><i style="background:color-mix(in srgb,var(--pos) 55%,transparent)"></i>Surplus <b class="num" id="gSurV">—</b></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- LEADERBOARD -->
+  <section class="panel">
+    <h2>Route leaderboard
+      <span class="note">every closed cycle, ranked by how close it is to clearing — tradeable first, then rates with no size behind them</span></h2>
+    <div class="scroll scrollx">
+      <table>
+        <thead><tr>
+          <th>Route</th><th>Venues &amp; fee tiers</th><th class="r">Gap</th><th class="r">Fees</th>
+          <th class="r">Edge</th><th style="width:170px">Gap vs wall</th><th class="r">Depth</th>
+        </tr></thead>
+        <tbody id="routes"><tr><td colspan="7" class="empty">No sweep yet.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="grid split">
+    <!-- CHART -->
+    <section class="panel">
+      <h2>Dislocation vs the fee wall
+        <span class="note">bps · green where the gap exceeds the cost of crossing it</span></h2>
+      <div class="body"><canvas id="chart"></canvas></div>
+    </section>
+
+    <!-- FEE TIER MAP -->
+    <section class="panel">
+      <h2>Universe by fee tier <span class="note">what we can actually trade against</span></h2>
+      <div class="body"><div class="tiers" id="tiers"><div class="empty">Waiting for pools.</div></div></div>
+    </section>
+  </div>
+
+  <!-- KPIs -->
+  <section class="panel">
+    <h2>Measurement</h2>
+    <div class="kpis">
+      <div class="kpi"><div class="k">Cycles priced</div><div class="v num" id="kCycles">0</div><div class="n">since start</div></div>
+      <div class="kpi"><div class="k">Cleared fees</div><div class="v num" id="kCleared">0</div><div class="n">detections, edge &gt; 0</div></div>
+      <div class="kpi"><div class="k">Best edge seen</div><div class="v num" id="kBest">—</div><div class="n">bps</div></div>
+      <div class="kpi"><div class="k">Widest gap seen</div><div class="v num" id="kGap">—</div><div class="n">bps, before fees</div></div>
+      <div class="kpi"><div class="k">Cheapest loop</div><div class="v num" id="kFloor">—</div><div class="n">bps of fees</div></div>
+      <div class="kpi"><div class="k">Would take</div><div class="v num" id="kEpisodes">0</div><div class="n">distinct, net of costs</div></div>
+      <div class="kpi"><div class="k">Paper P&amp;L</div><div class="v num" id="kPnl">$0.0000</div><div class="n">net of tip</div></div>
+      <div class="kpi"><div class="k">After 30% VDA</div><div class="v num" id="kTax">$0.0000</div><div class="n">no loss set-off</div></div>
+      <div class="kpi"><div class="k">Data age</div><div class="v num" id="kAge">—</div><div class="n">seconds</div></div>
+      <div class="kpi"><div class="k">Marginal top rate</div><div class="v num dim" id="kMarginal">—</div><div class="n">bps, no size behind it</div></div>
+      <div class="kpi"><div class="k">Pools excluded</div><div class="v num" id="kStale">0</div><div class="n">stale, left out of the sweep</div></div>
+    </div>
+  </section>
+
+  <div class="grid split">
+    <!-- POOLS -->
+    <section class="panel">
+      <h2>Live pools <span class="note" id="poolNote">decoded from chain</span></h2>
+      <div class="scroll scrollx">
+        <table>
+          <thead><tr><th>Pair</th><th>Venue</th><th class="r">Price</th><th class="r">Depth A</th><th class="r">Depth B</th><th class="r">Slot</th></tr></thead>
+          <tbody id="poolRows"><tr><td colspan="6" class="empty">Waiting for account updates.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- OPPORTUNITIES -->
+    <section class="panel">
+      <h2>Opportunity feed <span class="note">cycles that cleared their own fees</span></h2>
+      <div class="scroll scrollx">
+        <table>
+          <thead><tr><th>Route</th><th class="r">Edge</th><th class="r">Size</th><th class="r">Gross</th><th class="r">Net</th><th>Status</th></tr></thead>
+          <tbody id="oppRows"><tr><td colspan="6" class="empty">
+            Nothing has cleared yet. The leaderboard above still reports how far short every route falls —
+            that shortfall is the measurement.
+          </td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <footer>
+    <b>Paper mode.</b> No private key is loaded and no transaction is ever signed. Live execution needs
+    <code>mode = "live"</code> in <code>config.toml</code> <em>and</em> <code>CRYPTOBOT_ALLOW_LIVE=1</code>,
+    and is deliberately not implemented.<br>
+    Every price here is decoded from mainnet accounts. Concentrated-liquidity pools are quoted through their
+    virtual reserves and refuse to price a trade larger than the current tick can hold, so a route's depth is
+    a real limit rather than an extrapolation.<br>
+    Decoders are audited against an independent router with <code>cb-bot --verify</code>, which flags any pool
+    claiming an output nobody else can route. That check exists because a missing fee field once put one pool
+    52&nbsp;bps off its true price and this page reported the difference as a standing arbitrage for four hours.
+    <b>Opportunities</b> counts distinct episodes, not detections: a gap that stands still is re-seen every
+    sweep, and counting each sighting as a trade inflates the total by orders of magnitude.
+  </footer>
+</main>
+
+<script>
+(() => {
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const fmt = (n, d = 2) => (n === null || n === undefined || !isFinite(n)) ? "—" :
+    n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+  const usd = (n, d = 4) => (n < 0 ? "-$" : "$") + fmt(Math.abs(n), d);
+  const bps = n => (n > 0 ? "+" : "") + fmt(n, 2);
+  const sign = n => n > 0 ? "pos" : n < 0 ? "neg" : "dim";
+
+  const state = {
+    pools: new Map(),          // address -> row data
+    hist: [],                  // {t, gap, fee}
+    cleared: 0,
+    bestEdge: -Infinity,
+    bestGap: -Infinity,
+    pnl: 0,
+    lastRoutes: new Map(),     // route key -> edge, to flash changes
+    lastSeen: new Map(),       // route -> when it last cleared, to collapse episodes
+    episodes: 0,
+    lastExecRoute: new Map(),  // opportunity id -> route
+    newEpisode: new Map(),     // opportunity id -> was this the start of an episode
+  };
+  const MAX_HIST = 900;
+
+  // ---------- header / status ----------
+  function onStatus(e) {
+    $("mode").textContent = (e.mode || "paper").toUpperCase() + " · NO KEYS LOADED";
+    $("dot").className = "dot " + (e.connected ? "on" : "off");
+    $("conn").textContent = e.connected ? "live" : "stalled";
+    $("sol").textContent = e.solPriceUsd ? "$" + fmt(e.solPriceUsd, 2) : "—";
+    $("pools").textContent = e.poolsTracked || 0;
+    $("venues").textContent = e.venues || 0;
+    $("slot").textContent = e.slot ? e.slot.toLocaleString() : "—";
+    $("updates").textContent = (e.updates || 0).toLocaleString();
+    $("dropped").textContent = (e.dropped || 0).toLocaleString();
+    $("sweep").textContent = e.sweepUs ? (e.sweepUs / 1000).toFixed(1) + "ms" : "—";
+
+    // Feed integrity. A refused subscription is a pool that will never update, which
+    // looks exactly like a pool nobody is trading — so it is counted, not inferred.
+    const subs = $("subs");
+    subs.textContent = (e.subscribed || 0) + (e.subscribeErrors ? " / " + e.subscribeErrors + " refused" : "");
+    subs.className = "v num" + (e.subscribeErrors ? " neg" : "");
+
+    // Drift is how many pools came back different from what the feed had, at the last
+    // reconciliation. Persistently non-zero means the WebSocket is dropping updates.
+    const dr = $("drift");
+    if (e.reconcileChecked) {
+      dr.textContent = e.reconcileDrift + "/" + e.reconcileChecked;
+      dr.className = "v num" + (e.reconcileDrift > e.reconcileChecked * 0.25 ? " warnc" : "");
+    }
+    $("uptime").textContent = dur(e.uptimeSecs || 0);
+    $("kCycles").textContent = (e.cyclesEvaluated || 0).toLocaleString();
+    $("kAge").textContent = e.dataAgeSecs === undefined ? "—" : e.dataAgeSecs + "s";
+    if (e.cheapestRoundTripBps) $("kFloor").textContent = fmt(e.cheapestRoundTripBps, 2);
+
+    // Pools dropped from the sweep for lagging. Quoting a price we have not heard
+    // confirmed in a minute is the most likely way to invent an opportunity, so the
+    // count of what was refused is shown rather than left implicit.
+    const st = $("kStale");
+    st.textContent = e.staleExcluded || 0;
+    st.className = "v num" + (e.staleExcluded ? " warnc" : "");
+
+    const w = $("stallWarn");
+    if (e.feedStalled) {
+      // Stricter than `connected`: recording has actually stopped. A measurement that
+      // knows its clock has stopped must not keep writing numbers, and must say so.
+      w.className = "on";
+      w.textContent = "FEED STALLED — no account data for " + (e.dataAgeSecs || "?") +
+        "s. Recording is PAUSED; sweeps continue but nothing is being written to the " +
+        "ledger. Every price below is that stale. " + (e.stalls || 0) + " stall" +
+        ((e.stalls === 1) ? "" : "s") + " so far; " + (e.reconnects || 0) + " reconnects.";
+    } else if (!e.connected) {
+      w.className = "on";
+      w.textContent = "FEED STALLED — no account data for " + (e.dataAgeSecs || "?") +
+        "s. Every price below is that stale. " + (e.stalls || 0) + " stall" +
+        ((e.stalls === 1) ? "" : "s") + " so far; " + (e.reconnects || 0) + " reconnects.";
+    } else {
+      w.className = "";
+    }
+  }
+  const dur = s => s < 60 ? s + "s" : s < 3600 ? Math.floor(s / 60) + "m " + (s % 60) + "s"
+    : Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+
+  // ---------- hero gauge ----------
+  // `lead` is the best route that can actually absorb our capital; `marginal` is the
+  // best rate anywhere, which is usually a different and much larger number attached
+  // to a tick with nothing in it. The hero shows the first and discloses the second.
+  function paintHero(lead, marginal, minUsd) {
+    const el = $("edge"), sub = $("edgeSub");
+
+    if (!lead) {
+      el.textContent = "—";
+      el.className = "big num dim";
+      sub.innerHTML = "<b>Nothing tradeable at $" + fmt(minUsd, 2) + ".</b> " +
+        (marginal
+          ? "The best rate on the board is " + bps(marginal.edgeBps) + " bps on <span class='route'>" +
+            esc(marginal.route) + "</span>, but its tightest leg holds only $" +
+            compact(marginal.depthUsd) + " — a price, not an opportunity."
+          : "No route is priceable right now.");
+      // A gauge drawn from an untradeable rate would be a picture of nothing.
+      $("gGap").style.width = "0"; $("gSurplus").style.width = "0";
+      $("gGapV").textContent = "—"; $("gWallV").textContent = "—"; $("gSurV").textContent = "—";
+      return;
+    }
+
+    const gap = lead.dislocationBps, fee = lead.feeBps, edge = lead.edgeBps;
+    el.textContent = bps(edge);
+    el.className = "big num " + sign(edge);
+
+    // Disclosed only when the two searches actually disagree, so it stays a signal.
+    const shadow = (marginal && marginal.edgeBps > edge + 1)
+      ? " <span class='dim'>(a " + bps(marginal.edgeBps) + " bps rate exists on " +
+        esc(marginal.route) + ", with only $" + compact(marginal.depthUsd) + " behind it.)</span>"
+      : "";
+
+    sub.innerHTML = (edge > 0
+      ? "<b>Clears.</b> <span class='route'>" + esc(lead.route) + "</span> across " +
+        esc(lead.venues) + " — the venues disagree by " + fmt(gap, 2) +
+        " bps and crossing them costs " + fmt(fee, 2) + " bps, on $" +
+        compact(lead.depthUsd) + " of depth."
+      : "Closest tradeable route is <span class='route'>" + esc(lead.route) + "</span> over " +
+        lead.hops + " hops on " + esc(lead.venues) + ". The venues disagree by <b>" + fmt(gap, 2) +
+        " bps</b>; crossing them costs <b>" + fmt(fee, 2) + " bps</b>. " +
+        (gap < fee * 0.35
+          ? "The gap is small relative to the fees — these venues are tightly arbitraged."
+          : "The gap is real but the fees eat it. Cheaper venues, not faster ones, would close this.")
+      ) + shadow;
+
+    // Scale: whichever of gap/fee is larger sets the axis, with headroom.
+    const span = Math.max(gap, fee, 1) * 1.25;
+    const pct = v => Math.max(0, Math.min(100, (v / span) * 100));
+    $("gGap").style.width = pct(gap) + "%";
+    $("gWall").style.left = pct(fee) + "%";
+    $("gWall").dataset.l = fmt(fee, 1) + "bp";
+    const sur = $("gSurplus");
+    if (gap > fee) { sur.style.left = pct(fee) + "%"; sur.style.width = (pct(gap) - pct(fee)) + "%"; }
+    else { sur.style.width = "0"; }
+    $("gGapV").textContent = fmt(gap, 2) + " bp";
+    $("gWallV").textContent = fmt(fee, 2) + " bp";
+    $("gSurV").textContent = fmt(Math.max(0, gap - fee), 2) + " bp";
+  }
+
+  // ---------- routes ----------
+  function onRoutes(e) {
+    const rows = e.rows || [];
+    if (!rows.length) return;
+    const minUsd = e.tradeableMinUsd || 0;
+
+    // Depth is the bottleneck across every leg of the cycle, not the pool we enter
+    // through. A row below the threshold is a quoted rate nobody can fill.
+    const deep = rows.filter(r => r.depthUsd >= minUsd);
+    const thin = rows.filter(r => r.depthUsd < minUsd);
+    const lead = deep[0] || null;
+    const marginal = rows.reduce((a, b) => (b.edgeBps > a.edgeBps ? b : a), rows[0]);
+    paintHero(lead, marginal, minUsd);
+
+    $("kMarginal").textContent = marginal ? bps(marginal.edgeBps) : "—";
+
+    // Only tradeable moments go into the history: a chart of rates nobody could take
+    // would show an opportunity that never existed.
+    if (lead) {
+      state.hist.push({ t: Date.now(), gap: lead.dislocationBps, fee: lead.feeBps });
+      if (state.hist.length > MAX_HIST) state.hist.shift();
+      if (lead.edgeBps > state.bestEdge) { state.bestEdge = lead.edgeBps; $("kBest").textContent = bps(lead.edgeBps); }
+      if (lead.dislocationBps > state.bestGap) { state.bestGap = lead.dislocationBps; $("kGap").textContent = fmt(lead.dislocationBps, 2); }
+    }
+
+    const span = Math.max(...rows.map(r => Math.max(r.dislocationBps, r.feeBps)), 1) * 1.15;
+    const pct = v => Math.max(0, Math.min(100, (v / span) * 100));
+
+    const tb = $("routes");
+    tb.innerHTML = "";
+
+    const group = (label, note) => {
+      const tr = document.createElement("tr");
+      tr.className = "grp";
+      tr.innerHTML = "<td colspan='7'><b>" + label + "</b> — " + note + "</td>";
+      tb.appendChild(tr);
+    };
+    const row = (r, thinClass) => {
+      const key = r.route + "|" + r.venues;
+      const prev = state.lastRoutes.get(key);
+      const changed = prev !== undefined && Math.abs(prev - r.edgeBps) > 0.01;
+      state.lastRoutes.set(key, r.edgeBps);
+
+      const tr = document.createElement("tr");
+      tr.className = (changed ? "bump " : "") + (thinClass ? "thin" : "");
+      const sur = r.dislocationBps > r.feeBps
+        ? "<div class='s' style='left:" + pct(r.feeBps) + "%;width:" + (pct(r.dislocationBps) - pct(r.feeBps)) + "%'></div>" : "";
+      tr.innerHTML =
+        "<td class='num'>" + esc(r.route) + "</td>" +
+        "<td class='dim'>" + esc(r.venues) + "</td>" +
+        "<td class='r num'>" + fmt(r.dislocationBps, 2) + "</td>" +
+        "<td class='r num neg'>" + fmt(r.feeBps, 2) + "</td>" +
+        "<td class='r num " + (thinClass ? "dim" : sign(r.edgeBps)) + "'>" + bps(r.edgeBps) + "</td>" +
+        "<td><div class='mini'><div class='g' style='width:" + pct(r.dislocationBps) + "%'></div>" +
+          sur + "<div class='w' style='left:" + pct(r.feeBps) + "%'></div></div></td>" +
+        "<td class='r num dim'>" + (r.depthUsd > 0 ? "$" + compact(r.depthUsd) : "—") + "</td>";
+      tb.appendChild(tr);
+    };
+
+    if (deep.length) {
+      group("Tradeable now", "at least $" + fmt(minUsd, 2) + " of depth on the tightest leg");
+      deep.forEach(r => row(r, false));
+    }
+    if (thin.length) {
+      group("Rate only", "under $" + fmt(minUsd, 2) + " of depth — the price exists, the size does not");
+      thin.forEach(r => row(r, true));
+    }
+  }
+  // Small numbers matter here: a route whose tick holds $40 is a different thing
+  // from one that holds nothing, and rounding both to "$0" hides the distinction.
+  const compact = n => n >= 1e9 ? (n / 1e9).toFixed(1) + "B" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M"
+    : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : n >= 10 ? n.toFixed(0)
+    : n >= 0.01 ? n.toFixed(2) : n > 0 ? n.toExponential(1) : "0";
+
+  // ---------- pools ----------
+  function onPool(e) {
+    state.pools.set(e.pool, e);
+    schedulePools();
+  }
+  let poolsDirty = false;
+  function schedulePools() {
+    if (poolsDirty) return;
+    poolsDirty = true;
+    setTimeout(() => { poolsDirty = false; paintPools(); }, 400);
+  }
+  function paintPools() {
+    const rows = [...state.pools.values()].sort((a, b) => b.slot - a.slot).slice(0, 24);
+    if (!rows.length) return;
+    $("poolNote").textContent = state.pools.size + " decoded from chain";
+    $("poolRows").innerHTML = rows.map(p =>
+      "<tr><td class='num'>" + esc(p.pair) + "</td>" +
+      "<td><span class='tag'>" + esc(p.dex) + "</span></td>" +
+      "<td class='r num'>" + fmt(p.price, p.price < 1 ? 6 : 4) + "</td>" +
+      "<td class='r num dim'>" + compact(p.reserveA) + "</td>" +
+      "<td class='r num dim'>" + compact(p.reserveB) + "</td>" +
+      "<td class='r num dim'>" + p.slot.toLocaleString() + "</td></tr>").join("");
+    paintTiers();
+  }
+
+  // ---------- fee tier map ----------
+  const TIER_COLOR = { "ORCA": "var(--data)", "RAY-CL": "var(--data-2)", "RAY-V4": "var(--accent)", "PUMP": "var(--warn)" };
+  function paintTiers() {
+    const byTier = new Map();     // fee label -> Map(venue -> count)
+    for (const p of state.pools.values()) {
+      const [venue, fee] = (p.dex || "? ?").split(" ");
+      if (!byTier.has(fee)) byTier.set(fee, new Map());
+      const m = byTier.get(fee);
+      m.set(venue, (m.get(venue) || 0) + 1);
+    }
+    if (!byTier.size) return;
+    const tiers = [...byTier.entries()].sort((a, b) => parseFloat(a[0]) - parseFloat(b[0]));
+    const max = Math.max(...tiers.map(([, m]) => [...m.values()].reduce((x, y) => x + y, 0)));
+    $("tiers").innerHTML = tiers.map(([fee, m]) => {
+      const total = [...m.values()].reduce((x, y) => x + y, 0);
+      const segs = [...m.entries()].sort().map(([v, n]) =>
+        "<div class='seg' title='" + esc(v + " x" + n) + "' style='width:" + (n / max * 100) + "%;background:" +
+        (TIER_COLOR[v] || "var(--text-3)") + "'></div>").join("");
+      return "<div class='tier'><span class='lbl'>" + esc(fee) + "</span>" +
+        "<div class='bar'>" + segs + "</div><span class='n'>" + total + "</span></div>";
+    }).join("") +
+      "<div class='legend' style='margin-top:6px'>" +
+      Object.entries(TIER_COLOR).map(([v, c]) =>
+        "<span><i style='background:" + c + "'></i>" + v + "</span>").join("") + "</div>";
+  }
+
+  // ---------- opportunities ----------
+  // A standing gap is re-detected on every sweep. Counting each detection as a
+  // separate trade turns one opportunity worth a fraction of a cent into a headline
+  // number that does not exist — so a route only counts again once it has been absent
+  // for a moment, matching how the ledger collapses detections into episodes.
+  const EPISODE_GAP_MS = 2000;
+  function isNewEpisode(route) {
+    const now = Date.now();
+    const last = state.lastSeen.get(route) || 0;
+    state.lastSeen.set(route, now);
+    return now - last > EPISODE_GAP_MS;
+  }
+
+  function onOpp(e) {
+    state.cleared++;
+    $("kCleared").textContent = state.cleared.toLocaleString();
+    const fresh = isNewEpisode(e.route + "|" + e.venues);
+    state.lastExecRoute.set(e.id, e.route);
+    state.newEpisode.set(e.id, fresh);
+    // Only surface the first detection of an episode; the rest are the same row.
+    if (!fresh) return;
+
+    const tb = $("oppRows");
+    if (tb.querySelector(".empty")) tb.innerHTML = "";
+    const tr = document.createElement("tr");
+    tr.className = "bump";
+    tr.innerHTML =
+      "<td class='num'>" + esc(e.route) + "<br><span class='dim' style='font-size:11px'>" + esc(e.venues) + "</span></td>" +
+      "<td class='r num pos'>" + bps(e.edgeBps) + "</td>" +
+      "<td class='r num'>" + usd(e.cappedSizeUsd, 2) + "<br><span class='dim' style='font-size:11px'>" +
+        fmt(e.capitalReachPct, 1) + "% of optimum</span></td>" +
+      "<td class='r num'>" + usd(e.grossProfitUsd) + "</td>" +
+      "<td class='r num " + sign(e.netProfitUsd) + "'>" + usd(e.netProfitUsd) + "</td>" +
+      "<td class='" + (e.skippedReason ? "warnc" : "pos") + "'>" + esc(e.skippedReason || "would take") + "</td>";
+    tb.insertBefore(tr, tb.firstChild);
+    while (tb.children.length > 60) tb.removeChild(tb.lastChild);
+  }
+
+  function onExec(e) {
+    if (!e.landed) return;
+    const route = state.lastExecRoute.get(e.opportunityId);
+    // Only the first detection of an episode counts toward P&L. The rest are the same
+    // gap, still standing because nothing has taken it.
+    if (route && !state.newEpisode.get(e.opportunityId)) return;
+    state.pnl += e.realisedUsd;
+    state.episodes++;
+    $("kEpisodes").textContent = state.episodes.toLocaleString();
+    $("kPnl").textContent = usd(state.pnl);
+    // India VDA: 30% on gains, and losses cannot be set off against them.
+    $("kTax").textContent = usd(state.pnl > 0 ? state.pnl * 0.7 : state.pnl);
+  }
+
+  // ---------- chart ----------
+  const cv = $("chart"), ctx = cv.getContext("2d");
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  function draw() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth, h = cv.clientHeight;
+    if (cv.width !== w * dpr || cv.height !== h * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    const d = state.hist;
+    if (d.length < 2) {
+      ctx.fillStyle = css("--text-3"); ctx.font = "12px system-ui"; ctx.textAlign = "center";
+      ctx.fillText("collecting…", w / 2, h / 2);
+      requestAnimationFrame(draw); return;
+    }
+    const pad = { l: 44, r: 8, t: 12, b: 18 };
+    const iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
+    let lo = Infinity, hi = -Infinity;
+    for (const p of d) { lo = Math.min(lo, p.gap, p.fee); hi = Math.max(hi, p.gap, p.fee); }
+    const padv = Math.max((hi - lo) * 0.15, 0.5);
+    lo -= padv; hi += padv;
+    const X = i => pad.l + (i / (d.length - 1)) * iw;
+    const Y = v => pad.t + ih - ((v - lo) / (hi - lo)) * ih;
+
+    // grid
+    ctx.strokeStyle = css("--line-soft"); ctx.lineWidth = 1;
+    ctx.fillStyle = css("--text-3"); ctx.font = "10px " + css("--mono"); ctx.textAlign = "right";
+    for (let i = 0; i <= 4; i++) {
+      const v = lo + (hi - lo) * (i / 4), y = Y(v);
+      ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y); ctx.stroke();
+      ctx.fillText(v.toFixed(1), pad.l - 6, y + 3);
+    }
+
+    // green fill where the gap clears the wall
+    ctx.fillStyle = "color-mix(in srgb," + css("--pos") + " 22%, transparent)";
+    ctx.beginPath();
+    let open = false;
+    for (let i = 0; i < d.length; i++) {
+      if (d[i].gap > d[i].fee) {
+        if (!open) { ctx.moveTo(X(i), Y(d[i].fee)); open = true; }
+        ctx.lineTo(X(i), Y(d[i].gap));
+      } else if (open) { ctx.lineTo(X(i - 1), Y(d[i - 1].fee)); ctx.closePath(); ctx.fill(); ctx.beginPath(); open = false; }
+    }
+    if (open) { ctx.lineTo(X(d.length - 1), Y(d[d.length - 1].fee)); ctx.closePath(); ctx.fill(); }
+
+    // fee wall
+    ctx.strokeStyle = css("--neg"); ctx.lineWidth = 1.5; ctx.setLineDash([4, 3]);
+    ctx.beginPath(); d.forEach((p, i) => i ? ctx.lineTo(X(i), Y(p.fee)) : ctx.moveTo(X(i), Y(p.fee))); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // dislocation
+    ctx.strokeStyle = css("--data"); ctx.lineWidth = 1.8;
+    ctx.beginPath(); d.forEach((p, i) => i ? ctx.lineTo(X(i), Y(p.gap)) : ctx.moveTo(X(i), Y(p.gap))); ctx.stroke();
+
+    // labels
+    ctx.textAlign = "left"; ctx.font = "10px " + css("--mono");
+    ctx.fillStyle = css("--data"); ctx.fillText("dislocation", pad.l + 4, pad.t + 10);
+    ctx.fillStyle = css("--neg"); ctx.fillText("fee wall", pad.l + 4, pad.t + 22);
+
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+
+  function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+  // ---------- socket ----------
+  let ws, backoff = 500;
+  function connect() {
+    ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/api/stream");
+    ws.onopen = () => { backoff = 500; };
+    ws.onmessage = m => {
+      let e; try { e = JSON.parse(m.data); } catch { return; }
+      switch (e.type) {
+        case "status": onStatus(e); break;
+        case "routes": onRoutes(e); break;
+        case "poolUpdate": onPool(e); break;
+        case "opportunity": onOpp(e); break;
+        case "execution": onExec(e); break;
+      }
+    };
+    ws.onclose = () => {
+      $("dot").className = "dot off"; $("conn").textContent = "disconnected";
+      setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 15000);
+    };
+    ws.onerror = () => ws.close();
+  }
+  connect();
+})();
+</script>
+</body>
+</html>

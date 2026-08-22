@@ -64,10 +64,31 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(180);
 /// and comfortably below the time it takes for a closed gap to reopen.
 const EPISODE_GAP_SLOTS: u64 = 5;
 
+/// How long the feed may go silent before the measurement stops recording.
+///
+/// The staleness guard in `sweep()` compares each pool against the newest slot we
+/// hold, which cannot detect the feed dying altogether: when nothing arrives, every
+/// pool ages together and none of them ever looks stale. Only a wall clock catches
+/// that, and this is it.
+///
+/// Sweeps keep running so the dashboard stays honest about what it is showing, but
+/// nothing is written to the ledger. A measurement that knows its clock has stopped
+/// does not go on writing numbers.
+const FEED_STALL_SECS: u64 = 5;
+
 /// What the last sweep saw, handed to the status heartbeat.
 #[derive(Debug, Clone, Default)]
 struct SweepSummary {
+    /// Highest marginal rate seen, tradeable or not. A diagnostic.
     best: Option<live::EdgeRow>,
+    /// Highest rate with the capital's worth of depth behind it. The headline.
+    tradeable: Option<live::EdgeRow>,
+    /// Capital a cycle had to be able to absorb to qualify, in USD.
+    tradeable_min_usd: f64,
+    /// Pools the last sweep dropped for lagging too far behind.
+    stale_excluded: usize,
+    /// Whether the feed has gone quiet long enough that recording is paused.
+    feed_stalled: bool,
     evaluated_total: u64,
     sweep_us: u64,
     pools_ready: usize,
@@ -221,6 +242,7 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
             let stale_for = if last_ms == 0 { u64::MAX } else { now_ms().saturating_sub(last_ms) };
             let s = shared_for_status.lock().map(|g| g.clone()).unwrap_or_default();
             let best = s.best.as_ref();
+            let tradeable = s.tradeable.as_ref();
 
             status_bus.publish(Event::Status {
                 mode: "paper · live mainnet".into(),
@@ -240,6 +262,13 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                 best_route: best.map_or_else(String::new, |b| b.route.clone()),
                 best_hops: best.map_or(0, |b| b.hops),
                 best_fee_bps: best.map_or(0.0, |b| b.fee_bps),
+                // Deliberately `None`, not `0.0`, when nothing qualifies: a zero here
+                // would read as a market sitting exactly at break-even.
+                tradeable_edge_bps: tradeable.map(|t| t.edge_bps),
+                tradeable_route: tradeable.map_or_else(String::new, |t| t.route.clone()),
+                tradeable_min_usd: s.tradeable_min_usd,
+                stale_excluded: s.stale_excluded,
+                feed_stalled: s.feed_stalled,
                 cycles_evaluated: s.evaluated_total,
                 venues: s.venues,
                 duplicate_pairs: dupe_count,
@@ -285,6 +314,10 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
         let mut usd_timer = tokio::time::interval(USD_REFRESH);
         let mut reconcile_timer = tokio::time::interval(RECONCILE_INTERVAL);
         let mut drift = (0usize, 0usize);
+        // Both are edge-triggered: logged when they change, not every sweep. A warning
+        // that fires five times a second is a warning nobody reads.
+        let mut was_stalled = false;
+        let mut last_stale_excluded = 0usize;
 
         loop {
             tokio::select! {
@@ -326,11 +359,43 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                     let sweep = market.sweep(tradable_usd, max_hops);
                     evaluated_total = evaluated_total.saturating_add(sweep.evaluated);
 
+                    // The one thing the per-pool staleness guard structurally cannot
+                    // see: a feed that has stopped entirely, where every pool ages
+                    // together and nothing looks stale relative to anything else.
+                    let last_ms = stats.last_update_ms.load(Ordering::Relaxed);
+                    let feed_age_ms =
+                        if last_ms == 0 { u64::MAX } else { now_ms().saturating_sub(last_ms) };
+                    let feed_stalled = feed_age_ms >= FEED_STALL_SECS * 1_000;
+                    if feed_stalled != was_stalled {
+                        if feed_stalled {
+                            tracing::warn!(
+                                "feed silent for over {FEED_STALL_SECS}s — pausing the ledger; sweeps continue but nothing is recorded"
+                            );
+                        } else {
+                            tracing::info!("feed recovered — recording resumed");
+                        }
+                        was_stalled = feed_stalled;
+                    }
+                    if sweep.stale_excluded != last_stale_excluded {
+                        if sweep.stale_excluded > 0 {
+                            tracing::warn!(
+                                "{} pool(s) excluded from the sweep for lagging over {} slots",
+                                sweep.stale_excluded,
+                                live::MAX_STALE_LAG_SLOTS,
+                            );
+                        }
+                        last_stale_excluded = sweep.stale_excluded;
+                    }
+
                     if let Ok(mut g) = shared.lock() {
                         *g = SweepSummary {
                             // Report the *current* best, not an all-time high-water
                             // mark: a record from ten minutes ago describes nothing.
                             best: sweep.best().cloned(),
+                            tradeable: sweep.tradeable().cloned(),
+                            tradeable_min_usd: sweep.tradeable_min_usd,
+                            stale_excluded: sweep.stale_excluded,
+                            feed_stalled,
                             evaluated_total,
                             sweep_us: sweep.duration_us,
                             pools_ready: market.ready_count(),
@@ -343,12 +408,18 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                     }
 
                     sweep_n = sweep_n.wrapping_add(1);
-                    if let (Some(l), Some(best)) = (ledger.as_ref(), sweep.best()) {
+                    // Nothing is recorded while the feed is stalled: the numbers would
+                    // describe a market that has stopped being observed, and they would
+                    // be indistinguishable afterwards from ones that had.
+                    if let (Some(l), Some(best), false) =
+                        (ledger.as_ref(), sweep.best(), feed_stalled)
+                    {
                         if sweep_n % LEDGER_EVERY_N_SWEEPS == 0 {
+                            let tradeable = sweep.tradeable();
                             let sample = cb_ledger::SweepSample {
                                 slot: sweep.slot,
                                 evaluated: sweep.evaluated,
-                                clearing: sweep.rows.iter().filter(|r| r.edge_bps > 0.0).count() as u64,
+                                clearing: sweep.clearing,
                                 best_edge_bps: best.edge_bps,
                                 best_dislocation_bps: best.dislocation_bps,
                                 best_fee_bps: best.fee_bps,
@@ -359,6 +430,14 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                                 sol_price_usd: market.sol_price_usd().unwrap_or(0.0),
                                 pools_ready: market.ready_count(),
                                 sweep_us: sweep.duration_us,
+                                tradeable_edge_bps: tradeable.map(|t| t.edge_bps),
+                                tradeable_dislocation_bps: tradeable.map(|t| t.dislocation_bps),
+                                tradeable_fee_bps: tradeable.map(|t| t.fee_bps),
+                                tradeable_depth_usd: tradeable.map(|t| t.depth_usd),
+                                tradeable_route: tradeable
+                                    .map_or_else(String::new, |t| t.route.clone()),
+                                stale_excluded: sweep.stale_excluded,
+                                depth_measured: true,
                             };
                             if let Err(e) = l.record_sweep(&sample) {
                                 tracing::warn!("could not record sweep: {e:#}");
@@ -369,6 +448,7 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                     if !sweep.rows.is_empty() {
                         bus.publish(Event::Routes {
                             rows: sweep.rows.iter().map(RouteRow::from).collect(),
+                            tradeable_min_usd: sweep.tradeable_min_usd,
                             evaluated: sweep.evaluated,
                             sweep_us: sweep.duration_us,
                             slot: sweep.slot,
@@ -401,7 +481,7 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                             None
                         };
 
-                        if let Some(l) = ledger.as_ref() {
+                        if let (Some(l), false) = (ledger.as_ref(), feed_stalled) {
                             let rec = cb_ledger::FillRecord {
                                 slot: opp.slot,
                                 route: opp.route.clone(),
@@ -501,19 +581,64 @@ fn report(path: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("\n  DISTANCE TO PROFITABLE      (best route in each sampled sweep)");
+    if !s.has_depth_measurement() {
+        println!(
+            "\n  This ledger predates the tradeable/marginal split, so every edge in it\n  \
+             is a marginal rate with no depth behind it. Those are not opportunities;\n  \
+             see HANDOVER 5.1. Only the fill-derived sections below are comparable.\n  \
+             Highest marginal rate on record: {:.2} bps.",
+            s.marginal_best_edge_bps
+        );
+    }
+
+    println!("\n  DISTANCE TO PROFITABLE      (best *tradeable* route per sweep)");
     println!("    samples                   {}", s.samples);
-    println!("    mean edge                 {:>8.2} bps", s.mean_edge_bps);
-    println!("    best edge                 {:>8.2} bps", s.best_edge_bps);
-    println!("    mean price dislocation    {:>8.2} bps", s.mean_dislocation_bps);
-    println!("    widest dislocation        {:>8.2} bps", s.best_dislocation_bps);
-    println!("    mean fee wall             {:>8.2} bps", s.mean_fee_bps);
-    println!(
-        "    moments something cleared {:>8.2}%   ({} of {})",
-        s.clearing_rate() * 100.0,
-        s.clearing_samples,
-        s.samples
-    );
+    if s.has_depth_measurement() {
+        println!(
+            "    with a tradeable cycle    {}   ({:.1}% of {} depth-measured)",
+            s.tradeable_samples,
+            100.0 * s.tradeable_samples as f64 / s.depth_samples as f64,
+            s.depth_samples
+        );
+        println!("    mean edge                 {:>8.2} bps", s.mean_edge_bps);
+        println!("    best edge                 {:>8.2} bps", s.best_edge_bps);
+        println!("    mean price dislocation    {:>8.2} bps", s.mean_dislocation_bps);
+        println!("    widest dislocation        {:>8.2} bps", s.best_dislocation_bps);
+        println!("    mean fee wall             {:>8.2} bps", s.mean_fee_bps);
+        println!(
+            "    moments something cleared {:>8.2}%   ({} of {})",
+            s.clearing_rate() * 100.0,
+            s.clearing_samples,
+            s.depth_samples
+        );
+
+        // The gap between the two searches, stated rather than smoothed away. It is
+        // not noise: it measures how much of the visible book has no size behind it.
+        println!("\n  WHAT THE BOOK ADVERTISES BUT WILL NOT FILL");
+        println!(
+            "    best marginal rate ever   {:>8.2} bps   (at infinitesimal size)",
+            s.marginal_best_edge_bps
+        );
+        println!(
+            "    leader untradeable in     {:>8.2}%   ({} of {} samples)",
+            s.untradeable_leader_rate() * 100.0,
+            s.untradeable_leader_samples,
+            s.depth_samples
+        );
+        if s.best_edge_bps > 0.0 && s.marginal_best_edge_bps > s.best_edge_bps * 2.0 {
+            println!(
+                "    the marginal maximum is {:.0}x the best rate anyone could have taken.",
+                s.marginal_best_edge_bps / s.best_edge_bps
+            );
+        }
+        if s.stale_excluded_max > 0 {
+            println!(
+                "    most pools excluded once  {:>8}       (lagging over {} slots)",
+                s.stale_excluded_max,
+                live::MAX_STALE_LAG_SLOTS
+            );
+        }
+    }
 
     println!("\n  EDGE DISTRIBUTION");
     let hist = ledger.edge_histogram(&EDGE_BUCKETS)?;
@@ -719,11 +844,11 @@ async fn verify(cfg: &Config) -> anyhow::Result<()> {
 
     let client = reqwest::Client::new();
     println!(
-        "  {:<18} {:<9} {:>14} {:>14} {:>9}  verdict",
+        "  {:<18} {:<9} {:>13} {:>13} {:>8}  routed via     verdict",
         "pair", "venue", "ours", "router", "diff"
     );
 
-    let (mut checked, mut faults, mut skipped) = (0usize, 0usize, 0usize);
+    let (mut checked, mut faults, mut skipped, mut off_premise) = (0usize, 0usize, 0usize, 0usize);
     for p in probes {
         tokio::time::sleep(VERIFY_PACE).await;
         let theirs = match jupiter_quote(&client, &p.from_b58, &p.to_b58, p.amount_in).await {
@@ -741,42 +866,103 @@ async fn verify(cfg: &Config) -> anyhow::Result<()> {
         checked += 1;
 
         // Positive means our quote claims more output than the router could find.
-        let diff_bps = if theirs > 0 {
-            (p.amount_out as f64 / theirs as f64 - 1.0) * 10_000.0
+        let diff_bps = if theirs.out > 0 {
+            (p.amount_out as f64 / theirs.out as f64 - 1.0) * 10_000.0
         } else {
             0.0
         };
-        let fault = diff_bps > VERIFY_TOLERANCE_BPS;
-        if fault {
+        let beaten = diff_bps > VERIFY_TOLERANCE_BPS;
+
+        // Being beaten only implicates a decoder if the router was quoting the same
+        // kind of liquidity. When it served an RFQ venue we do not decode, the audit's
+        // premise simply does not apply to that row — which is reported, never
+        // silently excused and never counted as a clean pass.
+        let verdict = if beaten && theirs.routed_through(&p.pool_b58) {
             faults += 1;
-        }
-        let verdict = if fault {
+            "FAULT — router used THIS pool and still paid less"
+        } else if beaten && theirs.touches_a_venue_we_decode() {
+            faults += 1;
             "FAULT — we quote better than any router can route"
+        } else if beaten {
+            off_premise += 1;
+            "premise broken — router served liquidity we do not decode"
         } else if diff_bps < -100.0 {
             "ok (router found a venue we do not watch)"
         } else {
             "ok"
         };
         println!(
-            "  {:<18} {:<9} {:>14} {:>14} {:>+8.1}b  {verdict}",
+            "  {:<18} {:<9} {:>13} {:>13} {:>+7.1}b  {:<14} {verdict}",
             truncate(&format!("{} {}", p.pair, p.label), 18),
             p.venue,
             p.amount_out,
-            theirs,
-            diff_bps
+            theirs.out,
+            diff_bps,
+            truncate(&theirs.venues(), 14),
         );
     }
 
-    println!("\n  {checked} checked, {skipped} skipped, {faults} faults");
+    println!("\n  {checked} checked, {skipped} skipped, {faults} faults, {off_premise} off-premise");
     if faults == 0 {
-        println!("  No pool quotes better than the router can route. Decoders look honest.\n");
+        println!("  No pool quotes better than the router can route. Decoders look honest.");
     } else {
         println!(
             "  {faults} pool(s) claim an output nobody else can produce. That is a decode \n\
-             \x20 error, not an edge — do not trade on those routes until it is explained.\n"
+             \x20 error, not an edge — do not trade on those routes until it is explained."
         );
     }
+    if off_premise > 0 {
+        println!(
+            "  {off_premise} row(s) were beaten only against liquidity we do not decode — RFQ\n\
+             \x20 market-maker fills rather than pools. The audit cannot judge those: it\n\
+             \x20 assumes the router is quoting the same venues we are. Inspect by hand\n\
+             \x20 rather than reading them as either a pass or a fault."
+        );
+    }
+    println!();
     Ok(())
+}
+
+/// What the router answered, and which venues it actually went through.
+///
+/// The route matters as much as the number. The audit's premise is "a router that
+/// covers these venues cannot be beaten by one of them", and that premise only holds
+/// while the router is quoting AMM liquidity. Jupiter now serves RFQ fills under
+/// labels like `Aquifer` and `Flux`, which are market-maker quotes rather than pools —
+/// being beaten by one of those says nothing about our decoders.
+#[derive(Debug, Clone)]
+struct RouterQuote {
+    out: u128,
+    /// One entry per leg: the venue label and the account it swapped against.
+    legs: Vec<(String, String)>,
+}
+
+impl RouterQuote {
+    fn venues(&self) -> String {
+        let mut names: Vec<&str> = self.legs.iter().map(|(l, _)| l.as_str()).collect();
+        names.dedup();
+        names.join("+")
+    }
+
+    /// Whether any leg ran through a venue family we decode ourselves.
+    ///
+    /// Matched on the label rather than a list of program ids, because the label is
+    /// what the router reports and what a human reading the audit sees. An unknown
+    /// label is treated as *not* ours, which is the conservative direction: it
+    /// downgrades a fault to "inspect this", never the reverse.
+    fn touches_a_venue_we_decode(&self) -> bool {
+        const OURS: [&str; 4] = ["orca", "raydium", "meteora", "whirlpool"];
+        self.legs
+            .iter()
+            .any(|(label, _)| {
+                let l = label.to_ascii_lowercase();
+                OURS.iter().any(|o| l.contains(o))
+            })
+    }
+
+    fn routed_through(&self, pool_b58: &str) -> bool {
+        self.legs.iter().any(|(_, amm)| amm == pool_b58)
+    }
 }
 
 /// Best output the router can find for a direct swap, or `None` if it has no route.
@@ -785,7 +971,7 @@ async fn jupiter_quote(
     from: &str,
     to: &str,
     amount_in: u128,
-) -> anyhow::Result<Option<u128>> {
+) -> anyhow::Result<Option<RouterQuote>> {
     let url = format!(
         "https://lite-api.jup.ag/swap/v1/quote?inputMint={from}&outputMint={to}\
          &amount={amount_in}&slippageBps=50&onlyDirectRoutes=true"
@@ -795,7 +981,102 @@ async fn jupiter_quote(
         return Ok(None);
     }
     let v: serde_json::Value = resp.json().await?;
-    Ok(v.get("outAmount")
+    let Some(out) = v
+        .get("outAmount")
         .and_then(serde_json::Value::as_str)
-        .and_then(|s| s.parse::<u128>().ok()))
+        .and_then(|s| s.parse::<u128>().ok())
+    else {
+        return Ok(None);
+    };
+
+    let legs = v
+        .get("routePlan")
+        .and_then(serde_json::Value::as_array)
+        .map(|plan| {
+            plan.iter()
+                .filter_map(|step| step.get("swapInfo"))
+                .map(|info| {
+                    let label = info
+                        .get("label")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let amm = info
+                        .get("ammKey")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    (label, amm)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(Some(RouterQuote { out, legs }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quote(out: u128, legs: &[(&str, &str)]) -> RouterQuote {
+        RouterQuote {
+            out,
+            legs: legs.iter().map(|(l, a)| ((*l).to_string(), (*a).to_string())).collect(),
+        }
+    }
+
+    #[test]
+    fn the_staleness_guard_does_not_fire_while_reconcile_is_working() {
+        // These two constants are coupled and live in different files. `reconcile()`
+        // re-reads every watched account on its own timer and refreshes each pool's
+        // slot, so any guard tighter than that cadence spends its time excluding pools
+        // that were just verified — measured at ~40 of 84 pools and a third of the
+        // cycle graph, for nothing. The guard is a backstop for reconcile having
+        // stopped, not a routine filter, so it must sit above the reconcile interval.
+        let guard_ms = live::MAX_STALE_LAG_SLOTS * SLOT_MS;
+        let reconcile_ms = RECONCILE_INTERVAL.as_millis() as u64;
+        assert!(
+            guard_ms >= reconcile_ms * 2,
+            "the staleness guard ({guard_ms} ms) must outlast two reconciles              ({reconcile_ms} ms each), or it excludes pools reconcile has already              proven correct and quietly shrinks the search space"
+        );
+    }
+
+    #[test]
+    fn a_fault_against_liquidity_we_do_not_watch_is_labelled_not_counted() {
+        // Jupiter serves RFQ fills under names like these. They are market-maker
+        // quotes, not pools, so being beaten by one says nothing about our decoders —
+        // and must not be scored as if it did.
+        let rfq = quote(1_000, &[("Aquifer", "someRfqAccount")]);
+        assert!(!rfq.touches_a_venue_we_decode());
+        assert!(!rfq.routed_through("ourPool111"));
+
+        let ours = quote(1_000, &[("Orca (Whirlpools)", "ourPool111")]);
+        assert!(ours.touches_a_venue_we_decode(), "an Orca leg is a venue we decode");
+    }
+
+    #[test]
+    fn a_router_leg_through_our_own_pool_is_recognised() {
+        // The strongest evidence a decode fault can produce: the router priced the
+        // exact account we did and still paid out less.
+        let q = quote(900, &[("Raydium CLMM", "poolAAA"), ("Meteora DLMM", "poolBBB")]);
+        assert!(q.routed_through("poolBBB"));
+        assert!(!q.routed_through("poolCCC"));
+    }
+
+    #[test]
+    fn an_unknown_venue_label_is_treated_as_not_ours() {
+        // Conservative direction: an unrecognised label downgrades a fault to
+        // "inspect this by hand", never the other way round.
+        let q = quote(1_000, &[("SomeNewAggregator", "acct")]);
+        assert!(!q.touches_a_venue_we_decode());
+    }
+
+    #[test]
+    fn the_route_is_named_for_the_reader() {
+        let q = quote(1, &[("Orca (Whirlpools)", "a"), ("Orca (Whirlpools)", "b")]);
+        assert_eq!(q.venues(), "Orca (Whirlpools)", "a repeated venue reads once");
+        let q = quote(1, &[("Orca (Whirlpools)", "a"), ("Raydium CLMM", "b")]);
+        assert_eq!(q.venues(), "Orca (Whirlpools)+Raydium CLMM");
+    }
 }

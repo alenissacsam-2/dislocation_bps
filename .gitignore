@@ -15,6 +15,12 @@ target/
 node_modules/
 .next/
 dist/
+
+# ...but the dashboard is not build output. It is a hand-written single file with no
+# build step, and the rule above was silently the only thing standing between it and
+# being lost — it was never tracked at all.
+!dashboard/dist/
+!dashboard/dist/index.html
 build/
 *.tsbuildinfo
 

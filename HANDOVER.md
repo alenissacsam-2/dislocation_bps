@@ -170,30 +170,40 @@ store L. Caught because the account carries `token_a_amount`/`token_b_amount`
 independently, so the reconstruction could be checked against something the decoder had
 not used.
 
-The pattern in all five: **an internal check cannot catch an error in what the code
-believes about the outside world.** Every new decoder must be pinned against a value
-the decoder itself did not produce.
+**A rate with nothing behind it, reported as an edge.** The board ranked cycles by
+marginal rate — profit per unit at infinitesimally small size — while depth was
+measured on the entry pool only. A cycle whose *downstream* leg sat at the end of its
+tick therefore showed an enormous rate over almost no capacity, and led the
+leaderboard for hours at 1156 bps without ever producing a fill. Nothing was
+mis-decoded and no arithmetic was wrong; the instrument was answering a different
+question from the one its label claimed. Caught by asking why the biggest number on
+the screen never appeared in `paper_fills`, and confirmed by the giveaway that depth
+*fell* as the reported edge rose. Fixed in §5.1.
+
+> **Two searches that answer different questions must not share one label.** The
+> arithmetic being right does not make the number mean what the heading says.
+
+The pattern in all six: **an internal check cannot catch an error in what the code
+believes about the outside world** — including what it believes its own numbers mean.
+Every new decoder must be pinned against a value the decoder itself did not produce,
+and every headline must name which search produced it.
 
 ---
 
 ## 5. Open items, ranked
 
-### 5.1 — The report's headline edge is a rate nobody can trade *(highest priority)*
+### 5.1 — The headline edge was a rate nobody could trade — **fixed 2026-08-22**
 
-The current run reports `best edge 1156.44 bps` on `SOL → TRUMP → USDC → SOL`, held
-steady for 7+ consecutive seconds. It is not a real opportunity, and chasing down why
-found a genuine reporting bug.
+Design: `docs/superpowers/specs/2026-08-22-reporting-integrity-design.md`.
 
-**It never became a fill.** The largest TRUMP entry in `paper_fills` is 12.7 bps. The
-1156 bps figure lives only in `sweeps.best_edge_bps`.
-
-**The mechanism.** Two different searches run each sweep. `survey_from_base` prices
-*every* cycle by `marginal_edge_bps` — the rate at infinitesimal size. `find_from_base`
-returns only cycles with a feasible, profitable size. The leaderboard and
-`sweeps.best_edge_bps` come from the first; fills come from the second. A cycle with a
-downstream leg parked at its tick boundary has near-zero capacity and an enormous
-marginal rate, so it tops the survey while being completely untradeable. Note the
-signature in the data — depth *falls* as the reported edge rises:
+The old run reported `best edge 1156.44 bps` on `SOL → TRUMP → USDC → SOL`, held for
+7+ seconds. It never became a fill — the largest TRUMP entry in `paper_fills` is
+12.7 bps — because two different searches ran each sweep and the report read the wrong
+one. `survey_from_base` prices *every* cycle at infinitesimal size; `find_from_base`
+returns only cycles with a feasible size, and only those ever become fills. A cycle
+with a downstream leg parked at its tick boundary has an enormous marginal rate and
+almost no capacity, so it topped a board ranked on rate alone. The signature was in
+the data — depth *fell* as the reported edge rose, backwards from a real dislocation:
 
 ```
 band            sweeps   avg depth $
@@ -202,57 +212,104 @@ under 50 bps      6,494      1,838.72
 over 200 bps         51        156.14
 ```
 
-That is backwards from a real dislocation, where a bigger gap is worth more, not less.
+Depth was also computed wrong: first leg only, when the binding constraint is usually
+downstream.
 
-**What this contaminates, and what it does not.** `mean edge`, `best edge`, and
-`mean price dislocation` in the report are computed from the marginal survey and are
-overstated — 51 of 6,356 samples sit above 200 bps and drag the mean. Everything
-derived from `paper_fills` — episodes, survival, what an opportunity is worth,
-break-even capital — requires a feasible size and is **not** affected. So the §1
-conclusions stand; the headline distance-to-profitable numbers do not.
+**What changed.**
 
-Suggested fix: report the marginal survey and the tradeable set as two separate
-things rather than one number, or weight the survey by quotable depth so a rate with
-nothing behind it cannot lead. Do not simply clamp the outliers — the gap between the
-two searches is real information about how much of the book is untouchable.
+- `cb_core::path::cycle_depth_base` computes the bottleneck across *every* leg,
+  converting each leg's capacity back to base units through the marginal rates ahead
+  of it. It is a first-order upper bound, so `optimal_input` always sizes at or under
+  it — the right direction for a depth figure to err.
+- The sweep now publishes two named numbers. `Sweep::tradeable` is the best edge among
+  cycles whose depth clears the tradable capital, and is the headline everywhere:
+  status event, report, histogram, clearing rate. `Sweep::best` keeps the raw marginal
+  maximum as an explicit diagnostic. When nothing qualifies, tradeable is `None` and
+  renders as `—`, never as zero.
+- `clearing` now requires depth as well as a positive edge, and is counted over every
+  cycle priced rather than over the truncated leaderboard (which silently capped it
+  at 12).
+- The leaderboard renders two groups, *tradeable now* above *rate only*. Both stay
+  visible; nothing untradeable leads.
+- The gap between the two searches is reported rather than smoothed away — the report
+  prints how often the leading rate had no size behind it, because that number
+  measures how much of the visible book is untouchable at this capital.
 
-### 5.2 — Stale state between reconciles is unguarded
+Ledger columns added: `tradeable_edge_bps`, `tradeable_dislocation_bps`,
+`tradeable_fee_bps`, `tradeable_depth_usd`, `tradeable_route`, `stale_excluded`,
+`depth_measured`. Rows written before this cannot tell *nothing was tradeable* from
+*we never looked*, so `depth_measured = 0` excludes them from tradeable statistics
+instead of counting them as zeros; `--report` says so at the top when it opens such a
+ledger.
 
-Not the cause of §5.1, but a real hole found while chasing it.
+### 5.2 — Stale state between reconciles — **fixed 2026-08-22**
 
 For an AMM, *no update means no change* — the account only moves when someone swaps
 it. That makes a silently dropped subscription indistinguishable from a quiet pool
-from the WebSocket stream alone, and `crates/bot/src/live.rs:606` says so explicitly.
-The answer in place is `reconcile()`, which re-reads every watched account over HTTP
-every 180 s and folds the result back into the store, so a stale pool *is* repaired —
-but only on that cadence, and nothing excludes it from the sweep in the meantime.
+from the stream alone. `reconcile()` repaired it every 180 s; nothing excluded it from
+the sweep in the meantime, and `PoolStore::stale_pools()` had no caller at all.
 
-`PoolStore::stale_pools()` exists at `crates/scanner/src/store.rs:79` and is **never
-called from the sweep path**. A per-sweep slot-lag guard, with the exclusion count
-surfaced the way subscribe errors and reconcile drift already are, would close the
-window without waiting on the timer.
+`PoolStore::snapshot_fresh(max_lag)` now builds each sweep's snapshot without pools
+lagging the newest slot by more than `MAX_STALE_LAG_SLOTS`, and returns the count
+excluded. It surfaces as `Sweep::stale_excluded` → status event →
+`sweeps.stale_excluded` → a dashboard tile, and warns on change.
 
-### 5.2b — `--verify` reports 5 faults and it is not explained
+**The threshold was set by measurement, and the first guess was wrong.** At 300 slots
+(~1–2 min) the guard looked prudent and was actively harmful: 37% of sweeps dropped
+~40 of 84 pools and cycles priced fell from ~1260 to ~600. The reason is that
+`reconcile()` already re-reads every account every 180 s and refreshes its slot whether
+or not it traded — so a tight guard mostly excludes pools the last reconcile *just
+proved correct*, for the crime of being quiet since. Losing a third of the cycle graph
+understates every rate the instrument reports, and does it invisibly, which is a worse
+failure for a measurement than the extra staleness it was buying against a bound
+reconcile already holds.
 
-51 checked, 5 faults, clustered at +21 to +25 bps, on pools that previously passed
-clean. This is *not* explained by §5.1: `--verify` quotes real sizes through real
-pools, not marginal rates.
+It is now 1800 slots — above the reconcile cadence — so it fires only once reconcile
+has itself stopped repairing, the one failure with no other backstop. In normal running
+it excludes nothing, which makes a non-zero `stale_excluded` a real signal instead of
+routine noise. The two constants live in different files, so
+`the_staleness_guard_does_not_fire_while_reconcile_is_working` in `main.rs` fails if
+anyone tightens one without the other.
 
-- Jupiter now serves routes labelled `Aquifer` and `Flux` — market-maker/RFQ
-  liquidity, not the AMM pool being asked about. The audit's premise ("better than the
-  router ⇒ we are wrong") assumed the router quotes AMM liquidity.
-- Against that, a direct cross-check of SOL/USDC across three independent programs
-  agreed with Jupiter to under 1 bps ($93.84–93.88 vs $93.84), with the new DAMM v2
-  pool right in line — so the decoders are not uniformly biased.
+Stated plainly because it matters: slot lag **cannot** tell a quiet-but-correct pool
+from a dropped-subscription-and-wrong one. It bounds how long an unrepaired quote can
+survive; it does not prove anything right.
 
-Worth recording *which* venue Jupiter actually routed through, so a mismatch is visible
-rather than inferred, and re-running before drawing conclusions.
+That guard has one hole it structurally cannot cover — if the feed dies completely
+every pool ages together and nothing ever looks stale. Only a wall clock catches that,
+so ledger recording now pauses when feed data age exceeds `FEED_STALL_SECS` (5 s).
+Sweeps continue for the dashboard, labelled stalled. A measurement that knows its
+clock has stopped does not go on writing numbers.
+
+### 5.2b — `--verify` faults now name who served the quote — **fixed 2026-08-22**
+
+51 checked, 5 faults, clustered at +21 to +25 bps on pools that previously passed
+clean. Jupiter now serves routes labelled `Aquifer` and `Flux` — RFQ market-maker
+liquidity, not the AMM pool being asked about — and the audit's premise ("better than
+the router ⇒ we are wrong") assumed the router quotes AMM liquidity. Against that, a
+direct cross-check of SOL/USDC across three independent programs agreed with Jupiter
+to under 1 bps, so the decoders are not uniformly biased.
+
+`jupiter_quote` now parses `routePlan[].swapInfo.{label, ammKey}`. Each row prints
+which venues actually served it, and faults split three ways:
+
+- the router routed through **our own pool** (`ammKey` match) and still paid less —
+  the strongest evidence a decode fault can produce, counted as a fault;
+- the route touched a venue we decode — counted as a fault, as before;
+- the route touched nothing we watch — counted separately as *off-premise* and
+  reported as "inspect by hand", never as a pass and never as a fault.
+
+An unrecognised venue label counts as not-ours, which only ever downgrades a fault to
+"inspect this" — never the reverse.
+
+**Still open:** re-run `--verify` against the new build and attribute those 5 faults
+concretely. The classifier makes them explainable; it has not yet explained them.
 
 ### 5.3 — Run longer
 
-Everything above is hours, not weeks. Nothing here says how the edge distribution
-behaves through a real volatility spike. The supervisor exists precisely so this can
-run unattended; it just has not yet.
+Everything measured so far is hours, not weeks. Nothing here says how the edge
+distribution behaves through a real volatility spike. The supervisor exists precisely
+so this can run unattended.
 
 ### 5.4 — Housekeeping
 
@@ -300,7 +357,8 @@ carry-forward, which penalises high-churn strategies specifically.
 
 | File | What it holds |
 |---|---|
-| `cryptobot.db` | current run — **suspect, see §5.1** |
+| `cryptobot.db` | current run — first with the tradeable/marginal split |
+| `cryptobot-pre-tradeable.db` | ~10h, correct fills, but every `sweeps` edge in it is a marginal rate (§5.1) |
 | `cryptobot-pre-cyclekey.db` | ~7h, correct decoders, but mirror-double-counted opportunity counts |
 | `cryptobot-contaminated-by-cpmm-bug.db` | kept as the record of what the phantom looked like |
 
@@ -309,10 +367,17 @@ whether or not anything cleared, which is what turns "found nothing" into a
 measurement. A run that records only its wins can report the size of a win but never
 the odds.
 
-Note the schema migration: `paper_fills.cycle_key` was added later, and `episodes()`
-falls back to `route || venues` for rows that predate it. Old and new rows in one
-database therefore group by different rules — which is why the pre-fix run was archived
-rather than continued.
+Two schema migrations matter when reading an old file. `paper_fills.cycle_key` was
+added later, and `episodes()` falls back to the printed route for rows predating it.
+`sweeps.depth_measured` marks rows written after the tradeable/marginal split; rows
+without it are excluded from every tradeable statistic rather than counted as zeros,
+and `--report` says so at the top when it opens one. Both are why each run was archived
+at the change rather than continued — old and new rows in one file would group and
+aggregate by different rules, and nothing downstream would show it.
+
+`scripts/archive-ledger.sh <name>` does the move, taking the `-wal` and `-shm` with it.
+A SQLite database in WAL mode is three files, and copying only the `.db` silently
+leaves the most recent writes behind.
 
 ---
 

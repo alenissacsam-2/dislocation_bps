@@ -47,7 +47,27 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             best_depth_usd       REAL    NOT NULL,
             sol_price_usd        REAL    NOT NULL,
             pools_ready          INTEGER NOT NULL,
-            sweep_us             INTEGER NOT NULL
+            sweep_us             INTEGER NOT NULL,
+            -- Best edge among cycles deep enough to absorb the run's capital. NULL
+            -- means no cycle qualified, which is a measurement, not a zero.
+            -- `best_edge_bps` beside it is the raw marginal maximum over every cycle
+            -- regardless of depth: a diagnostic, and routinely much larger.
+            tradeable_edge_bps   REAL,
+            -- Recorded beside the edge so the tradeable route decomposes the same way
+            -- the marginal one does: edge = dislocation - fees. Mixing a tradeable
+            -- edge with a marginal dislocation would print a sum that does not add up.
+            tradeable_dislocation_bps REAL,
+            tradeable_fee_bps    REAL,
+            tradeable_depth_usd  REAL,
+            tradeable_route      TEXT    NOT NULL DEFAULT '',
+            -- Pools left out of this sweep for lagging too far behind.
+            stale_excluded       INTEGER NOT NULL DEFAULT 0,
+            -- 1 once cycle depth was measured at all. Rows written before that
+            -- cannot tell nothing-was-tradeable apart from we-never-looked, so they
+            -- are excluded from tradeable statistics rather than counted as zero.
+            -- `clearing` also changed meaning here: it now requires depth as well
+            -- as a positive edge.
+            depth_measured       INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_sweep_at ON sweeps(at);
         CREATE INDEX IF NOT EXISTS idx_sweep_edge ON sweeps(best_edge_bps);
@@ -81,19 +101,41 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         ",
     )?;
 
-    // `cycle_key` arrived after the first runs. Add it in place rather than
-    // rebuilding the table, so a ledger already collecting keeps its history —
-    // those rows simply fall back to the old, coarser grouping.
-    let has_cycle_key: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('paper_fills') WHERE name = 'cycle_key'",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_cycle_key == 0 {
-        conn.execute_batch("ALTER TABLE paper_fills ADD COLUMN cycle_key TEXT;")?;
-    }
+    // Columns that arrived after runs were already collecting. Added in place rather
+    // than by rebuilding, so a ledger mid-flight keeps its history; old rows fall back
+    // to the older, coarser meaning, which each column's comment states.
+    //
+    // `cycle_key`: one loop entered at two mints is one opportunity, not two.
+    add_column_if_missing(conn, "paper_fills", "cycle_key", "TEXT")?;
+    // The depth-qualified headline, and the staleness guard's count.
+    add_column_if_missing(conn, "sweeps", "tradeable_edge_bps", "REAL")?;
+    add_column_if_missing(conn, "sweeps", "tradeable_dislocation_bps", "REAL")?;
+    add_column_if_missing(conn, "sweeps", "tradeable_fee_bps", "REAL")?;
+    add_column_if_missing(conn, "sweeps", "tradeable_depth_usd", "REAL")?;
+    add_column_if_missing(conn, "sweeps", "tradeable_route", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "sweeps", "stale_excluded", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "sweeps", "depth_measured", "INTEGER NOT NULL DEFAULT 0")?;
+
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_fill_cycle ON paper_fills(cycle_key, id);",
     )?;
+    Ok(())
+}
+
+/// Add a column to an existing table, if a ledger from an older build lacks it.
+///
+/// SQLite has no `ADD COLUMN IF NOT EXISTS`, and running the `ALTER` unconditionally
+/// fails on every start after the first. Checking `pragma_table_info` first keeps the
+/// migration idempotent, so an existing run's history survives a schema change instead
+/// of forcing a rebuild that would throw the measurement away.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let present: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+        [column],
+        |r| r.get(0),
+    )?;
+    if present == 0 {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
+    }
     Ok(())
 }

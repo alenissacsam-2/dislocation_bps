@@ -58,8 +58,10 @@ impl Ledger {
             "INSERT INTO sweeps
              (slot, evaluated, clearing, best_edge_bps, best_dislocation_bps, best_fee_bps,
               best_route, best_venues, best_hops, best_depth_usd, sol_price_usd,
-              pools_ready, sweep_us)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+              pools_ready, sweep_us, tradeable_edge_bps, tradeable_dislocation_bps,
+              tradeable_fee_bps, tradeable_depth_usd, tradeable_route, stale_excluded,
+              depth_measured)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             rusqlite::params![
                 s.slot as i64,
                 s.evaluated as i64,
@@ -74,6 +76,13 @@ impl Ledger {
                 s.sol_price_usd,
                 s.pools_ready as i64,
                 s.sweep_us as i64,
+                s.tradeable_edge_bps,
+                s.tradeable_dislocation_bps,
+                s.tradeable_fee_bps,
+                s.tradeable_depth_usd,
+                s.tradeable_route,
+                s.stale_excluded as i64,
+                i64::from(s.depth_measured),
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -118,24 +127,64 @@ impl Ledger {
     /// trusting the rest of the page.
     pub fn summary(&self) -> Result<Summary> {
         let _guard = self.conn.unchecked_transaction()?;
-        type Agg = (i64, Option<String>, Option<String>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
-        let (samples, first_at, last_at, mean_edge, best_edge, mean_gap, best_gap, mean_fee): Agg =
-            self.conn.query_row(
-                "SELECT COUNT(*), MIN(at), MAX(at), AVG(best_edge_bps), MAX(best_edge_bps),
-                        AVG(best_dislocation_bps), MAX(best_dislocation_bps), AVG(best_fee_bps)
-                 FROM sweeps",
-                [],
-                |r| {
-                    Ok((
-                        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
-                        r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
-                    ))
-                },
-            )?;
+        type Agg = (i64, Option<String>, Option<String>, Option<f64>);
+        let (samples, first_at, last_at, marginal_best): Agg = self.conn.query_row(
+            "SELECT COUNT(*), MIN(at), MAX(at), MAX(best_edge_bps) FROM sweeps",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
 
-        let clearing_samples: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM sweeps WHERE best_edge_bps > 0", [], |r| r.get(0))?;
+        // Everything headline comes from the depth-qualified set. Rows written before
+        // depth was measured are excluded rather than folded in: for those we cannot
+        // tell "nothing was tradeable" from "we never looked", and counting an unknown
+        // as a zero is the kind of quiet substitution this whole table exists to avoid.
+        //
+        // SQLite's aggregates skip NULLs, so the means below are over the samples that
+        // *had* a tradeable cycle. `tradeable_samples` reports that coverage next to
+        // them, because a mean taken over the good moments only is a biased number
+        // unless the reader can see how many moments it left out.
+        type Trade = (i64, i64, i64, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
+        let (
+            depth_samples,
+            tradeable_samples,
+            clearing_samples,
+            mean_edge,
+            best_edge,
+            mean_gap,
+            best_gap,
+            mean_fee,
+        ): Trade = self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(tradeable_edge_bps IS NOT NULL), 0),
+                    COALESCE(SUM(tradeable_edge_bps > 0), 0),
+                    AVG(tradeable_edge_bps), MAX(tradeable_edge_bps),
+                    AVG(tradeable_dislocation_bps), MAX(tradeable_dislocation_bps),
+                    AVG(tradeable_fee_bps)
+             FROM sweeps WHERE depth_measured = 1",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
+                    r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
+                ))
+            },
+        )?;
+
+        // Samples whose best rate had no size behind it at all. This is the size of
+        // the gap between the two searches, and it is information rather than noise:
+        // it says how much of the visible book is untouchable at this capital.
+        let untradeable_leader_samples: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sweeps
+             WHERE depth_measured = 1 AND best_edge_bps > 0 AND tradeable_edge_bps IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+
+        let stale_excluded_max: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(stale_excluded), 0) FROM sweeps",
+            [],
+            |r| r.get(0),
+        )?;
 
         type Fills = (i64, i64, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
         let (fills, taken, gross, net, best_net, best_at_optimal): Fills = self.conn.query_row(
@@ -154,11 +203,16 @@ impl Ledger {
 
         Ok(Summary {
             samples: samples as u64,
+            depth_samples: depth_samples as u64,
+            tradeable_samples: tradeable_samples as u64,
             clearing_samples: clearing_samples as u64,
+            untradeable_leader_samples: untradeable_leader_samples as u64,
             first_at,
             last_at,
             mean_edge_bps: mean_edge.unwrap_or(0.0),
             best_edge_bps: best_edge.unwrap_or(0.0),
+            marginal_best_edge_bps: marginal_best.unwrap_or(0.0),
+            stale_excluded_max: stale_excluded_max as u64,
             mean_dislocation_bps: mean_gap.unwrap_or(0.0),
             best_dislocation_bps: best_gap.unwrap_or(0.0),
             mean_fee_bps: mean_fee.unwrap_or(0.0),
@@ -408,11 +462,17 @@ impl Ledger {
     /// Buckets are inclusive of their lower bound. The point of a histogram rather
     /// than a mean: a market that sits at -2 bps all day and one that alternates
     /// between -20 and +16 have the same mean and completely different economics.
+    ///
+    /// Distributed over the *tradeable* edge. A histogram of marginal rates has a fat
+    /// right tail made entirely of routes with no size behind them, which is a picture
+    /// of the search space rather than of the opportunity.
     pub fn edge_histogram(&self, edges: &[f64]) -> Result<Vec<(f64, f64, u64)>> {
         let mut out = Vec::new();
         for w in edges.windows(2) {
             let n: i64 = self.conn.query_row(
-                "SELECT COUNT(*) FROM sweeps WHERE best_edge_bps >= ?1 AND best_edge_bps < ?2",
+                "SELECT COUNT(*) FROM sweeps
+                 WHERE depth_measured = 1
+                   AND tradeable_edge_bps >= ?1 AND tradeable_edge_bps < ?2",
                 rusqlite::params![w[0], w[1]],
                 |r| r.get(0),
             )?;
@@ -427,7 +487,10 @@ impl Ledger {
 pub struct SweepSample {
     pub slot: u64,
     pub evaluated: u64,
+    /// Cycles that cleared their fees *and* had the depth to take the capital.
     pub clearing: u64,
+    /// Highest marginal rate over every cycle, whatever its depth. A diagnostic:
+    /// routinely far above anything that could be traded.
     pub best_edge_bps: f64,
     pub best_dislocation_bps: f64,
     pub best_fee_bps: f64,
@@ -438,6 +501,18 @@ pub struct SweepSample {
     pub sol_price_usd: f64,
     pub pools_ready: usize,
     pub sweep_us: u64,
+    /// Best edge among cycles deep enough to absorb the capital, the honest headline.
+    /// `None` means nothing qualified — recorded as NULL, never as zero.
+    pub tradeable_edge_bps: Option<f64>,
+    pub tradeable_dislocation_bps: Option<f64>,
+    pub tradeable_fee_bps: Option<f64>,
+    pub tradeable_depth_usd: Option<f64>,
+    pub tradeable_route: String,
+    /// Pools dropped from this sweep for lagging too far behind the newest slot.
+    pub stale_excluded: usize,
+    /// Whether this sweep measured cycle depth at all. False only for rows written by
+    /// builds that predate the tradeable/marginal split.
+    pub depth_measured: bool,
 }
 
 /// One cycle that cleared its own fees.
@@ -517,13 +592,30 @@ impl SurvivalBand {
 /// Everything a run has measured.
 #[derive(Debug, Clone, Default)]
 pub struct Summary {
+    /// Every sweep ever sampled, including ones from before depth was measured.
     pub samples: u64,
-    /// Samples in which some route was actually profitable.
+    /// Sweeps that measured cycle depth, and so can say anything about tradeability.
+    /// The denominator for every rate below.
+    pub depth_samples: u64,
+    /// Of those, ones with at least one cycle deep enough to take the capital —
+    /// profitable or not. The means below are taken over exactly these.
+    pub tradeable_samples: u64,
+    /// Samples in which some route was profitable *and* could absorb the capital.
     pub clearing_samples: u64,
+    /// Samples whose best marginal rate had no tradeable size behind it at all. The
+    /// distance between what the book advertises and what it will actually fill.
+    pub untradeable_leader_samples: u64,
     pub first_at: Option<String>,
     pub last_at: Option<String>,
+    /// Depth-qualified: the edge of the best route that could actually be traded.
     pub mean_edge_bps: f64,
     pub best_edge_bps: f64,
+    /// The raw marginal maximum over every cycle regardless of depth. Kept beside the
+    /// tradeable figure as a diagnostic — it is routinely an order of magnitude larger,
+    /// and reading it as an opportunity is the mistake this pair exists to prevent.
+    pub marginal_best_edge_bps: f64,
+    /// Most pools any single sweep had to drop for lagging behind.
+    pub stale_excluded_max: u64,
     pub mean_dislocation_bps: f64,
     pub best_dislocation_bps: f64,
     pub mean_fee_bps: f64,
@@ -539,13 +631,34 @@ pub struct Summary {
 }
 
 impl Summary {
-    /// Fraction of sampled moments in which *something* was profitable.
+    /// Fraction of sampled moments in which something profitable was also tradeable.
+    ///
+    /// Denominated in depth-measuring samples, not all samples: a run that predates
+    /// the depth split has nothing to say about this, and dividing by its samples
+    /// would report a confident zero where the honest answer is "not measured".
     #[must_use]
     pub fn clearing_rate(&self) -> f64 {
-        if self.samples == 0 {
+        if self.depth_samples == 0 {
             0.0
         } else {
-            self.clearing_samples as f64 / self.samples as f64
+            self.clearing_samples as f64 / self.depth_samples as f64
+        }
+    }
+
+    /// Whether any sample in this ledger measured depth. When false, every
+    /// depth-qualified figure is absent rather than zero, and must be rendered that way.
+    #[must_use]
+    pub fn has_depth_measurement(&self) -> bool {
+        self.depth_samples > 0
+    }
+
+    /// Fraction of depth-measuring samples whose leading rate could not be traded.
+    #[must_use]
+    pub fn untradeable_leader_rate(&self) -> f64 {
+        if self.depth_samples == 0 {
+            0.0
+        } else {
+            self.untradeable_leader_samples as f64 / self.depth_samples as f64
         }
     }
 }
@@ -685,6 +798,15 @@ mod tests {
             sol_price_usd: 91.0,
             pools_ready: 83,
             sweep_us: 6000,
+            // Deep enough to trade by default: these fixtures exist to exercise the
+            // statistics, and a sample with no tradeable cycle is its own case below.
+            tradeable_edge_bps: Some(edge),
+            tradeable_dislocation_bps: Some(edge + 2.0),
+            tradeable_fee_bps: Some(2.0),
+            tradeable_depth_usd: Some(1234.0),
+            tradeable_route: "SOL -> USDC -> SOL".into(),
+            stale_excluded: 0,
+            depth_measured: true,
         }
     }
 
@@ -961,5 +1083,117 @@ mod tests {
         assert_eq!(l.hours_observed().unwrap(), 0.0);
         assert_eq!(l.fill_percentiles().unwrap().taken_net_p50, 0.0);
     }
-}
 
+    #[test]
+    fn a_sample_with_no_tradeable_cycle_records_null_not_zero() {
+        // The market showed a 40 bps rate with nothing behind it. That is not a
+        // 40 bps opportunity, and it is not a 0 bps one either — it is an absence,
+        // and it has to survive the round trip through SQLite as one.
+        let l = Ledger::open_in_memory().unwrap();
+        let mut s = sweep(40.0);
+        s.tradeable_edge_bps = None;
+        s.tradeable_dislocation_bps = None;
+        s.tradeable_fee_bps = None;
+        s.tradeable_depth_usd = None;
+        s.tradeable_route = String::new();
+        s.clearing = 0;
+        l.record_sweep(&s).unwrap();
+
+        let got = l.summary().unwrap();
+        assert_eq!(got.depth_samples, 1, "the sample still counts as measured");
+        assert_eq!(got.tradeable_samples, 0, "nothing was tradeable in it");
+        assert_eq!(got.clearing_samples, 0, "an untradeable rate does not clear");
+        assert_eq!(got.clearing_rate(), 0.0);
+        assert_eq!(got.untradeable_leader_samples, 1, "the gap must be counted, not hidden");
+        assert!(
+            (got.marginal_best_edge_bps - 40.0).abs() < 1e-9,
+            "the marginal rate is still reported, as a diagnostic"
+        );
+        assert_eq!(got.best_edge_bps, 0.0, "no tradeable edge existed to report");
+    }
+
+    #[test]
+    fn an_untradeable_leader_does_not_reach_the_headline_or_the_histogram() {
+        let l = Ledger::open_in_memory().unwrap();
+        // One real, small, tradeable opportunity...
+        l.record_sweep(&sweep(3.0)).unwrap();
+        // ...and one enormous rate with no size behind it.
+        let mut phantom = sweep(1156.0);
+        phantom.tradeable_edge_bps = None;
+        phantom.tradeable_dislocation_bps = None;
+        phantom.tradeable_fee_bps = None;
+        phantom.clearing = 0;
+        l.record_sweep(&phantom).unwrap();
+
+        let got = l.summary().unwrap();
+        assert!(
+            (got.best_edge_bps - 3.0).abs() < 1e-9,
+            "the headline must be the tradeable 3 bps, not the phantom 1156"
+        );
+        assert!((got.marginal_best_edge_bps - 1156.0).abs() < 1e-9);
+        assert!((got.untradeable_leader_rate() - 0.5).abs() < 1e-9);
+
+        let hist = l.edge_histogram(&[0.0, 10.0, 100_000.0]).unwrap();
+        assert_eq!(hist[0].2, 1, "the tradeable 3 bps lands in the low bucket");
+        assert_eq!(hist[1].2, 0, "the phantom must not appear in the tail");
+    }
+
+    #[test]
+    fn a_ledger_written_before_depth_was_measured_still_opens_and_reports() {
+        // Migration: a sweeps table from the older build, with none of the new
+        // columns. It must gain them, keep its rows, and refuse to pass its old
+        // marginal numbers off as tradeable ones.
+        let l = Ledger::open_in_memory().unwrap();
+        l.conn
+            .execute_batch(
+                "DROP TABLE sweeps;
+                 CREATE TABLE sweeps (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    at TEXT NOT NULL DEFAULT (datetime('now')),
+                    slot INTEGER NOT NULL, evaluated INTEGER NOT NULL,
+                    clearing INTEGER NOT NULL, best_edge_bps REAL NOT NULL,
+                    best_dislocation_bps REAL NOT NULL, best_fee_bps REAL NOT NULL,
+                    best_route TEXT NOT NULL, best_venues TEXT NOT NULL,
+                    best_hops INTEGER NOT NULL, best_depth_usd REAL NOT NULL,
+                    sol_price_usd REAL NOT NULL, pools_ready INTEGER NOT NULL,
+                    sweep_us INTEGER NOT NULL);
+                 INSERT INTO sweeps
+                   (slot, evaluated, clearing, best_edge_bps, best_dislocation_bps,
+                    best_fee_bps, best_route, best_venues, best_hops, best_depth_usd,
+                    sol_price_usd, pools_ready, sweep_us)
+                 VALUES (1, 400, 1, 12.5, 14.5, 2.0, 'SOL -> USDC -> SOL', 'ORCA', 2,
+                         1000.0, 91.0, 83, 6000);",
+            )
+            .unwrap();
+
+        crate::schema::migrate(&l.conn).expect("an older ledger must migrate in place");
+
+        let got = l.summary().unwrap();
+        assert_eq!(got.samples, 1, "the old row must survive the migration");
+        assert_eq!(got.depth_samples, 0, "it never measured depth");
+        assert!(!got.has_depth_measurement());
+        assert_eq!(got.clearing_samples, 0);
+        assert_eq!(
+            got.best_edge_bps, 0.0,
+            "an old marginal number must not be promoted to a tradeable one"
+        );
+        assert!((got.marginal_best_edge_bps - 12.5).abs() < 1e-9);
+
+        // And a new row lands alongside it without disturbing the old one.
+        l.record_sweep(&sweep(4.0)).unwrap();
+        let got = l.summary().unwrap();
+        assert_eq!(got.samples, 2);
+        assert_eq!(got.depth_samples, 1);
+        assert!((got.best_edge_bps - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn excluded_stale_pools_are_counted_not_hidden() {
+        let l = Ledger::open_in_memory().unwrap();
+        let mut s = sweep(2.0);
+        s.stale_excluded = 7;
+        l.record_sweep(&s).unwrap();
+        l.record_sweep(&sweep(2.0)).unwrap();
+        assert_eq!(l.summary().unwrap().stale_excluded_max, 7);
+    }
+}

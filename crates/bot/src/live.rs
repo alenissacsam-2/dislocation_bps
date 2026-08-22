@@ -48,6 +48,30 @@ const USD_INDEX_ROUNDS: usize = 4;
 /// Rows kept on the dashboard leaderboard.
 const LEADERBOARD_ROWS: usize = 12;
 
+/// Slots a pool may go unheard-from before the sweep stops quoting it.
+///
+/// # Why this is deliberately loose
+///
+/// The obvious setting is tight — a minute or two — on the reasoning that a dropped
+/// subscription should be caught fast. Measured, that is the wrong trade. `reconcile()`
+/// already re-reads every watched account every 180 s and folds it back in, which
+/// refreshes each pool's slot whether or not it traded. So a tight guard spends most
+/// of its time excluding pools that the last reconcile *just proved correct*, purely
+/// for the crime of being quiet since.
+///
+/// At 300 slots that cost was measured directly: 37% of sweeps dropped ~40 of 84
+/// pools, and cycles priced fell from ~1260 to ~600. Losing a third of the cycle graph
+/// understates every rate the instrument reports, and understates it invisibly — which
+/// is a worse failure for a measurement than the 60 s of extra staleness it was buying
+/// against a bound reconcile already holds at 180 s.
+///
+/// So this is set above the reconcile cadence: it fires only once reconcile itself has
+/// stopped repairing, which is the failure that genuinely has no other backstop. In
+/// normal operation it excludes nothing, and a non-zero `stale_excluded` becomes a real
+/// signal rather than routine noise. `the_staleness_guard_does_not_fire_while_reconcile_is_working`
+/// in `main.rs` pins that relationship so tightening one without the other fails a test.
+pub const MAX_STALE_LAG_SLOTS: u64 = 1800;
+
 /// What the bot knows about one watched pool beyond its current state.
 enum Venue {
     /// Everything needed is in the pool account, including the fee.
@@ -174,6 +198,11 @@ pub struct AuditProbe {
     pub pair: String,
     pub label: String,
     pub venue: String,
+    /// The pool being probed. When the router's own route runs through this exact
+    /// account and still quotes less output, the disagreement cannot be blamed on it
+    /// having priced a different pool — which makes it the strongest evidence a
+    /// decode fault can produce.
+    pub pool_b58: String,
     pub from_b58: String,
     pub to_b58: String,
     pub amount_in: u128,
@@ -196,16 +225,39 @@ pub struct ReconcileReport {
 #[derive(Debug, Clone, Default)]
 pub struct Sweep {
     pub evaluated: u64,
+    /// Cycles that cleared their fees **and** can absorb the capital. Counted over
+    /// every cycle priced, not over the truncated leaderboard.
+    pub clearing: u64,
+    /// The leaderboard, grouped: tradeable rows first, then rate-only rows, each
+    /// group ordered by edge. A display list — `best` and `tradeable` are computed
+    /// over everything and never depend on this truncation.
     pub rows: Vec<EdgeRow>,
+    /// Highest marginal rate anywhere, whether or not any size fits behind it.
+    /// A diagnostic, not a headline.
+    pub best: Option<EdgeRow>,
+    /// Highest rate among cycles deep enough to take the capital. `None` when nothing
+    /// qualifies — which is a real answer and must never be rendered as zero.
+    pub tradeable: Option<EdgeRow>,
     pub opportunities: Vec<LiveOpportunity>,
     pub duration_us: u64,
     pub slot: u64,
+    /// Pools left out of this pass for lagging too far behind the newest slot.
+    pub stale_excluded: usize,
+    /// Depth a cycle needed to count as tradeable here, in USD.
+    pub tradeable_min_usd: f64,
 }
 
 impl Sweep {
+    /// The marginal leader: best rate, ignoring whether anything can be traded at it.
     #[must_use]
     pub fn best(&self) -> Option<&EdgeRow> {
-        self.rows.first()
+        self.best.as_ref()
+    }
+
+    /// The best rate that actually has the capital's worth of depth behind it.
+    #[must_use]
+    pub fn tradeable(&self) -> Option<&EdgeRow> {
+        self.tradeable.as_ref()
     }
 }
 
@@ -536,9 +588,24 @@ impl LiveMarket {
     }
 
     /// One full pass over every cycle from every base mint.
+    ///
+    /// # Two searches, two different questions
+    ///
+    /// `survey_from_base` prices every cycle at infinitesimal size: that is a *rate*,
+    /// and it is what the leaderboard and the ledger's edge statistics are built from.
+    /// `find_from_base` sizes cycles against real capital and real tick depth, and
+    /// only its results ever become fills.
+    ///
+    /// These disagree far more than they look like they should, which is why
+    /// [`Sweep::tradeable`] exists beside [`Sweep::best`]. A cycle whose downstream leg
+    /// is parked at the end of its tick has an enormous marginal rate with nearly no
+    /// capacity behind it; ranked on rate alone it leads the board while being
+    /// untradeable. Publishing only the marginal maximum overstated this instrument's
+    /// headline edge for its whole history before the two were split apart.
     pub fn sweep(&self, tradable_usd: f64, max_hops: usize) -> Sweep {
         let started = Instant::now();
-        let snap = self.store.snapshot();
+        // Pools we have not heard from in a while are dropped rather than quoted.
+        let (snap, stale_excluded) = self.store.snapshot_fresh(MAX_STALE_LAG_SLOTS);
         let mut rows: Vec<EdgeRow> = Vec::new();
         let mut opportunities: Vec<LiveOpportunity> = Vec::new();
         let mut evaluated: u64 = 0;
@@ -559,13 +626,12 @@ impl LiveMarket {
                     edge_bps: sc.edge_bps,
                     dislocation_bps: sc.dislocation_bps(),
                     fee_bps: sc.cycle.fee_bps(),
-                    // Largest input the route can price exactly, in dollars. A
-                    // constant-product leg is unbounded in principle, so it is capped
-                    // at the pool's own input reserve — an unbounded number rendered
-                    // as depth would read as infinite liquidity, which is not a thing.
-                    depth_usd: sc.cycle.legs.first().map_or(0.0, |l| {
-                        l.max_in.min(l.reserve_in) as f64 * usd_per_unit
-                    }),
+                    // The bottleneck across every leg, in dollars — not the entry
+                    // pool's own reserve, which is almost never the binding one. A
+                    // constant-product leg is unbounded in principle and so is capped
+                    // at its input reserve; infinite liquidity is not a thing.
+                    depth_usd: cb_core::path::cycle_depth_base(&sc.cycle.legs) as f64
+                        * usd_per_unit,
                     slot: sc.cycle.slot(&snap),
                 });
             }
@@ -590,16 +656,40 @@ impl LiveMarket {
             }
         }
 
+        // Counted before truncation: the old count was capped by the size of the
+        // leaderboard, so a market with fifty clearing cycles reported twelve.
+        let clearing = rows
+            .iter()
+            .filter(|r| r.edge_bps > 0.0 && r.depth_usd >= tradable_usd)
+            .count() as u64;
+
         rows.sort_by(|a, b| b.edge_bps.total_cmp(&a.edge_bps));
-        rows.truncate(LEADERBOARD_ROWS);
+        let best = rows.first().cloned();
+        let tradeable = rows.iter().find(|r| r.depth_usd >= tradable_usd).cloned();
+
+        // Keep the head of both groups. The board shows what can be traded above what
+        // is only a rate, and neither group can truncate the other out of existence.
+        let mut kept: Vec<EdgeRow> = Vec::with_capacity(LEADERBOARD_ROWS * 2);
+        kept.extend(
+            rows.iter().filter(|r| r.depth_usd >= tradable_usd).take(LEADERBOARD_ROWS).cloned(),
+        );
+        kept.extend(
+            rows.iter().filter(|r| r.depth_usd < tradable_usd).take(LEADERBOARD_ROWS).cloned(),
+        );
+
         opportunities.sort_by(|a, b| b.gross_profit_usd.total_cmp(&a.gross_profit_usd));
 
         Sweep {
             evaluated,
-            rows,
+            clearing,
+            rows: kept,
+            best,
+            tradeable,
             opportunities,
             duration_us: started.elapsed().as_micros() as u64,
             slot: snap.newest_slot(),
+            stale_excluded,
+            tradeable_min_usd: tradable_usd,
         }
     }
 
@@ -825,6 +915,7 @@ impl LiveMarket {
                     ),
                     label: label.clone(),
                     venue: format!("{} {}", p.dex.tag(), fee_label(p.fee_ppm)),
+                    pool_b58: bs58::encode(p.id.0).into_string(),
                     from_b58: bs58::encode(from).into_string(),
                     to_b58: bs58::encode(to).into_string(),
                     amount_in,
@@ -1118,5 +1209,123 @@ mod tests {
         ]);
         let best = m.sweep(4.80, 3).rows.into_iter().next().unwrap();
         assert!(best.depth_usd > 5.0, "a tick that cannot hold $5 is useless to us");
+    }
+
+    /// Same pool, far less liquidity behind it. The price — and so the marginal rate —
+    /// is unchanged, because a rate is a ratio of reserves and ratios do not scale.
+    /// Only the depth moves.
+    fn thinned(mut p: PoolState, divisor: u128) -> PoolState {
+        use cb_core::types::PoolMath;
+        if let PoolMath::Concentrated { liquidity, .. } = &mut p.math {
+            *liquidity /= divisor;
+        }
+        p
+    }
+
+    fn at_slot(mut p: PoolState, slot: u64) -> PoolState {
+        p.slot = slot;
+        p
+    }
+
+    #[test]
+    fn the_headline_edge_ignores_cycles_that_cannot_absorb_the_capital() {
+        // A 20 bps gap across two venues that between them hold a couple of cents.
+        // The rate is real and the opportunity is not: nobody can put $4.80 through it.
+        // Ranked on rate alone this leads the board, which is exactly how a 1156 bps
+        // "edge" that never filled once got onto the dashboard for hours.
+        let m = market_with(vec![
+            thinned(sol_usdc(1, 5_569_625_019_338_410_820, 100), 1_000_000_000),
+            thinned(sol_usdc(2, 5_575_194_644_357_749_445, 200), 1_000_000_000),
+        ]);
+        let sweep = m.sweep(4.80, 3);
+
+        let best = sweep.best().expect("the rate is still measured and still reported");
+        assert!(best.edge_bps > 0.0, "the marginal rate really is positive");
+        assert!(
+            best.depth_usd < 4.80,
+            "the whole point of the fixture is that it is too thin, got ${}",
+            best.depth_usd
+        );
+        assert!(
+            sweep.tradeable().is_none(),
+            "nothing here can take the capital, so there is no tradeable headline"
+        );
+        assert_eq!(sweep.clearing, 0, "a rate with no size behind it does not clear");
+    }
+
+    #[test]
+    fn a_cycle_deep_enough_to_trade_becomes_the_headline() {
+        let m = market_with(vec![
+            sol_usdc(1, 5_569_625_019_338_410_820, 100),
+            sol_usdc(2, 5_575_194_644_357_749_445, 200),
+        ]);
+        let sweep = m.sweep(4.80, 3);
+
+        let tradeable = sweep.tradeable().expect("a $24M pair can absorb $4.80");
+        assert!(tradeable.depth_usd >= 4.80);
+        assert!(tradeable.edge_bps > 0.0);
+        assert_eq!(
+            tradeable.route,
+            sweep.best().unwrap().route,
+            "when the leader is deep, both numbers name the same route"
+        );
+        assert!(sweep.clearing > 0);
+    }
+
+    #[test]
+    fn depth_is_the_bottleneck_leg_not_the_one_we_enter_through() {
+        // Enter through the deep pool, exit through the thin one. The reported depth
+        // has to describe the exit, which is the leg that actually binds.
+        let m = market_with(vec![
+            sol_usdc(1, 5_569_625_019_338_410_820, 100),
+            thinned(sol_usdc(2, 5_575_194_644_357_749_445, 200), 100_000),
+        ]);
+        let sweep = m.sweep(4.80, 3);
+        let best = sweep.best().expect("a route must be reported");
+        let deep_alone = m.sweep(0.0, 3);
+        let unthinned_depth = deep_alone
+            .rows
+            .iter()
+            .map(|r| r.depth_usd)
+            .fold(0.0f64, f64::max);
+        assert!(
+            best.depth_usd < unthinned_depth,
+            "the thin leg must pull the cycle's depth down, got ${} against ${}",
+            best.depth_usd,
+            unthinned_depth
+        );
+    }
+
+    #[test]
+    fn a_pool_that_has_gone_quiet_is_left_out_of_the_sweep_and_counted() {
+        // One venue heard from recently, one silent for far longer than the guard
+        // tolerates. A cycle needs both, so excluding the stale one leaves no cycle —
+        // which is the correct outcome: no quote at all beats a quote against a price
+        // that may have moved without us.
+        let fresh = at_slot(sol_usdc(1, 5_569_625_019_338_410_820, 100), 100_000);
+        let silent = at_slot(
+            sol_usdc(2, 5_575_194_644_357_749_445, 200),
+            100_000 - (MAX_STALE_LAG_SLOTS + 1),
+        );
+        let m = market_with(vec![fresh, silent]);
+        let sweep = m.sweep(4.80, 3);
+
+        assert_eq!(sweep.stale_excluded, 1, "the lagging pool must be counted, not hidden");
+        assert_eq!(sweep.evaluated, 0, "one venue alone makes no round trip");
+        assert!(sweep.best().is_none());
+    }
+
+    #[test]
+    fn a_market_that_is_merely_slow_is_not_treated_as_stale() {
+        // Both pools equally old. Nothing lags anything, so nothing is excluded — the
+        // guard measures relative lag, not absolute age, precisely so a quiet market
+        // does not silently stop being measured.
+        let m = market_with(vec![
+            at_slot(sol_usdc(1, 5_569_625_019_338_410_820, 100), 5),
+            at_slot(sol_usdc(2, 5_575_194_644_357_749_445, 200), 5),
+        ]);
+        let sweep = m.sweep(4.80, 3);
+        assert_eq!(sweep.stale_excluded, 0);
+        assert!(sweep.evaluated > 0, "a slow market must still be swept");
     }
 }

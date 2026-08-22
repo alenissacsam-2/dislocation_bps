@@ -51,6 +51,41 @@ impl PoolStore {
         Snapshot::new(self.pools.iter().map(|r| *r.value()).collect())
     }
 
+    /// A snapshot with lagging pools left out, and the count of what was left out.
+    ///
+    /// # What this does and does not prove
+    ///
+    /// For an AMM, no update means no change — so an old slot is normally a *correct*
+    /// price on a pool nobody is trading, which is exactly why a silently dropped
+    /// subscription is dangerous: it looks the same from the stream. Slot lag cannot
+    /// tell those apart, and this method does not claim to.
+    ///
+    /// What it does is bound the damage. A pool that has not been heard from in
+    /// `max_lag` slots is dropped from the search rather than quoted, so the worst a
+    /// stale quote can be is `max_lag` slots out of date instead of however long it
+    /// takes the next reconcile to notice. The cost of being wrong the other way is
+    /// small: a genuinely quiet pool sits out one sweep and returns the moment it
+    /// trades.
+    ///
+    /// The reference is the store's own newest slot, not the chain head, so this stays
+    /// correct while the RPC's head is unknown. That leaves one hole it cannot cover:
+    /// if the feed dies completely, every pool ages together and nothing ever looks
+    /// stale. Detecting *that* needs a wall clock, and belongs to the caller.
+    #[must_use]
+    pub fn snapshot_fresh(&self, max_lag: u64) -> (Snapshot, usize) {
+        let newest = self.pools.iter().map(|r| r.slot).max().unwrap_or(0);
+        let mut kept: Vec<PoolState> = Vec::with_capacity(self.pools.len());
+        let mut excluded = 0usize;
+        for r in self.pools.iter() {
+            if newest.saturating_sub(r.slot) > max_lag {
+                excluded += 1;
+            } else {
+                kept.push(*r.value());
+            }
+        }
+        (Snapshot::new(kept), excluded)
+    }
+
     /// Every pool that trades `mint`, in either position.
     #[must_use]
     pub fn pools_trading(&self, mint: &Pubkey32) -> Vec<PoolState> {
@@ -143,6 +178,30 @@ mod tests {
         // current slot 200, tolerate 10 slots of lag
         let stale = s.stale_pools(200, 10);
         assert_eq!(stale, vec![PoolId([1; 32])]);
+    }
+
+    #[test]
+    fn a_snapshot_leaves_out_pools_that_have_gone_quiet_too_long() {
+        let s = PoolStore::new();
+        s.upsert(pool(1, 10, 20, 1_000)); // current
+        s.upsert(pool(2, 20, 30, 995));   // a little behind, still trusted
+        s.upsert(pool(3, 30, 40, 400));   // far behind
+        let (snap, excluded) = s.snapshot_fresh(300);
+        assert_eq!(excluded, 1, "only the lagging pool may be dropped");
+        assert_eq!(snap.len(), 2);
+        assert!(snap.get(&PoolId([3; 32])).is_none(), "the stale pool must not be quotable");
+    }
+
+    #[test]
+    fn a_quiet_market_is_not_mistaken_for_a_stale_one() {
+        // Every pool equally old is what a slow hour looks like, not a broken feed.
+        // The reference is our own newest slot, so nothing here lags anything.
+        let s = PoolStore::new();
+        s.upsert(pool(1, 10, 20, 500));
+        s.upsert(pool(2, 20, 30, 500));
+        let (snap, excluded) = s.snapshot_fresh(10);
+        assert_eq!(excluded, 0);
+        assert_eq!(snap.len(), 2);
     }
 
     #[test]

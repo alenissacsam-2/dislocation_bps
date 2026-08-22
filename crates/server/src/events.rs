@@ -49,6 +49,27 @@ pub enum Event {
         best_edge_bps: f64,
         #[serde(default)]
         best_route: String,
+        /// Best edge among cycles that can actually absorb the run's capital.
+        ///
+        /// `null` when nothing qualifies, and it must render as an em dash rather than
+        /// a zero — "no tradeable cycle right now" and "a tradeable cycle at 0 bps" are
+        /// different states of the market. `best_edge_bps` above is the marginal
+        /// maximum over every cycle regardless of depth, which is routinely far larger
+        /// and is a diagnostic, not an opportunity.
+        #[serde(default)]
+        tradeable_edge_bps: Option<f64>,
+        #[serde(default)]
+        tradeable_route: String,
+        /// Depth a cycle needs before it counts as tradeable, in USD.
+        #[serde(default)]
+        tradeable_min_usd: f64,
+        /// Pools the last sweep refused to quote because they had gone quiet too long.
+        #[serde(default)]
+        stale_excluded: usize,
+        /// The feed has been silent long enough that the ledger has stopped recording.
+        /// Sweeps continue; the numbers on screen are the last ones observed.
+        #[serde(default)]
+        feed_stalled: bool,
         #[serde(default)]
         best_hops: usize,
         /// Total fee cost of the best route, in bps. Compare against the edge to see
@@ -97,6 +118,10 @@ pub enum Event {
     #[serde(rename_all = "camelCase")]
     Routes {
         rows: Vec<RouteRow>,
+        /// Depth a row needs to be tradeable rather than a quoted rate, in USD. Rows
+        /// at or above it are shown as tradeable; the rest are rates with no size.
+        #[serde(default)]
+        tradeable_min_usd: f64,
         /// Cycles priced in this sweep.
         evaluated: u64,
         sweep_us: u64,
@@ -248,6 +273,11 @@ mod tests {
             pools_tracked: 0,
             sol_price_usd: 76.97,
             uptime_secs: 0,
+            tradeable_edge_bps: None,
+            tradeable_route: String::new(),
+            tradeable_min_usd: 0.0,
+            stale_excluded: 0,
+            feed_stalled: false,
             updates: 0,
             dropped: 0,
             reconnects: 0,

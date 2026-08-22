@@ -190,6 +190,59 @@ pub fn search_ceiling(legs: &[Leg]) -> u128 {
     legs.first().map_or(0, |l| l.reserve_in.min(l.max_in))
 }
 
+/// Largest input the whole cycle can absorb while every leg still quotes exactly,
+/// in units of the base (first leg's input) mint.
+///
+/// [`search_ceiling`] answers this for the *first* leg only, which is the wrong
+/// question. The binding constraint is usually downstream: a cycle whose second hop
+/// sits at the end of its tick has almost no capacity no matter how deep the pool you
+/// enter through, and reporting the entry pool's depth makes it look tradeable when
+/// it is not. That gap is exactly how a route with no size behind it can lead a
+/// leaderboard ranked by marginal rate.
+///
+/// Each leg's own capacity is `min(max_in, reserve_in)`, denominated in *that leg's*
+/// input mint. To compare them they are converted back to base units through the
+/// marginal rates of the legs ahead of them:
+///
+/// ```text
+/// depth_base = min_i ( cap_i / prod_{j<i} r_j ),   r_j = gamma_j * out_j / in_j
+/// ```
+///
+/// Exact to first order, one pass, no iteration. It is deliberately an *upper* bound
+/// on tradeable size: a real fill moves the price against itself, so [`optimal_input`]
+/// — which solves the composed curve exactly — always sizes at or under this. A depth
+/// figure that errs high is honest about capacity while the sizing stays exact.
+///
+/// `f64` for the same reason as [`marginal_edge_bps`]: this is a reporting statistic,
+/// never a trade decision.
+#[must_use]
+pub fn cycle_depth_base(legs: &[Leg]) -> u128 {
+    if legs.is_empty() {
+        return 0;
+    }
+    // Rate from one base unit into the current leg's input mint.
+    let mut rate = 1.0f64;
+    let mut depth = f64::INFINITY;
+
+    for leg in legs {
+        if leg.reserve_in == 0 || leg.reserve_out == 0 || rate <= 0.0 || rate.is_nan() {
+            return 0;
+        }
+        let cap = leg.max_in.min(leg.reserve_in) as f64;
+        depth = depth.min(cap / rate);
+        let gamma = (1_000_000.0 - f64::from(leg.fee_ppm)) / 1_000_000.0;
+        rate *= gamma * (leg.reserve_out as f64) / (leg.reserve_in as f64);
+    }
+
+    if depth.is_nan() || depth <= 0.0 {
+        return 0;
+    }
+    if depth >= u128::MAX as f64 {
+        return u128::MAX;
+    }
+    depth as u128
+}
+
 /// Largest size at which every leg still quotes, at or below `hi`.
 ///
 /// Feasibility is monotone in size, so this is a plain binary search. Returns 0 when
@@ -494,5 +547,49 @@ mod tests {
         let boundary = largest_feasible(&legs, 1_000_000);
         assert!(chain_quote(&legs, boundary).is_some(), "the boundary itself must be feasible");
         assert!(chain_quote(&legs, boundary + 1).is_none(), "one past it must not be");
+    }
+
+    #[test]
+    fn a_bottleneck_downstream_leg_bounds_the_reported_depth() {
+        // Enter through an enormous pool, exit through a tick with almost nothing in
+        // it. The first leg alone says a billion; the cycle can absorb about a
+        // thousand. Reporting the former is how an untradeable route leads a board.
+        let legs = [
+            leg(1_000_000_000, 1_000_000_000),
+            Leg::bounded(1_000_000_000, 1_000_000_000, FEE, 1_000),
+        ];
+        let depth = cycle_depth_base(&legs);
+        assert_eq!(search_ceiling(&legs), 1_000_000_000, "the first leg is not the constraint");
+        assert!(
+            (990..=1_010).contains(&depth),
+            "the downstream tick bounds the cycle, got {depth}"
+        );
+    }
+
+    #[test]
+    fn depth_of_a_single_unbounded_leg_is_its_own_reserve() {
+        assert_eq!(cycle_depth_base(&[leg(1_000_000, 2_000_000)]), 1_000_000);
+    }
+
+    #[test]
+    fn depth_never_promises_more_than_the_sizing_search_will_take() {
+        // Depth is a first-order upper bound; the exact search must land at or under
+        // it. If it ever came out low, the instrument would understate capacity and
+        // discard real opportunities.
+        let legs = [
+            leg(1_000_000, 1_050_000),
+            Leg::bounded(1_000_000, 1_050_000, FEE, 500),
+        ];
+        let depth = cycle_depth_base(&legs);
+        let sized = optimal_input(&legs, u128::MAX).expect("this cycle profits");
+        assert!(sized <= depth, "sizing took {sized} against a reported depth of {depth}");
+    }
+
+    #[test]
+    fn a_cycle_with_no_usable_leg_has_no_depth() {
+        assert_eq!(cycle_depth_base(&[]), 0);
+        assert_eq!(cycle_depth_base(&[leg(0, 100)]), 0);
+        assert_eq!(cycle_depth_base(&[leg(100, 0)]), 0);
+        assert_eq!(cycle_depth_base(&[Leg::bounded(1_000, 1_000, FEE, 0)]), 0);
     }
 }
