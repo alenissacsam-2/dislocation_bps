@@ -10,3 +10,4 @@ cb-core = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true }
+serde = { workspace = true }

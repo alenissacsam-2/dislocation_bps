@@ -8,6 +8,20 @@ use anyhow::Result;
 use cb_core::types::Opportunity;
 use rusqlite::Connection;
 
+/// Account sizes the run prices every opportunity against, in USD.
+///
+/// # Why a ladder and not a single book size
+///
+/// The question "would more capital help?" cannot be answered by a run at one book
+/// size. Profit is concave in trade size and capped by cycle depth, so what a $5 run
+/// observes says nothing reliable about a $100 one — the honest way to find out is to
+/// price the *same* opportunity at several sizes as it happens, and record all of them.
+///
+/// $100 is the rung that matters for a real starting book; the two above it exist to
+/// show where the depth ceiling bites, because a ladder that stops climbing is the
+/// measurement that says borrowed capital would not have helped.
+pub const CAPITAL_LADDER_USD: [f64; 3] = [100.0, 1_000.0, 10_000.0];
+
 pub struct Ledger {
     conn: Connection,
 }
@@ -25,6 +39,22 @@ impl Ledger {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         schema::migrate(&conn)?;
+        Ok(Self { conn })
+    }
+
+    /// Open an existing ledger for reading only.
+    ///
+    /// For readers that are not the run: the dashboard, a report, anything that must be
+    /// unable to alter the measurement. Deliberately does **not** migrate — a reader
+    /// that can rewrite the schema is a reader that can corrupt a run in flight — and
+    /// deliberately fails rather than creating the file, because a missing ledger is a
+    /// fact worth surfacing and an empty new one looks like a run that found nothing.
+    pub fn open_read_only(path: &str) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
         Ok(Self { conn })
     }
 
@@ -94,8 +124,9 @@ impl Ledger {
             "INSERT INTO paper_fills
              (slot, route, venues, hops, edge_bps, dislocation_bps, fee_bps, size_usd,
               optimal_size_usd, gross_usd, profit_at_optimal_usd, tip_usd, net_usd,
-              taken, skipped_reason, cycle_key)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+              taken, skipped_reason, cycle_key,
+              profit_at_100_usd, profit_at_1k_usd, profit_at_10k_usd)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             rusqlite::params![
                 f.slot as i64,
                 f.route,
@@ -113,6 +144,9 @@ impl Ledger {
                 i64::from(f.taken),
                 f.skipped_reason.as_deref(),
                 f.cycle_key,
+                f.profit_at_capital_usd.map(|l| l[0]),
+                f.profit_at_capital_usd.map(|l| l[1]),
+                f.profit_at_capital_usd.map(|l| l[2]),
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -407,7 +441,8 @@ impl Ledger {
         let _guard = self.conn.unchecked_transaction()?;
         let mut stmt = self.conn.prepare(
             "WITH k AS (
-                 SELECT id, slot, net_usd, profit_at_optimal_usd, optimal_size_usd, taken,
+                 SELECT id, at, slot, net_usd, profit_at_optimal_usd, optimal_size_usd, taken,
+                        profit_at_100_usd, profit_at_1k_usd, profit_at_10k_usd, skipped_reason,
                         COALESCE(NULLIF(cycle_key, ''), route || '|' || venues) AS ck
                  FROM paper_fills
              ),
@@ -422,10 +457,23 @@ impl Ledger {
                  SELECT *, SUM(brk) OVER (PARTITION BY ck ORDER BY id) AS ep FROM m
              )
              SELECT MAX(profit_at_optimal_usd), MAX(net_usd), MAX(taken), COUNT(*),
-                    MAX(slot) - MIN(slot), MAX(optimal_size_usd)
-             FROM e GROUP BY ck, ep",
+                    MAX(slot) - MIN(slot), MAX(optimal_size_usd), MIN(at),
+                    MAX(profit_at_100_usd), MAX(profit_at_1k_usd), MAX(profit_at_10k_usd),
+                    MAX(skipped_reason LIKE 'contested%')
+             FROM e GROUP BY ck, ep ORDER BY MIN(id)",
         )?;
         let rows = stmt.query_map([gap_slots as i64], |r| {
+            // The ladder survives as `None` unless every rung was measured. A partially
+            // filled ladder would silently read a missing rung as a zero, which is the
+            // one substitution this table exists to prevent.
+            let ladder = match (
+                r.get::<_, Option<f64>>(7)?,
+                r.get::<_, Option<f64>>(8)?,
+                r.get::<_, Option<f64>>(9)?,
+            ) {
+                (Some(a), Some(b), Some(c)) => Some([a, b, c]),
+                _ => None,
+            };
             Ok(EpisodeRow {
                 pie_usd: r.get(0)?,
                 best_net_usd: r.get(1)?,
@@ -433,9 +481,130 @@ impl Ledger {
                 detections: r.get::<_, i64>(3)? as u64,
                 lifetime_slots: r.get::<_, i64>(4)?.max(0) as u64,
                 optimal_size_usd: r.get(5)?,
+                first_at: r.get(6)?,
+                ladder,
+                contested: r.get::<_, Option<i64>>(10)?.unwrap_or(0) == 1,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Whether the contest classifier is measuring competition or only measuring size.
+    ///
+    /// # The claim being audited
+    ///
+    /// Opportunities above a profit threshold are declined on the assumption that a
+    /// faster searcher has already seen the same cycle and would win the race. That
+    /// assumption decides the large majority of the value this instrument ever sees,
+    /// and nothing has ever checked it. It is also, as written, a threshold on profit —
+    /// so by construction it cannot distinguish "contested" from "big", and the two
+    /// only coincide if big opportunities really are the contested ones.
+    ///
+    /// # What survival proves, and what it does not
+    ///
+    /// An opportunity still quotable in a later slot was, in that window, taken by
+    /// nobody — we are in paper mode, so we did not take it either. Persistence is
+    /// therefore direct evidence that the race was not lost. The converse is weaker:
+    /// vanishing within the slot could mean a competitor took it *or* that the price
+    /// simply moved, and this cannot tell those apart.
+    ///
+    /// So the honest reading is the **comparison**. If declined opportunities survive
+    /// about as often as accepted ones, the threshold is sorting by size and calling it
+    /// competition.
+    pub fn contest_audit(&self, gap_slots: u64) -> Result<ContestAudit> {
+        let mut a = ContestAudit::default();
+        for e in self.episode_rows(gap_slots)? {
+            let survived = e.lifetime_slots > 0;
+            if e.contested {
+                a.contested_episodes += 1;
+                a.contested_slots += e.lifetime_slots;
+                a.declined_usd += e.pie_usd.max(0.0);
+                if survived {
+                    a.contested_survived += 1;
+                    a.declined_but_survived_usd += e.pie_usd.max(0.0);
+                }
+            } else {
+                a.uncontested_episodes += 1;
+                a.uncontested_slots += e.lifetime_slots;
+                if survived {
+                    a.uncontested_survived += 1;
+                }
+            }
+        }
+        Ok(a)
+    }
+
+    /// Cumulative paper P&L over the life of the run, as a series ready to plot.
+    ///
+    /// # Why this is built from episodes rather than fills
+    ///
+    /// A gap that stands for a minute is re-detected on every sweep. Accumulating
+    /// `net_usd` across those rows draws a line climbing steadily through money that was
+    /// only ever available once, and the steeper that line the more wrong it is. Each
+    /// episode contributes its best single detection, exactly once, on the timestamp it
+    /// opened — so the curve steps when an opportunity arrives and stays flat when the
+    /// same one is merely still visible.
+    ///
+    /// Three series come back together because the interesting quantity is the distance
+    /// between them: `realised` is what this run's book actually reached, the ladder is
+    /// what larger books would have reached from the identical opportunities, and
+    /// `at_optimal` is the ceiling at any capital.
+    ///
+    /// `max_points` downsamples for the plot. The last point is always kept, so the
+    /// totals a caller reads off the tail are exact rather than whatever the stride
+    /// happened to land on.
+    pub fn equity_curve(&self, gap_slots: u64, max_points: usize) -> Result<Vec<EquityPoint>> {
+        let episodes = self.episode_rows(gap_slots)?;
+        let mut curve: Vec<EquityPoint> = Vec::with_capacity(episodes.len());
+        let mut acc = EquityPoint::default();
+        for e in &episodes {
+            acc.episodes += 1;
+            acc.at_optimal_usd += e.pie_usd.max(0.0);
+            if e.taken && e.best_net_usd > 0.0 {
+                acc.realised_usd += e.best_net_usd;
+                acc.taken += 1;
+            }
+            match e.ladder {
+                Some(l) => {
+                    for (slot, v) in acc.at_capital_usd.iter_mut().zip(l) {
+                        *slot += v.max(0.0);
+                    }
+                    acc.ladder_episodes += 1;
+                }
+                None => acc.unmeasured_episodes += 1,
+            }
+            acc.at.clone_from(&e.first_at);
+            curve.push(acc.clone());
+        }
+
+        if max_points == 0 || curve.len() <= max_points {
+            return Ok(curve);
+        }
+        let stride = curve.len().div_ceil(max_points);
+        let last = curve.len() - 1;
+        Ok(curve
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| i % stride == 0 || *i == last)
+            .map(|(_, p)| p)
+            .collect())
+    }
+
+    /// What this run's opportunities would have paid accounts of several sizes.
+    ///
+    /// The direct answer to "would a bigger book have made money", measured rather than
+    /// extrapolated: every rung prices the *same* episodes, so the gaps between them are
+    /// what capital actually buys. A ladder that flattens between two rungs is the
+    /// finding — it says depth, not capital, is what the run ran out of.
+    pub fn capital_ladder(&self, gap_slots: u64) -> Result<CapitalLadder> {
+        let tail = self.equity_curve(gap_slots, 0)?.pop().unwrap_or_default();
+        Ok(CapitalLadder {
+            rungs: CAPITAL_LADDER_USD.iter().copied().zip(tail.at_capital_usd).collect(),
+            at_optimal_usd: tail.at_optimal_usd,
+            realised_usd: tail.realised_usd,
+            measured_episodes: tail.ladder_episodes,
+            unmeasured_episodes: tail.unmeasured_episodes,
+        })
     }
 
     /// The routes that clear most often, with what they were worth.
@@ -535,6 +704,9 @@ pub struct FillRecord {
     pub skipped_reason: Option<String>,
     /// Rotation-invariant identity of the loop. See `Cycle::canonical_key`.
     pub cycle_key: String,
+    /// What this opportunity would have paid at each rung of [`CAPITAL_LADDER_USD`].
+    /// `None` when the run did not price the ladder — recorded as NULL, never as zero.
+    pub profit_at_capital_usd: Option<[f64; 3]>,
 }
 
 /// One episode: a gap, from the moment it opened to the moment it closed.
@@ -550,6 +722,117 @@ struct EpisodeRow {
     lifetime_slots: u64,
     /// Capital the pie would have required.
     optimal_size_usd: f64,
+    /// When the episode opened. Its first sighting, not its best one — the curve steps
+    /// when an opportunity arrives.
+    first_at: String,
+    /// Best value at each rung of [`CAPITAL_LADDER_USD`]. `None` unless every rung was
+    /// measured.
+    ladder: Option<[f64; 3]>,
+    /// Whether any detection in this episode was declined as a race we would lose.
+    contested: bool,
+}
+
+/// Evidence for or against the contest classifier, from the run's own data.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContestAudit {
+    pub contested_episodes: u64,
+    /// Of those, ones still quotable at least a slot later — which nobody had taken.
+    pub contested_survived: u64,
+    contested_slots: u64,
+    pub uncontested_episodes: u64,
+    pub uncontested_survived: u64,
+    uncontested_slots: u64,
+    /// Whole-pie value the classifier declined.
+    pub declined_usd: f64,
+    /// The part of it that outlived the slot it was declined in.
+    pub declined_but_survived_usd: f64,
+}
+
+impl ContestAudit {
+    /// Share of declined opportunities that were still there a slot later.
+    #[must_use]
+    pub fn contested_survival_rate(&self) -> f64 {
+        if self.contested_episodes == 0 {
+            0.0
+        } else {
+            self.contested_survived as f64 / self.contested_episodes as f64
+        }
+    }
+
+    #[must_use]
+    pub fn uncontested_survival_rate(&self) -> f64 {
+        if self.uncontested_episodes == 0 {
+            0.0
+        } else {
+            self.uncontested_survived as f64 / self.uncontested_episodes as f64
+        }
+    }
+
+    #[must_use]
+    pub fn contested_mean_slots(&self) -> f64 {
+        if self.contested_episodes == 0 {
+            0.0
+        } else {
+            self.contested_slots as f64 / self.contested_episodes as f64
+        }
+    }
+
+    #[must_use]
+    pub fn uncontested_mean_slots(&self) -> f64 {
+        if self.uncontested_episodes == 0 {
+            0.0
+        } else {
+            self.uncontested_slots as f64 / self.uncontested_episodes as f64
+        }
+    }
+
+    /// Whether there is enough of both groups for the comparison to mean anything.
+    ///
+    /// Below this the two rates are noise, and a report that printed them anyway would
+    /// invite exactly the conclusion the audit exists to avoid drawing prematurely.
+    #[must_use]
+    pub fn has_enough_evidence(&self) -> bool {
+        self.contested_episodes >= 20 && self.uncontested_episodes >= 20
+    }
+}
+
+/// One point on the run's cumulative P&L curve.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EquityPoint {
+    /// UTC timestamp of the episode that produced this step.
+    pub at: String,
+    /// Cumulative net across episodes this run's book would have taken, once each.
+    pub realised_usd: f64,
+    /// The same episodes valued at each rung of [`CAPITAL_LADDER_USD`], before tip.
+    pub at_capital_usd: [f64; 3],
+    /// Cumulative whole-pie value at unlimited capital: the ceiling.
+    pub at_optimal_usd: f64,
+    /// Distinct opportunities seen so far.
+    pub episodes: u64,
+    /// Of those, ones the paper trader acted on.
+    pub taken: u64,
+    /// Episodes that carried a full ladder measurement, and ones that did not. The
+    /// second number is the honest caveat on the first: ladder totals describe only the
+    /// episodes that measured it.
+    pub ladder_episodes: u64,
+    pub unmeasured_episodes: u64,
+}
+
+/// What a run's opportunities were worth to accounts of several sizes.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapitalLadder {
+    /// `(book size in USD, what this run's episodes would have paid it)`.
+    pub rungs: Vec<(f64, f64)>,
+    /// The same episodes at unlimited capital.
+    pub at_optimal_usd: f64,
+    /// What the run's actual book took, after tip. The only figure here that is a
+    /// result rather than a counterfactual.
+    pub realised_usd: f64,
+    pub measured_episodes: u64,
+    pub unmeasured_episodes: u64,
 }
 
 /// Opportunities of one size, and how long they lasted.
@@ -828,6 +1111,9 @@ mod tests {
             taken,
             skipped_reason: if taken { None } else { Some("net negative after tip".into()) },
             cycle_key: "aabbccdd:0101>eeff0011:0202".into(),
+            // Rising, then flat: this fixture's cycle runs out of depth between $1k and
+            // $10k, which is the shape the ladder exists to expose.
+            profit_at_capital_usd: Some([0.004, 0.006, 0.006]),
         }
     }
 
@@ -1069,6 +1355,163 @@ mod tests {
         assert_eq!(e.total_net_usd, 0.0);
     }
 
+    /// The curve must step once per opportunity, not once per sighting. A gap standing
+    /// for a thousand sweeps is one step — otherwise the chart draws a steady climb
+    /// through money that was only ever there once, and the steeper it looks the more
+    /// wrong it is.
+    #[test]
+    fn the_equity_curve_steps_per_episode_not_per_detection() {
+        let l = Ledger::open_in_memory().unwrap();
+        for _ in 0..500 {
+            l.record_fill(&fill(0.004, true)).unwrap();
+        }
+        let curve = l.equity_curve(5, 0).unwrap();
+        assert_eq!(curve.len(), 1, "one standing gap is one point");
+        assert!((curve[0].realised_usd - 0.004).abs() < 1e-9);
+        assert_eq!(curve[0].episodes, 1);
+        assert_eq!(curve[0].taken, 1);
+    }
+
+    #[test]
+    fn the_curve_accumulates_across_distinct_opportunities() {
+        let l = Ledger::open_in_memory().unwrap();
+        for (i, net) in [0.001, 0.002, 0.004].into_iter().enumerate() {
+            let mut f = fill(net, true);
+            // Distinct loops, so each is its own episode.
+            f.cycle_key = format!("{i:02}aabbcc:0101>ddeeff00:0202");
+            l.record_fill(&f).unwrap();
+        }
+        let curve = l.equity_curve(5, 0).unwrap();
+        assert_eq!(curve.len(), 3);
+        assert!(curve[0].realised_usd < curve[1].realised_usd);
+        assert!((curve[2].realised_usd - 0.007).abs() < 1e-9, "cumulative, not per-point");
+        assert_eq!(curve[2].episodes, 3);
+    }
+
+    /// Downsampling must never move the total. A caller reading the run's P&L off the
+    /// tail of a plotted curve has to get the same number the full curve ends on.
+    #[test]
+    fn downsampling_keeps_the_final_total_exact() {
+        let l = Ledger::open_in_memory().unwrap();
+        for i in 0..50 {
+            let mut f = fill(0.001, true);
+            f.cycle_key = format!("{i:04}bbcc:0101>ddeeff00:0202");
+            l.record_fill(&f).unwrap();
+        }
+        let full = l.equity_curve(5, 0).unwrap();
+        let sampled = l.equity_curve(5, 7).unwrap();
+        assert!(sampled.len() <= 8, "downsampled to {} points", sampled.len());
+        assert!(sampled.len() < full.len());
+        let (a, b) = (full.last().unwrap(), sampled.last().unwrap());
+        assert!((a.realised_usd - b.realised_usd).abs() < 1e-12);
+        assert_eq!(a.episodes, b.episodes);
+    }
+
+    /// The measurement the whole ladder exists for: what a bigger book would have taken
+    /// from the *same* opportunities, and where it stops helping.
+    #[test]
+    fn the_capital_ladder_prices_the_same_episodes_at_several_book_sizes() {
+        let l = Ledger::open_in_memory().unwrap();
+        for _ in 0..20 {
+            l.record_fill(&fill(0.0002, true)).unwrap();
+        }
+        let ladder = l.capital_ladder(5).unwrap();
+        assert_eq!(ladder.rungs.len(), CAPITAL_LADDER_USD.len());
+        assert_eq!(ladder.measured_episodes, 1);
+        assert_eq!(ladder.unmeasured_episodes, 0);
+
+        // Counted once each, like every other episode figure.
+        assert!((ladder.rungs[0].1 - 0.004).abs() < 1e-9);
+        assert!((ladder.rungs[1].1 - 0.006).abs() < 1e-9);
+        // Flat between $1k and $10k: depth ran out, so the extra capital bought nothing.
+        // This is the shape that says a flash loan would not have helped.
+        assert!((ladder.rungs[2].1 - ladder.rungs[1].1).abs() < 1e-12);
+        assert!(ladder.realised_usd < ladder.rungs[0].1, "our $5 book took less than $100 would");
+    }
+
+    /// A ladder from a run that never measured it must read as absent, not as zero.
+    /// "This opportunity was worth nothing at $100" is a claim the older run never made.
+    #[test]
+    fn episodes_without_a_ladder_are_counted_as_unmeasured_not_as_zero() {
+        let l = Ledger::open_in_memory().unwrap();
+        let mut old = fill(0.001, true);
+        old.profit_at_capital_usd = None;
+        l.record_fill(&old).unwrap();
+
+        let ladder = l.capital_ladder(5).unwrap();
+        assert_eq!(ladder.measured_episodes, 0);
+        assert_eq!(ladder.unmeasured_episodes, 1);
+        assert_eq!(ladder.rungs[0].1, 0.0, "nothing measured contributes nothing");
+        assert!((ladder.realised_usd - 0.001).abs() < 1e-9, "but its P&L is still real");
+    }
+
+    /// The audit's core comparison: an opportunity still quotable a slot later was
+    /// taken by nobody, so declining it as a lost race was wrong.
+    #[test]
+    fn the_contest_audit_separates_declined_episodes_that_survived() {
+        let l = Ledger::open_in_memory().unwrap();
+
+        // Declined, and still there four slots later — nobody took it.
+        for slot in 0..5 {
+            let mut f = fill(0.05, false);
+            f.skipped_reason = Some("contested — would lose the race".into());
+            f.profit_at_optimal_usd = 0.5;
+            f.slot = 100 + slot;
+            f.cycle_key = "aa000000:0101>bb000000:0202".into();
+            l.record_fill(&f).unwrap();
+        }
+        // Taken, and gone before the next slot.
+        let mut quick = fill(0.001, true);
+        quick.slot = 400;
+        quick.cycle_key = "cc000000:0101>dd000000:0202".into();
+        l.record_fill(&quick).unwrap();
+
+        let a = l.contest_audit(5).unwrap();
+        assert_eq!(a.contested_episodes, 1);
+        assert_eq!(a.contested_survived, 1, "it outlived the slot it was declined in");
+        assert!((a.contested_mean_slots() - 4.0).abs() < 1e-9);
+        assert_eq!(a.uncontested_episodes, 1);
+        assert_eq!(a.uncontested_survived, 0);
+        assert!((a.declined_usd - 0.5).abs() < 1e-9);
+        assert!((a.declined_but_survived_usd - 0.5).abs() < 1e-9);
+    }
+
+    /// Two episodes of each is not evidence. The report must say so rather than print a
+    /// verdict off four data points.
+    #[test]
+    fn the_audit_withholds_a_verdict_until_both_groups_are_large_enough() {
+        let l = Ledger::open_in_memory().unwrap();
+        for i in 0..3 {
+            let mut f = fill(0.05, false);
+            f.skipped_reason = Some("contested — would lose the race".into());
+            f.cycle_key = format!("{i:02}aa0000:0101>bb000000:0202");
+            l.record_fill(&f).unwrap();
+        }
+        assert!(!l.contest_audit(5).unwrap().has_enough_evidence());
+    }
+
+    /// A reader must not be able to alter the measurement, and must not conjure an
+    /// empty ledger that would read as a run which found nothing.
+    #[test]
+    fn a_read_only_open_cannot_write_and_refuses_a_missing_file() {
+        let dir = std::env::temp_dir().join(format!("cb-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.db");
+        let p = path.to_str().unwrap();
+
+        assert!(Ledger::open_read_only(p).is_err(), "must not create the file");
+
+        {
+            let w = Ledger::open(p).unwrap();
+            w.record_fill(&fill(0.002, true)).unwrap();
+        }
+        let ro = Ledger::open_read_only(p).unwrap();
+        assert_eq!(ro.summary().unwrap().fills, 1, "it can read");
+        assert!(ro.record_fill(&fill(0.002, true)).is_err(), "and only read");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn an_empty_ledger_summarises_to_zeroes_rather_than_erroring() {
         let l = Ledger::open_in_memory().unwrap();
@@ -1082,6 +1525,8 @@ mod tests {
         assert_eq!(l.episodes(5).unwrap().inflation(), 0.0);
         assert_eq!(l.hours_observed().unwrap(), 0.0);
         assert_eq!(l.fill_percentiles().unwrap().taken_net_p50, 0.0);
+        assert!(l.equity_curve(5, 100).unwrap().is_empty());
+        assert_eq!(l.capital_ladder(5).unwrap().rungs[0].1, 0.0);
     }
 
     #[test]

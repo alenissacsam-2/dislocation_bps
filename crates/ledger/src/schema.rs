@@ -94,7 +94,15 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             -- Identity of the loop itself, invariant to which mint it was entered at.
             -- The printed `route` is not that identity: one round trip shows up under
             -- two routes, one per entry point, and grouping on it counts it twice.
-            cycle_key             TEXT
+            cycle_key             TEXT,
+            -- What this same opportunity would have paid an account of a given size.
+            -- Profit is concave in size, so these are separate measurements rather than
+            -- one number rescaled: `size_usd` is what *this* run's book reached, and the
+            -- ladder is what a bigger one would have. NULL means the rung was never
+            -- measured, which is not the same as measuring zero.
+            profit_at_100_usd     REAL,
+            profit_at_1k_usd      REAL,
+            profit_at_10k_usd     REAL
         );
         CREATE INDEX IF NOT EXISTS idx_fill_at ON paper_fills(at);
         CREATE INDEX IF NOT EXISTS idx_fill_net ON paper_fills(net_usd);
@@ -115,6 +123,12 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "sweeps", "tradeable_route", "TEXT NOT NULL DEFAULT ''")?;
     add_column_if_missing(conn, "sweeps", "stale_excluded", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(conn, "sweeps", "depth_measured", "INTEGER NOT NULL DEFAULT 0")?;
+    // The capital ladder. Nullable on purpose: rows from before it existed must read as
+    // "not measured" rather than "this opportunity was worth nothing at $100", which is
+    // a claim the older run never made.
+    add_column_if_missing(conn, "paper_fills", "profit_at_100_usd", "REAL")?;
+    add_column_if_missing(conn, "paper_fills", "profit_at_1k_usd", "REAL")?;
+    add_column_if_missing(conn, "paper_fills", "profit_at_10k_usd", "REAL")?;
 
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_fill_cycle ON paper_fills(cycle_key, id);",

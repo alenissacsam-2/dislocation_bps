@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 cb-core = { workspace = true }
+cb-ledger = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 axum = { workspace = true }

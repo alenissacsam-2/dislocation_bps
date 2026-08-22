@@ -22,8 +22,23 @@ feed = "live"
 rpc_http_url = "https://api.mainnet-beta.solana.com"
 
 # Total working capital in USD, and how much of it is reserved for fees and rent.
-capital_usd = 5.0
+#
+# At $5 this was the binding constraint on nearly everything: the run sized ~$4.44 into
+# opportunities whose optimum averaged ~$145, collecting about 3% of what it found. The
+# ledger now prices every opportunity at $100 / $1k / $10k as it happens, so the next
+# change to this number can be made against a measurement instead of a guess.
+capital_usd = 100.0
 fee_buffer_usd = 0.20
+
+# Smallest trade worth carrying, and so the depth a cycle needs before its rate counts
+# as tradeable rather than as a quote.
+#
+# Not the same as capital: a book does not have to deploy all of itself in one loop.
+# What sets this floor is fixed cost — a transaction costs the same carrying $5 or
+# $5,000, so below some size the fee eats the edge. Roughly `tx cost / edge`: a few
+# dollars on Solana, hundreds on an L2 paying cents in gas, six figures on Ethereum L1.
+# It is the first number to change when pointing this instrument at another chain.
+min_trade_usd = 10.0
 
 # Longest cycle to search. 3 finds triangles (SOL -> USDC -> RAY -> SOL), which is
 # where real cycles live among the majors; 2 only finds duplicate-pair arbs.

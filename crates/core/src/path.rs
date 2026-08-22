@@ -316,6 +316,25 @@ pub fn optimal_input(legs: &[Leg], max_in: u128) -> Option<u128> {
     best.map(|(x, _)| x)
 }
 
+/// Profit this cycle would pay an account holding exactly `capital` base units.
+///
+/// # Why this is measured rather than scaled from the optimum
+///
+/// Profit is concave in size: it climbs, peaks at [`optimal_input`], then falls away as
+/// the trade moves the price against itself. So what a given account can take is
+/// neither proportional to its capital nor a fixed share of the whole pie. A $100 book
+/// facing an opportunity that peaks at $9,000 does not take 1.1% of it — and treating
+/// it as though it did is exactly how a run measured at one book size gets extrapolated
+/// into a claim about another.
+///
+/// Depth caps this independently of capital, which is the point worth keeping in view:
+/// a cycle whose tightest leg stops quoting at $19 pays a $1,000,000 account the same
+/// as a $100 one. Borrowed capital cannot widen a tick.
+#[must_use]
+pub fn profit_at_capital(legs: &[Leg], capital: u128) -> u128 {
+    optimal_input(legs, capital).and_then(|n| cycle_profit(legs, n)).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,5 +610,69 @@ mod tests {
         assert_eq!(cycle_depth_base(&[leg(0, 100)]), 0);
         assert_eq!(cycle_depth_base(&[leg(100, 0)]), 0);
         assert_eq!(cycle_depth_base(&[Leg::bounded(1_000, 1_000, FEE, 0)]), 0);
+    }
+
+    /// The ladder's whole purpose: more capital pays more, but only up to the optimum,
+    /// and never linearly. If this ever came out proportional, the ladder would be a
+    /// rescaling of one number rather than a measurement of several.
+    #[test]
+    fn profit_rises_with_capital_and_then_stops() {
+        let legs = [leg(1_000_000_000, 1_050_000_000), leg(1_000_000_000, 1_000_000_000)];
+        let optimum = optimal_input(&legs, u128::MAX).expect("this cycle profits");
+        let ceiling = profit_at_capital(&legs, u128::MAX);
+
+        let small = profit_at_capital(&legs, optimum / 100);
+        let half = profit_at_capital(&legs, optimum / 2);
+        assert!(small < half && half < ceiling, "{small} < {half} < {ceiling}");
+
+        // Concave, not linear: a hundredth of the capital takes far more than a
+        // hundredth of the pie. Extrapolating one book size to another gets this wrong
+        // in the direction that flatters the smaller account.
+        assert!(
+            small * 100 > ceiling,
+            "a 1% account took {small}, which linear scaling would put at {}",
+            ceiling / 100
+        );
+    }
+
+    #[test]
+    fn capital_past_the_optimum_buys_nothing_more() {
+        let legs = [leg(1_000_000_000, 1_050_000_000), leg(1_000_000_000, 1_000_000_000)];
+        let optimum = optimal_input(&legs, u128::MAX).expect("this cycle profits");
+        let at_optimum = profit_at_capital(&legs, optimum);
+
+        // Compared with a tolerance rather than exactly. `optimal_input` brackets by
+        // ternary search and settles within a base unit or two of the true peak, and
+        // which side of it a given cap lands on is an artefact of the bracketing, not a
+        // difference in what the capital bought. Asserting equality here would pin the
+        // search's rounding instead of the property that matters.
+        for cap in [optimum * 1_000, u128::MAX] {
+            let more = profit_at_capital(&legs, cap);
+            assert!(
+                more.abs_diff(at_optimum) <= 2,
+                "capital past the optimum changed profit from {at_optimum} to {more}"
+            );
+        }
+    }
+
+    /// The measurement that answers whether borrowed capital helps. A cycle whose
+    /// tightest leg stops quoting early pays a huge account exactly what it pays a
+    /// small one — depth is not something a flash loan can widen.
+    #[test]
+    fn a_shallow_cycle_pays_a_large_account_no_more_than_a_small_one() {
+        let legs = [
+            leg(1_000_000_000, 1_050_000_000),
+            Leg::bounded(1_000_000_000, 1_000_000_000, FEE, 500),
+        ];
+        let small = profit_at_capital(&legs, 1_000);
+        assert!(small > 0, "the cycle must profit at all for this to mean anything");
+        assert_eq!(small, profit_at_capital(&legs, 1_000_000_000));
+    }
+
+    #[test]
+    fn an_unprofitable_cycle_pays_nothing_at_any_capital() {
+        let legs = [leg(1_000_000, 1_000_000), leg(1_000_000, 1_000_000)];
+        assert_eq!(profit_at_capital(&legs, u128::MAX), 0);
+        assert_eq!(profit_at_capital(&legs, 0), 0);
     }
 }

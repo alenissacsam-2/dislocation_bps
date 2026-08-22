@@ -124,6 +124,21 @@
   .tier .n{font-family:var(--mono);text-align:right;color:var(--text-3);font-size:11px}
 
   canvas{display:block;width:100%;height:230px}
+
+  /* --- capital ladder --- */
+  /* Each rung is the same opportunities priced for a bigger book. A rung that does not
+     grow is the finding, so the bars are drawn on one shared scale — a ladder read on
+     per-row scales would make a flat step look like a rising one. */
+  .rungs{display:flex;flex-direction:column;gap:6px}
+  .rung{display:grid;grid-template-columns:74px 1fr 78px 62px;gap:10px;align-items:center;font-size:12px}
+  .rung .lbl{font-family:var(--mono);color:var(--text-2);text-align:right}
+  .rung .note{font-size:10.5px;color:var(--text-3)}
+  .rung .track{height:18px;background:var(--panel-2);border-radius:2px;overflow:hidden}
+  .rung .fill{height:100%;background:color-mix(in srgb,var(--data) 50%,transparent);transition:width .5s ease}
+  .rung.now .fill{background:color-mix(in srgb,var(--pos) 55%,transparent)}
+  .rung.ceiling .fill{background:color-mix(in srgb,var(--text-3) 40%,transparent)}
+  .rung .val{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;font-size:11.5px}
+  .rung .flat{color:var(--warn)}
   .empty{padding:26px 15px;text-align:center;color:var(--text-3);font-size:12.5px;line-height:1.6}
   footer{color:var(--text-3);font-size:11.5px;line-height:1.7;padding:0 4px}
   code{font-family:var(--mono);font-size:11.5px;color:var(--text-2)}
@@ -204,6 +219,25 @@
     </section>
   </div>
 
+  <div class="grid split">
+    <!-- P&L -->
+    <section class="panel">
+      <h2>Paper P&amp;L
+        <span class="note" id="pnlNote">cumulative, one step per opportunity — read from the ledger, so it survives a reload</span></h2>
+      <div class="body"><canvas id="pnlChart"></canvas></div>
+    </section>
+
+    <!-- CAPITAL LADDER -->
+    <section class="panel">
+      <h2>What a bigger book would have taken
+        <span class="note">the same opportunities, priced for each account size</span></h2>
+      <div class="body">
+        <div class="rungs" id="rungs"><div class="empty">Waiting for the first opportunity.</div></div>
+        <div class="legend" style="margin-top:11px;font-size:11px" id="rungNote"></div>
+      </div>
+    </section>
+  </div>
+
   <!-- KPIs -->
   <section class="panel">
     <h2>Measurement</h2>
@@ -219,6 +253,12 @@
       <div class="kpi"><div class="k">Data age</div><div class="v num" id="kAge">—</div><div class="n">seconds</div></div>
       <div class="kpi"><div class="k">Marginal top rate</div><div class="v num dim" id="kMarginal">—</div><div class="n">bps, no size behind it</div></div>
       <div class="kpi"><div class="k">Pools excluded</div><div class="v num" id="kStale">0</div><div class="n">stale, left out of the sweep</div></div>
+      <!-- The contest model decides most of the money this instrument ever sees, on a
+           bare profit threshold. These two tiles are the only check on it: an
+           opportunity still quotable a slot later was taken by nobody, so declining it
+           as a lost race was wrong. -->
+      <div class="kpi"><div class="k">Declined as contested</div><div class="v num" id="kDeclined">—</div><div class="n">whole-pie value skipped</div></div>
+      <div class="kpi"><div class="k">…but still there next slot</div><div class="v num" id="kDeclinedAlive">—</div><div class="n">nobody had taken it</div></div>
     </div>
   </section>
 
@@ -286,6 +326,9 @@
     episodes: 0,
     lastExecRoute: new Map(),  // opportunity id -> route
     newEpisode: new Map(),     // opportunity id -> was this the start of an episode
+    curve: [],                 // cumulative P&L, from the ledger
+    ladder: null,              // what bigger books would have taken
+    ledgerPnl: false,          // once true, the ledger owns the P&L KPIs
   };
   const MAX_HIST = 900;
 
@@ -578,10 +621,110 @@
     if (route && !state.newEpisode.get(e.opportunityId)) return;
     state.pnl += e.realisedUsd;
     state.episodes++;
-    $("kEpisodes").textContent = state.episodes.toLocaleString();
-    $("kPnl").textContent = usd(state.pnl);
+    // Live estimate only, and only until the next ledger poll overwrites it. This
+    // counter starts at zero when the page loads, so on its own it would report an
+    // overnight run as having earned whatever arrived since you opened the tab.
+    if (!state.ledgerPnl) paintPnlKpis(state.pnl, state.episodes);
+  }
+
+  function paintPnlKpis(pnl, episodes) {
+    $("kEpisodes").textContent = episodes.toLocaleString();
+    $("kPnl").textContent = usd(pnl);
     // India VDA: 30% on gains, and losses cannot be set off against them.
-    $("kTax").textContent = usd(state.pnl > 0 ? state.pnl * 0.7 : state.pnl);
+    $("kTax").textContent = usd(pnl > 0 ? pnl * 0.7 : pnl);
+  }
+
+  // ---------- P&L history + capital ladder ----------
+  // Both come from the ledger rather than from the socket. A curve accumulated in the
+  // browser restarts at zero on every reload, which would draw a run of days as a flat
+  // line beginning whenever someone happened to look at it.
+  const POLL_MS = 15000;
+  async function pollEquity() {
+    try {
+      const r = await fetch("/api/equity", { cache: "no-store" });
+      const d = await r.json();
+      if (d && d.available) {
+        state.curve = d.curve || [];
+        state.ladder = d.ladder || null;
+        const tail = state.curve[state.curve.length - 1];
+        if (tail) {
+          state.ledgerPnl = true;
+          paintPnlKpis(tail.realisedUsd, tail.taken);
+          $("pnlNote").textContent = tail.episodes.toLocaleString() + " opportunities over " +
+            fmt(d.hoursObserved || 0, 1) + "h — one step each, read from the ledger";
+        }
+        paintRungs();
+        paintContest(d);
+      } else if (d) {
+        $("pnlNote").textContent = "no ledger history: " + (d.reason || "unavailable");
+      }
+    } catch { /* the bot may be restarting; the next poll will pick it up */ }
+    setTimeout(pollEquity, POLL_MS);
+  }
+
+  // The audit of the contest model, against the run's own data. Survival is one-sided
+  // evidence: an opportunity still quotable a slot later was taken by nobody, so that
+  // race was not lost. One that vanished could have been taken, or the price could just
+  // have moved — which is why the comparison against uncontested is what matters, and
+  // why no verdict shows until both groups are big enough to mean something.
+  function paintContest(d) {
+    const c = d.contest;
+    if (!c) return;
+    $("kDeclined").textContent = usd(c.declinedUsd || 0);
+    const alive = $("kDeclinedAlive");
+    if (!c.contestedEpisodes) { alive.textContent = "—"; return; }
+    const rate = d.contestSurvivalRate || 0;
+    alive.textContent = fmt(100 * rate, 0) + "%";
+    alive.className = "v num" + (d.contestHasEvidence && rate >= (d.uncontestedSurvivalRate || 0) * 0.9
+      ? " warnc" : "");
+    alive.title = d.contestHasEvidence
+      ? "declined " + fmt(100 * rate, 0) + "% vs uncontested " +
+        fmt(100 * (d.uncontestedSurvivalRate || 0), 0) + "% — comparable survival means the " +
+        "threshold is sorting by size, not by competition"
+      : "not enough of both groups yet to compare (20 of each is the bar)";
+  }
+
+  function paintRungs() {
+    const L = state.ladder;
+    const el = $("rungs");
+    if (!L || !L.rungs || !L.rungs.length) return;
+    if (!L.measuredEpisodes) {
+      el.innerHTML = "<div class='empty'>No opportunity has been priced against the " +
+        "ladder yet. It fills in as they arrive.</div>";
+      return;
+    }
+
+    // One shared scale across every row, including the ceiling. Per-row scales would
+    // draw a rung that bought nothing as though it had grown.
+    const rows = [
+      { lbl: "took", v: L.realisedUsd, cls: "now", note: "after tip" },
+      ...L.rungs.map(([size, got]) => ({ lbl: "$" + compact(size), v: got, cls: "" })),
+      { lbl: "unlimited", v: L.atOptimalUsd, cls: "ceiling", note: "the ceiling" },
+    ];
+    const max = Math.max(...rows.map(r => r.v), 1e-9);
+
+    let prev = null;
+    el.innerHTML = rows.map(r => {
+      // A rung that fails to beat the one below it is the measurement: depth ran out,
+      // and no amount of borrowed capital widens a tick.
+      const flat = prev !== null && r.cls === "" && r.v - prev < 1e-9;
+      const note = r.note ? "<span class='note'>" + esc(r.note) + "</span>"
+        : flat ? "<span class='note flat'>bought nothing</span>" : "<span></span>";
+      if (r.cls === "") prev = r.v;
+      return "<div class='rung " + r.cls + "'>" +
+        "<span class='lbl'>" + esc(r.lbl) + "</span>" +
+        "<div class='track'><div class='fill' style='width:" + (r.v / max * 100) + "%'></div></div>" +
+        "<span class='val'>" + usd(r.v, 4) + "</span>" + note + "</div>";
+    }).join("");
+
+    $("rungNote").innerHTML =
+      "Every rung prices the <b>same</b> opportunities, so the gaps are what capital buys and " +
+      "nothing else. Gross of tip and assuming every race is won — an upper bound on both counts. " +
+      L.measuredEpisodes.toLocaleString() + " episode" + (L.measuredEpisodes === 1 ? "" : "s") +
+      " measured" +
+      (L.unmeasuredEpisodes
+        ? ", " + L.unmeasuredEpisodes.toLocaleString() + " older ones left out rather than counted as zero"
+        : "") + ".";
   }
 
   // ---------- chart ----------
@@ -648,6 +791,82 @@
   }
   requestAnimationFrame(draw);
 
+  // ---------- P&L curve ----------
+  // Redrawn on a timer rather than per frame: it changes only when the ledger poll
+  // brings new episodes, and a chart of a whole run does not need 60 fps.
+  const pv = $("pnlChart"), pctx = pv.getContext("2d");
+  function drawPnl() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = pv.clientWidth, h = pv.clientHeight;
+    if (pv.width !== w * dpr || pv.height !== h * dpr) { pv.width = w * dpr; pv.height = h * dpr; }
+    pctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    pctx.clearRect(0, 0, w, h);
+
+    const d = state.curve;
+    if (!d || d.length < 2) {
+      pctx.fillStyle = css("--text-3"); pctx.font = "12px system-ui"; pctx.textAlign = "center";
+      pctx.fillText(d && d.length ? "one opportunity so far" : "no opportunities recorded yet",
+        w / 2, h / 2);
+      return;
+    }
+
+    // Two series: what the run actually kept, and what the same opportunities would
+    // have paid the first rung of the ladder. The distance between them is what tips
+    // and lost races cost, which is the part worth looking at.
+    const rung = d.map(p => (p.atCapitalUsd || [0])[0]);
+    const pad = { l: 56, r: 10, t: 12, b: 20 };
+    const iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
+    let hi = Math.max(...d.map(p => p.realisedUsd), ...rung, 0);
+    let lo = Math.min(...d.map(p => p.realisedUsd), 0);
+    const padv = Math.max((hi - lo) * 0.12, 1e-6);
+    hi += padv; lo -= padv * 0.4;
+    const X = i => pad.l + (i / (d.length - 1)) * iw;
+    const Y = v => pad.t + ih - ((v - lo) / (hi - lo)) * ih;
+
+    pctx.strokeStyle = css("--line-soft"); pctx.lineWidth = 1;
+    pctx.fillStyle = css("--text-3"); pctx.font = "10px " + css("--mono"); pctx.textAlign = "right";
+    for (let i = 0; i <= 4; i++) {
+      const v = lo + (hi - lo) * (i / 4), y = Y(v);
+      pctx.beginPath(); pctx.moveTo(pad.l, y); pctx.lineTo(w - pad.r, y); pctx.stroke();
+      pctx.fillText(usd(v, v === 0 ? 2 : 4), pad.l - 6, y + 3);
+    }
+
+    // The zero line, drawn firmly: a P&L chart whose baseline is ambiguous is worse
+    // than none, because "up and to the right" reads as profit either way.
+    if (lo < 0 && hi > 0) {
+      pctx.strokeStyle = css("--line"); pctx.lineWidth = 1.5;
+      pctx.beginPath(); pctx.moveTo(pad.l, Y(0)); pctx.lineTo(w - pad.r, Y(0)); pctx.stroke();
+    }
+
+    const line = (vals, colour, width, dash) => {
+      pctx.strokeStyle = colour; pctx.lineWidth = width; pctx.setLineDash(dash || []);
+      pctx.beginPath();
+      vals.forEach((v, i) => i ? pctx.lineTo(X(i), Y(v)) : pctx.moveTo(X(i), Y(v)));
+      pctx.stroke(); pctx.setLineDash([]);
+    };
+
+    const realised = d.map(p => p.realisedUsd);
+    // Fill under the realised line so the sign is legible at a glance.
+    pctx.fillStyle = "color-mix(in srgb," + css("--pos") + " 16%, transparent)";
+    pctx.beginPath();
+    pctx.moveTo(X(0), Y(Math.max(lo, 0)));
+    realised.forEach((v, i) => pctx.lineTo(X(i), Y(v)));
+    pctx.lineTo(X(d.length - 1), Y(Math.max(lo, 0)));
+    pctx.closePath(); pctx.fill();
+
+    line(rung, css("--data"), 1.4, [4, 3]);
+    line(realised, css("--pos"), 1.9);
+
+    pctx.textAlign = "left"; pctx.font = "10px " + css("--mono");
+    pctx.fillStyle = css("--pos");
+    pctx.fillText("kept, after tip", pad.l + 4, pad.t + 10);
+    pctx.fillStyle = css("--data");
+    const first = state.ladder && state.ladder.rungs && state.ladder.rungs[0];
+    pctx.fillText("at $" + (first ? compact(first[0]) : "100") + ", gross", pad.l + 4, pad.t + 22);
+  }
+  setInterval(drawPnl, 2000);
+  addEventListener("resize", drawPnl);
+
   function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 
@@ -673,6 +892,7 @@
     ws.onerror = () => ws.close();
   }
   connect();
+  pollEquity();
 })();
 </script>
 </body>

@@ -560,6 +560,7 @@ dependencies = [
  "anyhow",
  "cb-core",
  "rusqlite",
+ "serde",
  "thiserror",
 ]
 
@@ -580,6 +581,7 @@ dependencies = [
  "anyhow",
  "axum",
  "cb-core",
+ "cb-ledger",
  "serde",
  "serde_json",
  "thiserror",

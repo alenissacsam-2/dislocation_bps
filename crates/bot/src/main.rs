@@ -133,8 +133,9 @@ async fn main() -> anyhow::Result<()> {
             rpc_ws_url: "wss://api.mainnet-beta.solana.com".into(),
             min_profit_lamports: 0,
             max_position_lamports: 20_000_000,
-            capital_usd: 5.0,
+            capital_usd: 100.0,
             fee_buffer_usd: 0.20,
+            min_trade_usd: 10.0,
             max_hops: 3,
         }
     });
@@ -164,7 +165,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("mode: PAPER — no transaction will be signed or sent");
     tracing::info!("dashboard: http://127.0.0.1:8787");
 
-    routes::serve(addr, routes::state(bus, "paper"), "dashboard/dist").await
+    // The dashboard reads history from the same ledger the run writes, so its P&L
+    // survives a browser reload and shows the whole run rather than the minutes since
+    // someone opened the tab.
+    routes::serve(addr, routes::state_with_ledger(bus, "paper", LEDGER_PATH), "dashboard/dist")
+        .await
 }
 
 fn spawn_simulated(bus: EventBus) {
@@ -283,8 +288,21 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
     });
 
     let tradable_usd = cfg.tradable_usd();
+    let min_depth_usd = cfg.tradeable_depth_usd();
     let max_hops = cfg.max_hops;
-    tracing::info!("capital: ${tradable_usd:.2} tradable, cycles up to {max_hops} hops");
+    tracing::info!(
+        "capital: ${tradable_usd:.2} tradable, ${min_depth_usd:.2} minimum trade, \
+         cycles up to {max_hops} hops"
+    );
+    tracing::info!(
+        "capital ladder: every opportunity is also priced at {} — what a larger book \
+         would have taken from the same moment",
+        cb_ledger::CAPITAL_LADDER_USD
+            .iter()
+            .map(|r| format!("${r:.0}"))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    );
 
     // A run that keeps no record measures nothing. Failing to open it is not fatal —
     // the dashboard still works — but it is loud, because a silent loss of the
@@ -356,7 +374,7 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                     }
                 }
                 _ = sweep_timer.tick() => {
-                    let sweep = market.sweep(tradable_usd, max_hops);
+                    let sweep = market.sweep(tradable_usd, min_depth_usd, max_hops);
                     evaluated_total = evaluated_total.saturating_add(sweep.evaluated);
 
                     // The one thing the per-pool staleness guard structurally cannot
@@ -499,6 +517,7 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                                 taken: skipped.is_none(),
                                 skipped_reason: skipped.clone(),
                                 cycle_key: opp.cycle_key.clone(),
+                                profit_at_capital_usd: Some(opp.profit_at_capital_usd),
                             };
                             if let Err(e) = l.record_fill(&rec) {
                                 tracing::warn!("could not record fill: {e:#}");
@@ -773,6 +792,116 @@ fn report(path: &str) -> anyhow::Result<()> {
                 "    Costs are per transaction, not per dollar: ~${fixed_cost:.4} of tip and"
             );
             println!("    base fee whatever the size. Below that line nothing clears.");
+        }
+    }
+
+    // The counterfactual this run exists to answer. Every rung prices the *same*
+    // episodes, so the gaps between them are what capital buys and nothing else — and a
+    // rung that fails to beat the one below it is depth, not funding, running out.
+    let ladder = ledger.capital_ladder(EPISODE_GAP_SLOTS)?;
+    if ladder.measured_episodes > 0 {
+        println!("\n  WHAT A BIGGER BOOK WOULD HAVE TAKEN");
+        println!("    {:<24} {:>14} {:>17}", "book size", "gross, run", "vs the rung below");
+        println!(
+            "    {:<24} {:>14} {:>17}",
+            "this run, after costs",
+            format!("${:.4}", ladder.realised_usd),
+            "—"
+        );
+        let mut prev = 0.0f64;
+        for (i, (rung, got)) in ladder.rungs.iter().enumerate() {
+            let delta = if i == 0 {
+                String::from("—")
+            } else if got - prev < 1e-9 {
+                String::from("nothing more")
+            } else {
+                format!("+${:.4}", got - prev)
+            };
+            println!("    {:<24} {:>14} {:>17}", format!("${rung:.0}"), format!("${got:.4}"), delta);
+            prev = *got;
+        }
+        println!(
+            "    {:<24} {:>14} {:>17}",
+            "unlimited",
+            format!("${:.4}", ladder.at_optimal_usd),
+            if ladder.at_optimal_usd - prev < 1e-9 { "nothing more" } else { "" }
+        );
+        println!(
+            "\n    Gross of tip and assuming every race is won — an upper bound on both\n    \
+             counts. Measured over {} episode{}{}.",
+            ladder.measured_episodes,
+            if ladder.measured_episodes == 1 { "" } else { "s" },
+            if ladder.unmeasured_episodes > 0 {
+                format!(
+                    ";\n    {} more predate the ladder and are left out rather than counted as zero",
+                    ladder.unmeasured_episodes
+                )
+            } else {
+                String::new()
+            }
+        );
+        println!("    Where two rungs agree the cycles ran out of depth, not funding.");
+        println!("    Borrowed capital cannot widen a tick, so a flat step is the");
+        println!("    measurement that says a flash loan would have added nothing.");
+    }
+
+    // The largest unverified assumption in the instrument, checked against its own data.
+    // Opportunities over a profit threshold are declined as races we would lose; that
+    // decision is worth more than every other decision here combined, and until now
+    // nothing has tested it.
+    let ca = ledger.contest_audit(EPISODE_GAP_SLOTS)?;
+    if ca.contested_episodes > 0 || ca.uncontested_episodes > 0 {
+        println!("\n  IS THE CONTEST MODEL MEASURING ANYTHING?");
+        println!(
+            "    {:<22} {:>10} {:>14} {:>14}",
+            "", "episodes", "outlived slot", "avg life"
+        );
+        println!(
+            "    {:<22} {:>10} {:>14} {:>14}",
+            "declined as contested",
+            ca.contested_episodes,
+            format!("{:.0}%", 100.0 * ca.contested_survival_rate()),
+            format!("{:.1} slots", ca.contested_mean_slots())
+        );
+        println!(
+            "    {:<22} {:>10} {:>14} {:>14}",
+            "not contested",
+            ca.uncontested_episodes,
+            format!("{:.0}%", 100.0 * ca.uncontested_survival_rate()),
+            format!("{:.1} slots", ca.uncontested_mean_slots())
+        );
+        println!(
+            "\n    Declined value: ${:.4}, of which ${:.4} was still quotable a slot",
+            ca.declined_usd, ca.declined_but_survived_usd
+        );
+        println!("    later — which means nobody had taken it, so that race was not lost.");
+
+        if ca.has_enough_evidence() {
+            let (c, u) = (ca.contested_survival_rate(), ca.uncontested_survival_rate());
+            if c >= u * 0.9 {
+                println!(
+                    "\n    VERDICT: declined opportunities survive about as well as accepted\n    \
+                     ones ({:.0}% vs {:.0}%). The threshold is sorting by size and calling\n    \
+                     it competition. It is a profit cutoff, so this is what it does by\n    \
+                     construction — and it is discarding real money to do it.",
+                    100.0 * c,
+                    100.0 * u
+                );
+            } else {
+                println!(
+                    "\n    VERDICT: declined opportunities do vanish faster ({:.0}% vs {:.0}%\n    \
+                     survival). Consistent with somebody else taking them, though a price\n    \
+                     that simply moved looks identical from here.",
+                    100.0 * c,
+                    100.0 * u
+                );
+            }
+        } else {
+            println!(
+                "\n    Not enough of both groups yet to compare ({} contested, {} not;\n    \
+                 20 of each is the bar). Let the run continue.",
+                ca.contested_episodes, ca.uncontested_episodes
+            );
         }
     }
 

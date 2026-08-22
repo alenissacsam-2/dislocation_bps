@@ -186,6 +186,14 @@ pub struct LiveOpportunity {
     pub optimal_size_usd: f64,
     pub gross_profit_usd: f64,
     pub profit_at_optimal_usd: f64,
+    /// What this same cycle would have paid a book of each size in
+    /// `cb_ledger::CAPITAL_LADDER_USD`, in USD, before tip.
+    ///
+    /// Priced against the live legs at the moment of detection rather than scaled from
+    /// `profit_at_optimal_usd`: profit is concave in size and capped by the cycle's
+    /// tightest tick, so the rungs are separate facts. Where they stop rising is where
+    /// depth, not capital, became the constraint.
+    pub profit_at_capital_usd: [f64; 3],
     pub edge_bps: f64,
     pub fee_bps: f64,
     pub slot: u64,
@@ -602,7 +610,15 @@ impl LiveMarket {
     /// capacity behind it; ranked on rate alone it leads the board while being
     /// untradeable. Publishing only the marginal maximum overstated this instrument's
     /// headline edge for its whole history before the two were split apart.
-    pub fn sweep(&self, tradable_usd: f64, max_hops: usize) -> Sweep {
+    /// `tradable_usd` caps how much any one trade may deploy. `min_depth_usd` is the
+    /// smallest trade worth carrying, and so the depth a cycle must have before its rate
+    /// counts as an opportunity rather than a quote.
+    ///
+    /// These were one argument until the book outgrew the pools. Requiring a cycle to
+    /// absorb the *whole* balance is only equivalent to requiring it to absorb a
+    /// worthwhile trade while the balance is small; past that it starts discarding
+    /// cycles a larger account could trade perfectly well, just not all at once.
+    pub fn sweep(&self, tradable_usd: f64, min_depth_usd: f64, max_hops: usize) -> Sweep {
         let started = Instant::now();
         // Pools we have not heard from in a while are dropped rather than quoted.
         let (snap, stale_excluded) = self.store.snapshot_fresh(MAX_STALE_LAG_SLOTS);
@@ -640,6 +656,16 @@ impl LiveMarket {
                 continue;
             }
             for p in find_from_base(&snap, base, max_hops, max_in) {
+                // Priced here, while the legs are the ones that produced the detection.
+                // Re-deriving it later from the recorded USD figures would be a guess:
+                // the curve's shape lives in the legs, not in its optimum.
+                let mut ladder = [0.0f64; 3];
+                for (rung, out) in cb_ledger::CAPITAL_LADDER_USD.iter().zip(&mut ladder) {
+                    let units = (rung / usd_per_unit) as u128;
+                    *out = cb_core::path::profit_at_capital(&p.cycle.legs, units) as f64
+                        * usd_per_unit;
+                }
+
                 opportunities.push(LiveOpportunity {
                     route: self.route_label(&p.cycle.mints),
                     cycle_key: p.cycle.canonical_key(),
@@ -649,6 +675,7 @@ impl LiveMarket {
                     optimal_size_usd: p.optimal_in as f64 * usd_per_unit,
                     gross_profit_usd: p.profit as f64 * usd_per_unit,
                     profit_at_optimal_usd: p.profit_at_optimal as f64 * usd_per_unit,
+                    profit_at_capital_usd: ladder,
                     edge_bps: cb_core::path::marginal_edge_bps(&p.cycle.legs).unwrap_or(0.0),
                     fee_bps: p.cycle.fee_bps(),
                     slot: p.cycle.slot(&snap),
@@ -660,21 +687,21 @@ impl LiveMarket {
         // leaderboard, so a market with fifty clearing cycles reported twelve.
         let clearing = rows
             .iter()
-            .filter(|r| r.edge_bps > 0.0 && r.depth_usd >= tradable_usd)
+            .filter(|r| r.edge_bps > 0.0 && r.depth_usd >= min_depth_usd)
             .count() as u64;
 
         rows.sort_by(|a, b| b.edge_bps.total_cmp(&a.edge_bps));
         let best = rows.first().cloned();
-        let tradeable = rows.iter().find(|r| r.depth_usd >= tradable_usd).cloned();
+        let tradeable = rows.iter().find(|r| r.depth_usd >= min_depth_usd).cloned();
 
         // Keep the head of both groups. The board shows what can be traded above what
         // is only a rate, and neither group can truncate the other out of existence.
         let mut kept: Vec<EdgeRow> = Vec::with_capacity(LEADERBOARD_ROWS * 2);
         kept.extend(
-            rows.iter().filter(|r| r.depth_usd >= tradable_usd).take(LEADERBOARD_ROWS).cloned(),
+            rows.iter().filter(|r| r.depth_usd >= min_depth_usd).take(LEADERBOARD_ROWS).cloned(),
         );
         kept.extend(
-            rows.iter().filter(|r| r.depth_usd < tradable_usd).take(LEADERBOARD_ROWS).cloned(),
+            rows.iter().filter(|r| r.depth_usd < min_depth_usd).take(LEADERBOARD_ROWS).cloned(),
         );
 
         opportunities.sort_by(|a, b| b.gross_profit_usd.total_cmp(&a.gross_profit_usd));
@@ -689,7 +716,7 @@ impl LiveMarket {
             duration_us: started.elapsed().as_micros() as u64,
             slot: snap.newest_slot(),
             stale_excluded,
-            tradeable_min_usd: tradable_usd,
+            tradeable_min_usd: min_depth_usd,
         }
     }
 
@@ -1143,7 +1170,7 @@ mod tests {
         let dear = sol_usdc(2, 5_575_194_644_357_749_445, 200); // +10bps on sqrt = +20bps on price
         let m = market_with(vec![cheap, dear]);
 
-        let sweep = m.sweep(4.80, 3);
+        let sweep = m.sweep(4.80, 4.80, 3);
         assert!(sweep.evaluated > 0, "a two-venue pair must produce cycles");
 
         let best = sweep.best().expect("there must be a best row");
@@ -1164,7 +1191,7 @@ mod tests {
             sol_usdc(1, 5_569_625_019_338_410_820, 100),
             sol_usdc(2, 5_575_194_644_357_749_445, 200),
         ]);
-        let sweep = m.sweep(4.80, 3);
+        let sweep = m.sweep(4.80, 4.80, 3);
         let opp = sweep.opportunities.first().expect("a clearing cycle must be sized");
 
         assert!(opp.size_usd <= 4.81, "must not size past our capital, got {}", opp.size_usd);
@@ -1184,7 +1211,7 @@ mod tests {
             sol_usdc(1, 5_569_625_019_338_410_820, 100),
             sol_usdc(2, 5_569_625_019_338_410_820, 200),
         ]);
-        let sweep = m.sweep(4.80, 3);
+        let sweep = m.sweep(4.80, 4.80, 3);
         let best = sweep.best().expect("a route must still be reported");
         assert!(best.edge_bps < 0.0);
         assert!(best.dislocation_bps.abs() < 0.1, "prices agree, so no dislocation");
@@ -1195,7 +1222,7 @@ mod tests {
     #[test]
     fn an_empty_market_sweeps_without_panicking() {
         let m = market_with(vec![]);
-        let sweep = m.sweep(4.80, 3);
+        let sweep = m.sweep(4.80, 4.80, 3);
         assert_eq!(sweep.evaluated, 0);
         assert!(sweep.best().is_none());
         assert!(sweep.opportunities.is_empty());
@@ -1207,7 +1234,7 @@ mod tests {
             sol_usdc(1, 5_569_625_019_338_410_820, 100),
             sol_usdc(2, 5_575_194_644_357_749_445, 200),
         ]);
-        let best = m.sweep(4.80, 3).rows.into_iter().next().unwrap();
+        let best = m.sweep(4.80, 4.80, 3).rows.into_iter().next().unwrap();
         assert!(best.depth_usd > 5.0, "a tick that cannot hold $5 is useless to us");
     }
 
@@ -1237,7 +1264,7 @@ mod tests {
             thinned(sol_usdc(1, 5_569_625_019_338_410_820, 100), 1_000_000_000),
             thinned(sol_usdc(2, 5_575_194_644_357_749_445, 200), 1_000_000_000),
         ]);
-        let sweep = m.sweep(4.80, 3);
+        let sweep = m.sweep(4.80, 4.80, 3);
 
         let best = sweep.best().expect("the rate is still measured and still reported");
         assert!(best.edge_bps > 0.0, "the marginal rate really is positive");
@@ -1259,7 +1286,7 @@ mod tests {
             sol_usdc(1, 5_569_625_019_338_410_820, 100),
             sol_usdc(2, 5_575_194_644_357_749_445, 200),
         ]);
-        let sweep = m.sweep(4.80, 3);
+        let sweep = m.sweep(4.80, 4.80, 3);
 
         let tradeable = sweep.tradeable().expect("a $24M pair can absorb $4.80");
         assert!(tradeable.depth_usd >= 4.80);
@@ -1280,9 +1307,9 @@ mod tests {
             sol_usdc(1, 5_569_625_019_338_410_820, 100),
             thinned(sol_usdc(2, 5_575_194_644_357_749_445, 200), 100_000),
         ]);
-        let sweep = m.sweep(4.80, 3);
+        let sweep = m.sweep(4.80, 4.80, 3);
         let best = sweep.best().expect("a route must be reported");
-        let deep_alone = m.sweep(0.0, 3);
+        let deep_alone = m.sweep(0.0, 0.0, 3);
         let unthinned_depth = deep_alone
             .rows
             .iter()
@@ -1308,7 +1335,7 @@ mod tests {
             100_000 - (MAX_STALE_LAG_SLOTS + 1),
         );
         let m = market_with(vec![fresh, silent]);
-        let sweep = m.sweep(4.80, 3);
+        let sweep = m.sweep(4.80, 4.80, 3);
 
         assert_eq!(sweep.stale_excluded, 1, "the lagging pool must be counted, not hidden");
         assert_eq!(sweep.evaluated, 0, "one venue alone makes no round trip");
@@ -1324,7 +1351,7 @@ mod tests {
             at_slot(sol_usdc(1, 5_569_625_019_338_410_820, 100), 5),
             at_slot(sol_usdc(2, 5_575_194_644_357_749_445, 200), 5),
         ]);
-        let sweep = m.sweep(4.80, 3);
+        let sweep = m.sweep(4.80, 4.80, 3);
         assert_eq!(sweep.stale_excluded, 0);
         assert!(sweep.evaluated > 0, "a slow market must still be swept");
     }
