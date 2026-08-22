@@ -150,6 +150,9 @@ impl From<&EdgeRow> for RouteRow {
 #[derive(Debug, Clone)]
 pub struct LiveOpportunity {
     pub route: String,
+    /// Identity of the loop itself, unchanged by which mint it was entered at. The
+    /// printed `route` differs between the two entries; this does not.
+    pub cycle_key: String,
     pub venues: String,
     pub hops: usize,
     pub size_usd: f64,
@@ -551,6 +554,7 @@ impl LiveMarket {
             for p in find_from_base(&snap, base, max_hops, max_in) {
                 opportunities.push(LiveOpportunity {
                     route: self.route_label(&p.cycle.mints),
+                    cycle_key: p.cycle.canonical_key(),
                     venues: self.venue_label(&p.cycle.pools),
                     hops: p.cycle.hops(),
                     size_usd: p.capped_in as f64 * usd_per_unit,

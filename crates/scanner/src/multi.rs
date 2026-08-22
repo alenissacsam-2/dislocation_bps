@@ -24,6 +24,8 @@
 //! live path runs that on a short timer and never has to reason about which updates
 //! could have made which cycles profitable.
 
+use std::fmt::Write as _;
+
 use crate::snapshot::Snapshot;
 use cb_core::path::{
     cycle_profit, is_profitable, marginal_edge_bps, optimal_input, route_fee_bps, Leg,
@@ -57,6 +59,49 @@ impl Cycle {
     #[must_use]
     pub fn fee_bps(&self) -> f64 {
         route_fee_bps(&self.legs)
+    }
+
+    /// Identity of this cycle as an *opportunity*, invariant to where the loop is
+    /// entered.
+    ///
+    /// `SOL → USDC → SOL` over pools (P, Q) and `USDC → SOL → USDC` over (Q, P) are
+    /// one closed loop entered at two different points. There is a single arbitrage
+    /// there, and taking it at either entry removes it from both — so treating the
+    /// printed route as the identity counts one opportunity twice.
+    ///
+    /// Rotation is collapsed. **Direction is not**: going round the same pools the
+    /// other way is a different trade, and at most one of the two can be profitable.
+    /// So each hop is keyed by the pool *and the mint going into it*, which differs
+    /// between the two directions while staying fixed under rotation.
+    #[must_use]
+    pub fn canonical_key(&self) -> String {
+        let n = self.pools.len();
+        if n == 0 {
+            return String::new();
+        }
+        // The smallest of all n rotations. Picking the smallest *pool* would be
+        // ambiguous if a loop ever used one pool twice; comparing whole rotations is
+        // canonical either way, and n is at most 3.
+        (0..n)
+            .map(|start| {
+                let mut out = String::with_capacity(n * 14);
+                for k in 0..n {
+                    let i = (start + k) % n;
+                    if k > 0 {
+                        out.push('>');
+                    }
+                    for b in &self.pools[i].0[..4] {
+                        let _ = write!(out, "{b:02x}");
+                    }
+                    out.push(':');
+                    for b in &self.mints[i][..2] {
+                        let _ = write!(out, "{b:02x}");
+                    }
+                }
+                out
+            })
+            .min()
+            .unwrap_or_default()
     }
 }
 
@@ -317,6 +362,48 @@ mod tests {
         let p2 = pool(2, RAY, USDC, 1_000_000, 900_000); // RAY cheap in USDC
         let p3 = pool(3, RAY, SOL, 1_000_000, 1_200_000); // RAY dear in SOL
         (Snapshot::new(vec![p1, p2, p3]), p1)
+    }
+
+    /// The mirror bug, pinned. Both entries into one loop must key the same, or
+    /// every "distinct opportunities" figure doubles.
+    #[test]
+    fn one_loop_entered_at_two_points_is_one_opportunity() {
+        let p1 = fee_pool(1, SOL, USDC, 1_000_000, 1_000_000, 100);
+        let p2 = fee_pool(2, SOL, USDC, 1_000_000, 1_010_000, 200);
+        let snap = Snapshot::new(vec![p1, p2]);
+
+        // The same round trip, found from each of its two mints.
+        let from_sol = find_from_base(&snap, &SOL, 2, u128::MAX);
+        let from_usdc = find_from_base(&snap, &USDC, 2, u128::MAX);
+        assert!(!from_sol.is_empty() && !from_usdc.is_empty());
+
+        assert_eq!(
+            from_sol[0].cycle.canonical_key(),
+            from_usdc[0].cycle.canonical_key(),
+            "entering the same loop at SOL or at USDC is one arbitrage, not two"
+        );
+        assert_ne!(
+            from_sol[0].cycle.mints[0], from_usdc[0].cycle.mints[0],
+            "the two really were found from different base mints"
+        );
+    }
+
+    /// ...but going round the other way is a different trade, and must not collapse.
+    #[test]
+    fn the_same_pools_traversed_backwards_is_a_different_opportunity() {
+        let p1 = fee_pool(1, SOL, USDC, 1_000_000, 1_000_000, 100);
+        let p2 = fee_pool(2, SOL, USDC, 1_000_000, 1_010_000, 200);
+        let snap = Snapshot::new(vec![p1, p2]);
+
+        let cycles = enumerate_from_base(&snap, &SOL, 2);
+        let keys: std::collections::HashSet<_> =
+            cycles.iter().map(super::Cycle::canonical_key).collect();
+        assert_eq!(
+            keys.len(),
+            cycles.len(),
+            "buy-on-1-sell-on-2 and buy-on-2-sell-on-1 are separate trades"
+        );
+        assert!(cycles.len() >= 2, "both directions must be enumerated at all");
     }
 
     #[test]

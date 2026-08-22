@@ -55,12 +55,14 @@ const LEDGER_EVERY_N_SWEEPS: u32 = 5;
 /// measurement of how much the WebSocket is missing.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(180);
 
-/// Detections of one route further apart than this are separate opportunities.
+/// Detections of one loop further apart than this many slots are separate
+/// opportunities. Slots are the chain's own clock (~400 ms) and are what the ledger
+/// records, so this needs no wall-clock and cannot drift.
 ///
 /// The sweep re-detects a standing gap five times a second, so consecutive detections
 /// of a live opportunity are about 0.2s apart. Two seconds is comfortably above that
 /// and comfortably below the time it takes for a closed gap to reopen.
-const EPISODE_GAP_SECS: f64 = 2.0;
+const EPISODE_GAP_SLOTS: u64 = 5;
 
 /// What the last sweep saw, handed to the status heartbeat.
 #[derive(Debug, Clone, Default)]
@@ -416,6 +418,7 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                                 net_usd: net,
                                 taken: skipped.is_none(),
                                 skipped_reason: skipped.clone(),
+                                cycle_key: opp.cycle_key.clone(),
                             };
                             if let Err(e) = l.record_fill(&rec) {
                                 tracing::warn!("could not record fill: {e:#}");
@@ -531,7 +534,7 @@ fn report(path: &str) -> anyhow::Result<()> {
     let hours = ledger.hours_observed()?.max(1e-9);
     println!("\n  CYCLES THAT CLEARED THEIR OWN FEES");
     println!("    observed for              {hours:.2} h");
-    let ep = ledger.episodes(EPISODE_GAP_SECS)?;
+    let ep = ledger.episodes(EPISODE_GAP_SLOTS)?;
     println!("    detections                {}   ({:.0}/h)", s.fills, s.fills as f64 / hours);
     println!(
         "    distinct opportunities    {}   ({:.1}/h)",
@@ -543,7 +546,10 @@ fn report(path: &str) -> anyhow::Result<()> {
         "    detections per opportunity{:>8.0}   <- one standing gap, re-seen every sweep",
         ep.inflation()
     );
-    println!("    longest single episode    {} detections", ep.longest_detections);
+    println!(
+        "    longest single episode    {} detections ({} slots)",
+        ep.longest_detections, ep.longest_slots
+    );
     println!();
     println!(
         "    net, counting each once   ${:.6}   (${:.4}/h)",
@@ -571,6 +577,29 @@ fn report(path: &str) -> anyhow::Result<()> {
                 "                              ^ every average above is mostly this pair"
             );
         }
+    }
+
+    let bands = ledger.survival(EPISODE_GAP_SLOTS)?;
+    if !bands.is_empty() {
+        println!("
+  HOW LONG AN OPPORTUNITY LASTS, AGAINST WHAT IT IS WORTH");
+        println!(
+            "    {:<16} {:>8} {:>10} {:>10} {:>15}",
+            "whole pie", "seen", "avg life", "longest", "capital needed"
+        );
+        for b in &bands {
+            println!(
+                "    {:<16} {:>8} {:>9.1}s {:>9.1}s {:>15}",
+                b.label,
+                b.episodes,
+                b.mean_secs(),
+                b.longest_slots as f64 * 0.4,
+                format!("${:.0}", b.mean_capital_usd())
+            );
+        }
+        println!("    Size and lifetime run in opposite directions. A longest of 0.0s means");
+        println!("    every gap in that band was gone before the next slot began — there is");
+        println!("    no size at which one is both worth taking and still there on arrival.");
     }
 
     let p = ledger.fill_percentiles()?;
@@ -690,8 +719,8 @@ async fn verify(cfg: &Config) -> anyhow::Result<()> {
 
     let client = reqwest::Client::new();
     println!(
-        "  {:<18} {:<9} {:>14} {:>14} {:>9}  {}",
-        "pair", "venue", "ours", "router", "diff", "verdict"
+        "  {:<18} {:<9} {:>14} {:>14} {:>9}  verdict",
+        "pair", "venue", "ours", "router", "diff"
     );
 
     let (mut checked, mut faults, mut skipped) = (0usize, 0usize, 0usize);

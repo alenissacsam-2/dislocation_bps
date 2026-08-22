@@ -20,7 +20,12 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="${CB_BOT_BIN:-$HOME/.cargo-target/cryptobot/release/cb-bot}"
+# Same file scripts/build.sh sources, so the binary this runs is by construction the
+# binary the last build wrote. Guessing the path in two places is how a supervisor
+# ends up faithfully restarting six-hour-old code.
+# shellcheck source=env.sh
+. "$ROOT/scripts/env.sh"
+BIN="$CB_BOT_BIN"
 LOG="${CB_BOT_LOG:-/tmp/cb-bot.log}"
 
 # A restart loop that retries instantly will spin at full speed against a permanent
@@ -34,7 +39,7 @@ cd "$ROOT" || exit 1
 
 if [[ ! -x "$BIN" ]]; then
   echo "run-forever: no binary at $BIN" >&2
-  echo "             build it first:  cargo build --release -p cb-bot" >&2
+  echo "             build it first:  scripts/build.sh" >&2
   exit 1
 fi
 

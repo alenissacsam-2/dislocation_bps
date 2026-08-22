@@ -295,9 +295,9 @@ mod tests {
     #[test]
     fn short_accounts_are_rejected_rather_than_read_out_of_bounds() {
         assert!(decode(&[]).is_err());
-        assert!(decode(&vec![0u8; POOL_LEN - 1]).is_err());
+        assert!(decode(&[0u8; POOL_LEN - 1]).is_err());
         assert!(decode_trade_fee_ppm(&[]).is_err());
-        assert!(decode_trade_fee_ppm(&vec![0u8; CONFIG_LEN - 1]).is_err());
+        assert!(decode_trade_fee_ppm(&[0u8; CONFIG_LEN - 1]).is_err());
     }
 
     #[test]

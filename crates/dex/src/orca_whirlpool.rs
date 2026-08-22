@@ -170,6 +170,9 @@ mod tests {
 
     /// Build a synthetic account with the verified layout. Everything not named is
     /// zero, which is exactly what a decoder should be indifferent to.
+    // One argument per field the layout actually has; grouping them would only hide
+    // which byte each test is varying.
+    #[allow(clippy::too_many_arguments)]
     fn account(
         tick_spacing: u16,
         seed: u16,

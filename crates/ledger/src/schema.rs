@@ -70,11 +70,30 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             tip_usd               REAL    NOT NULL,
             net_usd               REAL    NOT NULL,
             taken                 INTEGER NOT NULL,
-            skipped_reason        TEXT
+            skipped_reason        TEXT,
+            -- Identity of the loop itself, invariant to which mint it was entered at.
+            -- The printed `route` is not that identity: one round trip shows up under
+            -- two routes, one per entry point, and grouping on it counts it twice.
+            cycle_key             TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_fill_at ON paper_fills(at);
         CREATE INDEX IF NOT EXISTS idx_fill_net ON paper_fills(net_usd);
         ",
+    )?;
+
+    // `cycle_key` arrived after the first runs. Add it in place rather than
+    // rebuilding the table, so a ledger already collecting keeps its history —
+    // those rows simply fall back to the old, coarser grouping.
+    let has_cycle_key: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('paper_fills') WHERE name = 'cycle_key'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_cycle_key == 0 {
+        conn.execute_batch("ALTER TABLE paper_fills ADD COLUMN cycle_key TEXT;")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_fill_cycle ON paper_fills(cycle_key, id);",
     )?;
     Ok(())
 }

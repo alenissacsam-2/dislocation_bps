@@ -109,6 +109,10 @@ pub struct PoolState {
 impl PoolState {
     /// Build a constant-product pool. Convenience for decoders and tests.
     #[must_use]
+    // Eight arguments, and all eight are distinct facts about a pool with no natural
+    // grouping between them. Bundling them into a struct to satisfy the lint would
+    // just move the same eight fields one level out.
+    #[allow(clippy::too_many_arguments)]
     pub fn constant_product(
         id: PoolId,
         dex: Dex,

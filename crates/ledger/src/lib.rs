@@ -85,8 +85,8 @@ impl Ledger {
             "INSERT INTO paper_fills
              (slot, route, venues, hops, edge_bps, dislocation_bps, fee_bps, size_usd,
               optimal_size_usd, gross_usd, profit_at_optimal_usd, tip_usd, net_usd,
-              taken, skipped_reason)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+              taken, skipped_reason, cycle_key)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             rusqlite::params![
                 f.slot as i64,
                 f.route,
@@ -103,6 +103,7 @@ impl Ledger {
                 f.net_usd,
                 i64::from(f.taken),
                 f.skipped_reason.as_deref(),
+                f.cycle_key,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -284,52 +285,103 @@ impl Ledger {
     /// This is still an upper bound — it ignores that our own trade moves the price,
     /// and it assumes we win every race — but it is an upper bound on the right
     /// quantity, which the raw sum is not.
-    pub fn episodes(&self, gap_secs: f64) -> Result<EpisodeStats> {
-        let _guard = self.conn.unchecked_transaction()?;
-        let mut stmt = self.conn.prepare(
-            "WITH d AS (
-                 SELECT id, route, net_usd, profit_at_optimal_usd, taken,
-                        (julianday(at) - julianday(LAG(at) OVER w)) * 86400.0 AS gap_s
-                 FROM paper_fills
-                 WINDOW w AS (PARTITION BY route ORDER BY id)
-             ),
-             m AS (
-                 SELECT *, CASE WHEN gap_s IS NULL OR gap_s > ?1 THEN 1 ELSE 0 END AS brk FROM d
-             ),
-             e AS (
-                 SELECT *, SUM(brk) OVER (PARTITION BY route ORDER BY id) AS ep FROM m
-             )
-             SELECT route, MAX(profit_at_optimal_usd), MAX(net_usd), MAX(taken), COUNT(*)
-             FROM e GROUP BY route, ep",
-        )?;
-        let rows = stmt.query_map([gap_secs], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, f64>(1)?,
-                r.get::<_, f64>(2)?,
-                r.get::<_, i64>(3)? == 1,
-                r.get::<_, i64>(4)? as u64,
-            ))
-        })?;
-
+    pub fn episodes(&self, gap_slots: u64) -> Result<EpisodeStats> {
         let mut st = EpisodeStats::default();
         let mut nets: Vec<f64> = Vec::new();
-        for row in rows {
-            let (_route, pie, best_net, taken, detections) = row?;
+        for e in self.episode_rows(gap_slots)? {
             st.count += 1;
-            st.detections += detections;
-            st.total_pie_usd += pie;
-            st.longest_detections = st.longest_detections.max(detections);
-            if taken && best_net > 0.0 {
+            st.detections += e.detections;
+            st.total_pie_usd += e.pie_usd;
+            st.longest_detections = st.longest_detections.max(e.detections);
+            st.longest_slots = st.longest_slots.max(e.lifetime_slots);
+            if e.taken && e.best_net_usd > 0.0 {
                 st.taken += 1;
-                st.total_net_usd += best_net;
-                nets.push(best_net);
+                st.total_net_usd += e.best_net_usd;
+                nets.push(e.best_net_usd);
             }
         }
         nets.sort_by(f64::total_cmp);
         st.median_net_usd = nets.get(nets.len() / 2).copied().unwrap_or(0.0);
         st.best_net_usd = nets.last().copied().unwrap_or(0.0);
         Ok(st)
+    }
+
+    /// How long an opportunity survives, against how much it is worth.
+    ///
+    /// # Why this is the measurement that settles the question
+    ///
+    /// Every other number here can be argued with — maybe more capital, maybe more
+    /// venues, maybe a faster machine. This one closes the argument, because size and
+    /// lifetime turn out to be *inversely* coupled: the gaps that would repay real
+    /// capital are gone within a slot, and the ones that sit around waiting are worth
+    /// a few thousandths of a cent. There is no size at which an opportunity is both
+    /// worth taking and still there when you arrive.
+    ///
+    /// Lifetime is counted in **slots**, not wall-clock. A slot is the chain's own
+    /// tick (~400 ms), it is what the ledger already records, and it is immune to the
+    /// local clock drifting.
+    pub fn survival(&self, gap_slots: u64) -> Result<Vec<SurvivalBand>> {
+        // Boundaries in dollars of whole-pie value, with the label for each bucket.
+        const BANDS: [(f64, &str); 5] = [
+            (0.001, "under $0.001"),
+            (0.01, "$0.001 - $0.01"),
+            (0.10, "$0.01 - $0.10"),
+            (1.00, "$0.10 - $1"),
+            (f64::INFINITY, "over $1"),
+        ];
+        let mut out: Vec<SurvivalBand> = BANDS
+            .iter()
+            .map(|(_, label)| SurvivalBand { label: (*label).to_string(), ..Default::default() })
+            .collect();
+
+        for e in self.episode_rows(gap_slots)? {
+            let i = BANDS.iter().position(|(hi, _)| e.pie_usd < *hi).unwrap_or(BANDS.len() - 1);
+            let b = &mut out[i];
+            b.episodes += 1;
+            b.total_slots += e.lifetime_slots;
+            b.longest_slots = b.longest_slots.max(e.lifetime_slots);
+            b.total_detections += e.detections;
+            b.total_capital_usd += e.optimal_size_usd;
+        }
+        out.retain(|b| b.episodes > 0);
+        Ok(out)
+    }
+
+    /// One row per episode. The single definition of what an episode *is* — both
+    /// [`Self::episodes`] and [`Self::survival`] read it, so they cannot disagree.
+    fn episode_rows(&self, gap_slots: u64) -> Result<Vec<EpisodeRow>> {
+        let _guard = self.conn.unchecked_transaction()?;
+        let mut stmt = self.conn.prepare(
+            "WITH k AS (
+                 SELECT id, slot, net_usd, profit_at_optimal_usd, optimal_size_usd, taken,
+                        COALESCE(NULLIF(cycle_key, ''), route || '|' || venues) AS ck
+                 FROM paper_fills
+             ),
+             d AS (
+                 SELECT *, slot - LAG(slot) OVER (PARTITION BY ck ORDER BY id) AS gap
+                 FROM k
+             ),
+             m AS (
+                 SELECT *, CASE WHEN gap IS NULL OR gap > ?1 THEN 1 ELSE 0 END AS brk FROM d
+             ),
+             e AS (
+                 SELECT *, SUM(brk) OVER (PARTITION BY ck ORDER BY id) AS ep FROM m
+             )
+             SELECT MAX(profit_at_optimal_usd), MAX(net_usd), MAX(taken), COUNT(*),
+                    MAX(slot) - MIN(slot), MAX(optimal_size_usd)
+             FROM e GROUP BY ck, ep",
+        )?;
+        let rows = stmt.query_map([gap_slots as i64], |r| {
+            Ok(EpisodeRow {
+                pie_usd: r.get(0)?,
+                best_net_usd: r.get(1)?,
+                taken: r.get::<_, i64>(2)? == 1,
+                detections: r.get::<_, i64>(3)? as u64,
+                lifetime_slots: r.get::<_, i64>(4)?.max(0) as u64,
+                optimal_size_usd: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// The routes that clear most often, with what they were worth.
@@ -406,6 +458,60 @@ pub struct FillRecord {
     pub net_usd: f64,
     pub taken: bool,
     pub skipped_reason: Option<String>,
+    /// Rotation-invariant identity of the loop. See `Cycle::canonical_key`.
+    pub cycle_key: String,
+}
+
+/// One episode: a gap, from the moment it opened to the moment it closed.
+#[derive(Debug, Clone)]
+struct EpisodeRow {
+    /// What it was worth at the size that maximises it, at any capital.
+    pie_usd: f64,
+    best_net_usd: f64,
+    taken: bool,
+    detections: u64,
+    /// Slots between first and last sighting. Zero means it did not survive to the
+    /// next slot.
+    lifetime_slots: u64,
+    /// Capital the pie would have required.
+    optimal_size_usd: f64,
+}
+
+/// Opportunities of one size, and how long they lasted.
+#[derive(Debug, Clone, Default)]
+pub struct SurvivalBand {
+    pub label: String,
+    pub episodes: u64,
+    total_slots: u64,
+    pub longest_slots: u64,
+    total_detections: u64,
+    total_capital_usd: f64,
+}
+
+impl SurvivalBand {
+    /// Mean lifetime in slots.
+    #[must_use]
+    pub fn mean_slots(&self) -> f64 {
+        if self.episodes == 0 { 0.0 } else { self.total_slots as f64 / self.episodes as f64 }
+    }
+
+    /// Mean lifetime in seconds, at ~400 ms per slot.
+    #[must_use]
+    pub fn mean_secs(&self) -> f64 {
+        self.mean_slots() * 0.4
+    }
+
+    /// Mean capital the opportunities in this band would have needed.
+    #[must_use]
+    pub fn mean_capital_usd(&self) -> f64 {
+        if self.episodes == 0 { 0.0 } else { self.total_capital_usd / self.episodes as f64 }
+    }
+
+    /// Mean sightings before it closed.
+    #[must_use]
+    pub fn mean_detections(&self) -> f64 {
+        if self.episodes == 0 { 0.0 } else { self.total_detections as f64 / self.episodes as f64 }
+    }
 }
 
 /// Everything a run has measured.
@@ -457,6 +563,8 @@ pub struct EpisodeStats {
     /// Longest single episode, in detections. A large value means one standing gap
     /// nobody else bothered to close.
     pub longest_detections: u64,
+    /// Longest single episode in slots — the same thing on the chain's own clock.
+    pub longest_slots: u64,
     /// Sum over episodes of what each was worth at unlimited capital.
     pub total_pie_usd: f64,
     /// Sum over episodes of what we would have kept, once each.
@@ -597,6 +705,7 @@ mod tests {
             net_usd: net,
             taken,
             skipped_reason: if taken { None } else { Some("net negative after tip".into()) },
+            cycle_key: "aabbccdd:0101>eeff0011:0202".into(),
         }
     }
 
@@ -737,26 +846,77 @@ mod tests {
         let raw = l.summary().unwrap();
         assert!((raw.realised_net_usd - 5.0).abs() < 1e-6, "the naive sum says $5");
 
-        let e = l.episodes(2.0).unwrap();
+        let e = l.episodes(5).unwrap();
         assert_eq!(e.count, 1, "it was one gap the whole time");
         assert_eq!(e.detections, 1000);
         assert!(e.inflation() > 900.0, "the raw count overstated by ~1000x");
         assert!((e.total_net_usd - 0.005).abs() < 1e-9, "worth one fill, not a thousand");
     }
 
-    /// Two routes that clear at the same time are two opportunities, not one.
+    /// Two different loops that clear at the same time are two opportunities.
     #[test]
-    fn distinct_routes_are_distinct_episodes() {
+    fn distinct_cycles_are_distinct_episodes() {
         let l = Ledger::open_in_memory().unwrap();
         for _ in 0..10 {
             l.record_fill(&fill(0.001, true)).unwrap();
             let mut other = fill(0.002, true);
             other.route = "SOL -> USDT -> SOL".into();
+            other.cycle_key = "11223344:0303>55667788:0404".into();
             l.record_fill(&other).unwrap();
         }
-        let e = l.episodes(2.0).unwrap();
+        let e = l.episodes(5).unwrap();
         assert_eq!(e.count, 2);
         assert!((e.total_net_usd - 0.003).abs() < 1e-9, "best of each, summed once");
+    }
+
+    /// The mirror bug, pinned at the ledger. One round trip is reported under two
+    /// routes — one per mint you could enter it at — and they must collapse, or every
+    /// opportunity count this instrument prints is doubled.
+    #[test]
+    fn one_loop_reported_under_two_route_names_is_one_episode() {
+        let l = Ledger::open_in_memory().unwrap();
+        for _ in 0..20 {
+            l.record_fill(&fill(0.004, true)).unwrap();
+            // Same loop, entered at the other mint: different printed route and a
+            // reversed venue list, but the identical set of pools in the same order.
+            let mut mirror = fill(0.004, true);
+            mirror.route = "USDC -> SOL -> USDC".into();
+            mirror.venues = "RAY-CL 1bp - ORCA 1bp".into();
+            l.record_fill(&mirror).unwrap();
+        }
+        let e = l.episodes(5).unwrap();
+        assert_eq!(e.count, 1, "one loop, entered two ways, is one arbitrage");
+        assert!((e.total_net_usd - 0.004).abs() < 1e-9, "and it pays once");
+    }
+
+    /// Opportunities big enough to matter do not survive; small ones linger. If this
+    /// ever inverts, the whole verdict changes and it should be re-examined.
+    #[test]
+    fn survival_buckets_by_value_and_measures_lifetime_in_slots() {
+        let l = Ledger::open_in_memory().unwrap();
+        // A fat gap, seen once and gone.
+        let mut fat = fill(0.5, true);
+        fat.profit_at_optimal_usd = 3.0;
+        fat.optimal_size_usd = 4000.0;
+        fat.cycle_key = "fa000000:0101>fb000000:0202".into();
+        l.record_fill(&fat).unwrap();
+        // A crumb, standing for ten slots.
+        for slot in 0..10 {
+            let mut thin = fill(0.0001, true);
+            thin.profit_at_optimal_usd = 0.0002;
+            thin.optimal_size_usd = 1.0;
+            thin.slot = 100 + slot;
+            l.record_fill(&thin).unwrap();
+        }
+
+        let bands = l.survival(5).unwrap();
+        let over = bands.iter().find(|b| b.label == "over $1").expect("fat band");
+        let under = bands.iter().find(|b| b.label == "under $0.001").expect("thin band");
+        assert_eq!(over.episodes, 1);
+        assert_eq!(over.longest_slots, 0, "gone before the next slot");
+        assert_eq!(under.episodes, 1);
+        assert_eq!(under.longest_slots, 9, "still there ten slots later");
+        assert!(over.mean_capital_usd() > under.mean_capital_usd() * 100.0);
     }
 
     /// An episode is worth its best moment, not the sum of its moments — taking an
@@ -767,7 +927,7 @@ mod tests {
         for net in [0.001, 0.004, 0.002] {
             l.record_fill(&fill(net, true)).unwrap();
         }
-        let e = l.episodes(2.0).unwrap();
+        let e = l.episodes(5).unwrap();
         assert_eq!(e.count, 1);
         assert!((e.total_net_usd - 0.004).abs() < 1e-9);
         assert!((e.best_net_usd - 0.004).abs() < 1e-9);
@@ -781,7 +941,7 @@ mod tests {
         for _ in 0..5 {
             l.record_fill(&fill(-0.001, false)).unwrap();
         }
-        let e = l.episodes(2.0).unwrap();
+        let e = l.episodes(5).unwrap();
         assert_eq!(e.count, 1);
         assert_eq!(e.taken, 0);
         assert_eq!(e.total_net_usd, 0.0);
@@ -795,9 +955,9 @@ mod tests {
         assert_eq!(s.clearing_rate(), 0.0);
         assert!(l.top_routes(5).unwrap().is_empty());
         assert_eq!(l.concentration().unwrap().1, 0.0);
-        assert_eq!(l.episodes(2.0).unwrap().count, 0);
+        assert_eq!(l.episodes(5).unwrap().count, 0);
         assert_eq!(l.median_sol_price().unwrap(), 0.0);
-        assert_eq!(l.episodes(2.0).unwrap().inflation(), 0.0);
+        assert_eq!(l.episodes(5).unwrap().inflation(), 0.0);
         assert_eq!(l.hours_observed().unwrap(), 0.0);
         assert_eq!(l.fill_percentiles().unwrap().taken_net_p50, 0.0);
     }
