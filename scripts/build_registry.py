@@ -29,6 +29,7 @@ Usage:  python3 scripts/build_registry.py [--budget 120] [--min-tvl 150000]
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import sys
 import urllib.request
@@ -48,7 +49,20 @@ RAYDIUM_POOLS = "https://api-v3.raydium.io/pools/info/list"
 
 # One subscription per concentrated pool; three per constant-product pool, whose
 # reserves live in two separate vault accounts alongside the pool.
-SUB_COST = {"orca_whirlpool": 1, "raydium_clmm": 1, "raydium_v4": 3, "raydium_cpmm": 3}
+SUB_COST = {
+    "orca_whirlpool": 1,
+    "raydium_clmm": 1,
+    "raydium_v4": 3,
+    "raydium_cpmm": 3,
+    "meteora_damm_v2": 1,
+}
+
+# Meteora DAMM v2 has no directory API, so its pools come from the chain itself. That
+# is the better source anyway: `getProgramAccounts` cannot describe a pool that does
+# not exist, and every number below is read from the account rather than reported.
+DAMM_V2_PROGRAM = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"
+DAMM_V2_LEN = 1112
+RPC_URL = "https://api.mainnet-beta.solana.com"
 
 # Raydium runs four separate AMM programs and its API calls three of them "Standard".
 # They share no account layout. Keying the decoder off the API's `type` field rather
@@ -163,6 +177,151 @@ def fetch_raydium(pages: int) -> list[dict]:
     return out
 
 
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def base58(raw: bytes) -> str:
+    """Encode 32 raw bytes as a Solana address."""
+    n = int.from_bytes(raw, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = _B58[r] + out
+    return "1" * (len(raw) - len(raw.lstrip(b"\0"))) + out
+
+
+def rpc(method: str, params: list) -> dict:
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+    req = urllib.request.Request(
+        RPC_URL, data=body.encode(), headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=120) as r:
+        out = json.load(r)
+    if "error" in out:
+        raise RuntimeError(f"{method}: {out['error']}")
+    return out
+
+
+def _u(d: bytes, o: int, n: int) -> int:
+    return int.from_bytes(d[o : o + n], "little")
+
+
+def fetch_meteora_damm_v2(known: dict[str, dict]) -> list[dict]:
+    """Discover DAMM v2 pools on mints we already track, straight from the chain.
+
+    Two passes on purpose. There are tens of thousands of these pools, nearly all of
+    them dust from token launches, and pulling 1112 bytes for every one would move
+    tens of megabytes to discard almost all of it. So the first pass asks only for the
+    64 bytes holding the two mints, and the second reads in full only the pools whose
+    pair we can actually route through.
+    """
+    out: list[dict] = []
+    candidates: dict[str, tuple[str, str]] = {}
+
+    for quote in BASE_MINTS:
+        try:
+            res = rpc("getProgramAccounts", [DAMM_V2_PROGRAM, {
+                "encoding": "base64",
+                "commitment": "processed",
+                "filters": [{"dataSize": DAMM_V2_LEN}, {"memcmp": {"offset": 200, "bytes": quote}}],
+                "dataSlice": {"offset": 168, "length": 64},
+            }])["result"]
+        except Exception as e:  # noqa: BLE001 - one dead quote must not kill the build
+            print(f"  damm v2: {quote[:8]}… lookup failed: {e}", file=sys.stderr)
+            continue
+        hits = 0
+        for a in res:
+            d = base64.b64decode(a["account"]["data"][0])
+            mint_a = base58(d[0:32])
+            if mint_a in known and mint_a != quote:
+                candidates[a["pubkey"]] = (mint_a, quote)
+                hits += 1
+        print(f"  damm v2: {len(res):>6} pools quoted in {known.get(quote, {}).get('sym', quote[:6])}"
+              f", {hits} on pairs we track", file=sys.stderr)
+
+    # Second pass: full accounts, in batches, for the shortlist only.
+    addrs = list(candidates)
+    for i in range(0, len(addrs), 100):
+        batch = addrs[i : i + 100]
+        vals = rpc("getMultipleAccounts", [batch, {"encoding": "base64", "commitment": "processed"}])
+        for addr, v in zip(batch, vals["result"]["value"]):
+            if not v:
+                continue
+            d = base64.b64decode(v["data"][0])
+            if len(d) < DAMM_V2_LEN:
+                continue
+            mint_a, mint_b = candidates[addr]
+            ka, kb = known[mint_a], known[mint_b]
+            amt_a = _u(d, 680, 8) / 10 ** ka["dec"]
+            amt_b = _u(d, 688, 8) / 10 ** kb["dec"]
+            # Value the quote side and double it. Every quote here is a BASE_MINT, so
+            # its price is either $1 or comes from the anchor pass in main().
+            out.append({
+                "address": addr,
+                "dex": "meteora_damm_v2",
+                "mint_a": mint_a,
+                "mint_b": mint_b,
+                "sym_a": ka["sym"],
+                "sym_b": kb["sym"],
+                "dec_a": ka["dec"],
+                "dec_b": kb["dec"],
+                "prog_a": SPL_TOKEN if d[482] == 0 else "token-2022",
+                "prog_b": SPL_TOKEN if d[483] == 0 else "token-2022",
+                "fee_ppm": -(-_u(d, 8, 8) // 1_000),   # numerator over 1e9, rounded up
+                "tvl_usd": 0.0,                        # filled once prices are known
+                "_amt_a": amt_a,
+                "_amt_b": amt_b,
+                # Price of A in B, from sqrt_price. NOT from the balance ratio: a
+                # concentrated pool holds its two tokens in a ratio set by where spot
+                # sits inside its range, so balances imply a price only for a
+                # full-range pool. Reading it that way put SOL at $32 against a real
+                # $99, because the deepest pool happened to be a narrow one.
+                "_price_ab": (_u(d, 456, 16) / 2**64) ** 2 * 10 ** (ka["dec"] - kb["dec"]),
+                "pool_type": "damm_v2",
+                # A dynamic fee or a fee schedule means the stored base fee is not the
+                # price. The decoder refuses both; reject here so the pool never
+                # occupies a subscription in the first place.
+                "has_dynamic_fee": d[56] != 0 or any(d[16:48]),
+                "disabled": d[481] != 0,
+            })
+    return out
+
+
+def price_damm_v2(pools: list[dict]) -> dict[str, float]:
+    """Fill in TVL for DAMM v2 pools, in place, and return the prices used.
+
+    Self-contained on purpose: the pools were read from the chain, so their own state
+    implies every price needed. A stablecoin-quoted pool prices its base mint, and
+    those prices then value everything quoted in one of them. No API is asked for a
+    price and no dollar value is hardcoded.
+    """
+    usd: dict[str, float] = {USDC: 1.0, USDT: 1.0}
+    damm = [p for p in pools if p["dex"] == "meteora_damm_v2"]
+
+    def tvl(p: dict) -> float:
+        """Both sides valued separately — a concentrated pool is not 50/50."""
+        return p["_amt_a"] * usd.get(p["mint_a"], 0.0) + p["_amt_b"] * usd.get(p["mint_b"], 0.0)
+
+    # Two rounds outward from the stablecoins: the first prices whatever they quote,
+    # the second values pools quoted in those. Deepest quote wins each mint, since a
+    # thin pool can sit far from the market with nobody bothering to correct it.
+    for _ in range(2):
+        implied: dict[str, list[tuple[float, float]]] = defaultdict(list)
+        for p in damm:
+            if p["mint_a"] not in usd and p["mint_b"] in usd and p["_price_ab"] > 0:
+                implied[p["mint_a"]].append((tvl(p), p["_price_ab"] * usd[p["mint_b"]]))
+        if not implied:
+            break
+        for mint, quotes in implied.items():
+            usd[mint] = max(quotes)[1]
+
+    for p in damm:
+        p["tvl_usd"] = tvl(p)
+        for k in ("_amt_a", "_amt_b", "_price_ab"):
+            p.pop(k, None)
+    return usd
+
+
 def usable(p: dict, min_tvl: float) -> str | None:
     """Return a rejection reason, or None if the pool is usable."""
     if p["prog_a"] != SPL_TOKEN or p["prog_b"] != SPL_TOKEN:
@@ -172,7 +331,9 @@ def usable(p: dict, min_tvl: float) -> str | None:
     if p["mint_a"] == p["mint_b"]:
         return "degenerate pair"
     if p.get("has_dynamic_fee"):
-        return "dynamic fee not read from chain"
+        return "dynamic fee or fee schedule not read from chain"
+    if p.get("disabled"):
+        return "swaps disabled on the pool"
     if p["dex"] == "orca_whirlpool" and p["pool_type"] != "whirlpool":
         return f"unsupported orca pool type {p['pool_type']!r}"
     if not (0 <= p["fee_ppm"] < 1_000_000):
@@ -240,11 +401,30 @@ def main() -> int:
     ap.add_argument("--pages", type=int, default=3)
     ap.add_argument("--max-v4", type=int, default=6, help="cap on Raydium AMM v4 pools")
     ap.add_argument("--out", default="crates/bot/pools.json")
+    ap.add_argument("--no-damm-v2", action="store_true", help="skip the chain scan")
     args = ap.parse_args()
 
     print("fetching venue directories...", file=sys.stderr)
     candidates = fetch_orca(args.pages) + fetch_raydium(args.pages)
     print(f"  {len(candidates)} pools listed", file=sys.stderr)
+
+    if not args.no_damm_v2:
+        # DAMM v2 has no directory API. It needs to know which mints are worth
+        # looking at, which the API venues have already told us.
+        known: dict[str, dict] = {}
+        for p in candidates:
+            known.setdefault(p["mint_a"], {"sym": p["sym_a"], "dec": p["dec_a"]})
+            known.setdefault(p["mint_b"], {"sym": p["sym_b"], "dec": p["dec_b"]})
+        print("scanning Meteora DAMM v2 on chain...", file=sys.stderr)
+        try:
+            damm = fetch_meteora_damm_v2(known)
+            usd = price_damm_v2(damm)
+            candidates += damm
+            print(f"  {len(damm)} damm v2 pools on tracked pairs"
+                  f" (SOL priced at ${usd.get(SOL, 0):,.2f} from their own balances)",
+                  file=sys.stderr)
+        except Exception as e:  # noqa: BLE001 - the other venues are still usable
+            print(f"  damm v2 discovery failed, continuing without it: {e}", file=sys.stderr)
 
     rejects: dict[str, int] = defaultdict(int)
     kept = []

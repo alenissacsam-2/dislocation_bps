@@ -20,6 +20,7 @@ pub enum Dex {
     OrcaWhirlpool,
     RaydiumClmm,
     RaydiumCpmm,
+    MeteoraDammV2,
 }
 
 impl Dex {
@@ -32,6 +33,7 @@ impl Dex {
             Dex::OrcaWhirlpool => "Orca Whirlpool",
             Dex::RaydiumClmm => "Raydium CLMM",
             Dex::RaydiumCpmm => "Raydium CP-Swap",
+            Dex::MeteoraDammV2 => "Meteora DAMM v2",
         }
     }
 
@@ -44,6 +46,7 @@ impl Dex {
             Dex::OrcaWhirlpool => "ORCA",
             Dex::RaydiumClmm => "RAY-CL",
             Dex::RaydiumCpmm => "RAY-CP",
+            Dex::MeteoraDammV2 => "MET-D2",
         }
     }
 
@@ -56,7 +59,7 @@ impl Dex {
     /// fit inside an RPC provider's subscription budget.
     #[must_use]
     pub fn is_self_contained(self) -> bool {
-        matches!(self, Dex::OrcaWhirlpool | Dex::RaydiumClmm)
+        matches!(self, Dex::OrcaWhirlpool | Dex::RaydiumClmm | Dex::MeteoraDammV2)
     }
 }
 

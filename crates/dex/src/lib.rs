@@ -4,6 +4,7 @@
 //! Decoders take reserves as parameters rather than fetching them, so they remain
 //! testable without a network.
 
+pub mod meteora_damm_v2;
 pub mod orca_whirlpool;
 pub mod pumpswap;
 pub mod raydium_clmm;

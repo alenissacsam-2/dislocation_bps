@@ -5,7 +5,7 @@
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
   ],
-  "subscriptions": 102,
+  "subscriptions": 104,
   "mints": {
     "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB": {
       "symbol": "USD1",
@@ -51,6 +51,10 @@
       "symbol": "JLP",
       "decimals": 6
     },
+    "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm": {
+      "symbol": "$WIF",
+      "decimals": 6
+    },
     "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs": {
       "symbol": "whETH",
       "decimals": 8
@@ -59,10 +63,6 @@
       "symbol": "RAY",
       "decimals": 6
     },
-    "7JA5eZdCzztSfQbJvS8aVVxMFfd81Rs9VvwnocV1mKHu": {
-      "symbol": "GEOD",
-      "decimals": 9
-    },
     "METAewgxyPbgwsseH8T16a39CQ5VyVxZi9zXiDPY18m": {
       "symbol": "MPLX",
       "decimals": 6
@@ -70,6 +70,10 @@
     "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN": {
       "symbol": "TRUMP",
       "decimals": 6
+    },
+    "7JA5eZdCzztSfQbJvS8aVVxMFfd81Rs9VvwnocV1mKHu": {
+      "symbol": "GEOD",
+      "decimals": 9
     },
     "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump": {
       "symbol": "Fartcoin",
@@ -94,10 +98,6 @@
     "Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk": {
       "symbol": "USELESS",
       "decimals": 6
-    },
-    "J3NKxxXZcnNiMjKw9hYb2K4LUxgwB6t1FtPtQVsv3KFr": {
-      "symbol": "SPX",
-      "decimals": 8
     },
     "8MohwPY3hm8SJfQGi4KuDfKTMeisGhcGiTa7yEFabray": {
       "symbol": "ALNOOR",
@@ -132,7 +132,7 @@
       "mint_a": "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 100,
-      "tvl_usd": 9898441.35
+      "tvl_usd": 9898863.2
     },
     {
       "address": "2e3WeM4WwdEqwTtRnWN3gJSbhNg1P6Aj2y7kEdfrYbix",
@@ -141,7 +141,7 @@
       "mint_a": "6FrrzDk5mQARGc1TDYoyVnSyRdds1t4PbtohCD6p3tgG",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 100,
-      "tvl_usd": 9346946.34
+      "tvl_usd": 9350608.19
     },
     {
       "address": "Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp",
@@ -150,7 +150,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
       "fee_ppm": 100,
-      "tvl_usd": 6725717.84
+      "tvl_usd": 7282514.73
     },
     {
       "address": "EUGzX8kKvbLB55idiETEdXm6NZzB3Dz7c1ui6wGhcviR",
@@ -159,7 +159,7 @@
       "mint_a": "JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 100,
-      "tvl_usd": 3894185.09
+      "tvl_usd": 3894102.71
     },
     {
       "address": "4tgA77vUnDaTADqGJYhJYT1Qf8nnukxFGohoXR3tzPau",
@@ -168,7 +168,7 @@
       "mint_a": "JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 100,
-      "tvl_usd": 3847849.73
+      "tvl_usd": 3847590.25
     },
     {
       "address": "BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU",
@@ -177,7 +177,7 @@
       "mint_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "mint_b": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
       "fee_ppm": 100,
-      "tvl_usd": 3645780.93
+      "tvl_usd": 3702850.3
     },
     {
       "address": "2uoKbPEidR7KAMYtY4x7xdkHXWqYib5k4CutJauSL3Mc",
@@ -186,16 +186,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
       "fee_ppm": 100,
-      "tvl_usd": 2002701.54
-    },
-    {
-      "address": "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4",
-      "dex": "orca_whirlpool",
-      "label": "USDC/USDT",
-      "mint_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-      "mint_b": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-      "fee_ppm": 100,
-      "tvl_usd": 1121378.45
+      "tvl_usd": 2141570.01
     },
     {
       "address": "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF",
@@ -204,7 +195,16 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
       "fee_ppm": 100,
-      "tvl_usd": 1102848.63
+      "tvl_usd": 1128866.13
+    },
+    {
+      "address": "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4",
+      "dex": "orca_whirlpool",
+      "label": "USDC/USDT",
+      "mint_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "mint_b": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+      "fee_ppm": 100,
+      "tvl_usd": 1110835.82
     },
     {
       "address": "EWivkwNtcxuPsU6RyD7Pfvs7u9Yv8nQ79tJ7xgGyPrp6",
@@ -213,7 +213,7 @@
       "mint_a": "6FrrzDk5mQARGc1TDYoyVnSyRdds1t4PbtohCD6p3tgG",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 100,
-      "tvl_usd": 967013.64
+      "tvl_usd": 966748.4
     },
     {
       "address": "8EzbUfvcRT1Q6RL462ekGkgqbxsPmwC5FMLQZhSPMjJ3",
@@ -222,7 +222,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
       "fee_ppm": 100,
-      "tvl_usd": 817064.64
+      "tvl_usd": 873589.14
     },
     {
       "address": "8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj",
@@ -231,7 +231,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 100,
-      "tvl_usd": 489514.8
+      "tvl_usd": 498553.56
     },
     {
       "address": "8GuXrPq6deS1ZzNXYmBjVZ5P48cAmKGrhhpdAn2FURPC",
@@ -240,7 +240,7 @@
       "mint_a": "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij",
       "mint_b": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
       "fee_ppm": 100,
-      "tvl_usd": 208937.02
+      "tvl_usd": 206561.14
     },
     {
       "address": "HQcY5n2zP6rW74fyFEhWeBd3LnJpBcZechkvJpmdb8cx",
@@ -249,7 +249,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
       "fee_ppm": 100,
-      "tvl_usd": 178922.65
+      "tvl_usd": 198027.58
     },
     {
       "address": "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC",
@@ -258,7 +258,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
       "fee_ppm": 200,
-      "tvl_usd": 542042.7
+      "tvl_usd": 591745.61
     },
     {
       "address": "6NUiVmsNjsi4AfsMsEiaezsaV9N4N1ZrD4jEnuWNRvyb",
@@ -267,7 +267,7 @@
       "mint_a": "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 200,
-      "tvl_usd": 464019.85
+      "tvl_usd": 486159.08
     },
     {
       "address": "CYbD9RaToYMtWKA7QZyoLahnHdWq553Vm62Lh6qWtuxq",
@@ -276,7 +276,16 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 200,
-      "tvl_usd": 368220.16
+      "tvl_usd": 373110.11
+    },
+    {
+      "address": "8KbrpeSRYXYjWSSdG7gE1tR7Go8MmKKxKaei1gGc4U7Q",
+      "dex": "raydium_clmm",
+      "label": "WSOL/JLP",
+      "mint_a": "So11111111111111111111111111111111111111112",
+      "mint_b": "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4",
+      "fee_ppm": 300,
+      "tvl_usd": 157557.09
     },
     {
       "address": "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE",
@@ -285,16 +294,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 400,
-      "tvl_usd": 24418574.12
-    },
-    {
-      "address": "HxA6SKW5qA4o12fjVgTpXdq2YnZ5Zv1s7SB4FFomsyLM",
-      "dex": "orca_whirlpool",
-      "label": "cbBTC/USDC",
-      "mint_a": "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij",
-      "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-      "fee_ppm": 400,
-      "tvl_usd": 6049536.06
+      "tvl_usd": 25007391.88
     },
     {
       "address": "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv",
@@ -303,7 +303,25 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 400,
-      "tvl_usd": 5888621.17
+      "tvl_usd": 6046935.65
+    },
+    {
+      "address": "HxA6SKW5qA4o12fjVgTpXdq2YnZ5Zv1s7SB4FFomsyLM",
+      "dex": "orca_whirlpool",
+      "label": "cbBTC/USDC",
+      "mint_a": "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij",
+      "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "fee_ppm": 400,
+      "tvl_usd": 5968947.13
+    },
+    {
+      "address": "8Pm2kZpnxD3hoMmt4bjStX2Pw2Z9abpbHzZxMPqxPmie",
+      "dex": "meteora_damm_v2",
+      "label": "SOL/USDC",
+      "mint_a": "So11111111111111111111111111111111111111112",
+      "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "fee_ppm": 400,
+      "tvl_usd": 1516101.61
     },
     {
       "address": "6a3m2EgFFKfsFuQtP4LJJXPcAe3TQYXNyHUjjZpUxYgd",
@@ -312,7 +330,16 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4",
       "fee_ppm": 400,
-      "tvl_usd": 1261920.53
+      "tvl_usd": 1399823.37
+    },
+    {
+      "address": "D6NdKrKNQPmRZCCnG1GqXtF7MMoHB7qR6GU5TkG59Qz1",
+      "dex": "orca_whirlpool",
+      "label": "SOL/$WIF",
+      "mint_a": "So11111111111111111111111111111111111111112",
+      "mint_b": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+      "fee_ppm": 400,
+      "tvl_usd": 155230.59
     },
     {
       "address": "HktfL7iwGKT5QHjywQkcDnZXScoh811k7akrMZJkCcEF",
@@ -321,7 +348,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
       "fee_ppm": 500,
-      "tvl_usd": 5001029.06
+      "tvl_usd": 4341206.66
     },
     {
       "address": "2AXXcN6oN9bBT5owwmTH53C7QHUXvhLeu718Kqt8rvY2",
@@ -330,7 +357,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
       "fee_ppm": 500,
-      "tvl_usd": 1255964.67
+      "tvl_usd": 1330082.07
     },
     {
       "address": "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA",
@@ -339,7 +366,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
       "fee_ppm": 500,
-      "tvl_usd": 1126580.52
+      "tvl_usd": 1215264.9
     },
     {
       "address": "HD8i7qr1hd9ida6sN71RbkLxbWcbvZS4NA5CY6vfcDpj",
@@ -348,16 +375,7 @@
       "mint_a": "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 500,
-      "tvl_usd": 1056963.84
-    },
-    {
-      "address": "14ikayyXmmi96rNqq6kDWGAUbRWLMTjXbXYTfw2Eey1",
-      "dex": "raydium_clmm",
-      "label": "GEOD/USDC",
-      "mint_a": "7JA5eZdCzztSfQbJvS8aVVxMFfd81Rs9VvwnocV1mKHu",
-      "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-      "fee_ppm": 500,
-      "tvl_usd": 826585.63
+      "tvl_usd": 1082140.76
     },
     {
       "address": "78QBVQz3EnpuzmY42LRcCkn7gSyuFEMmQn1m5bY1yHgw",
@@ -366,7 +384,7 @@
       "mint_a": "METAewgxyPbgwsseH8T16a39CQ5VyVxZi9zXiDPY18m",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 500,
-      "tvl_usd": 532353.5
+      "tvl_usd": 556793.51
     },
     {
       "address": "5hWJUNTtEtKmKgDXpthJXXRRmJrz5vJ7uJzrUNVdrwLg",
@@ -375,7 +393,7 @@
       "mint_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "mint_b": "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
       "fee_ppm": 500,
-      "tvl_usd": 397236.67
+      "tvl_usd": 391890.67
     },
     {
       "address": "2QdhepnKRTLjjSqPL1PtKNwqrUkoLee5Gqs8bvZhRdMv",
@@ -384,7 +402,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 500,
-      "tvl_usd": 375514.42
+      "tvl_usd": 385773.53
     },
     {
       "address": "AU971DrPyhhrpRnmEBp5pDTWL2ny7nofb5vYBjDJkR2E",
@@ -393,25 +411,7 @@
       "mint_a": "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 500,
-      "tvl_usd": 223150.09
-    },
-    {
-      "address": "7qbRF6YsyGuLUVs6Y1q64bdVrfe4ZcUUz1JRdoVNUJnm",
-      "dex": "orca_whirlpool",
-      "label": "SOL/USDC",
-      "mint_a": "So11111111111111111111111111111111111111112",
-      "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-      "fee_ppm": 500,
-      "tvl_usd": 211660.99
-    },
-    {
-      "address": "AqJ5JYNb7ApkJwvbuXxPnTtKeuizjvC1s2fkp382y9LC",
-      "dex": "orca_whirlpool",
-      "label": "mSOL/USDC",
-      "mint_a": "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
-      "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-      "fee_ppm": 500,
-      "tvl_usd": 183686.1
+      "tvl_usd": 228628.84
     },
     {
       "address": "Ckp1kwZqosaLU1h3zWtuaMBubyWM7LX3cxYezRVin7p2",
@@ -420,7 +420,25 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
       "fee_ppm": 500,
-      "tvl_usd": 174050.36
+      "tvl_usd": 224306.09
+    },
+    {
+      "address": "7qbRF6YsyGuLUVs6Y1q64bdVrfe4ZcUUz1JRdoVNUJnm",
+      "dex": "orca_whirlpool",
+      "label": "SOL/USDC",
+      "mint_a": "So11111111111111111111111111111111111111112",
+      "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "fee_ppm": 500,
+      "tvl_usd": 222068.72
+    },
+    {
+      "address": "AqJ5JYNb7ApkJwvbuXxPnTtKeuizjvC1s2fkp382y9LC",
+      "dex": "orca_whirlpool",
+      "label": "mSOL/USDC",
+      "mint_a": "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
+      "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "fee_ppm": 500,
+      "tvl_usd": 188513.04
     },
     {
       "address": "3RA4PDZAZ49nm6hdDCnCTrnECqQD93ny8oHP4T1CSTcR",
@@ -429,7 +447,16 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "7JA5eZdCzztSfQbJvS8aVVxMFfd81Rs9VvwnocV1mKHu",
       "fee_ppm": 500,
-      "tvl_usd": 171920.3
+      "tvl_usd": 177364.22
+    },
+    {
+      "address": "14ikayyXmmi96rNqq6kDWGAUbRWLMTjXbXYTfw2Eey1",
+      "dex": "raydium_clmm",
+      "label": "GEOD/USDC",
+      "mint_a": "7JA5eZdCzztSfQbJvS8aVVxMFfd81Rs9VvwnocV1mKHu",
+      "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "fee_ppm": 500,
+      "tvl_usd": 156052.3
     },
     {
       "address": "CRoTdDUM3NJGbuvB7Vr9rhmRxnSswMjnTLC1ANjhwsdq",
@@ -438,7 +465,7 @@
       "mint_a": "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 1000,
-      "tvl_usd": 889778.59
+      "tvl_usd": 1082261.83
     },
     {
       "address": "CeaZcxBNLpJWtxzt58qQmfMBtJY8pQLvursXTJYGQpbN",
@@ -447,7 +474,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij",
       "fee_ppm": 1600,
-      "tvl_usd": 5118709.33
+      "tvl_usd": 5525570.99
     },
     {
       "address": "BxRhW4q1wTRwJkJ1C4NR4yJCRL2uusoju4g1bVenspZK",
@@ -456,7 +483,7 @@
       "mint_a": "METAewgxyPbgwsseH8T16a39CQ5VyVxZi9zXiDPY18m",
       "mint_b": "So11111111111111111111111111111111111111112",
       "fee_ppm": 1600,
-      "tvl_usd": 1808079.35
+      "tvl_usd": 1903249.23
     },
     {
       "address": "Tuy6gMupGQN7wCZ8rVP1EuLRYB132VSo9Smy4AJvQgn",
@@ -465,7 +492,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump",
       "fee_ppm": 1600,
-      "tvl_usd": 1149088.11
+      "tvl_usd": 1268425.88
     },
     {
       "address": "5WrgXzWiz93g4L5XBmr3ggMybW5gfL7drNAKoQMgpDHc",
@@ -474,7 +501,7 @@
       "mint_a": "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 1600,
-      "tvl_usd": 894241.81
+      "tvl_usd": 1132256.41
     },
     {
       "address": "C9U2Ksk6KKWvLEeo5yUQ7Xu46X7NzeBJtd9PBfuXaUSM",
@@ -483,7 +510,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump",
       "fee_ppm": 1600,
-      "tvl_usd": 597168.86
+      "tvl_usd": 649860.28
     },
     {
       "address": "55phmyZ2QfWsA1xbedEzgqeZdkMhxgM89hEdQaNX39K",
@@ -492,7 +519,7 @@
       "mint_a": "2EvzX3DF28aQY4TU6r8mLzVSEG6v7ZdTVrpv95RtoSTA",
       "mint_b": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "fee_ppm": 1600,
-      "tvl_usd": 398954.86
+      "tvl_usd": 398870.22
     },
     {
       "address": "F379ZDwkmSsxvBLfw8BaZmQ4P7edPkUsdFPEKMp3EQ4N",
@@ -501,7 +528,7 @@
       "mint_a": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "mint_b": "7SDDWS8cEUp1qYWCA7RnR4FdH4neDAi9itm5R3stoSTB",
       "fee_ppm": 1600,
-      "tvl_usd": 394700.09
+      "tvl_usd": 394616.35
     },
     {
       "address": "5azLWnTEGdETPwjiXb55x6MUuqpK9QQAazNqihCxtcgq",
@@ -510,7 +537,7 @@
       "mint_a": "98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 1600,
-      "tvl_usd": 236195.98
+      "tvl_usd": 242993.88
     },
     {
       "address": "Cxi1ubNfcmunR3zYyLpuc82bCiJq7MDcWC7LjQk5pUpq",
@@ -519,7 +546,7 @@
       "mint_a": "2EvzX3DF28aQY4TU6r8mLzVSEG6v7ZdTVrpv95RtoSTA",
       "mint_b": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "fee_ppm": 1800,
-      "tvl_usd": 398955.04
+      "tvl_usd": 398870.4
     },
     {
       "address": "9f3DQhJhGTZHVzRVyRhBryLRzHynG1vVKdohbwCJHGvq",
@@ -528,7 +555,7 @@
       "mint_a": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "mint_b": "7SDDWS8cEUp1qYWCA7RnR4FdH4neDAi9itm5R3stoSTB",
       "fee_ppm": 1800,
-      "tvl_usd": 394699.95
+      "tvl_usd": 394616.21
     },
     {
       "address": "2gfSk33cSQxgEcwF4BCB2FV7G1gbzxZtxyWBk15xX1D5",
@@ -537,7 +564,7 @@
       "mint_a": "2EvzX3DF28aQY4TU6r8mLzVSEG6v7ZdTVrpv95RtoSTA",
       "mint_b": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "fee_ppm": 2000,
-      "tvl_usd": 398954.81
+      "tvl_usd": 398870.17
     },
     {
       "address": "8eJMhsTtCehnAUkEs1fL5wBiym2SBTa7bZo9yU1cSvfA",
@@ -546,7 +573,7 @@
       "mint_a": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "mint_b": "7SDDWS8cEUp1qYWCA7RnR4FdH4neDAi9itm5R3stoSTB",
       "fee_ppm": 2000,
-      "tvl_usd": 394699.93
+      "tvl_usd": 394616.19
     },
     {
       "address": "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2",
@@ -555,7 +582,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 2500,
-      "tvl_usd": 12023400.37
+      "tvl_usd": 12464409.05
     },
     {
       "address": "Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw",
@@ -564,7 +591,16 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump",
       "fee_ppm": 2500,
-      "tvl_usd": 7937668.61
+      "tvl_usd": 8393184.52
+    },
+    {
+      "address": "EP2ib6dYdEeqD8MfE2ezHCxX3kP3K2eLKkirfPm5eyMx",
+      "dex": "raydium_v4",
+      "label": "$WIF/WSOL",
+      "mint_a": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+      "mint_b": "So11111111111111111111111111111111111111112",
+      "fee_ppm": 2500,
+      "tvl_usd": 5772777.71
     },
     {
       "address": "AQAGYQsdU853WAKhXM79CgNdoyhrRwXvYHX6qrDyC1FS",
@@ -573,7 +609,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB",
       "fee_ppm": 2500,
-      "tvl_usd": 4432257.8
+      "tvl_usd": 4539887.84
     },
     {
       "address": "6UmmUiYoBjSrhakAobJw8BvkmJtDVxaeBtbt7rxWo1mg",
@@ -582,7 +618,7 @@
       "mint_a": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 2500,
-      "tvl_usd": 3998016.36
+      "tvl_usd": 4112768.79
     },
     {
       "address": "AVs9TA4nWDzfPJE9gGVNJMVhcQy3V9PGazuz33BfG2RA",
@@ -591,7 +627,7 @@
       "mint_a": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
       "mint_b": "So11111111111111111111111111111111111111112",
       "fee_ppm": 2500,
-      "tvl_usd": 2883887.92
+      "tvl_usd": 3056344.27
     },
     {
       "address": "Q2sPHPdUWFMg7M7wwrQKLrn619cAucfRsmhVJffodSp",
@@ -600,16 +636,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk",
       "fee_ppm": 2500,
-      "tvl_usd": 2140547.37
-    },
-    {
-      "address": "9t1H1uDJ558iMPNkEPSN1fqkpC4XSPQ6cqSf6uEsTfTR",
-      "dex": "raydium_v4",
-      "label": "SPX/WSOL",
-      "mint_a": "J3NKxxXZcnNiMjKw9hYb2K4LUxgwB6t1FtPtQVsv3KFr",
-      "mint_b": "So11111111111111111111111111111111111111112",
-      "fee_ppm": 2500,
-      "tvl_usd": 2081391.0
+      "tvl_usd": 2342006.53
     },
     {
       "address": "6ipSysvprRVvyAcHUcQc5aeXioBUen9DWivSUx3UfkCS",
@@ -618,7 +645,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "8MohwPY3hm8SJfQGi4KuDfKTMeisGhcGiTa7yEFabray",
       "fee_ppm": 2500,
-      "tvl_usd": 777254.91
+      "tvl_usd": 830161.52
     },
     {
       "address": "FZ8MJvdTPbp8juhtFCCzb7LsKunhexgzShGQ59SUJkNL",
@@ -627,7 +654,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof",
       "fee_ppm": 2500,
-      "tvl_usd": 434972.74
+      "tvl_usd": 461210.93
     },
     {
       "address": "7YVk6w2qzW8vEsScbQR7Hp3AWAVtRrVAmPSihB79DFqq",
@@ -636,7 +663,7 @@
       "mint_a": "2EvzX3DF28aQY4TU6r8mLzVSEG6v7ZdTVrpv95RtoSTA",
       "mint_b": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "fee_ppm": 2500,
-      "tvl_usd": 398954.75
+      "tvl_usd": 398870.11
     },
     {
       "address": "DGMcTtrmz2YxtrHHgidMkGduwM97qiKzY4cWEnogow67",
@@ -645,7 +672,7 @@
       "mint_a": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "mint_b": "7SDDWS8cEUp1qYWCA7RnR4FdH4neDAi9itm5R3stoSTB",
       "fee_ppm": 2500,
-      "tvl_usd": 394699.85
+      "tvl_usd": 394616.12
     },
     {
       "address": "BkX9RSHoDJGkU7pbHiksv3DprdLM3KWGoDSfGN9cGJ5d",
@@ -654,7 +681,7 @@
       "mint_a": "7JA5eZdCzztSfQbJvS8aVVxMFfd81Rs9VvwnocV1mKHu",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 2500,
-      "tvl_usd": 310754.8
+      "tvl_usd": 315111.45
     },
     {
       "address": "GTJ2S27UL7yZ3TdTwpKjfNcxeEZRkRPHjpj5Fubwb8Mk",
@@ -663,7 +690,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "Grass7B4RdKfBCjTKgSqnXkqjwiGvQyFbuSCUJr3XXjs",
       "fee_ppm": 2500,
-      "tvl_usd": 261949.1
+      "tvl_usd": 275160.98
     },
     {
       "address": "Enfoa5Xdtirwa46xxa5LUVcQWe7EUb2pGzTjfvU7EBS1",
@@ -672,7 +699,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
       "fee_ppm": 2500,
-      "tvl_usd": 257100.0
+      "tvl_usd": 274448.55
     },
     {
       "address": "8BELgBQ5vSDvBnUAyQ79qqijZ8Hcp6MGjEAD93dKC7GX",
@@ -681,7 +708,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "8MohwPY3hm8SJfQGi4KuDfKTMeisGhcGiTa7yEFabray",
       "fee_ppm": 2500,
-      "tvl_usd": 243202.37
+      "tvl_usd": 257737.62
     },
     {
       "address": "x4ND6LEXnrj3ufeCTY8RSuo3qbktirsz4tqPus5SjrH",
@@ -699,7 +726,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g",
       "fee_ppm": 3000,
-      "tvl_usd": 1944512.19
+      "tvl_usd": 2114493.02
     },
     {
       "address": "KLkoFSdCpC523EmmGyJxmLv1A3itv8ZNiMZwjPmFXuk",
@@ -708,16 +735,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "3dQTr7ror2QPKQ3GbBCokJUmjErGg8kTJzdnYjNfvi3Z",
       "fee_ppm": 3000,
-      "tvl_usd": 458289.88
-    },
-    {
-      "address": "AgeSxtVWWMojFWYNrXKnVp9cFuC5CQ7M4rzmrseLxfUj",
-      "dex": "orca_whirlpool",
-      "label": "USDC/SPX",
-      "mint_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-      "mint_b": "J3NKxxXZcnNiMjKw9hYb2K4LUxgwB6t1FtPtQVsv3KFr",
-      "fee_ppm": 3000,
-      "tvl_usd": 394539.36
+      "tvl_usd": 501251.34
     },
     {
       "address": "ig9EkJ63zrSRg7BKMGdyfPfNRCRwxGNVV1FByz26QkC",
@@ -726,7 +744,7 @@
       "mint_a": "7JA5eZdCzztSfQbJvS8aVVxMFfd81Rs9VvwnocV1mKHu",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 3000,
-      "tvl_usd": 330440.72
+      "tvl_usd": 321295.25
     },
     {
       "address": "AmXR6YeshKfnx23gQpJkktUXoGb7cAXi5hWk3w2pw1a3",
@@ -735,7 +753,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof",
       "fee_ppm": 3000,
-      "tvl_usd": 251985.67
+      "tvl_usd": 278605.81
     },
     {
       "address": "62xUy3X5qeFzE36tbvnAod8wDf7MT6CJmjnVkNeZQpKV",
@@ -744,16 +762,7 @@
       "mint_a": "boopkpWqe68MSxLqBGogs8ZbUDN4GXaLhFwNP7mpP1i",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 3000,
-      "tvl_usd": 208572.34
-    },
-    {
-      "address": "Ab5pqdTEw1McsizEaQfLEyMLhkfxwzrpyqFASpftQcpq",
-      "dex": "orca_whirlpool",
-      "label": "BORG/USDC",
-      "mint_a": "3dQTr7ror2QPKQ3GbBCokJUmjErGg8kTJzdnYjNfvi3Z",
-      "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-      "fee_ppm": 3000,
-      "tvl_usd": 189441.5
+      "tvl_usd": 208690.07
     },
     {
       "address": "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ",
@@ -762,7 +771,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 3000,
-      "tvl_usd": 186936.73
+      "tvl_usd": 192838.41
     },
     {
       "address": "6XDUav9p3XiGRRZMQZcQmYvinCrax26EdqVCMHR9x43M",
@@ -771,7 +780,16 @@
       "mint_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "mint_b": "Grass7B4RdKfBCjTKgSqnXkqjwiGvQyFbuSCUJr3XXjs",
       "fee_ppm": 3000,
-      "tvl_usd": 153454.19
+      "tvl_usd": 161802.66
+    },
+    {
+      "address": "Ab5pqdTEw1McsizEaQfLEyMLhkfxwzrpyqFASpftQcpq",
+      "dex": "orca_whirlpool",
+      "label": "BORG/USDC",
+      "mint_a": "3dQTr7ror2QPKQ3GbBCokJUmjErGg8kTJzdnYjNfvi3Z",
+      "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "fee_ppm": 3000,
+      "tvl_usd": 158125.02
     },
     {
       "address": "3GkFzURGWNWyErnjQvnkZpgcLnNocjnRwvMYXiVDiVQk",
@@ -780,7 +798,7 @@
       "mint_a": "nosXBVoaCTtYdLvKY6Csb4AC8JCdQKKAaWYtx2ZMoo7",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 4000,
-      "tvl_usd": 475637.62
+      "tvl_usd": 486386.94
     },
     {
       "address": "3w7yKP4E6aGeorMc9DgTGsDMj8SwHaSVzuoCsYiomLvV",
@@ -789,7 +807,7 @@
       "mint_a": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "mint_b": "7SDDWS8cEUp1qYWCA7RnR4FdH4neDAi9itm5R3stoSTB",
       "fee_ppm": 4000,
-      "tvl_usd": 398686.41
+      "tvl_usd": 398601.83
     },
     {
       "address": "FeXgKip6eUdHjB73Z4r6vGvTpsn7N8Tb1TLLgF8caCPn",
@@ -798,7 +816,7 @@
       "mint_a": "2EvzX3DF28aQY4TU6r8mLzVSEG6v7ZdTVrpv95RtoSTA",
       "mint_b": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "fee_ppm": 4000,
-      "tvl_usd": 394964.8
+      "tvl_usd": 394881.01
     },
     {
       "address": "JS4VAUXFkMvtbxWxUVNG48SRK6QCkqThzED83QXvZsQ",
@@ -807,7 +825,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "nosXBVoaCTtYdLvKY6Csb4AC8JCdQKKAaWYtx2ZMoo7",
       "fee_ppm": 4000,
-      "tvl_usd": 174122.8
+      "tvl_usd": 183673.62
     },
     {
       "address": "CMxvsnxiFE6ijrkRsT8icWrzvfJFxrwuGdgyZUvYMFFx",
@@ -816,7 +834,7 @@
       "mint_a": "2EvzX3DF28aQY4TU6r8mLzVSEG6v7ZdTVrpv95RtoSTA",
       "mint_b": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "fee_ppm": 6000,
-      "tvl_usd": 398954.09
+      "tvl_usd": 398869.46
     },
     {
       "address": "Gxq2XgoiQt8FBRqktdgfsf4c33jErjeDUuTuRp4cqydm",
@@ -825,7 +843,7 @@
       "mint_a": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "mint_b": "7SDDWS8cEUp1qYWCA7RnR4FdH4neDAi9itm5R3stoSTB",
       "fee_ppm": 6000,
-      "tvl_usd": 394699.54
+      "tvl_usd": 394615.81
     },
     {
       "address": "HsQGWEh3ib6w59rBh5n1jXmi8VXFBqKEjxozL6PGfcgb",
@@ -834,7 +852,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk",
       "fee_ppm": 6500,
-      "tvl_usd": 224476.79
+      "tvl_usd": 256656.57
     },
     {
       "address": "84SQGB3frFSNEJBqYjuSsYMUJPgjnnGL5y6RvM1jbSS8",
@@ -843,7 +861,7 @@
       "mint_a": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "mint_b": "7SDDWS8cEUp1qYWCA7RnR4FdH4neDAi9itm5R3stoSTB",
       "fee_ppm": 8000,
-      "tvl_usd": 398686.41
+      "tvl_usd": 398601.83
     },
     {
       "address": "ErNd9Xo5hsXfejz68iqxnYUkFNrJek5TrTF4GEr2aM2H",
@@ -852,7 +870,7 @@
       "mint_a": "2EvzX3DF28aQY4TU6r8mLzVSEG6v7ZdTVrpv95RtoSTA",
       "mint_b": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "fee_ppm": 8000,
-      "tvl_usd": 394964.55
+      "tvl_usd": 394880.76
     },
     {
       "address": "HTvwzkkfViVUQigPyVHN5g1s7n8vFqB42mU5FdX4nQ8B",
@@ -861,7 +879,7 @@
       "mint_a": "2EvzX3DF28aQY4TU6r8mLzVSEG6v7ZdTVrpv95RtoSTA",
       "mint_b": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "fee_ppm": 10000,
-      "tvl_usd": 398954.09
+      "tvl_usd": 398869.46
     },
     {
       "address": "CP6GLKeSAS6MHYUz98YnxmX8A19PZh8kJhJXQnK4qtew",
@@ -870,7 +888,7 @@
       "mint_a": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "mint_b": "7SDDWS8cEUp1qYWCA7RnR4FdH4neDAi9itm5R3stoSTB",
       "fee_ppm": 10000,
-      "tvl_usd": 398686.41
+      "tvl_usd": 398601.83
     },
     {
       "address": "GqxUEcFw8GbfDPoWU6UG2ypvsM3aw3vZmiN4e1Nbv94G",
@@ -879,7 +897,7 @@
       "mint_a": "So11111111111111111111111111111111111111112",
       "mint_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
       "fee_ppm": 10000,
-      "tvl_usd": 162416.04
+      "tvl_usd": 170578.61
     },
     {
       "address": "FRpZPGcqMCJpo96TD5LjVUa8jEeZZexJSxG4BrTdufzN",
@@ -888,7 +906,7 @@
       "mint_a": "2EvzX3DF28aQY4TU6r8mLzVSEG6v7ZdTVrpv95RtoSTA",
       "mint_b": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "fee_ppm": 20000,
-      "tvl_usd": 398954.09
+      "tvl_usd": 398869.46
     },
     {
       "address": "5aSPuFPnSLkgtFDVjDmYW7cNKQyNPvyceRCCRLtAZv9K",
@@ -897,7 +915,7 @@
       "mint_a": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "mint_b": "7SDDWS8cEUp1qYWCA7RnR4FdH4neDAi9itm5R3stoSTB",
       "fee_ppm": 20000,
-      "tvl_usd": 394699.54
+      "tvl_usd": 394615.81
     },
     {
       "address": "4ijFwa6gTnPhQj3GekYJKv4Q3t3wim5p8L8jxDYVdXmV",
@@ -906,7 +924,7 @@
       "mint_a": "2EvzX3DF28aQY4TU6r8mLzVSEG6v7ZdTVrpv95RtoSTA",
       "mint_b": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "fee_ppm": 30000,
-      "tvl_usd": 199477.05
+      "tvl_usd": 199434.73
     },
     {
       "address": "mWb3UE6bGVFtZ7D5RfT6afrHi469S6umrCDXXTa8Dt1",
@@ -915,7 +933,7 @@
       "mint_a": "3bjea65A3CWPKV5sS33Jn3tfgfvsrtixgaDpKK55toST",
       "mint_b": "7SDDWS8cEUp1qYWCA7RnR4FdH4neDAi9itm5R3stoSTB",
       "fee_ppm": 30000,
-      "tvl_usd": 199343.2
+      "tvl_usd": 199300.91
     }
   ]
 }

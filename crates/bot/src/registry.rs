@@ -80,6 +80,7 @@ fn parse_dex(s: &str) -> Result<Dex> {
         "raydium_clmm" => Dex::RaydiumClmm,
         "raydium_v4" => Dex::RaydiumAmmV4,
         "raydium_cpmm" => Dex::RaydiumCpmm,
+        "meteora_damm_v2" => Dex::MeteoraDammV2,
         "pumpswap" => Dex::PumpSwap,
         other => anyhow::bail!("unknown dex {other:?} in registry"),
     })
@@ -272,7 +273,11 @@ mod tests {
             assert!(
                 matches!(
                     p.dex,
-                    Dex::OrcaWhirlpool | Dex::RaydiumClmm | Dex::RaydiumAmmV4 | Dex::RaydiumCpmm
+                    Dex::OrcaWhirlpool
+                        | Dex::RaydiumClmm
+                        | Dex::RaydiumAmmV4
+                        | Dex::RaydiumCpmm
+                        | Dex::MeteoraDammV2
                 ),
                 "{} claims venue {:?}, which has no live decoder",
                 p.label,

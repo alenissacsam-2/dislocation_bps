@@ -23,7 +23,7 @@
 
 use anyhow::{Context, Result};
 use cb_core::types::{Dex, PoolId, PoolState, Pubkey32};
-use cb_dex::{orca_whirlpool, raydium_clmm, raydium_cpmm, raydium_v4};
+use cb_dex::{meteora_damm_v2, orca_whirlpool, raydium_clmm, raydium_cpmm, raydium_v4};
 use cb_feed::AccountUpdate;
 use cb_scanner::multi::{find_from_base, survey_from_base};
 use cb_scanner::store::PoolStore;
@@ -52,6 +52,9 @@ const LEADERBOARD_ROWS: usize = 12;
 enum Venue {
     /// Everything needed is in the pool account, including the fee.
     Whirlpool,
+    /// Same: self-contained, and quotable across the pool's whole range rather than
+    /// one tick of it.
+    MeteoraDammV2,
     /// Everything except the fee, which comes from a shared config account.
     RaydiumClmm { trade_fee_ppm: u32 },
     /// Reserves live in two vaults, tracked separately and combined on read.
@@ -266,6 +269,22 @@ impl LiveMarket {
                     }
                     Err(e) => failures.push(format!("{}: {e:#}", entry.label)),
                 },
+                Dex::MeteoraDammV2 => match meteora_damm_v2::to_pool_state(addr, data, boot_slot)
+                {
+                    Ok(ps) => {
+                        store.upsert(ps);
+                        watches.insert(
+                            addr,
+                            Watch {
+                                label: entry.label.clone(),
+                                dex: entry.dex,
+                                venue: Venue::MeteoraDammV2,
+                                slot: boot_slot,
+                            },
+                        );
+                    }
+                    Err(e) => failures.push(format!("{}: {e:#}", entry.label)),
+                },
                 Dex::RaydiumClmm => match raydium_clmm::decode(data) {
                     Ok(p) => {
                         config_b58.push(bs58::encode(p.amm_config).into_string());
@@ -464,6 +483,9 @@ impl LiveMarket {
             w.slot = w.slot.max(u.slot);
             match &mut w.venue {
                 Venue::Whirlpool => orca_whirlpool::to_pool_state(u.pubkey, &u.data, u.slot).ok()?,
+                Venue::MeteoraDammV2 => {
+                    meteora_damm_v2::to_pool_state(u.pubkey, &u.data, u.slot).ok()?
+                }
                 Venue::RaydiumClmm { trade_fee_ppm } => {
                     raydium_clmm::to_pool_state(u.pubkey, &u.data, *trade_fee_ppm, u.slot).ok()?
                 }
@@ -652,6 +674,7 @@ impl LiveMarket {
         w.slot = w.slot.max(slot);
         match &mut w.venue {
             Venue::Whirlpool => orca_whirlpool::to_pool_state(addr, data, slot).ok(),
+            Venue::MeteoraDammV2 => meteora_damm_v2::to_pool_state(addr, data, slot).ok(),
             Venue::RaydiumClmm { trade_fee_ppm } => {
                 raydium_clmm::to_pool_state(addr, data, *trade_fee_ppm, slot).ok()
             }
