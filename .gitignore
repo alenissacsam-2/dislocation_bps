@@ -51,3 +51,7 @@ cryptobot*.db-shm
 # Tauri codegen
 crates/desk/gen/
 
+
+# bot log, written by cryptobot-desk
+cb-bot.log
+
