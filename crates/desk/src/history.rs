@@ -47,6 +47,7 @@ fn read(db: &Path) -> anyhow::Result<serde_json::Value> {
         "available": true,
         "curve": ledger.equity_curve(EPISODE_GAP_SLOTS, CURVE_POINTS)?,
         "ladder": ledger.capital_ladder(EPISODE_GAP_SLOTS)?,
+        "race": ledger.race_ladder(EPISODE_GAP_SLOTS)?,
         "episodes": ledger.episode_scatter(EPISODE_GAP_SLOTS, SCATTER_POINTS)?,
         "contest": contest,
         "contestSurvivalRate": contest.contested_survival_rate(),

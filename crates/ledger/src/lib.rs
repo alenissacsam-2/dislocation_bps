@@ -636,6 +636,42 @@ impl Ledger {
         })
     }
 
+    /// The run priced across a range of assumed win rates for contested races.
+    ///
+    /// See [`RaceLadder`] for why this exists. Episodes the run took are counted at
+    /// their net; episodes declined as contested are counted at `win_rate × net`, and
+    /// only when that net was positive — a contested cycle that was already negative
+    /// after its tip is correctly worth nothing however often you would win it.
+    pub fn race_ladder(&self, gap_slots: u64) -> Result<RaceLadder> {
+        let rows = self.episode_rows(gap_slots)?;
+        let mut realised = 0.0;
+        let mut declined_net = 0.0;
+        let mut declined = 0u64;
+        let mut declined_unprofitable = 0u64;
+        for r in &rows {
+            if r.taken {
+                realised += r.best_net_usd;
+            } else if r.contested {
+                if r.best_net_usd > 0.0 {
+                    declined_net += r.best_net_usd;
+                    declined += 1;
+                } else {
+                    declined_unprofitable += 1;
+                }
+            }
+        }
+        Ok(RaceLadder {
+            rungs: RACE_LADDER_WIN_RATES
+                .iter()
+                .map(|&p| (p, realised + p * declined_net))
+                .collect(),
+            realised_usd: realised,
+            declined_net_usd: declined_net,
+            declined_episodes: declined,
+            declined_unprofitable_episodes: declined_unprofitable,
+        })
+    }
+
     /// The routes that clear most often, with what they were worth.
     pub fn top_routes(&self, limit: usize) -> Result<Vec<RouteStat>> {
         let mut stmt = self.conn.prepare(
@@ -863,6 +899,41 @@ pub struct EquityPoint {
     /// episodes that measured it.
     pub ladder_episodes: u64,
     pub unmeasured_episodes: u64,
+}
+
+/// Win rates the race ladder is priced at. Not predictions — the span of assumptions
+/// worth seeing, from "we never win a contested race" to "we always do".
+pub const RACE_LADDER_WIN_RATES: [f64; 5] = [0.0, 0.05, 0.25, 0.50, 1.00];
+
+/// What the run would have earned at several assumed win rates for contested races.
+///
+/// # The assumption this exists to expose
+///
+/// A cycle worth more than a threshold is declined on the belief that a faster searcher
+/// takes it first. That single rule decides the large majority of the value this
+/// instrument ever sees — and the decline is applied *after* the same cycle has already
+/// been charged a tip large enough to win the race, so competition is priced twice: once
+/// as a haircut, again as a refusal.
+///
+/// Which of the two is right cannot be settled from paper. What can be done is to stop
+/// hiding the assumption inside a boolean and price the run across the range, exactly as
+/// [`CapitalLadder`] does for capital. A losing race costs the base fee or nothing at
+/// all — the bundle simply does not land — so the downside of attempting is close to
+/// zero and the ladder is close to linear in the win rate.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RaceLadder {
+    /// `(assumed win rate, net USD the run would have made)`.
+    pub rungs: Vec<(f64, f64)>,
+    /// Net actually booked — uncontested episodes only. The 0.0 rung equals this.
+    pub realised_usd: f64,
+    /// Net-after-tip currently refused for being contested, and how many episodes.
+    /// This is the whole size of the question.
+    pub declined_net_usd: f64,
+    pub declined_episodes: u64,
+    /// Contested episodes whose net was already negative. Refusing these costs nothing
+    /// and the ladder correctly gives them no weight at any win rate.
+    pub declined_unprofitable_episodes: u64,
 }
 
 /// What a run's opportunities were worth to accounts of several sizes.
@@ -1160,6 +1231,74 @@ mod tests {
             // $10k, which is the shape the ladder exists to expose.
             profit_at_capital_usd: Some([0.004, 0.006, 0.006]),
         }
+    }
+
+    /// A fill on its own cycle and slot, so each becomes its own episode.
+    fn contested_fill(slot: u64, key: &str, net: f64) -> FillRecord {
+        FillRecord {
+            slot,
+            cycle_key: key.into(),
+            net_usd: net,
+            taken: false,
+            skipped_reason: Some("contested — would lose the race".into()),
+            ..fill(net, false)
+        }
+    }
+
+    #[test]
+    fn the_race_ladder_starts_at_what_the_run_actually_booked() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.record_fill(&FillRecord { slot: 1, cycle_key: "a".into(), ..fill(0.10, true) }).unwrap();
+        l.record_fill(&FillRecord { slot: 2, cycle_key: "b".into(), ..fill(0.20, true) }).unwrap();
+        let r = l.race_ladder(5).unwrap();
+        assert!((r.realised_usd - 0.30).abs() < 1e-9);
+        // Nothing was declined, so every rung is the same number: the win rate has
+        // nothing to act on.
+        for (_, v) in &r.rungs {
+            assert!((v - 0.30).abs() < 1e-9, "flat ladder expected, got {v}");
+        }
+    }
+
+    #[test]
+    fn declined_contested_value_is_priced_in_proportion_to_the_assumed_win_rate() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.record_fill(&FillRecord { slot: 1, cycle_key: "a".into(), ..fill(0.10, true) }).unwrap();
+        l.record_fill(&contested_fill(2, "b", 1.00)).unwrap();
+        l.record_fill(&contested_fill(3, "c", 3.00)).unwrap();
+        let r = l.race_ladder(5).unwrap();
+        assert_eq!(r.declined_episodes, 2);
+        assert!((r.declined_net_usd - 4.00).abs() < 1e-9);
+        let at = |p: f64| r.rungs.iter().find(|(w, _)| (w - p).abs() < 1e-9).unwrap().1;
+        assert!((at(0.0) - 0.10).abs() < 1e-9, "never winning is what we book today");
+        assert!((at(0.25) - 1.10).abs() < 1e-9);
+        assert!((at(1.0) - 4.10).abs() < 1e-9, "winning every race is the ceiling");
+    }
+
+    /// A contested cycle already negative after its tip is worth nothing however often
+    /// you would win it — counting it would make refusing look expensive when refusing
+    /// is exactly right.
+    #[test]
+    fn a_contested_episode_that_was_already_unprofitable_adds_nothing_at_any_win_rate() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.record_fill(&contested_fill(1, "a", -0.50)).unwrap();
+        let r = l.race_ladder(5).unwrap();
+        assert_eq!(r.declined_episodes, 0);
+        assert_eq!(r.declined_unprofitable_episodes, 1);
+        for (_, v) in &r.rungs {
+            assert!(v.abs() < 1e-9, "a losing trade cannot become profit by winning it");
+        }
+    }
+
+    /// The same standing gap seen five hundred times is one decision, not five hundred.
+    #[test]
+    fn one_contested_gap_is_counted_once_however_often_it_was_re_detected() {
+        let l = Ledger::open_in_memory().unwrap();
+        for slot in 1..=8 {
+            l.record_fill(&contested_fill(slot, "same", 2.00)).unwrap();
+        }
+        let r = l.race_ladder(5).unwrap();
+        assert_eq!(r.declined_episodes, 1, "eight detections of one gap are one episode");
+        assert!((r.declined_net_usd - 2.00).abs() < 1e-9);
     }
 
     /// The table that matters: a run must record what the market looked like even

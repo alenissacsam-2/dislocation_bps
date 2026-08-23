@@ -365,6 +365,7 @@ function paintHistory() {
     (S.viewingArchive ? "  (archived run)" : "");
 
   paintLadder(L);
+  paintRace(H.race);
   paintContest(H);
   drawPnl(curve);
   drawScatter(eps);
@@ -390,6 +391,37 @@ function paintLadder(L) {
   for (const [book, paid] of rungs) row("$" + book.toLocaleString(), paid, true);
   row("unlimited", L.atOptimalUsd || 0, false);
   row("actual", L.realisedUsd || 0, true);
+}
+
+function paintRace(R) {
+  const el = $("race");
+  el.innerHTML = "";
+  if (!R || !R.rungs || !R.rungs.length || !R.declinedEpisodes) {
+    el.innerHTML =
+      '<div class="empty">Nothing refused as contested yet — the run has no race to price.</div>';
+    return;
+  }
+  const top = Math.max(...R.rungs.map((r) => r[1]), 1e-9);
+  for (const [p, got] of R.rungs) {
+    const d = document.createElement("div");
+    d.className = "bar-row";
+    const now = p === 0;
+    d.innerHTML =
+      `<div class="bar-lab">${now ? "now" : (p * 100).toFixed(0) + "%"}</div>` +
+      `<div class="bar-track"><div class="bar-fill" style="width:${
+        Math.max(0, Math.min(100, (got / top) * 100))}%${now ? ";background:var(--faint)" : ""}"></div></div>` +
+      `<div class="bar-val">${money(got)}</div>`;
+    el.appendChild(d);
+  }
+  const note = document.createElement("div");
+  note.className = "bar-lab";
+  note.style.marginTop = "4px";
+  note.textContent =
+    `${R.declinedEpisodes} episodes worth ${money(R.declinedNetUsd)} net refused for being contested` +
+    (R.declinedUnprofitableEpisodes
+      ? `; a further ${R.declinedUnprofitableEpisodes} were already negative and are rightly refused`
+      : "");
+  el.appendChild(note);
 }
 
 function paintContest(H) {

@@ -850,6 +850,41 @@ fn report(path: &str) -> anyhow::Result<()> {
         println!("    measurement that says a flash loan would have added nothing.");
     }
 
+    // What the contest rule costs, priced across the range of win rates rather than
+    // assumed at one. The rule refuses cycles it has *already* charged a tip large
+    // enough to win, so competition is priced twice — once as a haircut, again as a
+    // refusal — and the refusal decides most of the value this instrument ever sees.
+    let race = ledger.race_ladder(EPISODE_GAP_SLOTS)?;
+    if race.declined_episodes > 0 {
+        println!("\n  WHAT REFUSING CONTESTED RACES COSTS");
+        println!("    {:<28} {:>14}", "if we win this share…", "net, run");
+        for (p, got) in &race.rungs {
+            let label = if *p == 0.0 {
+                "  0%  (what we book now)".to_string()
+            } else {
+                format!("{:>3.0}%", p * 100.0)
+            };
+            println!("    {:<28} {:>14}", label, format!("${got:.4}"));
+        }
+        println!(
+            "\n    {} episode{} worth ${:.4} net are refused for being contested — after\n    \
+             already paying a tip sized to win them. A lost race costs the base fee or\n    \
+             nothing at all, since the bundle does not land, so the downside of trying is\n    \
+             close to zero and this ladder is close to linear.",
+            race.declined_episodes,
+            if race.declined_episodes == 1 { "" } else { "s" },
+            race.declined_net_usd,
+        );
+        if race.declined_unprofitable_episodes > 0 {
+            println!(
+                "    A further {} were already negative after tip; refusing those is right\n    \
+                 at any win rate, and they carry no weight here.",
+                race.declined_unprofitable_episodes
+            );
+        }
+        println!("    Which rung is real cannot be settled on paper. Only trying settles it.");
+    }
+
     // The largest unverified assumption in the instrument, checked against its own data.
     // Opportunities over a profit threshold are declined as races we would lose; that
     // decision is worth more than every other decision here combined, and until now
