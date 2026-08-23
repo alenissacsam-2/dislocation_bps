@@ -886,6 +886,42 @@ fn report(path: &str) -> anyhow::Result<()> {
         );
     }
 
+    // The cut that isolates timing from disagreement. Comparing spread bands does not
+    // work - each band mixes fee tiers and the effect hides inside them. Holding the fee
+    // tier fixed and requiring both legs from one slot is what shows it.
+    let sim = ledger.simultaneity_audit()?;
+    if sim.iter().any(|t| t.fills_same_slot > 0) {
+        println!("
+  WAS THE EDGE EVER SIMULTANEOUSLY ON OFFER?");
+        println!(
+            "    {:<13} {:>9} {:>11} {:>11} {:>11} {:>10}",
+            "route fee", "fills", "edge, all", "same-slot", "n same-slot", "timing"
+        );
+        for t in &sim {
+            if t.fills_all == 0 {
+                continue;
+            }
+            let timing = t
+                .timing_share()
+                .map_or_else(|| "—".to_string(), |v| format!("{:.0}%", v * 100.0));
+            println!(
+                "    {:<13} {:>9} {:>11.2} {:>11.2} {:>11} {:>10}",
+                t.label, t.fills_all, t.edge_all_bps, t.edge_same_slot_bps, t.fills_same_slot, timing
+            );
+        }
+        println!();
+        for line in [
+            "    82% of loops price their two legs from different slots, because the",
+            "    staleness guard admits a pool minutes behind the head. Where the",
+            "    same-slot column is lower, that tier was reporting the market moving",
+            "    between two observations as two venues disagreeing — an edge that was",
+            "    never simultaneously on offer and cannot be taken.",
+            "    Read the sample size before believing either column.",
+        ] {
+            println!("{line}");
+        }
+    }
+
     // What the contest rule costs, priced across the range of win rates rather than
     // assumed at one. The rule refuses cycles it has *already* charged a tip large
     // enough to win, so competition is priced twice — once as a haircut, again as a

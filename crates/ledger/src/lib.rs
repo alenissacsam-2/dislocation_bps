@@ -718,6 +718,53 @@ impl Ledger {
         Ok(out)
     }
 
+    /// Edge by fee tier, priced twice: over every loop, and over only those whose legs
+    /// were read in the **same slot**.
+    ///
+    /// # The question this answers
+    ///
+    /// An arbitrage is a claim that two venues disagree at one moment. 82% of loops here
+    /// price their legs from different slots, because `MAX_STALE_LAG_SLOTS` admits a pool
+    /// minutes behind the head. So part of any reported edge may be the market moving
+    /// between two observations rather than two venues disagreeing — and that part cannot
+    /// be traded, because the older price has already gone.
+    ///
+    /// Comparing the two columns *within a fee tier* is what isolates it. Comparing
+    /// spread bands instead does not: each band mixes fee tiers and the effect hides.
+    /// A tier whose edge falls when simultaneity is required was reporting timing.
+    pub fn simultaneity_audit(&self) -> Result<Vec<FeeTierEdge>> {
+        let tiers = [
+            ("under 5 bps", 0.0f64, 5.0f64),
+            ("5-20", 5.0, 20.0),
+            ("20-50", 20.0, 50.0),
+            ("over 50", 50.0, f64::INFINITY),
+        ];
+        let mut out = Vec::new();
+        for (label, lo, hi) in tiers {
+            let hi = if hi.is_finite() { hi } else { f64::MAX };
+            let (fills_all, edge_all): (i64, Option<f64>) = self.conn.query_row(
+                "SELECT COUNT(*), AVG(edge_bps) FROM paper_fills
+                 WHERE slot_spread IS NOT NULL AND fee_bps >= ?1 AND fee_bps < ?2",
+                rusqlite::params![lo, hi],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let (fills_same, edge_same): (i64, Option<f64>) = self.conn.query_row(
+                "SELECT COUNT(*), AVG(edge_bps) FROM paper_fills
+                 WHERE slot_spread = 0 AND fee_bps >= ?1 AND fee_bps < ?2",
+                rusqlite::params![lo, hi],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            out.push(FeeTierEdge {
+                label: label.to_string(),
+                fills_all: fills_all as u64,
+                edge_all_bps: edge_all.unwrap_or(0.0),
+                fills_same_slot: fills_same as u64,
+                edge_same_slot_bps: edge_same.unwrap_or(0.0),
+            });
+        }
+        Ok(out)
+    }
+
     /// The routes that clear most often, with what they were worth.
     pub fn top_routes(&self, limit: usize) -> Result<Vec<RouteStat>> {
         let mut stmt = self.conn.prepare(
@@ -952,6 +999,32 @@ pub struct EquityPoint {
     /// episodes that measured it.
     pub ladder_episodes: u64,
     pub unmeasured_episodes: u64,
+}
+
+/// Edge in one fee tier, over every loop and over only the simultaneous ones.
+///
+/// `fills_same_slot` is the sample size that decides whether the comparison means
+/// anything. A tier with a handful of same-slot fills is not evidence of either case.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeeTierEdge {
+    pub label: String,
+    pub fills_all: u64,
+    pub edge_all_bps: f64,
+    pub fills_same_slot: u64,
+    pub edge_same_slot_bps: f64,
+}
+
+impl FeeTierEdge {
+    /// What requiring simultaneity costs this tier, as a share of its pooled edge.
+    /// Positive means the pooled figure was flattered by non-simultaneous loops.
+    #[must_use]
+    pub fn timing_share(&self) -> Option<f64> {
+        if self.fills_same_slot == 0 || self.edge_all_bps.abs() < 1e-9 {
+            return None;
+        }
+        Some((self.edge_all_bps - self.edge_same_slot_bps) / self.edge_all_bps)
+    }
 }
 
 /// Claimed dislocation, grouped by how far apart in time the legs were observed.

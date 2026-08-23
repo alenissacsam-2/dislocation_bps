@@ -209,10 +209,10 @@ the screen never appeared in `paper_fills`, and confirmed by the giveaway that d
 > **Two searches that answer different questions must not share one label.** The
 > arithmetic being right does not make the number mean what the heading says.
 
-**Edge that grows with the fee you pay to reach it — open, 2026-08-23.**
+**Edge that may grow with the fee you pay to reach it — open, evidence conflicting.**
 
-Measured over 25,700 episodes and then re-measured on a second run: the *edge* — profit
-after fees, the number that decides everything — rises with the route's fee tier.
+On the 17.85 h run archived as `cryptobot-20260823-193303.db`, the *edge* — profit after
+fees, the number that decides everything — rose sharply with the route's fee tier:
 
 ```
 route fee     fills    mean edge
@@ -222,39 +222,47 @@ under 5 bps  16,067      2.16 bps
 over 50       1,429     11.95
 ```
 
-Five and a half times the edge on the dearest routes. And 93% of all claimed value sits
-above 5 bps of fees, while the cheap, liquid, genuinely-arbitraged tier produced $3.12
-of the $44.55 a $100 book was told it could reach.
+93% of that run's claimed value sat above 5 bps of fees, while the cheap, liquid,
+genuinely-arbitraged tier produced $3.12 of the $44.55 a $100 book was told it could
+reach. That ordering is backwards for real arbitrage, and it is the reason the headline
+profit from that run should not be believed.
 
-That ordering is backwards for real arbitrage and it is the single reason not to trust
-the headline profit.
+**It has not reproduced.** The run started 2026-08-23 14:03 UTC, on the same code plus
+`slot_spread` and with `max_hops` raised 3 → 4, reads flat: 1.75, 1.84, 1.83 bps across
+the first three tiers over ~8,000 fills. Only `over 50` is elevated (7.54 bps) and it has
+138 fills, six of them simultaneous — which is not evidence of anything.
 
-**Two explanations have been tested and one is dead.**
+So there are two runs disagreeing, and the difference is unexplained. **This is the open
+question.** Do not close it on either run alone.
 
-*Time skew* — expensive pools trade less, so update less, so are staler, so the two legs
-get priced from different moments and the drift is read as opportunity. This was
-plausible: `MAX_STALE_LAG_SLOTS` admits a pool 1800 slots (~6 min) behind the head, and
-81.9% of loops do price their legs from different slots. `Cycle::slot_spread` was added
-to measure it, and it says no — edge by spread band is 1.67, 1.62, 1.78, 1.68 bps, flat.
-The legs being minutes apart is not where the edge comes from.
+**What was ruled out along the way.**
 
-*A tautology in the reporting* — `dislocation_bps` is **defined** as `edge_bps +
-fee_bps` (`main.rs:514`). So "dislocation rises with fee" is arithmetic and says nothing.
-Anyone re-deriving this finding must use `edge_bps`; the table above does.
+*A tautology in the reporting.* `dislocation_bps` is **defined** as `edge_bps + fee_bps`
+(`main.rs:514`). "Dislocation rises with fee" is therefore arithmetic and evidence of
+nothing. Anyone re-deriving this must use `edge_bps`; the tables above do. An earlier
+pass through this data did not, and reported the tautology as a finding.
 
-**What remains unexplained** is the edge itself. The benign reading is that a 25 bp pool
-is simply left to drift until the gap exceeds its fee, because nobody profits from
-correcting it sooner — real, and consistent with `--verify` finding those pools quoting
-*worse* than the router. The hostile reading is that something in sizing or pricing
-flatters exactly the pools with the widest spreads. Nothing yet distinguishes them.
+*Time skew as the whole story.* 82% of loops price their two legs from **different
+slots** — `MAX_STALE_LAG_SLOTS` admits a pool 1800 slots (~6 min) behind the head, and
+`Cycle::slot()` reports only the stalest leg without anything rejecting the loop. So part
+of a reported edge can be the market moving between two observations rather than two
+venues disagreeing, and that part cannot be traded. `Cycle::slot_spread` measures it per
+loop and `--report` prints two sections built on it.
 
-> **`--verify` structurally cannot settle this.** It checks one pool against a router at
-> one instant, in one direction. It returned 118 checked, 0 faults while the pattern
-> above sat in the same data. A clean decoder audit is evidence about decoders, not
-> about the arithmetic built on top of them.
+The measured cost of requiring simultaneity, per fee tier, is small so far: −9%, −6%,
++11%. Real but not the explanation for a 5× gradient. **Note the trap:** comparing
+*spread bands* directly looks flat and appears to exonerate timing, because each band
+mixes fee tiers. The fee tier has to be held fixed. An earlier pass made that mistake in
+both directions within an hour.
 
-Until it is explained, **the value concentrated in high-fee routes should be treated as
-unproven**, and that is most of the value this instrument reports.
+> **`--verify` structurally cannot settle any of this.** It checks one pool against a
+> router at one instant, in one direction. It returned **118 checked, 0 faults** while the
+> archived run's gradient sat in the same data. A clean decoder audit is evidence about
+> decoders, not about the arithmetic built on top of them.
+
+Until it is explained, **value concentrated in high-fee routes is unproven** — and on the
+archived run that is most of the value the instrument reported. What settles it is a long
+run on the current build, then `--report`'s two simultaneity sections read together.
 
 The pattern in all seven: **an internal check cannot catch an error in what the code
 believes about the outside world** — including what it believes its own numbers mean.
@@ -534,7 +542,9 @@ because of the episode query, not the file size.
 
 ---
 
-*Last updated 2026-08-23. 252 tests passing, clippy clean under `-D warnings`.
-Runs natively on Windows; WSL no longer required.
+*Last updated 2026-08-23. 259 tests passing, clippy clean under `-D warnings`.
+Runs natively on Windows; WSL no longer required. `crates/executor` and
+`crates/evaluator` deleted — there is no execution code, and an empty crate with a
+confident name is worse than none.
 Test names are sentences on purpose — `one_standing_gap_is_one_opportunity_not_a_thousand_trades`
 is the specification, and the assertion is the proof.*
