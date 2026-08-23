@@ -202,7 +202,43 @@ the screen never appeared in `paper_fills`, and confirmed by the giveaway that d
 > **Two searches that answer different questions must not share one label.** The
 > arithmetic being right does not make the number mean what the heading says.
 
-The pattern in all six: **an internal check cannot catch an error in what the code
+**Two prices that were never on screen together — under investigation 2026-08-23.**
+`MAX_STALE_LAG_SLOTS` admits a pool up to 1800 slots (~6 min) behind the head, and
+`Cycle::slot` reports the *stalest* leg without anything rejecting a loop whose legs
+are minutes apart. So a cycle can price one leg from now and the other from six minutes
+ago and report the difference as dislocation. It is not one: you cannot trade against a
+price that has already gone.
+
+What is **measured**, on the 17.85 h run: claimed dislocation rises monotonically with
+the route's fee tier — 6.6 bps on sub-5 bp routes, 9.3, 33.6, then 81.6 bps on
+over-50 bp routes — and **93% of all claimed value sits on routes costing more than
+5 bps**, 63% above 20 bps. The cheap, liquid, genuinely-arbitraged tier produced $3.12
+of the $44.55.
+
+That ordering is backwards. Expensive pools should be *less* arbitrageable, not more.
+The hypothesis was that they trade less, so update less, so are staler, so skew more —
+and the skew is being read as opportunity. `Cycle::slot_spread` and the
+`WERE THE TWO PRICES EVER ON SCREEN AT THE SAME TIME?` report section exist to settle
+it: flat across spread bands means the gaps were real, rising means they were not.
+
+**First reading does not support the hypothesis.** 309 fills: same-slot 6.69 bps,
+1 slot 5.28, 2–10 slots 5.93, 11–100 slots 6.80. Flat. 81.9% of loops do price their
+legs from different slots, but the claimed gap does not grow with the distance.
+
+That sample is one minute of cheap routes — mean fee under 5.5 bps in every band — and
+contains none of the 20–100 bp routes where the anomaly lives, so it is not yet an
+answer. **The fee-tier correlation remains measured and unexplained.** Whoever picks
+this up: let the run cover the expensive routes, then read this table again. If it is
+still flat, the time-skew explanation is dead and the concentration of value in
+high-fee pools needs a different one — and it needs one before any of that value is
+believed.
+
+> **`--verify` structurally cannot catch this.** It checks one pool against a router at
+> one instant, and this is a gap that only exists *across two*. It returned 118 checked,
+> 0 faults while the pattern above was sitting in the same data. A clean audit is
+> evidence about decoders, not about the arithmetic built on top of them.
+
+The pattern in all seven: **an internal check cannot catch an error in what the code
 believes about the outside world** — including what it believes its own numbers mean.
 Every new decoder must be pinned against a value the decoder itself did not produce,
 and every headline must name which search produced it.
