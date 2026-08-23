@@ -307,9 +307,22 @@ function drawWall() {
 
 /* ── history ──────────────────────────────────────────────────────────── */
 
+let historyInFlight = false;
+
 async function loadHistory(path) {
-  S.history = path ? await invoke("read_history_at", { path }) : await invoke("read_history");
-  S.viewingArchive = path || null;
+  // A gigabyte-scale ledger takes real time to read. Overlapping reads would queue up
+  // behind each other on the blocking pool and never catch up.
+  if (historyInFlight) return;
+  historyInFlight = true;
+  if (!S.history) $("pnlNote").textContent = "Reading the ledger…";
+  try {
+    S.history = path ? await invoke("read_history_at", { path }) : await invoke("read_history");
+    S.viewingArchive = path || null;
+  } catch (e) {
+    S.history = { available: false, reason: String(e) };
+  } finally {
+    historyInFlight = false;
+  }
   paintHistory();
 }
 
@@ -490,7 +503,11 @@ const STATE_NOTE = {
 };
 
 async function refreshStatus() {
-  S.status = await invoke("bot_status");
+  try {
+    S.status = await invoke("bot_status");
+  } catch {
+    return; // a failed probe is not a state change; keep the last known one
+  }
   const s = S.status;
   $("dot").className = "dot " + ({ running: "run", starting: "run", foreign: "foreign", failed: "fail" }[s.state] || "");
   $("stateLabel").textContent = STATE_LABEL[s.state] || s.state;
@@ -505,7 +522,8 @@ async function refreshStatus() {
 }
 
 async function showFailure(msg) {
-  const lines = await invoke("read_log", { lines: 40 });
+  let lines = [];
+  try { lines = await invoke("read_log", { lines: 40 }); } catch { /* log may not exist */ }
   $("logBody").innerHTML =
     `<b>${esc(msg)}</b>\n\n` + (lines.length ? esc(lines.join("\n")) : "(log is empty)");
   setView("log");
@@ -581,7 +599,11 @@ $("btnSave").onclick = async () => {
 /* ── runs ─────────────────────────────────────────────────────────────── */
 
 async function loadRuns() {
-  const runs = await invoke("read_archives");
+  let runs = [];
+  try { runs = await invoke("read_archives"); } catch (e) {
+    $("runsNote").textContent = "Could not list archives: " + e;
+    return;
+  }
   const body = $("runsBody");
   body.innerHTML = "";
   $("runsEmpty").hidden = runs.length > 0;
@@ -604,7 +626,8 @@ async function loadRuns() {
 /* ── log ──────────────────────────────────────────────────────────────── */
 
 async function loadLog() {
-  const lines = await invoke("read_log", { lines: 400 });
+  let lines = [];
+  try { lines = await invoke("read_log", { lines: 400 }); } catch { /* no log yet */ }
   $("logBody").textContent = lines.length ? lines.join("\n") : "No log yet.";
   $("logBody").scrollTop = $("logBody").scrollHeight;
 }

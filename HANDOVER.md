@@ -454,6 +454,28 @@ Auto-restart of a dead bot is opt-in and **off by default**, and it fires on `Fa
 only, never `Stopped` — a run stopped deliberately stays stopped, and a resurrected one
 is a new run rather than a continuation.
 
+`cryptobot-desk.exe --start` begins the run on launch, which is what makes "launch with
+Windows" mean anything. `--no-tray` exists for bisecting event-loop problems.
+
+### The one that cost an hour: blocking the main thread
+
+**Every Tauri command that touches disk, a socket, or a process must be `async` and do
+its work in `tauri::async_runtime::spawn_blocking`.** Synchronous commands run on the
+main thread — the thread pumping the window's event loop. `read_history` walks every
+sweep in the ledger to build episodes, which takes tens of seconds, and doing that
+inline pinned a core and froze the window for the whole of startup.
+
+It presented as a spin in the event loop, and cost a four-way bisection (tray off, bot
+off, release build, blank page) to find. The blank page was what proved it: 0.1% CPU,
+so the fault was in the frontend's calls rather than the loop itself. `routes.rs`
+already had the same lesson written into it for the same reason, and it was not carried
+over. It is written here so the third occasion is cheaper than the second.
+
+Related: the ledger's WAL had grown to 172 MB without checkpointing, because a
+long-lived reader blocks it. `PRAGMA wal_checkpoint(TRUNCATE)` with the bot stopped
+folds it back in. That is housekeeping, not the cause of the freeze — the read is slow
+because of the episode query, not the file size.
+
 ---
 
 *Last updated 2026-08-23. 252 tests passing, clippy clean under `-D warnings`.

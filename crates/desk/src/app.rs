@@ -37,33 +37,51 @@ impl Default for App {
     }
 }
 
+/// Probes the child and the port. Async because both touch the OS, and a command that
+/// touches the OS on the main thread stalls the window — see [`read_history`].
+///
+/// # Errors
+/// If the blocking task panics or is cancelled.
 #[tauri::command]
-pub fn bot_status(app: tauri::State<'_, App>) -> serde_json::Value {
-    let state = app.runner.probe();
-    serde_json::json!({
-        "state": state,
-        "port": BOT_PORT,
-        "botExe": app.paths.bot_exe(),
-        "botExePresent": app.paths.bot_exe().exists(),
-        "root": app.paths.root,
-        "ledger": app.paths.ledger(),
-        "ledgerPresent": app.paths.ledger().exists(),
+pub async fn bot_status(app: tauri::State<'_, App>) -> Result<serde_json::Value, String> {
+    let runner = Arc::clone(&app.runner);
+    let paths = app.paths.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = runner.probe();
+        let exe = paths.bot_exe();
+        serde_json::json!({
+            "state": state,
+            "port": BOT_PORT,
+            "botExePresent": exe.exists(),
+            "botExe": exe,
+            "root": paths.root,
+            "ledger": paths.ledger(),
+            "ledgerPresent": paths.ledger().exists(),
+        })
     })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// # Errors
 /// If the binary is missing, the port is held by another instrument, or the spawn
 /// fails. The message is shown to the operator verbatim.
 #[tauri::command]
-pub fn bot_start(app: tauri::State<'_, App>) -> Result<(), String> {
-    app.runner.start().map_err(|e| e.to_string())
+pub async fn bot_start(app: tauri::State<'_, App>) -> Result<(), String> {
+    let runner = Arc::clone(&app.runner);
+    tauri::async_runtime::spawn_blocking(move || runner.start().map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// # Errors
 /// If the child cannot be reaped.
 #[tauri::command]
-pub fn bot_stop(app: tauri::State<'_, App>) -> Result<(), String> {
-    app.runner.stop().map_err(|e| e.to_string())
+pub async fn bot_stop(app: tauri::State<'_, App>) -> Result<(), String> {
+    let runner = Arc::clone(&app.runner);
+    tauri::async_runtime::spawn_blocking(move || runner.stop().map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// # Errors
@@ -87,55 +105,98 @@ pub fn read_config(app: tauri::State<'_, App>) -> Result<config::Params, String>
 /// If validation fails or the config cannot be written. Validation failure leaves both
 /// the file and the run untouched.
 #[tauri::command]
-pub fn save_config(
+pub async fn save_config(
     app: tauri::State<'_, App>,
     params: config::Params,
     restart: bool,
 ) -> Result<serde_json::Value, String> {
     config::validate(&params)?;
-    let was_running = matches!(app.runner.probe(), RunState::Running | RunState::Starting);
-    if was_running {
-        app.runner.stop().map_err(|e| e.to_string())?;
-    }
-    config::write_params(&app.paths.config(), &params).map_err(|e| e.to_string())?;
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let archived = archive::archive_ledger(&app.paths.ledger(), &app.paths.archive_dir(), &stamp)
-        .map_err(|e| e.to_string())?;
-    let mut restarted = false;
-    let mut restart_error = None;
-    if restart && was_running {
-        match app.runner.start() {
-            Ok(()) => restarted = true,
-            Err(e) => restart_error = Some(e.to_string()),
+    let runner = Arc::clone(&app.runner);
+    let paths = app.paths.clone();
+    // Off the main thread: archiving moves the database and its WAL, which are hundreds
+    // of megabytes, and doing that on the event loop freezes the window for the duration.
+    tauri::async_runtime::spawn_blocking(move || {
+        let was_running = matches!(runner.probe(), RunState::Running | RunState::Starting);
+        if was_running {
+            runner.stop().map_err(|e| e.to_string())?;
         }
-    }
-    Ok(serde_json::json!({
-        "saved": true,
-        "archived": archived.map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
-        "wasRunning": was_running,
-        "restarted": restarted,
-        "restartError": restart_error,
-    }))
+        config::write_params(&paths.config(), &params).map_err(|e| e.to_string())?;
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let archived = archive::archive_ledger(&paths.ledger(), &paths.archive_dir(), &stamp)
+            .map_err(|e| e.to_string())?;
+        let mut restarted = false;
+        let mut restart_error = None;
+        if restart && was_running {
+            match runner.start() {
+                Ok(()) => restarted = true,
+                Err(e) => restart_error = Some(e.to_string()),
+            }
+        }
+        Ok(serde_json::json!({
+            "saved": true,
+            "archived": archived.map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
+            "wasRunning": was_running,
+            "restarted": restarted,
+            "restartError": restart_error,
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
+/// Read the live ledger. **Async, and the SQLite work happens off the main thread.**
+///
+/// # Why this must not be a synchronous command
+///
+/// Tauri runs synchronous commands on the main thread — the same thread that pumps the
+/// window's event loop. Reading this ledger takes tens of seconds (it walks every sweep
+/// to build episodes), which pinned a core and froze the interface for the whole of
+/// startup. It presented as a spin in the event loop and was really one blocking call
+/// on the wrong thread.
+///
+/// `crates/server/src/routes.rs` already did this correctly for the same reason. This
+/// is that lesson, applied on the second occasion it was needed.
+///
+/// # Errors
+/// If the blocking task panics or is cancelled. A ledger that cannot be read is not an
+/// error here — it comes back as `{available: false, reason}`.
 #[tauri::command]
-pub fn read_history(app: tauri::State<'_, App>) -> serde_json::Value {
-    history::snapshot(&app.paths.ledger())
+pub async fn read_history(app: tauri::State<'_, App>) -> Result<serde_json::Value, String> {
+    let db = app.paths.ledger();
+    tauri::async_runtime::spawn_blocking(move || history::snapshot(&db))
+        .await
+        .map_err(|e| e.to_string())
 }
 
+/// # Errors
+/// If the blocking task panics or is cancelled.
 #[tauri::command]
-pub fn read_history_at(path: String) -> serde_json::Value {
-    history::snapshot(std::path::Path::new(&path))
+pub async fn read_history_at(path: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || history::snapshot(std::path::Path::new(&path)))
+        .await
+        .map_err(|e| e.to_string())
 }
 
+/// # Errors
+/// If the blocking task panics or is cancelled.
 #[tauri::command]
-pub fn read_archives(app: tauri::State<'_, App>) -> Vec<archive::ArchivedRun> {
-    archive::list_archives(&app.paths.archive_dir())
+pub async fn read_archives(
+    app: tauri::State<'_, App>,
+) -> Result<Vec<archive::ArchivedRun>, String> {
+    let dir = app.paths.archive_dir();
+    tauri::async_runtime::spawn_blocking(move || archive::list_archives(&dir))
+        .await
+        .map_err(|e| e.to_string())
 }
 
+/// # Errors
+/// If the blocking task panics or is cancelled.
 #[tauri::command]
-pub fn read_log(app: tauri::State<'_, App>, lines: usize) -> Vec<String> {
-    logs::tail(&app.paths.log(), lines)
+pub async fn read_log(app: tauri::State<'_, App>, lines: usize) -> Result<Vec<String>, String> {
+    let log = app.paths.log();
+    tauri::async_runtime::spawn_blocking(move || logs::tail(&log, lines))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

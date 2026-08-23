@@ -552,13 +552,13 @@ impl LiveMarket {
                 Venue::RaydiumV4 { info, .. } => {
                     // The pool account itself moved: fees and uncollected amounts
                     // change, and a stale copy corrupts the reserve calculation.
-                    *info = Box::new(raydium_v4::decode_amm_info(&u.data).ok()?);
+                    **info = raydium_v4::decode_amm_info(&u.data).ok()?;
                     self.watches.get(&u.pubkey)?.vault_state(u.pubkey)?
                 }
                 Venue::RaydiumCpmm { pool, .. } => {
                     // Same reasoning: the accrued-fee counters live in this account and
                     // are subtracted from the vault balances to get the real reserve.
-                    *pool = Box::new(raydium_cpmm::decode(&u.data).ok()?);
+                    **pool = raydium_cpmm::decode(&u.data).ok()?;
                     self.watches.get(&u.pubkey)?.vault_state(u.pubkey)?
                 }
             }
@@ -796,11 +796,11 @@ impl LiveMarket {
                 raydium_clmm::to_pool_state(addr, data, *trade_fee_ppm, slot).ok()
             }
             Venue::RaydiumV4 { info, .. } => {
-                *info = Box::new(raydium_v4::decode_amm_info(data).ok()?);
+                **info = raydium_v4::decode_amm_info(data).ok()?;
                 self.watches.get(&addr)?.vault_state(addr)
             }
             Venue::RaydiumCpmm { pool, .. } => {
-                *pool = Box::new(raydium_cpmm::decode(data).ok()?);
+                **pool = raydium_cpmm::decode(data).ok()?;
                 self.watches.get(&addr)?.vault_state(addr)
             }
         }

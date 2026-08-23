@@ -46,8 +46,23 @@ fn main() {
             app::set_autostart,
         ])
         .setup(|tauri_app| {
-            build_tray(tauri_app)?;
+            // `--no-tray` exists to bisect a CPU spin: it isolates the tray from the
+            // rest of the event loop without a separate build.
+            if !std::env::args().any(|a| a == "--no-tray") {
+                build_tray(tauri_app)?;
+            }
             spawn_watcher(tauri_app.handle().clone());
+
+            // `--start` begins the run on launch. Without it, "launch with Windows"
+            // only reopens a window, which is not what anyone means by it. Kept an
+            // explicit flag rather than a default: starting a measurement is a
+            // decision, and it must not be a side effect of logging in.
+            if std::env::args().any(|a| a == "--start") {
+                let state = tauri_app.state::<app::App>();
+                if let Err(e) = state.runner.start() {
+                    eprintln!("--start failed: {e}");
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| {

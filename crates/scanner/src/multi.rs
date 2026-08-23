@@ -198,7 +198,7 @@ pub fn find_from_base(
         .into_iter()
         .filter_map(|c| price(&c, max_in))
         .collect();
-    out.sort_by(|a, b| b.profit.cmp(&a.profit));
+    out.sort_by_key(|c| std::cmp::Reverse(c.profit));
     out
 }
 
@@ -303,7 +303,7 @@ pub fn find_cycles(
             out.push(priced);
         }
     }
-    out.sort_by(|a, b| b.profit.cmp(&a.profit));
+    out.sort_by_key(|c| std::cmp::Reverse(c.profit));
     out
 }
 
