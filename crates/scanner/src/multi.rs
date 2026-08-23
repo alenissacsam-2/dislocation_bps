@@ -55,6 +55,40 @@ impl Cycle {
         self.pools.iter().filter_map(|p| snap.get(p)).map(|p| p.slot).min().unwrap_or(0)
     }
 
+    /// Slots between the freshest and stalest pool in the loop.
+    ///
+    /// # Why a dislocation is not a dislocation unless this is small
+    ///
+    /// An arbitrage is a claim that two venues disagree **at the same moment**. This
+    /// number is how far from that ideal the claim actually is. Pools are quoted from
+    /// whatever state last arrived, and `MAX_STALE_LAG_SLOTS` admits one up to 1800
+    /// slots behind the head — so a cycle can price one leg now and the other from six
+    /// minutes ago and report the difference as opportunity. It is not: you cannot
+    /// trade against a price that has already gone.
+    ///
+    /// The signature to watch for is apparent dislocation rising with a pool's fee
+    /// tier. Expensive pools trade less, so they update less, so they are staler, so
+    /// they skew more — which produces exactly the pattern of "the biggest edges live
+    /// on the most expensive routes", a conclusion that is backwards for real
+    /// arbitrage and was visible in this instrument's own data before this existed.
+    ///
+    /// Zero means every leg came from one slot, which is the only case where the word
+    /// dislocation is honest.
+    #[must_use]
+    pub fn slot_spread(&self, snap: &Snapshot) -> u64 {
+        let mut lo = u64::MAX;
+        let mut hi = 0u64;
+        for p in self.pools.iter().filter_map(|p| snap.get(p)) {
+            lo = lo.min(p.slot);
+            hi = hi.max(p.slot);
+        }
+        if lo == u64::MAX {
+            0
+        } else {
+            hi - lo
+        }
+    }
+
     /// Total swap fee along the route, in bps.
     #[must_use]
     pub fn fee_bps(&self) -> f64 {
@@ -362,6 +396,50 @@ mod tests {
         let p2 = pool(2, RAY, USDC, 1_000_000, 900_000); // RAY cheap in USDC
         let p3 = pool(3, RAY, SOL, 1_000_000, 1_200_000); // RAY dear in SOL
         (Snapshot::new(vec![p1, p2, p3]), p1)
+    }
+
+    fn pool_at(id: u8, a: [u8; 32], b: [u8; 32], ra: u128, rb: u128, slot: u64) -> PoolState {
+        PoolState::constant_product(PoolId([id; 32]), Dex::OrcaWhirlpool, a, b, ra, rb, 100, slot)
+    }
+
+    /// An arbitrage is a claim that two venues disagree *at one moment*. When every
+    /// leg came from the same slot the claim is honest, and the spread says so.
+    #[test]
+    fn a_loop_whose_legs_all_came_from_one_slot_has_no_spread() {
+        let p1 = pool_at(1, SOL, USDC, 1_000_000, 1_000_000, 500);
+        let p2 = pool_at(2, SOL, USDC, 1_000_000, 1_010_000, 500);
+        let snap = Snapshot::new(vec![p1, p2]);
+        let found = find_from_base(&snap, &SOL, 2, u128::MAX);
+        assert!(!found.is_empty());
+        assert_eq!(found[0].cycle.slot_spread(&snap), 0);
+    }
+
+    /// The one this exists for: a cycle can price one leg from now and the other from
+    /// minutes ago, and report the difference as opportunity. It is not opportunity —
+    /// the older price has already gone — and nothing else in the search notices.
+    #[test]
+    fn a_loop_pricing_one_leg_from_minutes_ago_reports_the_gap_it_is_reaching_across() {
+        let fresh = pool_at(1, SOL, USDC, 1_000_000, 1_000_000, 2_000);
+        let stale = pool_at(2, SOL, USDC, 1_000_000, 1_010_000, 200);
+        let snap = Snapshot::new(vec![fresh, stale]);
+        let found = find_from_base(&snap, &SOL, 2, u128::MAX);
+        assert!(!found.is_empty(), "the search still finds it; that is the problem");
+        assert_eq!(
+            found[0].cycle.slot_spread(&snap),
+            1_800,
+            "1800 slots apart is the staleness guard's own limit, and it is admitted"
+        );
+    }
+
+    #[test]
+    fn spread_is_the_full_span_not_just_the_first_two_legs() {
+        let a = pool_at(1, SOL, USDC, 1_000_000, 1_000_000, 100);
+        let b = pool_at(2, RAY, USDC, 1_000_000, 900_000, 140);
+        let c = pool_at(3, RAY, SOL, 1_000_000, 1_200_000, 90);
+        let snap = Snapshot::new(vec![a, b, c]);
+        let found = find_from_base(&snap, &SOL, 3, u128::MAX);
+        assert!(!found.is_empty());
+        assert_eq!(found[0].cycle.slot_spread(&snap), 50, "140 - 90, across all three legs");
     }
 
     /// The mirror bug, pinned. Both entries into one loop must key the same, or

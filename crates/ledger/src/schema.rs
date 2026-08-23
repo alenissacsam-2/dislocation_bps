@@ -129,6 +129,13 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "paper_fills", "profit_at_100_usd", "REAL")?;
     add_column_if_missing(conn, "paper_fills", "profit_at_1k_usd", "REAL")?;
     add_column_if_missing(conn, "paper_fills", "profit_at_10k_usd", "REAL")?;
+    // Slots between the freshest and stalest leg of the loop. A dislocation is a claim
+    // that two venues disagree at one moment; this is how far from that the claim was.
+    // Non-zero means part of the "gap" is the market having moved between two
+    // observations rather than two venues disagreeing, and you cannot trade against a
+    // price that has already gone. NULL for rows written before it was measured —
+    // never zero, which would assert simultaneity nobody checked.
+    add_column_if_missing(conn, "paper_fills", "slot_spread", "INTEGER")?;
 
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_fill_cycle ON paper_fills(cycle_key, id);",

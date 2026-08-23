@@ -197,6 +197,15 @@ pub struct LiveOpportunity {
     pub edge_bps: f64,
     pub fee_bps: f64,
     pub slot: u64,
+    /// Slots between the freshest and stalest leg of this loop.
+    ///
+    /// A dislocation is a claim that two venues disagree *at one moment*. This is how
+    /// far the claim actually reached: zero means every leg came from the same slot,
+    /// and anything larger means part of the reported gap is the market having moved
+    /// between two observations rather than two venues disagreeing. You cannot trade
+    /// against a price that has already gone, so a large spread is a reason to distrust
+    /// the edge beside it rather than to celebrate it.
+    pub slot_spread: u64,
 }
 
 /// One pool, one direction, and what we claim it will pay — ready to be checked
@@ -679,6 +688,7 @@ impl LiveMarket {
                     edge_bps: cb_core::path::marginal_edge_bps(&p.cycle.legs).unwrap_or(0.0),
                     fee_bps: p.cycle.fee_bps(),
                     slot: p.cycle.slot(&snap),
+                    slot_spread: p.cycle.slot_spread(&snap),
                 });
             }
         }

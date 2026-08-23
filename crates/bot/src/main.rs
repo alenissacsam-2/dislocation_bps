@@ -523,6 +523,7 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                                 skipped_reason: skipped.clone(),
                                 cycle_key: opp.cycle_key.clone(),
                                 profit_at_capital_usd: Some(opp.profit_at_capital_usd),
+                                slot_spread: Some(opp.slot_spread),
                             };
                             if let Err(e) = l.record_fill(&rec) {
                                 tracing::warn!("could not record fill: {e:#}");
@@ -848,6 +849,41 @@ fn report(path: &str) -> anyhow::Result<()> {
         println!("    Where two rungs agree the cycles ran out of depth, not funding.");
         println!("    Borrowed capital cannot widen a tick, so a flat step is the");
         println!("    measurement that says a flash loan would have added nothing.");
+    }
+
+    // Whether the reported gaps were ever simultaneously available. A dislocation is a
+    // claim that two venues disagreed at one moment; if the claim grows with how far
+    // apart in time the legs were read, what is being reported is the market moving
+    // between two observations, not two venues disagreeing.
+    let spread = ledger.spread_audit()?;
+    let measured: u64 = spread.iter().map(|b| b.fills).sum();
+    if measured > 0 {
+        println!("\n  WERE THE TWO PRICES EVER ON SCREEN AT THE SAME TIME?");
+        println!(
+            "    {:<12} {:>9} {:>14} {:>10} {:>13}",
+            "legs apart", "fills", "mean gap bps", "mean fee", "value @ $100"
+        );
+        for b in &spread {
+            if b.fills == 0 {
+                continue;
+            }
+            println!(
+                "    {:<12} {:>9} {:>14.2} {:>10.2} {:>13}",
+                b.label,
+                b.fills,
+                b.mean_dislocation_bps,
+                b.mean_fee_bps,
+                format!("${:.4}", b.value_at_100_usd)
+            );
+        }
+        println!(
+            "\n    Flat is healthy: a real disagreement between venues has no reason to\n    \
+             depend on whether we read them one slot apart or five hundred. Rising is\n    \
+             the instrument reporting the market's movement between two observations as\n    \
+             an edge — one that was never simultaneously on offer and cannot be taken.\n    \
+             `--verify` cannot see this: it checks one pool against a router at one\n    \
+             instant, and this is a gap that only exists across two."
+        );
     }
 
     // What the contest rule costs, priced across the range of win rates rather than

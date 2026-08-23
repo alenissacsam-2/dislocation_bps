@@ -125,8 +125,8 @@ impl Ledger {
              (slot, route, venues, hops, edge_bps, dislocation_bps, fee_bps, size_usd,
               optimal_size_usd, gross_usd, profit_at_optimal_usd, tip_usd, net_usd,
               taken, skipped_reason, cycle_key,
-              profit_at_100_usd, profit_at_1k_usd, profit_at_10k_usd)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+              profit_at_100_usd, profit_at_1k_usd, profit_at_10k_usd, slot_spread)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             rusqlite::params![
                 f.slot as i64,
                 f.route,
@@ -147,6 +147,7 @@ impl Ledger {
                 f.profit_at_capital_usd.map(|l| l[0]),
                 f.profit_at_capital_usd.map(|l| l[1]),
                 f.profit_at_capital_usd.map(|l| l[2]),
+                f.slot_spread.map(|s| s as i64),
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -672,6 +673,51 @@ impl Ledger {
         })
     }
 
+    /// Claimed dislocation grouped by how far apart in time the legs actually were.
+    ///
+    /// # What a healthy result looks like
+    ///
+    /// Flat. If two venues genuinely disagree, the size of the disagreement has no
+    /// reason to depend on whether we observed them one slot apart or five hundred.
+    ///
+    /// # What a broken one looks like
+    ///
+    /// Dislocation rising with the spread. That is the instrument reporting the
+    /// market's *movement between two observations* as a disagreement between two
+    /// venues — an edge that was never simultaneously available and cannot be taken.
+    /// It is invisible to `--verify`, which checks one pool at a time against a router
+    /// at one instant and so can never see a gap that only exists across two.
+    pub fn spread_audit(&self) -> Result<Vec<SpreadBand>> {
+        let bands = [
+            ("same slot", 0i64, 0i64),
+            ("1 slot", 1, 1),
+            ("2-10", 2, 10),
+            ("11-100", 11, 100),
+            ("over 100", 101, i64::MAX),
+        ];
+        let mut out = Vec::new();
+        for (label, lo, hi) in bands {
+            let row = self.conn.query_row(
+                "SELECT COUNT(*), AVG(dislocation_bps), AVG(fee_bps),
+                        COALESCE(SUM(profit_at_100_usd), 0)
+                 FROM paper_fills
+                 WHERE slot_spread IS NOT NULL AND slot_spread >= ?1 AND slot_spread <= ?2",
+                rusqlite::params![lo, hi],
+                |r| {
+                    Ok(SpreadBand {
+                        label: label.to_string(),
+                        fills: r.get::<_, i64>(0)? as u64,
+                        mean_dislocation_bps: r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                        mean_fee_bps: r.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                        value_at_100_usd: r.get(3)?,
+                    })
+                },
+            )?;
+            out.push(row);
+        }
+        Ok(out)
+    }
+
     /// The routes that clear most often, with what they were worth.
     pub fn top_routes(&self, limit: usize) -> Result<Vec<RouteStat>> {
         let mut stmt = self.conn.prepare(
@@ -772,6 +818,13 @@ pub struct FillRecord {
     /// What this opportunity would have paid at each rung of [`CAPITAL_LADDER_USD`].
     /// `None` when the run did not price the ladder — recorded as NULL, never as zero.
     pub profit_at_capital_usd: Option<[f64; 3]>,
+    /// Slots between the freshest and stalest leg of the loop.
+    ///
+    /// Zero is the only value for which the word *dislocation* is honest: it means
+    /// every leg was observed in the same slot, so the difference between them is a
+    /// disagreement between venues rather than the market having moved in between.
+    /// `None` for runs that did not measure it.
+    pub slot_spread: Option<u64>,
 }
 
 /// One episode: a gap, from the moment it opened to the moment it closed.
@@ -899,6 +952,17 @@ pub struct EquityPoint {
     /// episodes that measured it.
     pub ladder_episodes: u64,
     pub unmeasured_episodes: u64,
+}
+
+/// Claimed dislocation, grouped by how far apart in time the legs were observed.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpreadBand {
+    pub label: String,
+    pub fills: u64,
+    pub mean_dislocation_bps: f64,
+    pub mean_fee_bps: f64,
+    pub value_at_100_usd: f64,
 }
 
 /// Win rates the race ladder is priced at. Not predictions — the span of assumptions
@@ -1230,6 +1294,9 @@ mod tests {
             // Rising, then flat: this fixture's cycle runs out of depth between $1k and
             // $10k, which is the shape the ladder exists to expose.
             profit_at_capital_usd: Some([0.004, 0.006, 0.006]),
+            // Simultaneous by default: a fixture asserting a dislocation should assert
+            // one that was actually observable at a single moment.
+            slot_spread: Some(0),
         }
     }
 
