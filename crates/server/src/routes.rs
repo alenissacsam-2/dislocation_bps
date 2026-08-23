@@ -22,6 +22,10 @@ const EPISODE_GAP_SLOTS: u64 = 5;
 /// shipping a row per detection to a browser.
 const CURVE_POINTS: usize = 600;
 
+/// Opportunities returned for the value-against-lifetime scatter. Kept by value, so a
+/// long run still ships the points that decide the question rather than its dust.
+const SCATTER_POINTS: usize = 1500;
+
 #[derive(Clone)]
 pub struct AppState {
     pub bus: EventBus,
@@ -95,11 +99,13 @@ async fn equity(State(state): State<AppState>) -> impl IntoResponse {
         let ladder = ledger.capital_ladder(EPISODE_GAP_SLOTS)?;
         let summary = ledger.summary()?;
         let contest = ledger.contest_audit(EPISODE_GAP_SLOTS)?;
+        let scatter = ledger.episode_scatter(EPISODE_GAP_SLOTS, SCATTER_POINTS)?;
         Ok(serde_json::json!({
             "available": true,
             "curve": curve,
             "ladder": ladder,
             "contest": contest,
+            "episodes": scatter,
             "contestSurvivalRate": contest.contested_survival_rate(),
             "uncontestedSurvivalRate": contest.uncontested_survival_rate(),
             "contestHasEvidence": contest.has_enough_evidence(),

@@ -102,12 +102,26 @@ impl Registry {
 
         let mut pools = Vec::with_capacity(raw.pools.len());
         for p in raw.pools {
+            let (mint_a, mint_b) = (pk(&p.mint_a)?, pk(&p.mint_b)?);
+            // Derive the label from the mints rather than trusting the upstream string.
+            //
+            // Two sources name wrapped SOL differently, so the *same* mint pair arrived
+            // as both "SOL/USDC" and "WSOL/USDC" — ten pools on one pair rendering as
+            // two unrelated ones. Nothing routes on the label, so this never affected a
+            // price; it affected every human reading of the universe, including the
+            // count of how many venues quote a pair, which is the whole basis for
+            // deciding a pair is worth watching. Unknown mints keep the upstream label,
+            // since an address prefix is a worse name than a hand-written one.
+            let label = match (mints.get(&mint_a), mints.get(&mint_b)) {
+                (Some(a), Some(b)) => format!("{}/{}", a.symbol, b.symbol),
+                _ => p.label,
+            };
             pools.push(PoolEntry {
                 address: pk(&p.address)?,
                 dex: parse_dex(&p.dex)?,
-                label: p.label,
-                mint_a: pk(&p.mint_a)?,
-                mint_b: pk(&p.mint_b)?,
+                label,
+                mint_a,
+                mint_b,
                 fee_ppm_hint: p.fee_ppm,
                 tvl_usd: p.tvl_usd,
             });

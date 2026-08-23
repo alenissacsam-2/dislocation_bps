@@ -590,7 +590,36 @@ impl Ledger {
             .collect())
     }
 
-    /// What this run's opportunities would have paid accounts of several sizes.
+    /// Every opportunity as a point of (what it was worth, how long it lasted).
+    ///
+    /// This is the plot that carries the project's central finding, and it needs to be
+    /// a scatter rather than an average because the relationship is an *inverse* one:
+    /// the gaps worth real money are gone within a slot, and the ones that sit around
+    /// waiting are worth thousandths of a cent. A mean over both says neither.
+    ///
+    /// Capped at `limit` points, keeping the most valuable — a scatter of ten thousand
+    /// dust episodes hides the handful that decide whether any of this works, and those
+    /// are exactly the ones a reader needs to see.
+    pub fn episode_scatter(&self, gap_slots: u64, limit: usize) -> Result<Vec<EpisodePoint>> {
+        let mut pts: Vec<EpisodePoint> = self
+            .episode_rows(gap_slots)?
+            .into_iter()
+            .map(|e| EpisodePoint {
+                pie_usd: e.pie_usd.max(0.0),
+                net_usd: if e.taken { e.best_net_usd } else { 0.0 },
+                lifetime_slots: e.lifetime_slots,
+                optimal_size_usd: e.optimal_size_usd,
+                detections: e.detections,
+                taken: e.taken,
+                contested: e.contested,
+            })
+            .collect();
+        pts.sort_by(|a, b| b.pie_usd.total_cmp(&a.pie_usd));
+        pts.truncate(limit);
+        Ok(pts)
+    }
+
+    /// What this run's opportunities were worth to accounts of several sizes.
     ///
     /// The direct answer to "would a bigger book have made money", measured rather than
     /// extrapolated: every rung prices the *same* episodes, so the gaps between them are
@@ -730,6 +759,22 @@ struct EpisodeRow {
     ladder: Option<[f64; 3]>,
     /// Whether any detection in this episode was declined as a race we would lose.
     contested: bool,
+}
+
+/// One opportunity, as a point on the value-against-lifetime plot.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpisodePoint {
+    /// What it was worth at the size that maximises it, at any capital.
+    pub pie_usd: f64,
+    /// What this run's book would have kept. Zero when it was not taken.
+    pub net_usd: f64,
+    /// Slots between first and last sighting. Zero means gone before the next slot.
+    pub lifetime_slots: u64,
+    pub optimal_size_usd: f64,
+    pub detections: u64,
+    pub taken: bool,
+    pub contested: bool,
 }
 
 /// Evidence for or against the contest classifier, from the run's own data.
