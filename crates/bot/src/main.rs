@@ -18,7 +18,14 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SLOT_MS: u64 = 200;
-const LISTEN: &str = "0.0.0.0:8787";
+/// Loopback only.
+///
+/// This was `0.0.0.0` while the bot lived in WSL, because the browser on the Windows
+/// side had to cross the VM boundary to reach it. Nothing crosses a boundary any more:
+/// the app and the bot are both Windows processes on one machine. Binding every
+/// interface now would put the run's state on the local network for no gain, and it is
+/// what made Windows Firewall prompt on first launch.
+const LISTEN: &str = "127.0.0.1:8787";
 
 /// How often the whole cycle graph is re-priced. Two sweeps per slot: fast enough
 /// that a measurement is never more than half a block stale, slow enough that the
