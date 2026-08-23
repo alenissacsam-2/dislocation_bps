@@ -160,6 +160,60 @@ mod tests {
         assert!(r.start().is_err(), "a missing binary must be an error, not a silent no-op");
     }
 
+    /// Spawns the real `cb-bot.exe` and stops it again.
+    ///
+    /// Ignored by default: it needs a release build present, it binds a real port, and
+    /// it appends a few seconds to whatever ledger sits at the workspace root. Run it
+    /// explicitly with `cargo test -p cb-desk -- --ignored --nocapture`.
+    ///
+    /// Note what it asserts when something else already holds the port — a refusal,
+    /// not a race. That is the interlock, and the assertion covers both worlds so the
+    /// test is meaningful whether or not an instrument is already running.
+    #[test]
+    #[ignore = "spawns the real bot"]
+    fn the_runner_starts_and_stops_the_real_bot() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/desk sits two levels below the workspace root")
+            .to_path_buf();
+        let exe = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default())
+            .join("cryptobot-win-target")
+            .join("release")
+            .join("cb-bot.exe");
+        if !exe.exists() {
+            eprintln!("no release cb-bot.exe at {}; build it first", exe.display());
+            return;
+        }
+        let already = port_is_bound(BOT_PORT);
+        let r = NativeRunner::new(exe, root.clone(), root.join("cb-bot.log"));
+
+        if already {
+            let err = r.start().expect_err("a bound port must be refused, not raced");
+            eprintln!("correctly refused: {err}");
+            assert!(err.to_string().contains("refusing"));
+            assert_eq!(r.probe(), RunState::Foreign, "a port we did not claim is Foreign");
+            return;
+        }
+
+        r.start().expect("start the bot");
+        // Give it time to bind. It reads a pool registry and opens a websocket first,
+        // so it is not instant.
+        let mut state = r.probe();
+        for _ in 0..40 {
+            if state == RunState::Running {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            state = r.probe();
+        }
+        eprintln!("state after start: {state:?}");
+        assert_eq!(state, RunState::Running, "the bot should be serving within 20s");
+
+        r.stop().expect("stop the bot");
+        assert_eq!(r.probe(), RunState::Stopped, "after stop, nothing of ours and no port");
+    }
+
     /// Stopping something we never started must not throw. The tray calls this on
     /// quit regardless of state, and an error there would block shutdown.
     #[test]
