@@ -32,11 +32,13 @@ Install once with:
 '@
 }
 
-$profileArg = if ($Dev) { @() } else { @('--release') }
 $profileDir = if ($Dev) { 'debug' } else { 'release' }
 
 Write-Host "building -> $env:CARGO_TARGET_DIR\$profileDir"
-cargo build @profileArg -p cb-bot -p cb-desk
+# Spelled out rather than splatted: `@array` is cmdlet-splatting syntax and misparses
+# into a bare `-` when handed to a native executable.
+if ($Dev) { cargo build -p cb-bot -p cb-desk }
+else      { cargo build --release -p cb-bot -p cb-desk }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 foreach ($exe in 'cb-bot.exe', 'cryptobot-desk.exe') {
