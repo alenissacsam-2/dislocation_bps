@@ -64,24 +64,24 @@ trait BotRunner {
 }
 ```
 
-Two implementations:
+**Resolved 2026-08-23: there is one implementation, `NativeRunner`.** The open question
+in §8 was whether `cb-bot` compiles for `x86_64-pc-windows-msvc`; it does, whole
+dependency tree including `rusqlite` with bundled SQLite. So the app spawns
+`cb-bot.exe` directly as a child process and **WSL leaves this project entirely** —
+taking with it the VM's CPU overhead and the failure class where the VM restarts and
+silently kills the run.
 
-| | |
-|---|---|
-| `NativeRunner` | spawns `cb-bot.exe` as a Windows child process |
-| `WslRunner` | shells to `wsl.exe -d Ubuntu -e bash -lc …`, the arrangement in use today |
+The trait survives the simplification because it is what makes the runner testable: a
+fake implementation lets the whole status state machine be tested without spawning
+anything. A second real implementation would be speculative, so there is not one.
 
-Selected once at startup by probing for a native binary, native preferred. **Nothing
-above this trait knows which one is active.** That is deliberate: at the time of
-writing it is not known whether `cb-bot` compiles for `x86_64-pc-windows-msvc` — the
-Solana dependency tree is the risk — and the app must ship either way. If native works,
-WSL leaves the picture and with it both the VM's CPU overhead and the class of failure
-where the VM restarts and takes the bot with it. If it does not, nothing above the
-trait changes.
+### 2.1.1 Only one instrument may run
 
-`WslRunner` must use the bracket-escape idiom (`pkill -f '[c]b-bot'`) for stopping.
-A plain `pkill -f cb-bot` matches the very `wsl.exe` command line that invokes it and
-kills its own shell; that has already happened once in this project's history.
+The bot and the app both address `cryptobot.db` and port 8787. Two live writers would
+corrupt the ledger, and a stale WSL bot from the previous arrangement is a real
+possibility on this machine. So `start()` refuses when it finds port 8787 already
+bound, reports **who** holds it, and offers to reclaim rather than starting a second
+writer. Refusing is the correct default: the ledger is the measurement.
 
 **Locating the project.** The app resolves the repository root once at startup and
 stores it in its own settings file under `%APPDATA%`, defaulting to the directory the
@@ -194,9 +194,24 @@ terminal.
 - **A frontend framework or bundler.** The existing dashboard is one static file and is
   the better precedent; a build step would add failure modes for no gain at this size.
 
-## 8. Open question, resolved empirically
+## 8. The open question, and its answer
 
-Whether `cb-bot` compiles for `x86_64-pc-windows-msvc`. Being tested during
-implementation rather than assumed. The answer selects the default runner and decides
-whether WSL remains a dependency of this project at all; it does not change any
-interface in this document.
+**Does `cb-bot` compile for `x86_64-pc-windows-msvc`?** Tested rather than assumed, on
+2026-08-23: **yes**, the whole tree, `rusqlite` with bundled SQLite included, clean in
+6m54s.
+
+The consequences are larger than the runner selection this was meant to decide:
+
+- **WSL leaves the project.** HANDOVER §2's "build and run from WSL, not Windows" was
+  never a property of the code — it was a property of this machine lacking a linker.
+  With MSVC installed, that instruction is obsolete and should be rewritten rather than
+  left to mislead the next reader.
+- **The CPU cost of the VM goes with it.** The measured 35% of a core was work done
+  through a virtualisation layer that no longer has to exist.
+- **A whole failure class disappears.** The run that died this morning died because the
+  WSL VM restarted. A Windows child process supervised by a Windows app cannot fail
+  that way.
+
+One migration hazard follows, and §2.1.1 exists because of it: for as long as both
+arrangements are installed, two bots could write one ledger. The app refuses to start
+into a bound port rather than becoming the second writer.
