@@ -113,6 +113,13 @@ mod tests {
             v["ladder"]["realisedUsd"],
         );
         eprintln!("ladder rungs = {}", v["ladder"]["rungs"]);
+        // The app's race panel reads these; if the key is missing the panel silently
+        // renders its empty state and the biggest number in the instrument disappears.
+        assert!(v["race"].is_object(), "the race ladder must reach the window");
+        eprintln!(
+            "race rungs   = {}   declined {} episodes, ${}",
+            v["race"]["rungs"], v["race"]["declinedEpisodes"], v["race"]["declinedNetUsd"]
+        );
         assert!(!curve.is_empty(), "a ledger with samples must produce a curve");
     }
 
