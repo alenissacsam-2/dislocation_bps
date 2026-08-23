@@ -1,4 +1,11 @@
-//! Axum routes: a WebSocket event stream, a health endpoint, and the static dashboard.
+//! Axum routes: a WebSocket event stream, a health endpoint, and a ledger read.
+//!
+//! # Why there is no longer a UI here
+//!
+//! This server used to serve `dashboard/dist` as well, and that was the arrangement's
+//! defect: the interface was served by the process it observed, so a stopped bot had
+//! no interface at all — not a degraded one, none. `cryptobot-desk` inverts that. The
+//! server keeps the three endpoints and stops pretending to be a window.
 
 use crate::events::{Event, EventBus};
 use axum::{
@@ -12,7 +19,6 @@ use axum::{
 };
 use std::net::SocketAddr;
 use tokio::sync::broadcast::error::RecvError;
-use tower_http::services::{ServeDir, ServeFile};
 
 /// Detections this far apart in slots belong to different episodes. Matches the value
 /// the report uses, so the dashboard's P&L and `cb-bot --report` cannot disagree.
@@ -36,23 +42,19 @@ pub struct AppState {
     pub ledger_path: Option<String>,
 }
 
-/// Serve the dashboard and event stream on `addr`.
+/// Serve the API on `addr`.
 ///
-/// `static_dir` is the built frontend. If it is missing the API still works, which
-/// keeps the bot runnable headless.
-pub async fn serve(addr: SocketAddr, state: AppState, static_dir: &str) -> anyhow::Result<()> {
-    let index = format!("{static_dir}/index.html");
-    let spa = ServeDir::new(static_dir).fallback(ServeFile::new(index));
-
+/// # Errors
+/// If the address cannot be bound, or the server stops with an error.
+pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/stream", get(ws_handler))
         .route("/api/equity", get(equity))
-        .fallback_service(spa)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("dashboard listening on http://{addr}");
+    tracing::info!("api listening on http://{addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }

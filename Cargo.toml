@@ -10,6 +10,7 @@ members = [
     "crates/ledger",
     "crates/server",
     "crates/bot",
+    "crates/desk",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ cb-evaluator = { path = "crates/evaluator" }
 cb-executor  = { path = "crates/executor" }
 cb-ledger    = { path = "crates/ledger" }
 cb-server    = { path = "crates/server" }
+cb-desk      = { path = "crates/desk" }
 
 # solana
 solana-sdk    = "4.1"
@@ -59,6 +61,7 @@ futures-util = "0.3"
 bs58 = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 figment = { version = "0.10", features = ["toml", "env"] }
+toml_edit = "0.22"
 
 [profile.release]
 opt-level = 3

@@ -63,27 +63,44 @@ same directory, numbered in order.
 
 ## 2. Running it
 
-**Build and run from WSL, not Windows.** There is no MSVC linker on this machine and
-Git Bash shadows the error confusingly.
+**This builds and runs natively on Windows as of 2026-08-23.** The old instruction here
+said "build and run from WSL, not Windows" — that was true of *this machine*, which had
+no MSVC linker, and was never true of the code. With Visual Studio Build Tools
+installed the whole tree compiles for `x86_64-pc-windows-msvc`, `rusqlite` with bundled
+SQLite included. WSL is no longer a dependency of this project, and with it go the VM's
+CPU overhead and the failure mode where the VM restarts and silently takes the run with
+it.
 
-```bash
-wsl -d Ubuntu -- bash -c 'cd /mnt/d/Dev/Quant/cryptobot && ./scripts/build.sh'
+```powershell
+$env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\cryptobot-win-target"
+cargo build --release -p cb-bot -p cb-desk
 ```
 
-Always use `scripts/build.sh`, never bare `cargo build`. `scripts/env.sh` sets
-`CARGO_TARGET_DIR` to `$HOME/.cargo-target/cryptobot`, both to keep `target/` off the
-`/mnt/d` 9p mount (~10x on build time) and because that is where the supervisor looks
-for the binary. A bare `cargo build` writes to `./target`, succeeds, and leaves the
-supervisor faithfully running whatever was there before — silently. That cost two
-builds' worth of confusion before `env.sh` existed; do not reintroduce it.
+**Keep the target directory out of the repo.** `./target` is where a bare `cargo build`
+writes, and anything looking elsewhere for the binary will then run a stale one without
+saying so. The WSL arrangement had the same hazard and solved it in `scripts/env.sh`;
+on Windows, set `CARGO_TARGET_DIR` as above.
 
-```bash
-scripts/run-forever.sh          # supervised run, restarts on process death
+The normal way to run it is **`cryptobot-desk.exe`** — the application starts, stops,
+configures and observes the bot, and reads the ledger whether or not anything is
+running. See §9.
+
+Headless, or for the reports:
+
+```powershell
+cb-bot                          # run it directly
 cb-bot --report                 # read the ledger without stopping the run
 cb-bot --verify                 # audit decoders against an independent router
 ```
 
-Dashboard on `http://127.0.0.1:8787` while running.
+> **Run `cb-bot` from the repository root and nowhere else.** It creates
+> `cryptobot.db` in the working directory. Started from the wrong directory it makes a
+> second, empty ledger and cheerfully records into that instead — which reads exactly
+> like a run that found nothing. This has already happened once, from a shell left in
+> `crates/desk`.
+
+The API is on `http://127.0.0.1:8787` while running: `/api/health`, `/api/stream`,
+`/api/equity`. It no longer serves a UI.
 
 `config.toml` — `mode = "paper"`. **Leave it there.** Nothing in `crates/executor`
 should be given keys on the strength of these measurements.
@@ -103,9 +120,11 @@ crates/ledger     SQLite. sweeps (every sample), paper_fills (every clearing cyc
                   episodes()/survival() collapse detections into opportunities
 crates/bot        live.rs (venue dispatch, sweep, USD index, reconcile), main.rs
                   (event loop, --report, --verify), registry.rs (embedded pools.json)
-crates/server     event bus + static dashboard
+crates/server     event bus + three API endpoints. No UI since 2026-08-23.
+crates/desk       the Windows application. runner.rs (process control behind one
+                  trait), config.rs (toml_edit, so the file's prose survives an edit),
+                  archive.rs, history.rs (cb-ledger read-only), paths.rs, ui/
 crates/evaluator, crates/executor   present, not on the measurement path
-dashboard/dist    single-file dashboard
 scripts           env.sh, build.sh, run-forever.sh, build_registry.py
 ```
 
@@ -401,7 +420,43 @@ leaves the most recent writes behind.
 
 ---
 
-*Last updated 2026-08-22, at commit `7bb5b19` plus this file. 184 tests passing, clippy
-clean under `-D warnings`. Supervised run live and collecting.
+---
+
+## 9. The application
+
+`crates/desk` — `cryptobot-desk.exe`. Design:
+`docs/superpowers/specs/2026-08-23-cryptobot-desk-design.md`.
+
+It exists because the dashboard was **served by the process it observed**. With the bot
+down there was no server, so there was no interface at all, and a WSL restart that
+killed an overnight run announced itself only when someone thought to ask. The app
+inverts the dependency: the app is durable, the bot is a child process it supervises,
+and the ledger is read from disk with `cb-ledger` in-process — so history renders with
+nothing running.
+
+What it does: start/stop, live telemetry over the same WebSocket, the history panels,
+`config.toml` editing, ledger archiving, a log tail, and a tray icon that shows run
+state without opening anything.
+
+Three things in it are load-bearing and should not be casually undone:
+
+1. **It refuses to start into a bound port 8787.** Two processes writing one SQLite
+   ledger corrupts the measurement rather than duplicating it. A port held by something
+   this app did not start reads as `Foreign`, and the Stop button stays disabled —
+   it will not kill a process it cannot identify.
+2. **Changing a trading parameter archives the run.** §7: rows recorded under different
+   parameters aggregate by different rules and nothing downstream reveals the mixture.
+3. **There is no control that can set `mode = "live"`.** Invariant #1 is enforced by
+   the absence of a mechanism, not by a dialog. `config.rs` writes four keys and no
+   others.
+
+Auto-restart of a dead bot is opt-in and **off by default**, and it fires on `Failed`
+only, never `Stopped` — a run stopped deliberately stays stopped, and a resurrected one
+is a new run rather than a continuation.
+
+---
+
+*Last updated 2026-08-23. 252 tests passing, clippy clean under `-D warnings`.
+Runs natively on Windows; WSL no longer required.
 Test names are sentences on purpose — `one_standing_gap_is_one_opportunity_not_a_thousand_trades`
 is the specification, and the assertion is the proof.*

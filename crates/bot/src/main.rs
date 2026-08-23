@@ -163,13 +163,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing::info!("mode: PAPER — no transaction will be signed or sent");
-    tracing::info!("dashboard: http://127.0.0.1:8787");
+    tracing::info!("api: http://127.0.0.1:8787 — the window is cryptobot-desk");
 
-    // The dashboard reads history from the same ledger the run writes, so its P&L
-    // survives a browser reload and shows the whole run rather than the minutes since
-    // someone opened the tab.
-    routes::serve(addr, routes::state_with_ledger(bus, "paper", LEDGER_PATH), "dashboard/dist")
-        .await
+    // The app reads history from this same ledger directly, rather than through the
+    // endpoint below, which is what lets it show the run after this process is gone.
+    routes::serve(addr, routes::state_with_ledger(bus, "paper", LEDGER_PATH)).await
 }
 
 fn spawn_simulated(bus: EventBus) {

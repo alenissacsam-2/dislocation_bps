@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>cryptobot</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<aside class="rail">
+  <div class="brand">
+    <svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true">
+      <path d="M4.6 15.2A8 8 0 1 1 17.4 15.2" fill="none" stroke="var(--accent)"
+            stroke-width="2.1" stroke-linecap="round"/>
+      <path d="M11 11 L15 7.9" stroke="var(--accent)" stroke-width="2" stroke-linecap="round"/>
+      <circle cx="11" cy="11" r="1.7" fill="var(--accent)"/>
+    </svg>
+    <div>
+      <div class="brand-name">cryptobot</div>
+      <div class="brand-sub">instrument</div>
+    </div>
+  </div>
+
+  <div class="state-card">
+    <div class="state-top">
+      <span class="dot" id="dot"></span>
+      <span id="stateLabel">Checking…</span>
+    </div>
+    <div class="state-note" id="stateNote"></div>
+    <div class="controls">
+      <button id="btnStart" class="primary" disabled>Start</button>
+      <button id="btnStop" disabled>Stop</button>
+    </div>
+  </div>
+
+  <nav>
+    <button data-view="live" class="on">Live</button>
+    <button data-view="history">History</button>
+    <button data-view="config">Parameters</button>
+    <button data-view="runs">Runs</button>
+    <button data-view="log">Log</button>
+  </nav>
+
+  <div class="rail-foot">
+    <button id="themeBtn">Toggle theme</button>
+    <div class="rail-path" id="railPath"></div>
+  </div>
+</aside>
+
+<main class="stage">
+
+  <!-- ── LIVE ─────────────────────────────────────────────────────────── -->
+  <section class="view" id="view-live">
+    <div class="strip">
+      <div class="cell">
+        <div class="k">Tradeable edge</div>
+        <div class="v dim" id="mEdge">—</div>
+        <div class="s" id="mEdgeSub">nothing deep enough</div>
+      </div>
+      <div class="cell">
+        <div class="k">Price dislocation</div>
+        <div class="v" id="mDisl">—</div>
+        <div class="s">between venues, before fees</div>
+      </div>
+      <div class="cell">
+        <div class="k">Fee wall</div>
+        <div class="v" id="mFee">—</div>
+        <div class="s">cost of crossing them</div>
+      </div>
+      <div class="cell">
+        <div class="k">Cheapest loop</div>
+        <div class="v" id="mFloor">—</div>
+        <div class="s">the floor to clear</div>
+      </div>
+      <div class="cell">
+        <div class="k">Pools live</div>
+        <div class="v" id="mPools">—</div>
+        <div class="s" id="mPoolsSub">across venues</div>
+      </div>
+    </div>
+
+    <div class="panel span8">
+      <h2>Venue divergence — where the arbitrage actually is</h2>
+      <canvas id="divChart"></canvas>
+      <p class="note">
+        Every venue quoting one pair, drawn as distance in basis points from their own
+        consensus. Absolute price hides this: a 2 bp gap on a $90 asset is invisible on
+        a price axis. Where the lines separate is the entire business.
+      </p>
+    </div>
+
+    <div class="panel span4">
+      <h2>Distance to profitable</h2>
+      <canvas id="feeChart"></canvas>
+      <p class="note">
+        Dislocation against the fee wall. The gap between them is what the market would
+        have to move before anything clears.
+      </p>
+    </div>
+
+    <div class="panel span12">
+      <h2>Leaderboard — tradeable now</h2>
+      <table id="routesTable">
+        <thead>
+          <tr>
+            <th>Route</th><th>Venues</th>
+            <th class="n">Edge</th><th class="n">Gap</th>
+            <th class="n">Fees</th><th class="n">Depth</th>
+          </tr>
+        </thead>
+        <tbody id="routesBody"></tbody>
+      </table>
+      <div class="empty" id="routesEmpty">Not connected to a running instrument.</div>
+    </div>
+  </section>
+
+  <!-- ── HISTORY ──────────────────────────────────────────────────────── -->
+  <section class="view" id="view-history" hidden>
+    <div class="strip">
+      <div class="cell">
+        <div class="k">Observed</div>
+        <div class="v" id="hHours">—</div>
+        <div class="s" id="hWindow"></div>
+      </div>
+      <div class="cell">
+        <div class="k">Opportunities</div>
+        <div class="v" id="hOpps">—</div>
+        <div class="s">episodes, not detections</div>
+      </div>
+      <div class="cell">
+        <div class="k">Taken</div>
+        <div class="v" id="hTaken">—</div>
+        <div class="s" id="hTakenSub"></div>
+      </div>
+      <div class="cell">
+        <div class="k">Realised</div>
+        <div class="v" id="hNet">—</div>
+        <div class="s">paper, net of tips</div>
+      </div>
+      <div class="cell">
+        <div class="k">Median opportunity</div>
+        <div class="v" id="hMedian">—</div>
+        <div class="s">whole pie, any capital</div>
+      </div>
+    </div>
+
+    <div class="panel span7">
+      <h2>Realised P&amp;L</h2>
+      <canvas id="pnlChart"></canvas>
+      <p class="note" id="pnlNote"></p>
+    </div>
+
+    <div class="panel span5">
+      <h2>What a bigger book would have taken</h2>
+      <div class="bars" id="ladder"></div>
+      <p class="note">
+        The same opportunities, priced at each book size. Not extrapolated — measured
+        at every rung on every episode.
+      </p>
+    </div>
+
+    <div class="panel span7">
+      <h2>Value against lifetime</h2>
+      <canvas id="scatter"></canvas>
+      <p class="note">
+        Both axes logarithmic; horizontal is how long the opportunity survived, vertical
+        is what it was worth. The two run in opposite directions, and that is the
+        finding the whole project rests on.
+      </p>
+    </div>
+
+    <div class="panel span5">
+      <h2>Is the contest model measuring anything?</h2>
+      <div id="contest"></div>
+    </div>
+  </section>
+
+  <!-- ── PARAMETERS ───────────────────────────────────────────────────── -->
+  <section class="view" id="view-config" hidden>
+    <div class="panel span6">
+      <h2>Trading parameters</h2>
+      <div class="warn">
+        <b>Saving ends the current run.</b> The ledger is archived and a new measurement
+        begins. Rows recorded under different parameters aggregate by different rules,
+        and nothing downstream would show the mixture — so the run is cut rather than
+        quietly contaminated.
+      </div>
+      <div class="field">
+        <label for="fCapital">Working capital (USD)</label>
+        <input type="number" id="fCapital" step="1" min="1">
+        <div class="hint">
+          Caps every trade size. The ladder opposite measures what larger books would
+          have taken from the identical opportunities.
+        </div>
+      </div>
+      <div class="field">
+        <label for="fBuffer">Fee buffer (USD)</label>
+        <input type="number" id="fBuffer" step="0.05" min="0">
+        <div class="hint">Held back for transaction fees and rent; not tradable.</div>
+      </div>
+      <div class="field">
+        <label for="fMinTrade">Minimum trade (USD)</label>
+        <input type="number" id="fMinTrade" step="1" min="0.01">
+        <div class="hint">
+          Set by fixed cost, not by the book. A transaction costs what it costs whether
+          it carries $5 or $5,000, so below some size the fee eats the edge.
+        </div>
+      </div>
+      <div class="field">
+        <label for="fHops">Maximum hops</label>
+        <input type="number" id="fHops" step="1" min="2" max="4">
+        <div class="hint">
+          2 is a direct round trip, 3 adds triangles, 4 explodes the search for little
+          added reach.
+        </div>
+      </div>
+      <button id="btnSave" class="primary">Save, archive and restart</button>
+      <p class="note" id="saveResult"></p>
+    </div>
+
+    <div class="panel span6">
+      <h2>Startup</h2>
+      <div class="field">
+        <label><input type="checkbox" id="fAutostart" style="width:auto"> Launch with Windows</label>
+        <div class="hint">The app starts with the session and sits in the tray.</div>
+      </div>
+      <div class="field">
+        <label><input type="checkbox" id="fAutorestart" style="width:auto"> Restart the bot if it dies</label>
+        <div class="hint">
+          Off by default, deliberately. An instrument that silently resurrects itself
+          hides the failures this app exists to make visible, and what it starts is a
+          new run rather than a continuation of the old one.
+        </div>
+      </div>
+      <h2 style="margin-top:20px">Mode</h2>
+      <p class="note">
+        <b>Paper.</b> There is no control here that can change it. Live execution needs
+        both a config edit and an environment switch, and this application implements
+        neither — the guarantee is the absence of a mechanism, not a dialog.
+      </p>
+    </div>
+  </section>
+
+  <!-- ── RUNS ─────────────────────────────────────────────────────────── -->
+  <section class="view" id="view-runs" hidden>
+    <div class="panel span12">
+      <h2>Archived runs</h2>
+      <table>
+        <thead>
+          <tr><th>Run</th><th class="n">Size</th><th style="width:170px"></th></tr>
+        </thead>
+        <tbody id="runsBody"></tbody>
+      </table>
+      <div class="empty" id="runsEmpty">No archived runs yet.</div>
+      <p class="note" id="runsNote"></p>
+    </div>
+  </section>
+
+  <!-- ── LOG ──────────────────────────────────────────────────────────── -->
+  <section class="view" id="view-log" hidden>
+    <div class="panel span12">
+      <h2>Bot log</h2>
+      <pre class="log" id="logBody">No log yet.</pre>
+    </div>
+  </section>
+
+</main>
+
+<footer class="statusline">
+  <span><i>slot</i> <b id="sSlot">—</b></span>
+  <span><i>lag</i> <b id="sLag">—</b></span>
+  <span><i>data age</i> <b id="sAge">—</b></span>
+  <span><i>pools</i> <b id="sPools">—</b></span>
+  <span><i>stale</i> <b id="sStale">—</b></span>
+  <span><i>sweep</i> <b id="sSweep">—</b></span>
+  <span class="sep"></span>
+  <span><i>ledger</i> <b id="sLedger">—</b></span>
+  <span><b id="sMode">—</b></span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
