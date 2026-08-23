@@ -1,57 +1,86 @@
 # cryptobot
 
-A **paper-first Solana arbitrage research system** with a real-time dashboard.
+A **measurement instrument** for Solana AMM arbitrage, running in paper mode against
+live mainnet.
 
-This is not a "make money" bot. It is an instrument that measures whether a tradeable
-edge exists — and can be switched into execution mode only once the data says so.
+It is not a trading bot and has never signed a transaction. There is no execution code,
+no key handling, and no path from this repository to a real order. What it does is
+answer one question honestly: *is there a tradeable edge, and how big is it?*
 
-## Status
+## What it has measured
 
-Phase 1 in progress. 42 tests passing. Core arbitrage maths verified against
-mainnet-scale reserves. Live dashboard running against a simulated market.
+| | |
+|---|---|
+| Cheapest complete round trip anywhere in the universe | **2 bps** |
+| Median opportunity, at the size that maximises it, at any capital | **$0.0013** |
+| Max lifetime of every opportunity worth more than $0.10 | **0 slots** |
+
+Opportunity size and opportunity lifetime run in **opposite** directions. Sub-cent gaps
+loiter for seconds; every one worth more than a dime was gone before the next slot
+began. There is no size at which an opportunity is both worth taking and still there
+when you arrive — which answers "just add more capital" and "just go faster" with data
+rather than argument.
+
+**One finding is open and it matters.** Edge rises with the fee of the route it is on —
+2.16 bps on sub-5 bp routes, 11.95 bps on routes over 50 bps — and most of the reported
+value sits on the expensive ones. That ordering is backwards for real arbitrage. Two
+explanations have been tested and one is dead. Until it is explained, **the headline
+profit should be treated as unproven.** See §4 of [`HANDOVER.md`](HANDOVER.md).
 
 ## Run it
 
-```bash
-wsl -d Ubuntu
-export CARGO_TARGET_DIR=$HOME/.cargo-target/cryptobot
-cd /mnt/d/Dev/Quant/cryptobot
-cargo run -p cb-bot
+Windows, natively. Requires Visual Studio Build Tools (the C++ workload) for a linker.
+
+```powershell
+scripts\build.ps1
+$env:LOCALAPPDATA\cryptobot-win-target\release\cryptobot-desk.exe --start
 ```
 
-Then open <http://127.0.0.1:8787>. The bot binds `0.0.0.0` so the Windows host can
-reach the WSL listener — it has no authentication, so don't run it on an untrusted
-network.
+`cryptobot-desk` is the application: it starts and stops the bot, edits its parameters,
+archives runs, and reads the ledger **whether or not anything is running**. That last
+part is the reason it exists — the old browser dashboard was served by the process it
+observed, so a stopped bot showed no history at all.
 
-The market is currently **simulated**: pool reserves are synthetic, but they are priced
-by the exact `cb-core` maths that will run against mainnet. The dashboard labels this
-clearly. Nothing signs a transaction.
+Headless, and for the reports:
+
+```powershell
+cb-bot --report     # read the ledger without stopping the run
+cb-bot --verify     # audit every decoder against an independent router
+```
+
+> Run `cb-bot` from the repository root. It creates its ledger in the working directory,
+> so started elsewhere it quietly opens a second, empty one — which reads exactly like a
+> run that found nothing.
+
+The API binds **loopback only** (`127.0.0.1:8787`) and has no authentication.
 
 ## Read this first
 
-- [`docs/research/00-key-numbers.md`](docs/research/00-key-numbers.md) — the numbers that
-  set expectations. Mean Solana arbitrage profit is **$1.58**.
-- [`docs/research/01-strategy-thesis.md`](docs/research/01-strategy-thesis.md) — why the
-  edge, if any, is in *uncontested* opportunities rather than speed.
-- [`docs/research/02-infrastructure-economics.md`](docs/research/02-infrastructure-economics.md)
-  — why infra costs more per month than the trading capital, and what follows.
+- [`HANDOVER.md`](HANDOVER.md) — start here. The most useful part is not the
+  architecture; it is §4, the catalogue of ways this instrument has already lied, and
+  the one way it may be lying now. Every entry passed all of its own tests.
+- [`docs/research/06-multi-venue-measurement.md`](docs/research/06-multi-venue-measurement.md)
+  — the current measurement, and why cross-chain and flash loans do not rescue it.
 - [`docs/research/04-security.md`](docs/research/04-security.md) — read before running
-  **any** third-party Solana bot code.
-
-## Build
-
-Build in **WSL2 Ubuntu**, not Windows — MSVC build tools are absent and the Solana
-on-chain toolchain is Linux-native.
-
-```bash
-wsl -d Ubuntu
-export CARGO_TARGET_DIR=$HOME/.cargo-target/cryptobot   # keep target/ off the 9p mount
-cd /mnt/d/Dev/Quant/cryptobot
-cargo test
-```
+  **any** third-party Solana bot code, including this.
 
 ## Safety
 
-Live trading requires **two independent switches**: `mode = "live"` in config **and**
-`CRYPTOBOT_ALLOW_LIVE=1` in the environment. Default is paper. No key material is ever
-committed; see `.gitignore`.
+Live trading requires **two independent switches** — `mode = "live"` in config *and*
+`CRYPTOBOT_ALLOW_LIVE=1` in the environment — and neither does anything, because live
+execution is not implemented. The application deliberately exposes no control that can
+write `mode`: the guarantee is the absence of a mechanism, not a dialog someone can
+click through. No key material is ever committed.
+
+## Design principles worth keeping
+
+1. **Refuse rather than extrapolate.** A quote past a tick's capacity, an adaptive-fee
+   pool, an unknown fee schedule — decline it. Overstating profit is the only error
+   direction that loses money.
+2. **A new decoder is not trusted until something outside it agrees.** Errors that
+   flatter need an adversary, not more of your own tests.
+3. **An opportunity is an episode, not a detection.** One standing gap re-seen five
+   hundred times is one opportunity. Summing detections once turned $0.43/hour into
+   $105/hour.
+4. **Record what the market looked like even when nothing cleared.** A run that records
+   only its wins can report the size of a win but never the odds.

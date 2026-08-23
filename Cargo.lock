@@ -722,24 +722,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cb-evaluator"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cb-core",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "cb-executor"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cb-core",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "cb-feed"
 version = "0.1.0"
 dependencies = [

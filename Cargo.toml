@@ -5,8 +5,6 @@ members = [
     "crates/dex",
     "crates/feed",
     "crates/scanner",
-    "crates/evaluator",
-    "crates/executor",
     "crates/ledger",
     "crates/server",
     "crates/bot",
@@ -25,8 +23,6 @@ cb-core      = { path = "crates/core" }
 cb-dex       = { path = "crates/dex" }
 cb-feed      = { path = "crates/feed" }
 cb-scanner   = { path = "crates/scanner" }
-cb-evaluator = { path = "crates/evaluator" }
-cb-executor  = { path = "crates/executor" }
 cb-ledger    = { path = "crates/ledger" }
 cb-server    = { path = "crates/server" }
 cb-desk      = { path = "crates/desk" }
