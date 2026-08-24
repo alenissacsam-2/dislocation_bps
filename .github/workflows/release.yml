@@ -1,0 +1,64 @@
+# Cutting a tag builds the Windows installer and attaches it to a GitHub release,
+# so the published artifact is always reproducible from a commit rather than from
+# whatever happened to be on someone's machine.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Stage the bot as a sidecar
+        # The installed app spawns cb-bot.exe from beside itself, so the bundle has to
+        # carry it. Tauri resolves sidecars by target triple.
+        shell: bash
+        run: |
+          cargo build --release -p cb-bot
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          mkdir -p crates/desk/binaries
+          cp target/release/cb-bot.exe "crates/desk/binaries/cb-bot-$triple.exe"
+
+      - name: Build the installer
+        # NSIS is fetched by the bundler on first run. The sidecar declaration is merged
+        # in here rather than living in tauri.conf.json, so that the ordinary build and
+        # the test job above do not require a staged binary.
+        working-directory: crates/desk
+        run: cargo tauri build --config tauri.installer.conf.json
+
+      - name: Collect the artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          find target/release/bundle -type f \( -name '*.exe' -o -name '*.msi' \) -exec cp {} dist/ \;
+          cp target/release/cb-bot.exe dist/ 2>/dev/null || true
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cryptobot-windows-installer
+          path: dist/*
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

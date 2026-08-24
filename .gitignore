@@ -55,3 +55,6 @@ crates/desk/gen/
 # bot log, written by cryptobot-desk
 cb-bot.log
 
+
+# Sidecar staged by scripts/installer.ps1 — build output, not source.
+crates/desk/binaries/

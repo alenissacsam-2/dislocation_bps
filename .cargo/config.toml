@@ -1,4 +1,10 @@
-# Keep build artifacts off the /mnt/d 9p mount when building from WSL — writing
-# target/ across the Windows filesystem boundary is roughly an order of magnitude
-# slower. Set CARGO_TARGET_DIR in the shell instead; documented in README.
+# Deliberately not setting `target-dir` here.
+#
+# Every entry point sets CARGO_TARGET_DIR to %LOCALAPPDATA%\cryptobot-win-target
+# instead, and they all have to agree: a build that writes somewhere other than where
+# the app looks for the binary succeeds while whatever was there before keeps running.
+# scripts/build.ps1 and scripts/installer.ps1 both set it for exactly that reason.
+#
+# Pinning it in this file would work too, but it would silently override the variable
+# for anyone who set it on purpose, which is the harder failure to see.
 [build]

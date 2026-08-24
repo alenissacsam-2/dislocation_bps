@@ -107,6 +107,41 @@ on the strength of these measurements. There is no execution code to give them t
 placeholder `crates/executor` was deleted on 2026-08-23 precisely so that nobody mistakes
 an empty crate with a confident name for something that was ever built or tested.
 
+### The installer, and the two shapes of install — added 2026-08-24
+
+`scripts\installer.ps1` produces a per-user NSIS installer. Three things about it are
+load-bearing and none are obvious:
+
+**The root is resolved, not assumed.** `Paths::discover` takes a saved choice, then a
+checkout found by walking up from the executable and the working directory, then
+`%LOCALAPPDATA%\cryptobot`. *Both* markers are required to call something a checkout —
+`config.toml` **and** `crates/` — because `config.toml` alone also describes the data
+directory. Installed, the app seeds a paper-mode config into that data directory on
+first launch (`Paths::ensure_ready`, from a `include_str!` of `config.example.toml`).
+The Parameters tab prints whichever root it settled on, because a ledger whose location
+is a guess is a ledger nobody can go and check.
+
+**The data directory is not beside the executable, deliberately.** An installer puts the
+binaries somewhere the running account cannot write. A ledger that cannot be opened for
+writing is a run that records nothing while every panel still looks healthy.
+
+**`externalBin` is merged in only at bundle time.** `cb-bot.exe` ships as a Tauri
+sidecar so `Paths::bot_exe` finds it beside the app. Declaring that in `tauri.conf.json`
+makes a staged, triple-suffixed binary a precondition of *every* `cargo build` and
+`cargo test` in the workspace — CI included, which is how it was first discovered. The
+declaration therefore lives in `crates/desk/tauri.installer.conf.json` and is passed as
+`cargo tauri build --config tauri.installer.conf.json`.
+
+### CI does not gate on `cargo fmt` — and that is on purpose
+
+The tree has never been fmt-clean. At rustfmt's default width about 290 files differ; at
+`max_width = 100` about 70 still do, and those disagree with *each other* — some lines
+want joining that a narrower setting split, others want splitting that a wider one
+joined. It was hand-laid at inconsistent widths over time. `rustfmt.toml` records the
+closest width so new code does not drift further, but gating CI on it would fail every
+pull request on unrelated files. Running `cargo fmt --all` once is reasonable; it just
+deserves its own commit rather than riding inside someone else's.
+
 ---
 
 ## 3. Layout
@@ -126,9 +161,12 @@ crates/server     event bus + three API endpoints. No UI since 2026-08-23.
 crates/desk       the Windows application. runner.rs (process control behind one
                   trait), config.rs (toml_edit, so the file's prose survives an edit),
                   archive.rs, history.rs (cb-ledger read-only), paths.rs, ui/
-scripts           build.ps1 (Windows build), build_registry.py (regenerates the pool
-                  registry). env.sh/build.sh/run-forever.sh are the WSL-era scripts and
-                  are kept only because build_registry.py is still driven from a shell.
+scripts           build.ps1 (Windows build), installer.ps1 (the NSIS bundle),
+                  build_registry.py (regenerates the pool registry).
+                  env.sh/build.sh/run-forever.sh are the WSL-era scripts and are kept
+                  only because build_registry.py is still driven from a shell.
+.github/workflows ci.yml (clippy + tests on windows-latest), release.yml (builds the
+                  installer and attaches it to a tag)
 ```
 
 **The central mathematical fact**, in `crates/core/src/clmm.rs`: a concentrated-liquidity

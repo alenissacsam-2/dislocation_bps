@@ -1,0 +1,10 @@
+# The width this codebase was actually written to. Not enforced in CI, and deliberately
+# so: the tree predates any formatting convention and was laid out at inconsistent
+# widths over time, so `cargo fmt` still rewrites about seventy files — some by joining
+# lines a narrower setting had split, others by splitting lines a wider one had joined.
+#
+# This file exists to stop that drift getting worse rather than to fix it. Running
+# `cargo fmt --all` once is a reasonable thing to do; it is just a large mechanical diff
+# that deserves its own commit rather than riding along inside someone else's.
+max_width = 100
+use_small_heuristics = "Max"

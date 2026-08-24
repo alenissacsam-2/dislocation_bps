@@ -1,0 +1,39 @@
+# The project builds natively on Windows and is not tested anywhere else, so CI
+# runs where the code actually ships rather than on a cheaper Linux runner that
+# would exercise a configuration nobody uses.
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        # rust-toolchain.toml pins the channel; this action reads it.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # No `cargo fmt --check` gate. The tree predates a formatting convention and is
+      # not currently fmt-clean at any single width; see the note in rustfmt.toml.
+      # Gating on it here would mean every pull request failing on unrelated files.
+
+      - name: Clippy
+        # Warnings are errors here for the same reason they are locally: this
+        # instrument's correctness claims are only worth as much as its lint floor.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace

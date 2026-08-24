@@ -1,6 +1,8 @@
-# Build in WSL2 Ubuntu, not Windows: MSVC build tools are absent, and the Solana
-# on-chain toolchain (cargo-build-sbf, Anchor) is Linux-native anyway. Building in
-# WSL also matches the Linux VPS this would eventually deploy to.
+# Builds natively on Windows with the MSVC toolchain. The note that used to live here
+# said to build in WSL2 instead; that was never about the code, it was a missing linker.
+# Installing the Visual Studio C++ build tools resolves it — see scripts/build.ps1,
+# which checks for them up front and prints the one-line winget command if they are
+# absent.
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]

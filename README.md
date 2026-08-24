@@ -27,7 +27,24 @@ value sits on the expensive ones. That ordering is backwards for real arbitrage.
 explanations have been tested and one is dead. Until it is explained, **the headline
 profit should be treated as unproven.** See §4 of [`HANDOVER.md`](HANDOVER.md).
 
-## Run it
+## Install it
+
+Grab `Cryptobot Desk_<version>_x64-setup.exe` from the
+[releases page](../../releases) and run it. It installs per-user, so there is no admin
+prompt, and it carries both the application and the bot.
+
+An installed copy has no repository to read, so it keeps its config, ledger and archives
+in `%LOCALAPPDATA%\cryptobot`, seeding a paper-mode config on first launch. The
+Parameters tab shows the exact folder it settled on.
+
+To build the installer yourself:
+
+```powershell
+cargo install tauri-cli --version "^2" --locked
+scripts\installer.ps1
+```
+
+## Run it from a checkout
 
 Windows, natively. Requires Visual Studio Build Tools (the C++ workload) for a linker.
 
@@ -35,6 +52,9 @@ Windows, natively. Requires Visual Studio Build Tools (the C++ workload) for a l
 scripts\build.ps1
 $env:LOCALAPPDATA\cryptobot-win-target\release\cryptobot-desk.exe --start
 ```
+
+Run from a checkout, the repository *is* the root: the config beside `crates/` is the
+one being edited and the ledger lands where `cb-bot --report` will look for it.
 
 `cryptobot-desk` is the application: it starts and stops the bot, edits its parameters,
 archives runs, and reads the ledger **whether or not anything is running**. That last
