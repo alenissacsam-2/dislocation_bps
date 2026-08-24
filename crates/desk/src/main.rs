@@ -44,6 +44,7 @@ fn main() {
             app::set_auto_restart,
             app::get_autostart,
             app::set_autostart,
+            app::get_root,
         ])
         .setup(|tauri_app| {
             // `--no-tray` exists to bisect a CPU spin: it isolates the tray from the

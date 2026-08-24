@@ -25,6 +25,12 @@ impl App {
     #[must_use]
     pub fn new() -> Self {
         let paths = Paths::discover();
+        // An installed copy starts with an empty data directory. Seeding it here rather
+        // than on first read means the config editor and the bot both find a file, and
+        // neither has to special-case its absence.
+        if let Err(e) = paths.ensure_ready() {
+            eprintln!("could not prepare {}: {e}", paths.root.display());
+        }
         let runner =
             Arc::new(NativeRunner::new(paths.bot_exe(), paths.root.clone(), paths.log()));
         Self { paths, runner, auto_restart: Arc::new(AtomicBool::new(false)) }
@@ -224,4 +230,15 @@ pub fn set_autostart(app: tauri::AppHandle, on: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
     let al = app.autolaunch();
     if on { al.enable() } else { al.disable() }.map_err(|e| e.to_string())
+}
+
+/// The directory this run reads and writes.
+///
+/// Worth showing rather than assuming: run from a checkout it is the repository, run
+/// from the installer it is a data directory the operator never chose and would
+/// otherwise have no way to find. A ledger whose location is a guess is a ledger nobody
+/// can go and check.
+#[tauri::command]
+pub fn get_root(app: tauri::State<'_, App>) -> String {
+    app.paths.root.display().to_string()
 }

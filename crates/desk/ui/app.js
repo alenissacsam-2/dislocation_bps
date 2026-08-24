@@ -598,6 +598,10 @@ async function loadConfig() {
   }
   try { $("fAutostart").checked = await invoke("get_autostart"); } catch { /* not registrable */ }
   $("fAutorestart").checked = await invoke("get_auto_restart");
+  // Worth stating rather than leaving to be inferred: an installed copy records to a
+  // folder the operator never chose and would otherwise have no way to find.
+  try { $("fRoot").textContent = await invoke("get_root"); }
+  catch { $("fRoot").textContent = "unknown"; }
 }
 
 $("fAutostart").onchange = async (e) => {

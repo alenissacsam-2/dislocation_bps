@@ -1,11 +1,26 @@
 //! Where the project is, resolved once.
 //!
-//! One value — the repository root — and every other path derived from it. The
+//! One value — the project root — and every other path derived from it. The
 //! alternative, letting each module find `config.toml` its own way, is how a config
 //! editor and a bot end up disagreeing about which file is the config.
+//!
+//! # Two shapes of install
+//!
+//! Run from a checkout, the root is the repository: the config beside `crates/` is the
+//! one being edited, and the ledger lands where `cb-bot --report` will look for it. Run
+//! from the installer there is no repository at all, so the root becomes a per-user
+//! data directory seeded with the default config on first launch. Both resolve through
+//! [`Paths::discover`], and a saved choice overrides both.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// The default config, compiled in rather than shipped as a bundle resource.
+///
+/// An installed copy has no repository beside it to copy from, and a resource path is
+/// one more thing that can resolve differently on someone else's machine. This cannot
+/// go missing.
+const DEFAULT_CONFIG: &str = include_str!("../../../config.example.toml");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Paths {
@@ -13,8 +28,11 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// Saved choice if it still points at a project, else walk up from the executable
-    /// and the working directory looking for one.
+    /// Saved choice if it still points at a project, else the checkout we are inside,
+    /// else the per-user data directory.
+    ///
+    /// The last case cannot fail, so a fresh install always has somewhere to record to.
+    /// [`Paths::ensure_ready`] is what makes that somewhere usable.
     #[must_use]
     pub fn discover() -> Self {
         if let Some(saved) = Self::load_saved() {
@@ -22,18 +40,55 @@ impl Paths {
                 return saved;
             }
         }
+        Self::find_checkout().unwrap_or_else(|| Self { root: Self::data_dir() })
+    }
+
+    /// Walk up from the executable and the working directory looking for a repository.
+    ///
+    /// Both markers are required. `config.toml` alone also describes the data
+    /// directory, and matching that here would collapse the distinction this function
+    /// exists to draw.
+    fn find_checkout() -> Option<Self> {
         let beside_exe =
             std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
         for cand in [beside_exe, std::env::current_dir().ok()].into_iter().flatten() {
             let mut dir = Some(cand);
             while let Some(d) = dir {
                 if d.join("config.toml").exists() && d.join("crates").is_dir() {
-                    return Self { root: d };
+                    return Some(Self { root: d });
                 }
                 dir = d.parent().map(Path::to_path_buf);
             }
         }
-        Self { root: std::env::current_dir().unwrap_or_default() }
+        None
+    }
+
+    /// Where an installed copy keeps its config, ledger and archives.
+    ///
+    /// Deliberately not beside the executable: the installer puts that under Program
+    /// Files, which the user running the app cannot write to, and a ledger that cannot
+    /// be opened for writing is a run that records nothing while looking healthy.
+    #[must_use]
+    pub fn data_dir() -> PathBuf {
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        PathBuf::from(local).join("cryptobot")
+    }
+
+    /// Create the root, and seed a config if there is not one already.
+    ///
+    /// Without this a fresh install resolves a config path that does not exist, and
+    /// every panel in the window reads as an error with no action attached to it.
+    ///
+    /// # Errors
+    /// If the root cannot be created or the seed config cannot be written.
+    pub fn ensure_ready(&self) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.root)?;
+        if !self.config().exists() {
+            // The seed is the example, so a new install starts in paper mode. Nothing
+            // in this application writes `mode`; see the note in `config.rs`.
+            std::fs::write(self.config(), DEFAULT_CONFIG)?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -122,5 +177,46 @@ mod tests {
         let f = Paths::settings_file();
         assert!(f.ends_with("settings.json"));
         assert!(f.to_string_lossy().contains("cryptobot-desk"));
+    }
+
+    /// The installed case: no repository anywhere on the machine, and the app still
+    /// has to have something to read.
+    #[test]
+    fn a_fresh_root_is_given_a_config_to_start_from() {
+        let tmp = std::env::temp_dir().join("cb-paths-seed-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let p = Paths { root: tmp.clone() };
+
+        p.ensure_ready().expect("a writable temp directory should seed");
+
+        assert!(p.config().exists(), "a fresh install has no config until this writes one");
+        let seeded = std::fs::read_to_string(p.config()).unwrap();
+        assert!(seeded.contains("mode = \"paper\""), "a new install must start in paper mode");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Seeding twice would silently discard whatever had been edited in between.
+    #[test]
+    fn seeding_never_overwrites_a_config_that_is_already_there() {
+        let tmp = std::env::temp_dir().join("cb-paths-noclobber-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let p = Paths { root: tmp.clone() };
+        std::fs::write(p.config(), "capital_usd = 12345.0\n").unwrap();
+
+        p.ensure_ready().unwrap();
+
+        let after = std::fs::read_to_string(p.config()).unwrap();
+        assert!(after.contains("12345"), "an existing config must survive a later launch");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The data directory must not read as a checkout, or an installed copy would
+    /// start walking up Program Files looking for `crates/`.
+    #[test]
+    fn the_installed_root_is_not_mistaken_for_a_repository() {
+        let d = Paths::data_dir();
+        assert!(d.ends_with("cryptobot"));
+        assert!(!d.join("crates").exists(), "the data directory is not a source tree");
     }
 }
