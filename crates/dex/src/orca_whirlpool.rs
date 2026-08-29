@@ -41,7 +41,11 @@ const OFF_LIQUIDITY: usize = 49;
 const OFF_SQRT_PRICE: usize = 65;
 const OFF_TICK_CURRENT: usize = 81;
 const OFF_MINT_A: usize = 101;
+/// `token_vault_a` sits immediately after `token_mint_a`, and `token_vault_b` after
+/// `token_mint_b`. Needed to build a swap, not to price one.
+const OFF_VAULT_A: usize = 133;
 const OFF_MINT_B: usize = 181;
+const OFF_VAULT_B: usize = 213;
 
 fn u16_at(d: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([d[o], d[o + 1]])
@@ -76,6 +80,11 @@ pub struct Whirlpool {
     pub liquidity: u128,
     pub sqrt_price_x64: u128,
     pub tick_current: i32,
+    /// The pool's own token accounts. Not used for pricing — a swap instruction needs
+    /// them, and re-fetching the account at signing time would be a second round trip
+    /// against state that has already been read once.
+    pub vault_a: Pubkey32,
+    pub vault_b: Pubkey32,
 }
 
 /// Decode a Whirlpool account.
@@ -121,6 +130,8 @@ pub fn decode(data: &[u8]) -> Result<Whirlpool> {
         liquidity: u128_at(data, OFF_LIQUIDITY),
         sqrt_price_x64: u128_at(data, OFF_SQRT_PRICE),
         tick_current,
+        vault_a: pubkey_at(data, OFF_VAULT_A),
+        vault_b: pubkey_at(data, OFF_VAULT_B),
     })
 }
 
@@ -281,5 +292,53 @@ mod tests {
             let d = account(spacing, spacing, fee, 1_000_000_000, 5_569_625_019_338_410_820, -23953, 1, 2);
             assert_eq!(decode(&d).unwrap().fee_rate_ppm, u32::from(fee));
         }
+    }
+
+    /// The vault offsets cannot be proved here, and this test does not pretend to.
+    ///
+    /// Every other field in this decoder is corroborated from outside: `--verify`
+    /// prices the pool against an independent router, and a wrong `mint`, `liquidity`,
+    /// `sqrt_price` or `tick` would not survive that. The vaults are not priced, so
+    /// nothing in the quote path would notice them being wrong — the outside opinion
+    /// that catches them is a failed `simulateTransaction`, which happens before
+    /// anything is signed.
+    ///
+    /// What is checkable here is that they do not collide with the fields that *are*
+    /// corroborated. An off-by-one-field slip is the realistic mistake, and it would
+    /// land a vault squarely on a mint.
+    #[test]
+    fn the_vault_offsets_do_not_overlap_any_verified_field() {
+        const PUBKEY: usize = 32;
+        let spans = [
+            ("mint_a", OFF_MINT_A, PUBKEY),
+            ("vault_a", OFF_VAULT_A, PUBKEY),
+            ("mint_b", OFF_MINT_B, PUBKEY),
+            ("vault_b", OFF_VAULT_B, PUBKEY),
+            ("liquidity", OFF_LIQUIDITY, 16),
+            ("sqrt_price", OFF_SQRT_PRICE, 16),
+            ("tick_current", OFF_TICK_CURRENT, 4),
+        ];
+        for (i, (an, ao, al)) in spans.iter().enumerate() {
+            assert!(ao + al <= WHIRLPOOL_LEN, "{an} runs past the account");
+            for (bn, bo, bl) in spans.iter().skip(i + 1) {
+                let overlap = *ao < bo + bl && *bo < ao + al;
+                assert!(!overlap, "{an} at {ao} overlaps {bn} at {bo}");
+            }
+        }
+        // And the two vaults must be the two distinct 32-byte spans that follow each
+        // mint, which is the layout's actual shape.
+        assert_eq!(OFF_VAULT_A, OFF_MINT_A + PUBKEY);
+        assert_eq!(OFF_VAULT_B, OFF_MINT_B + PUBKEY);
+    }
+
+    #[test]
+    fn a_decoded_pool_reports_the_two_vaults_it_was_given() {
+        let mut d = account(64, 64, 400, 1_000_000_000, 5_569_625_019_338_410_820, -23953, 1, 2);
+        d[OFF_VAULT_A] = 7;
+        d[OFF_VAULT_B] = 9;
+        let w = decode(&d).unwrap();
+        assert_eq!(w.vault_a[0], 7);
+        assert_eq!(w.vault_b[0], 9);
+        assert_ne!(w.vault_a, w.vault_b);
     }
 }
