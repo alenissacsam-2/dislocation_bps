@@ -9,6 +9,8 @@ members = [
     "crates/server",
     "crates/bot",
     "crates/desk",
+    "crates/wallet",
+    "crates/executor",
 ]
 
 [workspace.package]
@@ -26,6 +28,8 @@ cb-scanner   = { path = "crates/scanner" }
 cb-ledger    = { path = "crates/ledger" }
 cb-server    = { path = "crates/server" }
 cb-desk      = { path = "crates/desk" }
+cb-wallet    = { path = "crates/wallet" }
+cb-executor  = { path = "crates/executor" }
 
 # solana
 solana-sdk    = "4.1"
