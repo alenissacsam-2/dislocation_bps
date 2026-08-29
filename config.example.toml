@@ -48,3 +48,35 @@ min_trade_usd = 10.0
 # Longest cycle to search. 3 finds triangles (SOL -> USDC -> RAY -> SOL), which is
 # where real cycles live among the majors; 2 only finds duplicate-pair arbs.
 max_hops = 3
+
+# ── Risk limits ───────────────────────────────────────────────────────────────
+#
+# Hard stops for live execution, not targets. Nothing is signed that breaches one.
+# They are read by the gate in crates/executor, which assumes the rest of the system
+# is wrong and bounds what being wrong costs.
+#
+# These are edited from the Parameters tab. Saving them does not archive the run:
+# limits bound what may be signed, they do not change how anything is measured.
+
+# The most any single trade may carry.
+max_position_usd = 25.0
+
+# Realised losses reaching this halt trading for the day. A halt survives midnight —
+# a breaker still tripped in the morning was tripped by something the night did not fix.
+max_daily_loss_usd = 5.0
+
+# Expected net below which a trade is not worth its own risk. Deliberately not zero:
+# a trade expected to net a hundredth of a cent is indistinguishable from noise in the
+# estimate that produced it, and that estimate is what is trusted when it signs.
+min_net_profit_usd = 0.01
+
+# How far the simulated result may fall short of the quote before it is refused.
+max_slippage_bps = 30.0
+
+# Consecutive reverts or rejections before the breaker trips. A lost race does not
+# count: losing races is what racing is, and counting it would stop trading on a busy
+# day rather than a broken one.
+max_consecutive_failures = 3
+
+# Upper bound on trades per day, whatever they are worth.
+max_daily_trades = 500

@@ -251,6 +251,84 @@
         neither — the guarantee is the absence of a mechanism, not a dialog.
       </p>
 
+      <h2 style="margin-top:20px">Wallet</h2>
+      <div class="warn">
+        <b>The measured edge is currently negative.</b> The instrument's own leaderboard
+        shows a typical tradeable edge below the 2 bps it costs to cross two pools, and
+        §4 of HANDOVER records an unexplained result that makes the headline profit
+        unproven. A key here does not change that. Use a wallet holding only what you
+        are prepared to lose.
+      </div>
+
+      <p class="note" id="walletState">Checking…</p>
+
+      <div id="walletSetup">
+        <div class="field">
+          <label for="fSecret">Private key</label>
+          <input type="password" id="fSecret" autocomplete="off" spellcheck="false"
+                 placeholder="base58, or a [1,2,3,…] array from solana-keygen">
+          <div class="hint">
+            Encrypted immediately and never stored in the clear. It is not written to
+            <code>config.toml</code>, never logged, and the field is cleared as soon as
+            it is read.
+          </div>
+        </div>
+        <div class="field">
+          <label for="fPass">Passphrase</label>
+          <input type="password" id="fPass" autocomplete="off">
+          <div class="hint">
+            Encrypts the key at rest with Argon2id. There is no recovery if it is lost —
+            re-import the original key instead.
+          </div>
+        </div>
+        <button id="btnImport" class="primary">Encrypt and save key</button>
+      </div>
+
+      <div id="walletUnlock" hidden>
+        <div class="field">
+          <label for="fUnlockPass">Passphrase</label>
+          <input type="password" id="fUnlockPass" autocomplete="off">
+          <div class="hint">Unlocks the key for this session only.</div>
+        </div>
+        <button id="btnUnlock" class="primary">Unlock</button>
+        <button id="btnForget">Remove key</button>
+      </div>
+      <p class="note" id="walletResult"></p>
+
+      <h2 style="margin-top:20px">Risk limits</h2>
+      <div class="hint" style="margin-bottom:10px">
+        Hard stops, not targets. Nothing is signed that breaches one, and a tripped
+        breaker stays tripped until it is cleared deliberately.
+      </div>
+      <div class="field">
+        <label for="fMaxPos">Maximum position (USD)</label>
+        <input type="number" id="fMaxPos" step="1" min="0.01">
+        <div class="hint">The most any single trade may carry.</div>
+      </div>
+      <div class="field">
+        <label for="fMaxLoss">Maximum daily loss (USD)</label>
+        <input type="number" id="fMaxLoss" step="0.5" min="0.01">
+        <div class="hint">Realised losses reaching this halt trading for the day.</div>
+      </div>
+      <div class="field">
+        <label for="fMinNet">Minimum net profit (USD)</label>
+        <input type="number" id="fMinNet" step="0.001" min="0">
+        <div class="hint">
+          Below this a trade is indistinguishable from noise in the estimate that
+          produced it — and that estimate is what is being trusted when it signs.
+        </div>
+      </div>
+      <div class="field">
+        <label for="fMaxFails">Consecutive failures before stopping</label>
+        <input type="number" id="fMaxFails" step="1" min="1">
+        <div class="hint">
+          A lost race does not count. Only reverts and rejections, which mean something
+          is wrong that retrying will not fix.
+        </div>
+      </div>
+      <button id="btnSaveLimits" class="primary">Save limits</button>
+      <p class="note" id="limitsResult"></p>
+
       <h2 style="margin-top:20px">Recording to</h2>
       <p class="note">
         <code id="fRoot">…</code>

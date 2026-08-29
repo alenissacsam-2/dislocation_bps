@@ -45,6 +45,12 @@ fn main() {
             app::get_autostart,
             app::set_autostart,
             app::get_root,
+            app::wallet_status,
+            app::wallet_import,
+            app::wallet_unlock,
+            app::wallet_forget,
+            app::read_limits,
+            app::save_limits,
         ])
         .setup(|tauri_app| {
             // `--no-tray` exists to bisect a CPU spin: it isolates the tray from the

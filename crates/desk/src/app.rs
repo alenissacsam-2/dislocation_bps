@@ -13,6 +13,9 @@ use std::sync::{
 pub struct App {
     pub paths: Paths,
     pub runner: Arc<dyn BotRunner>,
+    /// The signing key, when the operator has unlocked it this session. Never written
+    /// anywhere from here, and dropped when the process exits.
+    pub custody: crate::wallet::Custody,
     /// Whether to restart the bot when it is found dead.
     ///
     /// Off by default and deliberately so: an instrument that silently resurrects
@@ -33,7 +36,12 @@ impl App {
         }
         let runner =
             Arc::new(NativeRunner::new(paths.bot_exe(), paths.root.clone(), paths.log()));
-        Self { paths, runner, auto_restart: Arc::new(AtomicBool::new(false)) }
+        Self {
+            paths,
+            runner,
+            custody: crate::wallet::Custody::default(),
+            auto_restart: Arc::new(AtomicBool::new(false)),
+        }
     }
 }
 
@@ -230,6 +238,66 @@ pub fn set_autostart(app: tauri::AppHandle, on: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
     let al = app.autolaunch();
     if on { al.enable() } else { al.disable() }.map_err(|e| e.to_string())
+}
+
+/// Key custody, all four of them, kept together because they share one invariant: the
+/// secret exists in the clear only inside [`wallet_import`], and only for as long as
+/// that call runs.
+///
+/// None of these are `spawn_blocking`. Argon2 at 64 MiB takes a noticeable fraction of a
+/// second and that is a main-thread stall — but these are operator actions taken once,
+/// not the polling path that froze the window before, and moving a secret across a
+/// thread boundary to save 300ms is the wrong trade.
+#[tauri::command]
+pub fn wallet_status(app: tauri::State<'_, App>) -> crate::wallet::WalletStatus {
+    crate::wallet::status(&app.paths.wallet(), &app.custody)
+}
+
+/// # Errors
+/// If the key is not valid, the passphrase is empty, or the file cannot be written.
+#[tauri::command]
+pub fn wallet_import(
+    app: tauri::State<'_, App>,
+    secret: String,
+    passphrase: String,
+) -> Result<crate::wallet::WalletStatus, String> {
+    crate::wallet::import(&app.paths.wallet(), secret, &passphrase)
+}
+
+/// # Errors
+/// If there is no key, or the passphrase is wrong.
+#[tauri::command]
+pub fn wallet_unlock(
+    app: tauri::State<'_, App>,
+    passphrase: String,
+) -> Result<crate::wallet::WalletStatus, String> {
+    crate::wallet::unlock(&app.paths.wallet(), &passphrase, &app.custody)
+}
+
+/// # Errors
+/// If the key file cannot be removed.
+#[tauri::command]
+pub fn wallet_forget(app: tauri::State<'_, App>) -> Result<crate::wallet::WalletStatus, String> {
+    crate::wallet::remove(&app.paths.wallet(), &app.custody)
+}
+
+/// # Errors
+/// If the config cannot be read or parsed.
+#[tauri::command]
+pub fn read_limits(app: tauri::State<'_, App>) -> Result<cb_executor::risk::Limits, String> {
+    config::read_limits(&app.paths.config()).map_err(|e| e.to_string())
+}
+
+/// Saving limits deliberately does **not** archive the run — see `config::write_limits`.
+///
+/// # Errors
+/// If the limits are unusable or the file cannot be written.
+#[tauri::command]
+pub fn save_limits(
+    app: tauri::State<'_, App>,
+    limits: cb_executor::risk::Limits,
+) -> Result<(), String> {
+    config::write_limits(&app.paths.config(), &limits).map_err(|e| e.to_string())
 }
 
 /// The directory this run reads and writes.

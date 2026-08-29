@@ -111,6 +111,19 @@ impl Paths {
         self.root.join("cb-bot.log")
     }
 
+    /// The encrypted signing key.
+    ///
+    /// Beside the ledger rather than in the settings directory, because it belongs to
+    /// the project the operator is running: pointing the app at a different root should
+    /// change which wallet is in use, not silently keep the old one. Its name matches
+    /// the `keypair*.json` pattern `.gitignore` has excluded since the first commit,
+    /// which is deliberate belt-and-braces — the file is encrypted, and also cannot be
+    /// committed by accident.
+    #[must_use]
+    pub fn wallet(&self) -> PathBuf {
+        self.root.join("keypair-encrypted.json")
+    }
+
     /// Beside the app first — that is what a shipped install looks like — then the
     /// Windows build tree, which is what a development run looks like.
     #[must_use]

@@ -602,7 +602,114 @@ async function loadConfig() {
   // folder the operator never chose and would otherwise have no way to find.
   try { $("fRoot").textContent = await invoke("get_root"); }
   catch { $("fRoot").textContent = "unknown"; }
+  await paintWallet();
+  await paintLimits();
 }
+
+// ── risk limits ─────────────────────────────────────────────────────────────
+//
+// Saved separately from the trading parameters, and deliberately without archiving the
+// run: limits bound what may be signed, they do not change how anything is measured.
+
+const LIMIT_FIELDS = {
+  fMaxPos:   "maxPositionUsd",
+  fMaxLoss:  "maxDailyLossUsd",
+  fMinNet:   "minNetProfitUsd",
+  fMaxFails: "maxConsecutiveFailures",
+};
+
+async function paintLimits() {
+  try {
+    const l = await invoke("read_limits");
+    for (const [id, key] of Object.entries(LIMIT_FIELDS)) $(id).value = l[key];
+    window.__limits = l;
+  } catch (e) {
+    $("limitsResult").textContent = "Could not read limits: " + e;
+  }
+}
+
+$("btnSaveLimits").onclick = async () => {
+  // Carry through the fields the form does not show, so saving does not silently reset
+  // them to defaults the operator never chose.
+  const limits = Object.assign({}, window.__limits || {});
+  for (const [id, key] of Object.entries(LIMIT_FIELDS)) limits[key] = Number($(id).value);
+  try {
+    await invoke("save_limits", { limits });
+    $("limitsResult").textContent = "Limits saved. They apply to the next trade considered.";
+    await paintLimits();
+  } catch (e) {
+    $("limitsResult").textContent = "" + e;
+  }
+};
+
+// ── wallet ──────────────────────────────────────────────────────────────────
+//
+// The key is in the clear in exactly one place — the value of #fSecret — and for as
+// long as it takes to hand it to the backend. Everything here exists to keep that
+// window short: the field is cleared on success and on failure alike, because a
+// rejected paste left sitting in a form is still a secret sitting in a form.
+
+function clearSecretFields() {
+  for (const id of ["fSecret", "fPass", "fUnlockPass"]) {
+    const el = $(id);
+    if (el) el.value = "";
+  }
+}
+
+async function paintWallet() {
+  let s;
+  try { s = await invoke("wallet_status"); }
+  catch { $("walletState").textContent = "Could not read wallet state."; return; }
+
+  const setup = $("walletSetup"), unlock = $("walletUnlock");
+  if (!s.configured) {
+    $("walletState").textContent = "No key configured. The bot cannot trade without one.";
+    setup.hidden = false; unlock.hidden = true;
+    return;
+  }
+  setup.hidden = true; unlock.hidden = false;
+  $("walletState").innerHTML = s.unlocked
+    ? `Unlocked for this session — <code>${s.pubkey}</code>`
+    : `Key present but locked — <code>${s.pubkey}</code>`;
+}
+
+$("btnImport").onclick = async () => {
+  const secret = $("fSecret").value, passphrase = $("fPass").value;
+  $("walletResult").textContent = "Encrypting…";
+  try {
+    await invoke("wallet_import", { secret, passphrase });
+    $("walletResult").textContent = "Key encrypted and saved. Unlock it to use it.";
+  } catch (e) {
+    $("walletResult").textContent = "" + e;
+  } finally {
+    clearSecretFields();
+    await paintWallet();
+  }
+};
+
+$("btnUnlock").onclick = async () => {
+  $("walletResult").textContent = "Unlocking…";
+  try {
+    await invoke("wallet_unlock", { passphrase: $("fUnlockPass").value });
+    $("walletResult").textContent = "Unlocked for this session.";
+  } catch (e) {
+    $("walletResult").textContent = "" + e;
+  } finally {
+    clearSecretFields();
+    await paintWallet();
+  }
+};
+
+$("btnForget").onclick = async () => {
+  if (!confirm("Delete the encrypted key from this machine?\n\nThis cannot be undone here — you would need the original key to import it again.")) return;
+  try {
+    await invoke("wallet_forget");
+    $("walletResult").textContent = "Key removed.";
+  } catch (e) {
+    $("walletResult").textContent = "" + e;
+  }
+  await paintWallet();
+};
 
 $("fAutostart").onchange = async (e) => {
   try { await invoke("set_autostart", { on: e.target.checked }); }

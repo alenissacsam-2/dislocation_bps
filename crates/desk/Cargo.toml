@@ -26,3 +26,6 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 toml_edit = { workspace = true }
 chrono = { workspace = true }
+cb-wallet = { workspace = true }
+cb-executor = { workspace = true }
+bs58 = { workspace = true }

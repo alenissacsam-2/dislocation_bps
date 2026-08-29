@@ -496,10 +496,24 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                         let base_fee_usd = BASE_FEE_SOL * sol_price;
                         let net = opp.gross_profit_usd - est_tip_usd - base_fee_usd;
 
+                        // Competition is charged once, in the tip, and not again here.
+                        //
+                        // This used to also decline every contested cycle outright,
+                        // *after* pricing in a tip sized to win it — paying to win the
+                        // race and then refusing to enter. The ledger says the flag was
+                        // not detecting races anyway: cycles declined as contested were
+                        // still quotable a slot later 27.9% of the time against 15.3%
+                        // for everything else, so they survived *better*, which is what
+                        // it looks like when nobody took them. A $0.01 threshold sorts
+                        // by size and calls the big ones a race.
+                        //
+                        // What remains is the honest question: a bundle that loses does
+                        // not land, so a lost race costs the base fee or nothing at all.
+                        // Anything still positive after the tip it would have to pay is
+                        // worth attempting. See `race_ladder` for what the assumption is
+                        // worth at each win rate.
                         let skipped = if net <= 0.0 {
                             Some("net negative after tip".to_string())
-                        } else if contested {
-                            Some("contested — would lose the race".to_string())
                         } else {
                             None
                         };

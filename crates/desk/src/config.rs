@@ -91,6 +91,66 @@ pub fn write_params(path: &Path, p: &Params) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Read the risk limits, falling back to the conservative defaults for anything the
+/// file does not mention.
+///
+/// A missing limit is not an error. The defaults exist precisely so that a config
+/// written before these keys existed still produces a gate that refuses sensibly,
+/// rather than one that trades without bounds because a key was absent.
+///
+/// # Errors
+/// If the file cannot be read or is not valid TOML.
+pub fn read_limits(path: &Path) -> anyhow::Result<cb_executor::risk::Limits> {
+    let text = std::fs::read_to_string(path)?;
+    let doc: toml_edit::DocumentMut = text.parse()?;
+    let d = cb_executor::risk::Limits::default();
+    let num = |k: &str, fallback: f64| -> f64 {
+        doc.get(k)
+            .and_then(|i| i.as_float().or_else(|| i.as_integer().map(|v| v as f64)))
+            .unwrap_or(fallback)
+    };
+    let int = |k: &str, fallback: u32| -> u32 {
+        doc.get(k)
+            .and_then(toml_edit::Item::as_integer)
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(fallback)
+    };
+    Ok(cb_executor::risk::Limits {
+        max_position_usd: num("max_position_usd", d.max_position_usd),
+        max_daily_loss_usd: num("max_daily_loss_usd", d.max_daily_loss_usd),
+        min_net_profit_usd: num("min_net_profit_usd", d.min_net_profit_usd),
+        max_slippage_bps: num("max_slippage_bps", d.max_slippage_bps),
+        max_consecutive_failures: int("max_consecutive_failures", d.max_consecutive_failures),
+        max_daily_trades: int("max_daily_trades", d.max_daily_trades),
+    })
+}
+
+/// Write the risk limits.
+///
+/// Unlike [`write_params`] this does **not** end the run. Limits bound what may be
+/// signed; they do not change how anything is measured, so rows recorded before and
+/// after a change still aggregate by the same rules and there is nothing to contaminate.
+///
+/// # Errors
+/// If the limits are unusable, or the file cannot be read, parsed, or written. On a
+/// validation failure the file is left untouched.
+pub fn write_limits(path: &Path, l: &cb_executor::risk::Limits) -> anyhow::Result<()> {
+    if let Err(why) = l.validate() {
+        anyhow::bail!(why);
+    }
+    let text = std::fs::read_to_string(path)?;
+    let mut doc: toml_edit::DocumentMut = text.parse()?;
+    doc["max_position_usd"] = toml_edit::value(l.max_position_usd);
+    doc["max_daily_loss_usd"] = toml_edit::value(l.max_daily_loss_usd);
+    doc["min_net_profit_usd"] = toml_edit::value(l.min_net_profit_usd);
+    doc["max_slippage_bps"] = toml_edit::value(l.max_slippage_bps);
+    doc["max_consecutive_failures"] =
+        toml_edit::value(i64::from(l.max_consecutive_failures));
+    doc["max_daily_trades"] = toml_edit::value(i64::from(l.max_daily_trades));
+    std::fs::write(path, doc.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

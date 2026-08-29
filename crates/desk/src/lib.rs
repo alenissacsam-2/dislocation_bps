@@ -13,3 +13,4 @@ pub mod history;
 pub mod logs;
 pub mod paths;
 pub mod runner;
+pub mod wallet;

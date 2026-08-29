@@ -817,8 +817,11 @@ name = "cb-desk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bs58",
  "cb-core",
+ "cb-executor",
  "cb-ledger",
+ "cb-wallet",
  "chrono",
  "serde",
  "serde_json",
