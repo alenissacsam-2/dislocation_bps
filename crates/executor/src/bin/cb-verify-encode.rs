@@ -347,6 +347,25 @@ async fn check_pool(
     // This is the only check that needs an address which actually exists and holds the
     // pool's mints. Without one the runtime rejects the transaction before running it,
     // which says nothing about the encoder, so the check is skipped rather than failed.
+    // A pool with no tick arrays cannot be swapped through by anyone, so simulating one
+    // measures the pool rather than the encoder. Every such pool failed with "an account
+    // belongs to the wrong program" — correct, and about the empty array address rather
+    // than the account order. Skipping keeps the swap column meaning what it claims.
+    if chosen.found == 0 {
+        checks.push(Check {
+            name: "swap",
+            verdict: Verdict::Inconclusive,
+            detail: "skipped: this pool has no tick arrays, so a swap through it cannot                      be built by anyone and simulating one says nothing about the encoder"
+                .into(),
+        });
+        return Ok(PoolReport {
+            address: raw.address.clone(),
+            label: raw.label.clone(),
+            dex,
+            checks,
+        });
+    }
+
     let Some(owner) = simulate_as else {
         checks.push(Check {
             name: "swap",
@@ -396,14 +415,26 @@ async fn check_pool(
                 continue;
             }
         };
+        // Create both token accounts inside the probe.
+        //
+        // Without this the program stops at position 3 of 11 — the simulating address's
+        // own token account, which it does not hold — and everything after it stays
+        // unchecked. The idempotent variant is a no-op when the account already exists,
+        // so this costs nothing for a funded wallet and makes the account order testable
+        // for one that is not. It needs the address to hold enough SOL for rent
+        // (~0.00204 per account); simulation charges it the same as a real run would.
+        let mut probe = vec![tx::set_compute_limit(600_000)];
+        for mint in [&mint_a, &mint_b] {
+            let m = to_pubkey(mint);
+            let ata = associated_token_address(&owner, &m, &token_program);
+            probe.push(tx::create_ata_idempotent(&owner, &ata, &owner, &m, &token_program));
+        }
+        probe.push(ix);
+
         let (blockhash, _) = rpc.latest_blockhash().await?;
         // Unsigned: a placeholder signature, because simulation does not check one and
         // verification must never need a key.
-        let compiled = match tx::compile_unsigned(
-            &owner,
-            &[tx::set_compute_limit(400_000), ix],
-            blockhash,
-        ) {
+        let compiled = match tx::compile_unsigned(&owner, &probe, blockhash) {
             Ok(a) => a,
             Err(e) => {
                 checks.push(Check { name, verdict: Verdict::Fail, detail: e.to_string() });
@@ -489,9 +520,13 @@ fn summarise(reports: &[PoolReport]) {
 
     println!("No check contradicted the encoders.");
     println!();
-    println!("What a clean vault and tick_array column establishes: the account offsets and");
-    println!("the PDA derivations agree with live mainnet. What it does not establish: the");
-    println!("account *order* inside the instruction, or the arithmetic of a trade. Only the");
-    println!("swap column speaks to the first, and only a funded simulation of a real cycle");
-    println!("speaks to the second.");
+    println!("What a clean run establishes: the account offsets, the PDA derivations, the");
+    println!("discriminators, and — for every pool the swap column covers — the account");
+    println!("order, all agreeing with live mainnet. A skipped swap is a pool with no tick");
+    println!("arrays, which nothing can trade whatever the encoding.");
+    println!();
+    println!("What it still does not establish: the arithmetic of a trade. These probes");
+    println!("swap a token the address does not hold, so they prove the instruction is");
+    println!("well formed and stop at the balance. Whether a cycle is *profitable* is a");
+    println!("different question, and the only honest answer to it is a funded dry run.");
 }

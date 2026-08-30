@@ -86,7 +86,20 @@ pub fn swap(
     if policy == BitmapPolicy::Include {
         accounts.push(AccountMeta::new(raydium_bitmap_extension(&ctx.pool, &program), false));
     }
+    // Distinct arrays only, and this is not a tidiness measure.
+    //
+    // Raydium walks its remaining accounts and borrows each one mutably. Handing it the
+    // same array twice makes it borrow the same account twice and the program panics —
+    // `already mutably borrowed: BorrowError`, an SBF panic rather than a clean error,
+    // so it costs the whole transaction. `ticks::resolve` repeats the last live array
+    // when fewer than three exist, which is correct for Orca and fatal here.
+    //
+    // Found by simulating against mainnet: JupUSD/USDC has fewer than three initialised
+    // arrays ahead of it and panicked the program every time.
     for array in &ctx.tick_arrays[1..] {
+        if *array == ctx.tick_arrays[0] || accounts.iter().any(|a| a.pubkey == *array) {
+            continue;
+        }
         accounts.push(AccountMeta::new(*array, false));
     }
 
@@ -232,5 +245,54 @@ mod tests {
         let mut c = ctx(true);
         c.min_amount_out = 0;
         assert!(swap(&c, &pool(), tp, BitmapPolicy::Omit).is_err());
+    }
+
+    /// The fix for an on-chain panic, so it stays fixed.
+    ///
+    /// `ticks::resolve` repeats the last live array when fewer than three exist. Orca
+    /// accepts that; Raydium borrows each remaining account mutably and panics on a
+    /// duplicate, taking the whole transaction with it.
+    #[test]
+    fn a_repeated_tick_array_is_passed_once_not_twice() {
+        let tp = pk(programs::SPL_TOKEN);
+        let mut c = ctx(true);
+        let only = Pubkey::new_unique();
+        c.tick_arrays = [only, only, only];
+
+        let ix = swap(&c, &pool(), tp, BitmapPolicy::Omit).unwrap();
+        let times = ix.accounts.iter().filter(|a| a.pubkey == only).count();
+        assert_eq!(times, 1, "a duplicated array must appear once, not {times} times");
+
+        // Two distinct plus a repeat keeps both distinct ones, in order.
+        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        c.tick_arrays = [a, b, b];
+        let ix = swap(&c, &pool(), tp, BitmapPolicy::Omit).unwrap();
+        assert_eq!(ix.accounts.iter().filter(|m| m.pubkey == a).count(), 1);
+        assert_eq!(ix.accounts.iter().filter(|m| m.pubkey == b).count(), 1);
+        assert_eq!(ix.accounts[9].pubkey, a, "the named array must still be first");
+
+        // And the bitmap must not be dropped by the same filter.
+        let ix = swap(&c, &pool(), tp, BitmapPolicy::Include).unwrap();
+        assert_eq!(
+            ix.accounts[10].pubkey,
+            raydium_bitmap_extension(&c.pool, &pk(cb_dex::raydium_clmm::PROGRAM_ID))
+        );
+    }
+
+    /// Every account in the list must be unique, which is the property the program
+    /// actually requires and the one worth asserting directly.
+    #[test]
+    fn no_account_appears_twice_in_the_instruction() {
+        let tp = pk(programs::SPL_TOKEN);
+        let mut c = ctx(true);
+        let only = Pubkey::new_unique();
+        c.tick_arrays = [only, only, only];
+        for policy in [BitmapPolicy::Include, BitmapPolicy::Omit] {
+            let ix = swap(&c, &pool(), tp, policy).unwrap();
+            let mut seen = std::collections::HashSet::new();
+            for m in &ix.accounts {
+                assert!(seen.insert(m.pubkey), "{} appears twice under {policy:?}", m.pubkey);
+            }
+        }
     }
 }

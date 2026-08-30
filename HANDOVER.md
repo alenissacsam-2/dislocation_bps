@@ -602,18 +602,42 @@ leaves the most recent writes behind.
    the application cannot prevent it. The Mode panel reports the effective mode and says
    when the environment is winning.
 
-1b. **What is verified, and what is not.** `cb-verify-encode` checked every pool in the
-   registry against mainnet: **154 of 154 vault checks and 53 of 53 readable tick arrays
-   agree**, with no contradictions. That establishes the account offsets and the PDA
-   derivations. It does **not** establish the account *order* inside an instruction.
+1b. **What is verified — completed 2026-08-30.** `cb-verify-encode --as <funded
+   address>` now runs clean over the whole registry:
 
-   Simulating as a real address got the program to dispatch `Swap` and accept every
-   account up to position 3 of 11 — where it stopped, because that address holds no
-   token account for the pool's mints. So the discriminator and three accounts are
-   confirmed and the other eight are not. Completing it needs an address that holds both
-   mints; `cb-verify-encode --as <address>` runs it, and only the public address is
-   needed. **Until that column is clean, treat the account orders as unproven and leave
-   `dry_run = true`.**
+   | check | pass | fail |
+   |---|---|---|
+   | vault offsets | 154 | 0 |
+   | tick-array derivation | 53 | 0 |
+   | Orca `swap` account order | 29 | 0 |
+   | Raydium `swap`, bitmap included | 27 | 0 |
+   | Raydium `swap`, bitmap omitted | 27 | 0 |
+
+   The account order is no longer an open question. Getting there needed the probe to
+   create the simulating address's token accounts itself — without that the program
+   stopped at position 3 of 11, on an account the address did not hold, and everything
+   after it was untested. It needs ~0.00204 SOL of rent per account, which is why this
+   could not be answered until the wallet was funded.
+
+   Two things fell out of it:
+
+   - **`BitmapPolicy` is settled: both work.** 27 pools accept the tick-array bitmap
+     extension and the same 27 accept its absence. The uncertainty documented in
+     `venue/raydium.rs` is resolved by measurement — either is valid.
+   - **Raydium panics on a duplicated tick array.** `ticks::resolve` repeats the last
+     live array when fewer than three exist, which Orca accepts and Raydium does not:
+     it borrows each remaining account mutably and dies with
+     `already mutably borrowed: BorrowError`, an SBF panic that costs the transaction.
+     The encoder now passes distinct arrays only. This would have broken every Raydium
+     swap on a pool with a thin array set, and no test could have found it.
+
+   The 21 skipped swaps are the 21 pools with no tick arrays at all — the correlation is
+   exact, and they are untradeable by anyone rather than mis-encoded.
+
+   **What is still not established is the arithmetic of a trade.** These probes swap a
+   token the address does not hold, so they prove the instruction is well formed and
+   stop at the balance. Whether a cycle is profitable is a different question, and only
+   a funded dry run answers it.
 
 2. **Every priced number comes from chain.** Venue APIs are a directory only. No
    hardcoded price of anything, SOL included — the USD index walks the pool graph out
