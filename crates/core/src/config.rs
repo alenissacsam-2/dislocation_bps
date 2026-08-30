@@ -80,11 +80,22 @@ pub struct Config {
 
     /// How far below each hop's quote its output floor is set, in basis points.
     ///
-    /// Deliberately generous against an edge measured in single bps. The floor exists
-    /// to stop a *bad* fill; what stops a *pointless* one is the route's refusal to
-    /// encode a cycle whose last floor does not exceed its first input. A floor tight
-    /// enough to be the binding constraint converts wins into reverts and pays the fee
-    /// for both.
+    /// # This must be smaller than the edge, divided by the hop count
+    ///
+    /// A route only builds if its last floor exceeds its first input, so for `n` hops
+    /// with edge `e` the constraint is `(1 + e)(1 - s)^n > 1`, which for small numbers
+    /// is **`s < e / n`**. A 3 bp edge over two hops leaves room for 1.5 bp per hop and
+    /// no more.
+    ///
+    /// The first version of this was 30, on the reasoning that a wide floor is cautious
+    /// and the route's own loss-check would stop anything pointless. That is backwards:
+    /// a floor this wide makes the loss-check *unsatisfiable*, and a live dry run
+    /// refused every single cycle at −25 to −28 bps guaranteed. Nothing can be traded
+    /// with a tolerance larger than the profit being chased.
+    ///
+    /// The consequence of a tight floor is that an adverse tick reverts the transaction
+    /// rather than filling it badly. That costs the fee, which is the correct price to
+    /// pay when the alternative is a fill that loses more than the trade was worth.
     #[serde(default = "default_slippage_bps")]
     pub slippage_bps: u32,
 
@@ -102,6 +113,27 @@ pub struct Config {
     /// than one.
     #[serde(default = "default_dry_run")]
     pub dry_run: bool,
+
+    // --- risk limits -------------------------------------------------------
+    //
+    // These live in the same file the application's Risk Limits panel writes, and are
+    // loaded here so the bot actually obeys them. It previously built
+    // `cb_executor::risk::Limits::default()` and ignored the file entirely — so a
+    // deliberately tiny `max_position_usd = 0.1` was silently a $25 cap, and a control
+    // the operator had set to protect themselves did nothing. A safety limit that is
+    // quietly inert is worse than an absent one, because it is believed.
+    #[serde(default = "default_max_position_usd")]
+    pub max_position_usd: f64,
+    #[serde(default = "default_max_daily_loss_usd")]
+    pub max_daily_loss_usd: f64,
+    #[serde(default = "default_min_net_profit_usd")]
+    pub min_net_profit_usd: f64,
+    #[serde(default = "default_max_slippage_bps")]
+    pub max_slippage_bps: f64,
+    #[serde(default = "default_max_consecutive_failures")]
+    pub max_consecutive_failures: u32,
+    #[serde(default = "default_max_daily_trades")]
+    pub max_daily_trades: u32,
 }
 
 fn default_capital() -> f64 {
@@ -120,13 +152,36 @@ fn default_min_trade() -> f64 {
 fn default_max_hops() -> usize {
     3
 }
-/// Thirty basis points. See the field's own documentation for why it is not tighter.
+/// One basis point. See the field's own documentation: this is bounded above by the
+/// edge divided by the hop count, and the edge here is single digits.
 fn default_slippage_bps() -> u32 {
-    30
+    1
 }
 /// True. The only safe default for a field whose false value spends money.
 fn default_dry_run() -> bool {
     true
+}
+
+// Defaults matching `cb_executor::risk::Limits::default()`. Deliberately timid: the
+// cost of them being too tight is a missed trade, the cost of them being too loose is
+// a drained wallet.
+fn default_max_position_usd() -> f64 {
+    25.0
+}
+fn default_max_daily_loss_usd() -> f64 {
+    5.0
+}
+fn default_min_net_profit_usd() -> f64 {
+    0.01
+}
+fn default_max_slippage_bps() -> f64 {
+    30.0
+}
+fn default_max_consecutive_failures() -> u32 {
+    3
+}
+fn default_max_daily_trades() -> u32 {
+    500
 }
 
 impl Config {
@@ -193,6 +248,12 @@ mod tests {
             slippage_bps: 30,
             priority_micro_lamports: 0,
             dry_run: true,
+            max_position_usd: 25.0,
+            max_daily_loss_usd: 5.0,
+            min_net_profit_usd: 0.01,
+            max_slippage_bps: 30.0,
+            max_consecutive_failures: 3,
+            max_daily_trades: 500,
         }
     }
 
@@ -289,8 +350,46 @@ min_profit_lamports = 0
         )
         .expect("a config without the optional keys must still parse");
         assert!(cfg.dry_run, "a config with no dry_run key must not submit transactions");
-        assert_eq!(cfg.slippage_bps, 30);
         assert_eq!(cfg.priority_micro_lamports, 0);
+
+        // The slippage default must satisfy `s < edge / hops`, or no route can ever
+        // build. Asserted as the property rather than the number, because the number is
+        // only correct while the edge is what it is — and 30 bps, the first value used
+        // here, refused every cycle in a live dry run.
+        // Two hops, which is the common cycle and the one the cheapest round trips use.
+        // A three-hop cycle needs proportionally more edge to clear the same per-hop
+        // floor, and at this default a 3 bp edge over three hops sits exactly on the
+        // boundary — which is a fact about the strategy, not a misconfiguration.
+        let plausible_edge_bps = 3.0;
+        let hops = 2.0;
+        assert!(
+            f64::from(cfg.slippage_bps) < plausible_edge_bps / hops,
+            "slippage of {} bps cannot be satisfied by a {plausible_edge_bps} bp edge over              {hops} hops — every route would refuse as a guaranteed loss",
+            cfg.slippage_bps
+        );
+
+        // The risk limits must come from the file too, not from Default. The bot ignored
+        // them entirely once, so a deliberately tiny position cap was silently $25.
+        assert_eq!(cfg.max_position_usd, 25.0, "absent means the documented default");
+        assert_eq!(cfg.min_net_profit_usd, 0.01);
+    }
+
+    /// The limits the application's panel writes must actually be read back.
+    #[test]
+    fn risk_limits_are_loaded_from_the_file_rather_than_defaulted() {
+        let cfg: Config = toml::from_str(
+            "rpc_ws_url = \"wss://x\"
+min_profit_lamports = 0
+max_position_lamports = 1
+             max_position_usd = 0.1
+max_daily_trades = 7
+min_net_profit_usd = 0.002
+",
+        )
+        .expect("parses");
+        assert_eq!(cfg.max_position_usd, 0.1, "a 0.1 cap must not silently become 25");
+        assert_eq!(cfg.max_daily_trades, 7);
+        assert_eq!(cfg.min_net_profit_usd, 0.002);
     }
 
     /// And the value is honoured when it *is* written, in both directions — a default

@@ -87,14 +87,23 @@ max_daily_trades = 500
 
 # How far below each hop's quote its output floor is set, in basis points.
 #
-# Generous on purpose against an edge measured in single bps. This floor stops a *bad*
-# fill; what stops a *pointless* one is that a route whose last floor does not exceed
-# its first input refuses to encode at all. A floor tight enough to bind turns wins
-# into reverts and pays the fee for both.
+# THIS MUST BE SMALLER THAN THE EDGE DIVIDED BY THE HOP COUNT.
+#
+# A route only builds if its last floor exceeds its first input, so for n hops at edge
+# e the requirement is (1 + e)(1 - s)^n > 1, which for small numbers is s < e / n.
+# A 3 bp edge over two hops leaves room for 1.5 bp per hop and no more.
+#
+# This was 30, on the reasoning that a wide floor is cautious. That is backwards: a
+# floor this wide makes the route's own loss-check unsatisfiable, and a live dry run
+# refused every cycle it found at -25 to -28 bps guaranteed. You cannot tolerate more
+# slippage than the profit you are chasing.
+#
+# The cost of a tight floor is that an adverse tick reverts the transaction instead of
+# filling it badly. That is the fee, and it is the right price for the alternative.
 #
 # Not the same number as max_slippage_bps above: that one judges the simulated result
 # after the fact, this one is written into the instruction the pool must honour.
-slippage_bps = 30
+slippage_bps = 1
 
 # Priority bid in micro-lamports per compute unit. 0 pays the base fee only.
 priority_micro_lamports = 0

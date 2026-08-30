@@ -105,11 +105,14 @@ pub struct TradeOptions {
 impl Default for TradeOptions {
     fn default() -> Self {
         Self {
-            // 30 bps. Generous against a measured edge of a few bps, deliberately: the
-            // floor exists to stop a *bad* fill, and the route's own refusal to encode
-            // an unprofitable cycle is what stops a pointless one. A floor set tight
-            // enough to be the binding constraint just converts wins into reverts.
-            slippage_bps: 30,
+            // One basis point, and it has to be about this small.
+            //
+            // A route builds only if its last floor exceeds its first input, so for `n`
+            // hops at edge `e` the requirement is `s < e / n`. At 30 bps — the first
+            // value here — a live dry run refused every cycle it found, guaranteeing
+            // −25 to −28 bps. You cannot tolerate more slippage than the profit you are
+            // chasing.
+            slippage_bps: 1,
             priority_micro_lamports: 0,
             compute_units: 400_000,
             dry_run: true,

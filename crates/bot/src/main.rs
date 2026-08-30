@@ -179,7 +179,25 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
 
     let address = wallet.pubkey();
     let rpc = execute::rpc_for(&cfg.rpc_http_url)?;
-    let limits = cb_executor::risk::Limits::default();
+    // From the file, not from Default. The application's Risk Limits panel writes these
+    // and the operator expects them to bind.
+    let limits = cb_executor::risk::Limits {
+        max_position_usd: cfg.max_position_usd,
+        max_daily_loss_usd: cfg.max_daily_loss_usd,
+        min_net_profit_usd: cfg.min_net_profit_usd,
+        max_slippage_bps: cfg.max_slippage_bps,
+        max_consecutive_failures: cfg.max_consecutive_failures,
+        max_daily_trades: cfg.max_daily_trades,
+    };
+    limits.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
+    tracing::info!(
+        "risk limits from config.toml: max position ${:.2}, min net ${:.4}, daily loss ${:.2}, {} consecutive failures, {} trades/day",
+        limits.max_position_usd,
+        limits.min_net_profit_usd,
+        limits.max_daily_loss_usd,
+        limits.max_consecutive_failures,
+        limits.max_daily_trades
+    );
     let opts = execute::TradeOptions {
         slippage_bps: cfg.slippage_bps,
         priority_micro_lamports: cfg.priority_micro_lamports,
@@ -263,6 +281,12 @@ async fn main() -> anyhow::Result<()> {
             slippage_bps: 30,
             priority_micro_lamports: 0,
             dry_run: true,
+            max_position_usd: 25.0,
+            max_daily_loss_usd: 5.0,
+            min_net_profit_usd: 0.01,
+            max_slippage_bps: 30.0,
+            max_consecutive_failures: 3,
+            max_daily_trades: 500,
         }
     });
 
