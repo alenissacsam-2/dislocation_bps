@@ -317,4 +317,23 @@ max_position_lamports = 1
         .unwrap();
         assert!(dry.dry_run);
     }
+
+    /// The file a fresh install is seeded from must load.
+    ///
+    /// `cb_desk::paths::ensure_ready` writes `config.example.toml` into the data
+    /// directory on first launch, so a key that does not parse — or a comment block
+    /// that accidentally swallows one — breaks every new installation and nothing in
+    /// the workspace would otherwise notice. Embedded rather than read at run time so
+    /// the check is against the file that ships.
+    #[test]
+    fn the_example_config_shipped_to_new_installs_actually_loads() {
+        const EXAMPLE: &str = include_str!("../../../config.example.toml");
+        let cfg: Config = toml::from_str(EXAMPLE).expect("config.example.toml must parse");
+
+        // And the defaults it ships with are the safe ones. A seeded config that armed
+        // anything would arm it on a machine whose owner has not opened the app yet.
+        assert_eq!(cfg.mode, Mode::Paper, "a seeded config must be paper");
+        assert!(cfg.dry_run, "a seeded config must be a dry run");
+        assert!(!cfg.is_live_enabled_with(Some("1")), "paper must ignore the env switch");
+    }
 }
