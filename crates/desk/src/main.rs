@@ -49,6 +49,7 @@ fn main() {
             app::wallet_import,
             app::wallet_unlock,
             app::wallet_forget,
+            app::wallet_balances,
             app::read_mode,
             app::set_mode,
             app::read_limits,

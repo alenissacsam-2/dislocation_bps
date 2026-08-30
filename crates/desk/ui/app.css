@@ -248,3 +248,33 @@ pre.log b{color:var(--neg);font-weight:400}
 .bar-lab{font-family:var(--mono);font-size:11px;color:var(--muted)}
 .bar-val{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:11.5px;
   text-align:right}
+
+/* ACCOUNT PANEL
+ * A balance is not the interesting number here; whether it clears the rent on the token
+ * accounts a cycle opens is. So the verdict gets the colour and the balances stay
+ * quiet — an operator glancing at this should read "can/cannot", not do arithmetic. */
+.account{
+  background:var(--raise);border:1px solid var(--line);border-radius:var(--r);
+  padding:12px 13px;margin:11px 0 13px;
+}
+.acct-row{display:flex;align-items:baseline;gap:11px;margin-bottom:9px}
+.acct-key{
+  flex:0 0 62px;font-size:10.5px;color:var(--faint);text-transform:uppercase;
+  letter-spacing:.055em;
+}
+.acct-addr{
+  font-family:var(--mono);font-size:11.5px;color:var(--ink);word-break:break-all;flex:1;
+}
+.acct-holdings{flex:1;font-family:var(--mono);font-size:11.5px;line-height:1.65}
+.acct-holdings .amt{color:var(--ink)}
+.acct-holdings .sym{color:var(--muted)}
+.acct-holdings .mint{color:var(--faint);font-size:10.5px}
+.acct-verdict{
+  font-size:11.5px;line-height:1.55;padding:8px 10px;border-radius:var(--r);
+  border:1px solid var(--line);background:var(--panel);margin:10px 0;
+}
+.acct-verdict.ok{border-color:var(--pos);color:var(--pos)}
+.acct-verdict.no{border-color:var(--accent);background:var(--accent-soft);color:var(--ink)}
+.acct-actions{display:flex;align-items:center;gap:11px;flex-wrap:wrap}
+.acct-actions .note{margin:0}
+button.ghost{background:transparent;padding:3px 8px;font-size:11px}

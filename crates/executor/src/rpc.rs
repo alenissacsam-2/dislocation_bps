@@ -280,6 +280,47 @@ impl Rpc {
             .collect())
     }
 
+    /// Every token account `owner` holds under `token_program`.
+    ///
+    /// Uses `jsonParsed`, which is the one place this client lets the node do the
+    /// decoding. Everywhere else the raw bytes are read here on purpose, because a
+    /// number that decides a trade should not depend on a node's parser. A balance
+    /// shown in a panel is not that, and asking for parsed output avoids fetching and
+    /// decoding the mint of every account to learn its decimals.
+    ///
+    /// # Errors
+    /// If the call fails or the response is not the expected shape.
+    pub async fn token_accounts(
+        &self,
+        owner: &Pubkey,
+        token_program: &Pubkey,
+    ) -> Result<Vec<TokenHolding>> {
+        let r = self
+            .call(
+                "getTokenAccountsByOwner",
+                json!([
+                    owner.to_string(),
+                    { "programId": token_program.to_string() },
+                    { "encoding": "jsonParsed", "commitment": "confirmed" }
+                ]),
+            )
+            .await?;
+        let arr = r["value"]
+            .as_array()
+            .ok_or_else(|| anyhow!("getTokenAccountsByOwner returned no array"))?;
+        Ok(arr
+            .iter()
+            .filter_map(|a| {
+                let info = &a["account"]["data"]["parsed"]["info"];
+                let mint = info["mint"].as_str()?.to_string();
+                // `amount` is a decimal string because it does not fit a JSON number.
+                let amount = info["tokenAmount"]["amount"].as_str()?.parse().ok()?;
+                let decimals = u8::try_from(info["tokenAmount"]["decimals"].as_u64()?).ok()?;
+                Some(TokenHolding { mint, amount, decimals })
+            })
+            .collect())
+    }
+
     /// The owner program of an account, which is how a mint's token program is known.
     ///
     /// # Errors
@@ -305,6 +346,18 @@ impl Rpc {
             .await?;
         Ok(r["value"].as_u64().unwrap_or(0))
     }
+}
+
+/// One SPL holding, with the decimals needed to render it.
+///
+/// The decimals come from the node's parsed output rather than from a registry, so an
+/// unfamiliar mint renders correctly instead of being shown at a guessed scale — nine
+/// decimals applied to a USDC balance is off by a thousand.
+#[derive(Debug, Clone)]
+pub struct TokenHolding {
+    pub mint: String,
+    pub amount: u64,
+    pub decimals: u8,
 }
 
 /// An account as the node returned it.

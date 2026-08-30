@@ -233,6 +233,30 @@ pub fn write_limits(path: &Path, l: &cb_executor::risk::Limits) -> anyhow::Resul
     Ok(())
 }
 
+/// The RPC endpoint the app should ask about balances.
+///
+/// Read from `config.toml` rather than hardcoded, so the panel reports what it saw from
+/// the same node the bot is talking to. `figment` lets `CRYPTOBOT_RPC_HTTP_URL` override
+/// the file for the bot, so that is honoured here too — otherwise the window could show
+/// balances from one endpoint while the instrument runs against another.
+///
+/// # Errors
+/// If the file cannot be read or parsed.
+pub fn read_rpc_url(path: &Path) -> anyhow::Result<String> {
+    if let Ok(from_env) = std::env::var("CRYPTOBOT_RPC_HTTP_URL") {
+        if !from_env.trim().is_empty() {
+            return Ok(from_env);
+        }
+    }
+    let text = std::fs::read_to_string(path)?;
+    let doc: toml_edit::DocumentMut = text.parse()?;
+    Ok(doc
+        .get("rpc_http_url")
+        .and_then(toml_edit::Item::as_str)
+        .unwrap_or("https://api.mainnet-beta.solana.com")
+        .to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +419,19 @@ max_position_lamports = 20000000
             "execution is now implemented — update set_mode's refusal, the bot's startup \
              bail, the Mode panel copy, and HANDOVER invariant 1 in the same change"
         );
+    }
+
+    /// The panel must report balances from the same endpoint the bot is using, or a
+    /// surprising number gets blamed on the wrong node.
+    #[test]
+    fn the_rpc_url_comes_from_the_file_and_falls_back_to_mainnet() {
+        let p = tmp("rpc", "rpc_http_url = \"https://example.test/rpc\"
+");
+        assert_eq!(read_rpc_url(&p).unwrap(), "https://example.test/rpc");
+
+        // A config with no endpoint still yields a usable one rather than an error.
+        let bare = tmp("rpc-bare", "mode = \"paper\"
+");
+        assert!(read_rpc_url(&bare).unwrap().contains("mainnet"));
     }
 }

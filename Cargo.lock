@@ -825,6 +825,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "solana-sdk",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",

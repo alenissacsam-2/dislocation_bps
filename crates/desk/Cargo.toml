@@ -28,4 +28,5 @@ toml_edit = { workspace = true }
 chrono = { workspace = true }
 cb-wallet = { workspace = true }
 cb-executor = { workspace = true }
+solana-sdk = { workspace = true }
 bs58 = { workspace = true }

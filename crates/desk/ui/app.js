@@ -644,6 +644,7 @@ async function paintMode() {
 
 function syncModeConfirm() {
   $("modeConfirmWrap").hidden = !$("modeLive").checked;
+  paintLiveAccount();
 }
 $("modeDemo").onchange = syncModeConfirm;
 $("modeLive").onchange = syncModeConfirm;
@@ -723,16 +724,124 @@ async function paintWallet() {
   try { s = await invoke("wallet_status"); }
   catch { $("walletState").textContent = "Could not read wallet state."; return; }
 
+  window.__walletUnlocked = !!s.unlocked;
   const setup = $("walletSetup"), unlock = $("walletUnlock");
   if (!s.configured) {
     $("walletState").textContent = "No key configured. The bot cannot trade without one.";
     setup.hidden = false; unlock.hidden = true;
+    $("accountPanel").hidden = true;
+    window.__address = null;
+    window.__holdings = null;
+    paintLiveAccount();
     return;
   }
   setup.hidden = true; unlock.hidden = false;
   $("walletState").innerHTML = s.unlocked
-    ? `Unlocked for this session — <code>${s.pubkey}</code>`
-    : `Key present but locked — <code>${s.pubkey}</code>`;
+    ? "Unlocked for this session."
+    : "Key present but locked. Unlock it before this address can sign anything.";
+
+  // The address is shown whether or not the key is unlocked. Seeing what an address
+  // holds should never require the ability to spend from it, and the public key sits in
+  // the clear beside the ciphertext precisely so this works without a passphrase.
+  $("accountPanel").hidden = false;
+  $("accAddress").textContent = s.pubkey || "—";
+  window.__address = s.pubkey || null;
+
+  // Fetch once when the panel first appears, then only on request. Automatic on open
+  // because an operator asking "what do I hold" should not have to press anything;
+  // once because the endpoint is shared with the instrument and a balance does not
+  // change on its own.
+  if (window.__address && !window.__balancesFetched) {
+    window.__balancesFetched = true;
+    paintBalances(true);
+  }
+}
+
+// Balances are fetched on demand rather than on a timer. A poll would put this app on
+// somebody's RPC quota for a number that only changes when the operator does something,
+// and the endpoint is shared with the instrument that is actually working.
+async function paintBalances(quiet) {
+  const holdings = $("accBalances"), verdict = $("accReadiness");
+  if (!window.__address) { verdict.textContent = ""; return; }
+  if (!quiet) holdings.textContent = "reading…";
+  let h;
+  try { h = await invoke("wallet_balances"); }
+  catch (e) {
+    holdings.textContent = "could not read balances";
+    verdict.className = "acct-verdict";
+    verdict.textContent = "" + e;
+    return;
+  }
+  window.__holdings = h;
+
+  const rows = [`<div><span class="amt">${h.sol}</span> <span class="sym">SOL</span></div>`];
+  for (const t of h.tokens) {
+    // An unnamed mint is shown by its address rather than a guessed ticker. Two tokens
+    // called USD-something that are not the same token is a normal Tuesday on Solana.
+    const label = t.symbol
+      ? `<span class="sym">${t.symbol}</span>`
+      : `<span class="mint">${t.mint}</span>`;
+    rows.push(`<div><span class="amt">${t.amount}</span> ${label}</div>`);
+  }
+  holdings.innerHTML = rows.join("");
+
+  verdict.className = "acct-verdict " + (h.readiness.canTrade ? "ok" : "no");
+  verdict.innerHTML = (h.readiness.canTrade ? "<b>Can trade.</b> " : "<b>Cannot trade.</b> ")
+    + h.readiness.reason;
+  $("accSource").textContent = "from " + h.rpc;
+
+  // The mode panel quotes these numbers, so keep the two in step.
+  paintLiveAccount();
+}
+
+$("btnRefreshBalances").onclick = () => paintBalances(false);
+
+$("btnCopyAddr").onclick = async () => {
+  if (!window.__address) return;
+  try {
+    await navigator.clipboard.writeText(window.__address);
+    $("accSource").textContent = "address copied";
+  } catch {
+    $("accSource").textContent = "could not reach the clipboard";
+  }
+};
+
+// What Live would actually sign with, shown at the moment Live is selected rather than
+// after it is applied. The operator is being asked to arm real money; the address and
+// what it holds are the two facts that decision needs, and making them look them up
+// somewhere else is how the wrong wallet gets armed.
+function paintLiveAccount() {
+  const box = $("liveAccount");
+  if (!$("modeLive").checked) { box.hidden = true; return; }
+  box.hidden = false;
+  box.className = "warn";
+
+  const addr = window.__address;
+  if (!addr) {
+    box.innerHTML = "<b>No key is configured.</b> Live has nothing to sign with. "
+      + "Import one under Wallet below.";
+    return;
+  }
+
+  const h = window.__holdings;
+  const bits = [`<b>Live would sign with:</b><br><code>${addr}</code>`];
+
+  if (!h) {
+    bits.push("Balances not read yet — press <b>Refresh balances</b> under Wallet to see "
+      + "what this address holds before arming it.");
+  } else {
+    const held = [`${h.sol} SOL`]
+      .concat(h.tokens.map(t => `${t.amount} ${t.symbol || t.mint.slice(0, 6) + "…"}`));
+    bits.push("Holding " + held.join(" · "));
+    if (!h.readiness.canTrade) bits.push("<b>This address cannot trade.</b> " + h.readiness.reason);
+  }
+
+  const unlocked = window.__walletUnlocked;
+  if (!unlocked) {
+    bits.push("<b>The key is locked.</b> Unlock it under Wallet — a locked key cannot sign, "
+      + "so Live would run without being able to do anything.");
+  }
+  box.innerHTML = bits.join("<br><br>");
 }
 
 $("btnImport").onclick = async () => {

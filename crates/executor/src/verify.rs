@@ -179,6 +179,34 @@ pub fn classify(err: &str, logs: &[String]) -> (Verdict, String) {
         );
     }
 
+    // `AccountNotInitialized` naming one of the *simulating address's own* token
+    // accounts is not an encoder fault: that address simply does not hold the mint. It
+    // is also not a pass, and the distinction is worth keeping sharp. Anchor validates
+    // accounts in declaration order, so stopping here proves everything before this
+    // position and nothing after it — for both venues the user's token account sits at
+    // position 3 of eleven, so this verifies the discriminator and three accounts, not
+    // the account order that the check exists to test.
+    const USER_ACCOUNTS: &[&str] = &[
+        "input_token_account",
+        "output_token_account",
+        "token_owner_account_a",
+        "token_owner_account_b",
+    ];
+    if hay.contains("accountnotinitialized") {
+        if let Some(which) = USER_ACCOUNTS.iter().find(|a| hay.contains(*a)) {
+            return (
+                Verdict::Inconclusive,
+                format!(
+                    "the program dispatched Swap and accepted every account before \
+                     `{which}`, which the simulating address does not hold. That verifies \
+                     the discriminator and the accounts ahead of position 3; it says \
+                     nothing about the eight after it. Simulate as an address that holds \
+                     both mints to check the rest"
+                ),
+            );
+        }
+    }
+
     // Reaching a funds or liquidity complaint means every account was accepted.
     const ACCEPTED: &[&str] = &[
         "insufficient funds",
@@ -345,6 +373,40 @@ mod tests {
 
         // But the same words *with* logs came from the program, and do mean the encoder.
         let logs = vec!["Program log: AnchorError AccountNotFound".to_string()];
+        assert_eq!(classify("", &logs).0, Verdict::Fail);
+    }
+
+    /// The result of simulating as a real but empty address: the program dispatches,
+    /// validates what it can, and stops at the user's own missing token account. That
+    /// is neither a broken encoder nor a verified one, and reporting it as either would
+    /// be wrong in a way that matters.
+    #[test]
+    fn a_missing_user_token_account_is_neither_a_pass_nor_a_fail() {
+        let logs = vec![
+            "Program log: Instruction: Swap".to_string(),
+            "Program log: AnchorError caused by account: input_token_account. Error Code:              AccountNotInitialized. Error Number: 3012."
+                .to_string(),
+        ];
+        let (v, why) = classify("{\"InstructionError\":[1,{\"Custom\":3012}]}", &logs);
+        assert_eq!(v, Verdict::Inconclusive);
+        assert!(why.contains("position 3"), "the message must say how far it got: {why}");
+
+        // Orca names the same thing differently and must classify the same way.
+        let orca = vec![
+            "Program log: AnchorError caused by account: token_owner_account_a. Error Code:              AccountNotInitialized."
+                .to_string(),
+        ];
+        assert_eq!(classify("", &orca).0, Verdict::Inconclusive);
+    }
+
+    /// But `AccountNotInitialized` on an account the *encoder* chose - a tick array, a
+    /// vault, an oracle - is still a real failure, because we picked that address.
+    #[test]
+    fn a_missing_derived_account_is_still_a_failure() {
+        let logs = vec![
+            "Program log: AnchorError caused by account: tick_array_0. Error Code:              AccountNotInitialized."
+                .to_string(),
+        ];
         assert_eq!(classify("", &logs).0, Verdict::Fail);
     }
 }

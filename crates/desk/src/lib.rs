@@ -7,6 +7,7 @@
 //! whether or not anything is running.
 
 pub mod app;
+pub mod balances;
 pub mod archive;
 pub mod config;
 pub mod history;

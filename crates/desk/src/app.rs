@@ -281,6 +281,32 @@ pub fn wallet_forget(app: tauri::State<'_, App>) -> Result<crate::wallet::Wallet
     crate::wallet::remove(&app.paths.wallet(), &app.custody)
 }
 
+/// How many distinct token accounts a cycle needs, for the readiness calculation.
+///
+/// Three, because three hops is the ceiling a 1232-byte packet allows — see
+/// `cb_executor::tx`. A two-hop cycle needs two, so this is the pessimistic answer and
+/// it is the right one: an operator told they are ready should be ready for the widest
+/// cycle the instrument can find, not the narrowest.
+const MINTS_PER_CYCLE: usize = 3;
+
+/// What the trading address holds, read live from the configured RPC endpoint.
+///
+/// Read-only, and it needs no passphrase: the address is stored in the clear beside the
+/// ciphertext, so balances are visible whether or not the key is unlocked. Seeing what
+/// an address holds should never require the ability to spend from it.
+///
+/// # Errors
+/// If no key is configured, or the node cannot be reached.
+#[tauri::command]
+pub async fn wallet_balances(app: tauri::State<'_, App>) -> Result<crate::balances::Holdings, String> {
+    let status = crate::wallet::status(&app.paths.wallet(), &app.custody);
+    let Some(address) = status.pubkey else {
+        return Err("no key is configured, so there is no address to look up".into());
+    };
+    let rpc = config::read_rpc_url(&app.paths.config()).map_err(|e| e.to_string())?;
+    crate::balances::fetch(&rpc, &address, MINTS_PER_CYCLE).await.map_err(|e| e.to_string())
+}
+
 /// # Errors
 /// If the config cannot be read or parsed.
 #[tauri::command]

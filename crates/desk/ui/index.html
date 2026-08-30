@@ -251,6 +251,7 @@
         <label style="margin-top:8px"><input type="radio" name="mode" id="modeLive" value="live" style="width:auto">
           <b>Live</b> — sign and submit real transactions with the configured key.</label>
       </div>
+      <div id="liveAccount" hidden></div>
       <p class="note" id="modeState">Checking…</p>
       <div class="field" id="modeConfirmWrap" hidden>
         <label for="fModeConfirm">Type <code>LIVE</code> to confirm</label>
@@ -275,6 +276,23 @@
       </div>
 
       <p class="note" id="walletState">Checking…</p>
+
+      <div id="accountPanel" class="account" hidden>
+        <div class="acct-row">
+          <span class="acct-key">Address</span>
+          <code id="accAddress" class="acct-addr">—</code>
+          <button id="btnCopyAddr" class="ghost" type="button">Copy</button>
+        </div>
+        <div class="acct-row">
+          <span class="acct-key">Holdings</span>
+          <div id="accBalances" class="acct-holdings">not loaded</div>
+        </div>
+        <div id="accReadiness" class="acct-verdict"></div>
+        <div class="acct-actions">
+          <button id="btnRefreshBalances" type="button">Refresh balances</button>
+          <span class="note" id="accSource"></span>
+        </div>
+      </div>
 
       <div id="walletSetup">
         <div class="field">
