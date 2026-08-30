@@ -145,6 +145,13 @@ pub fn format_amount(raw: u64, decimals: u8) -> String {
     }
 }
 
+/// Note a non-fatal lookup failure. The desk has no tracing subscriber, so this is a
+/// stderr line rather than a dropped error — silence here would be the same mistake the
+/// Token-2022 gap already was.
+fn tracing_note(e: &anyhow::Error) {
+    eprintln!("token-2022 balances unavailable ({e}); classic SPL balances shown");
+}
+
 /// Fetch what the address holds.
 ///
 /// # Errors
@@ -154,7 +161,21 @@ pub async fn fetch(rpc_url: &str, address: &str, mints_needed: usize) -> anyhow:
     let rpc = Rpc::new(rpc_url)?;
 
     let lamports = rpc.balance(&who).await?;
-    let raw = rpc.token_accounts(&who, &programs::SPL_TOKEN.parse::<Pubkey>()?).await?;
+
+    // Both token programs, not just the classic one.
+    //
+    // `getTokenAccountsByOwner` filters by program, so asking only about SPL Token
+    // reports a Token-2022 holding as *absent* rather than as unknown — the panel would
+    // have shown "0 tokens" for a funded wallet and been believed. Found by checking a
+    // real wallet against the chain after a transfer that had not in fact arrived; the
+    // balance was genuinely unchanged, but the query could not have proved it.
+    let mut raw = rpc.token_accounts(&who, &programs::SPL_TOKEN.parse::<Pubkey>()?).await?;
+    match rpc.token_accounts(&who, &programs::SPL_TOKEN_2022.parse::<Pubkey>()?).await {
+        Ok(more) => raw.extend(more),
+        // A node that does not serve the Token-2022 filter should not blank the classic
+        // balances, which are the ones that matter for the base mints.
+        Err(e) => tracing_note(&e),
+    }
 
     let mut tokens: Vec<TokenHolding> = raw
         .into_iter()
@@ -256,6 +277,22 @@ mod tests {
             (0.006..0.007).contains(&(needed as f64 / 1e9)),
             "expected about 0.0062 SOL, got {}",
             needed as f64 / 1e9
+        );
+    }
+
+    /// The two token programs derive *different* addresses for the same owner and mint,
+    /// so a wallet can legitimately hold both and a panel that queries one program is
+    /// not showing a subset — it is showing a wrong answer with no indication.
+    #[test]
+    fn the_two_token_programs_are_distinct_and_both_are_queried() {
+        use cb_executor::encode::programs;
+        assert_ne!(programs::SPL_TOKEN, programs::SPL_TOKEN_2022);
+        // Both parse; a typo in either constant would silently return nothing.
+        assert!(programs::SPL_TOKEN.parse::<Pubkey>().is_ok());
+        assert!(programs::SPL_TOKEN_2022.parse::<Pubkey>().is_ok());
+        assert!(
+            include_str!("balances.rs").contains("SPL_TOKEN_2022"),
+            "fetch() must query Token-2022 as well as the classic program"
         );
     }
 }
