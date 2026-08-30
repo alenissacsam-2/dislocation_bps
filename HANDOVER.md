@@ -504,7 +504,32 @@ leaves the most recent writes behind.
 
 ## 8. Invariants — do not break these
 
-1. **Paper mode.** `mode = "paper"`. No key material anywhere.
+1. **Paper mode.** `mode = "paper"`. **Revised 2026-08-30** — the original wording was
+   "no key material anywhere", and that half is deliberately no longer true: the
+   application takes a key, encrypts it under a passphrase, and stores it at
+   `keypair-encrypted.json` (matched by the `keypair*.json` rule `.gitignore` has carried
+   since the first commit). The Mode control can now write `mode`, so the guarantee is
+   no longer "there is no mechanism". What carries it instead, and what must not be
+   weakened without an argument:
+   - `cb-bot` depends on neither `cb-executor`, `cb-wallet`, nor `solana-sdk`. **That
+     binary contains no code that can sign.** This is the strongest property in the
+     workspace and the only one that holds regardless of any config, any environment
+     variable, and any mistake in the application. Adding one of those dependencies is
+     the change that needs justifying.
+   - `crates/bot/src/main.rs` refuses to start against `mode = "live"` at all — not only
+     when both switches are set. It used to warn and continue in the half-armed case,
+     which was harmless while nothing could write `mode` and is the most likely mistake
+     now that something can.
+   - Every mode indicator is derived from the config. They were all hardcoded `"paper"`
+     literals — the startup log, `/api/health`, the status the footer renders, and
+     `Execution.paper` — so a live run could not have announced itself.
+   - `CRYPTOBOT_ALLOW_LIVE=1` is set outside the application, which does not set it.
+   - `cb_desk::config::EXECUTION_IMPLEMENTED` is the single place the "not built" claim
+     is made, and a test fails when it flips.
+
+   Note that `Config::load` merges `Env::prefixed("CRYPTOBOT_")` over the file, so
+   `CRYPTOBOT_MODE=live` overrides `config.toml` and the application cannot prevent it.
+   The Mode panel reports the effective mode and says when the environment is winning.
 2. **Every priced number comes from chain.** Venue APIs are a directory only. No
    hardcoded price of anything, SOL included — the USD index walks the pool graph out
    from USDC/USDT and nothing else is assumed to be a dollar.

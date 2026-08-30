@@ -604,7 +604,69 @@ async function loadConfig() {
   catch { $("fRoot").textContent = "unknown"; }
   await paintWallet();
   await paintLimits();
+  await paintMode();
 }
+
+// ── mode ────────────────────────────────────────────────────────────────────
+//
+// The control shows three things that can disagree, because in this system they
+// genuinely can: what the file says, what the bot will actually run as once the
+// environment is applied over it, and whether this build can execute at all.
+// Showing only the first would tell the operator the opposite of the truth in the one
+// case where it matters.
+
+async function paintMode() {
+  let m;
+  try { m = await invoke("read_mode"); }
+  catch (e) { $("modeState").textContent = "Could not read mode: " + e; return; }
+  window.__mode = m;
+
+  $("modeDemo").checked = m.effective === "paper";
+  $("modeLive").checked = m.effective === "live";
+
+  const lines = [];
+  if (m.envOverride) {
+    lines.push(`<b>CRYPTOBOT_MODE=${m.envOverride} is set in the environment and overrides the file.</b> `
+      + `The file says <code>${m.mode}</code>; the bot will run as <code>${m.effective}</code>. `
+      + `This application cannot change that — unset the variable and restart it.`);
+  }
+  if (!m.executionImplemented) {
+    lines.push("<b>Live execution is not implemented in this build.</b> No swap instructions are "
+      + "encoded, and <code>cb-bot</code> links no signing code, so Live cannot be armed. "
+      + "Demo is the whole of what currently works.");
+  }
+  lines.push(m.allowLiveSet
+    ? "<code>CRYPTOBOT_ALLOW_LIVE=1</code> is set — the outside half of the guard is open."
+    : "<code>CRYPTOBOT_ALLOW_LIVE</code> is not set. That is the half of the guard that lives "
+      + "outside this application, and it deliberately does not set it for you.");
+  $("modeState").innerHTML = lines.join("<br><br>");
+}
+
+function syncModeConfirm() {
+  $("modeConfirmWrap").hidden = !$("modeLive").checked;
+}
+$("modeDemo").onchange = syncModeConfirm;
+$("modeLive").onchange = syncModeConfirm;
+
+$("btnSetMode").onclick = async () => {
+  const mode = $("modeLive").checked ? "live" : "paper";
+  const confirm = $("fModeConfirm").value;
+  $("modeResult").textContent = "Applying…";
+  try {
+    const r = await invoke("set_mode", { mode, confirm });
+    const bits = [`Mode is now ${r.mode}.`];
+    if (r.archived) bits.push(`Previous run archived as ${r.archived}.`);
+    if (r.restartError) bits.push(`The bot did not restart: ${r.restartError}`);
+    else if (r.restarted) bits.push("The bot restarted.");
+    $("modeResult").textContent = bits.join(" ");
+  } catch (e) {
+    $("modeResult").textContent = "" + e;
+  } finally {
+    $("fModeConfirm").value = "";
+    await paintMode();
+    syncModeConfirm();
+  }
+};
 
 // ── risk limits ─────────────────────────────────────────────────────────────
 //

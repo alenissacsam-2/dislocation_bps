@@ -48,6 +48,21 @@ const BASE_FEE_SOL: f64 = 0.000_005;
 /// Where the measurement goes. The dashboard is a window; this is the record.
 const LEDGER_PATH: &str = "cryptobot.db";
 
+/// What this run should call itself, everywhere it says so.
+///
+/// Derived rather than written out at each site. Every mode string in this binary used
+/// to be the literal `"paper"` — in the startup log, in `/api/health`, in the status the
+/// window's footer renders, and on every execution event. That was true only because
+/// nothing could produce any other mode. Once something can, a hardcoded label is a run
+/// that cannot announce what it is doing, and the operator's only indicator agrees with
+/// them no matter what is actually happening.
+fn mode_label(cfg: &Config) -> &'static str {
+    match cfg.mode {
+        Mode::Paper => "paper",
+        Mode::Live => "live",
+    }
+}
+
 /// One sweep in this many is written to the ledger. Sweeps run at 5 Hz and the
 /// market does not change meaningfully between two of them, so sampling at 1 Hz
 /// keeps a day of running to ~86k rows while losing nothing a mean or a histogram
@@ -147,17 +162,26 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // The guard. Both switches, or nothing happens.
-    if cfg.is_live_enabled() {
-        anyhow::bail!(
-            "live execution is not implemented yet; refusing to start in live mode. \
-             Set mode = \"paper\" in config.toml."
-        );
-    }
+    // The guard. Any request to trade for real is refused, not just the fully-armed one.
+    //
+    // This used to bail only when *both* switches were set, and merely warn when the
+    // config asked for live without the environment switch — "staying in paper mode".
+    // That was safe while nothing could write `mode`. The application can now, which
+    // makes the half-armed state the most likely outcome of a mistake rather than an
+    // unreachable one, and it is precisely the state where the operator believes one
+    // thing and the process is doing another. There is no reading of `mode = "live"`
+    // under which continuing is the helpful answer, so both halves refuse.
+    //
+    // The deeper guarantee is not this check. It is that this binary links nothing that
+    // can sign: cb-bot depends on neither `cb-executor` nor `cb-wallet` nor `solana-sdk`,
+    // so there is no code path from here to a signature regardless of what any config
+    // says. Adding one of those to Cargo.toml is the change that needs an argument.
     if matches!(cfg.mode, Mode::Live) {
-        tracing::warn!(
-            "config requests live mode but {} is not set — staying in paper mode",
-            cb_core::config::LIVE_ENV_VAR
+        anyhow::bail!(
+            "live execution is not implemented, so this refuses to start with mode = \"live\". \
+             No swap instructions are built and this binary contains no signing code. \
+             Switch the Mode control back to Demo in cryptobot-desk, or set \
+             mode = \"paper\" in config.toml."
         );
     }
 
@@ -169,12 +193,12 @@ async fn main() -> anyhow::Result<()> {
         FeedSource::Live => spawn_live(bus.clone(), &cfg).await?,
     }
 
-    tracing::info!("mode: PAPER — no transaction will be signed or sent");
+    tracing::info!("mode: {} — no transaction will be signed or sent", mode_label(&cfg).to_uppercase());
     tracing::info!("api: http://127.0.0.1:8787 — the window is cryptobot-desk");
 
     // The app reads history from this same ledger directly, rather than through the
     // endpoint below, which is what lets it show the run after this process is gone.
-    routes::serve(addr, routes::state_with_ledger(bus, "paper", LEDGER_PATH)).await
+    routes::serve(addr, routes::state_with_ledger(bus, mode_label(&cfg), LEDGER_PATH)).await
 }
 
 fn spawn_simulated(bus: EventBus) {
@@ -243,6 +267,8 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
     let status_bus = bus.clone();
     let status_stats = std::sync::Arc::clone(&stats);
     let started = std::time::Instant::now();
+    // Captured before the task takes ownership. `&'static str` so this costs nothing.
+    let status_mode = mode_label(cfg);
     tokio::spawn(async move {
         let mut t = tokio::time::interval(Duration::from_secs(2));
         loop {
@@ -255,7 +281,7 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
             let tradeable = s.tradeable.as_ref();
 
             status_bus.publish(Event::Status {
-                mode: "paper · live mainnet".into(),
+                mode: format!("{status_mode} · live mainnet"),
                 // Consider the feed live only if something arrived in the last 30s.
                 connected: stale_for < 30_000,
                 slot: last_slot.max(s.slot),
@@ -322,6 +348,12 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
             None
         }
     };
+
+    // Captured before the sweep task takes ownership: `cfg` is a borrow and cannot cross
+    // into a 'static task. Always true today, because a live config is refused at
+    // startup — but derived rather than written as `true`, so that the flag stops being
+    // correct by accident the moment execution exists.
+    let paper_run = matches!(cfg.mode, Mode::Paper);
 
     tokio::spawn(async move {
         let mut next_id: u64 = 1;
@@ -574,7 +606,7 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                             bus.publish(Event::Execution {
                                 id,
                                 opportunity_id: id,
-                                paper: true,
+                                paper: paper_run,
                                 landed: true,
                                 realised_usd: net,
                                 tip_paid_usd: est_tip_usd,

@@ -132,11 +132,19 @@ Meteora DAMM v2 — 84 pools live.
 
 Live trading requires **two independent switches** — `mode = "live"` in config *and*
 `CRYPTOBOT_ALLOW_LIVE=1` in the environment — and neither does anything, because live
-execution is not implemented. The application deliberately exposes **no control that can
-write `mode`**: the guarantee is the absence of a mechanism, not a dialog someone can
-click through. No key material is ever committed, and the placeholder `executor` crate was
-deleted precisely so nobody mistakes an empty crate with a confident name for something
-that was built and tested.
+execution is not implemented.
+
+The application **does** now expose a Mode control, so the guarantee is no longer the
+absence of a mechanism. It is carried by four things that are: the second switch still
+lives outside the app and it deliberately does not set it; `cb-bot` refuses to start
+against any live config while execution is unbuilt; every mode indicator is derived from
+the config rather than hardcoded, so a live run cannot present itself as paper; and
+`cb-bot` links neither `cb-executor` nor `cb-wallet` nor `solana-sdk`, so that binary
+contains no path to a signature at all. The last one is the real guarantee — adding one
+of those to its `Cargo.toml` is the change that needs an argument.
+
+A key, if you configure one, is encrypted under a passphrase you choose and stored
+outside the repository's tracked files. No key material is ever committed.
 
 Read [`docs/research/04-security.md`](docs/research/04-security.md) before running **any**
 third-party Solana bot code, including this.

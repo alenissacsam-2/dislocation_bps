@@ -284,6 +284,103 @@ pub fn wallet_forget(app: tauri::State<'_, App>) -> Result<crate::wallet::Wallet
 /// # Errors
 /// If the config cannot be read or parsed.
 #[tauri::command]
+pub fn read_mode(app: tauri::State<'_, App>) -> Result<config::ModeStatus, String> {
+    config::read_mode(&app.paths.config()).map_err(|e| e.to_string())
+}
+
+/// Switch between demo and live, archiving the run either way.
+///
+/// # Why the preconditions are checked here and not in the window
+///
+/// The window can be made to send anything. Every guard that matters is re-checked in
+/// this function, so a malformed `invoke` cannot arm live trading by skipping a dialog.
+/// `confirm` must be the literal word `LIVE`: not a checkbox, because a checkbox is one
+/// stray click and this is not a decision that should be reachable by one stray click.
+///
+/// # Why the ledger is archived
+///
+/// `paper_fills` has no column saying which mode produced a row, so a run that changed
+/// mode half way through would leave a table whose realised P&L is part simulation and
+/// part real money, with nothing downstream able to separate them. Cutting the run is
+/// the only thing that keeps the two readable.
+///
+/// # Errors
+/// If a precondition fails, or the config cannot be written. On any failure the file
+/// and the run are left untouched.
+#[tauri::command]
+pub async fn set_mode(
+    app: tauri::State<'_, App>,
+    mode: String,
+    confirm: String,
+) -> Result<serde_json::Value, String> {
+    let going_live = mode == "live";
+
+    if going_live {
+        if confirm.trim() != "LIVE" {
+            return Err("Type LIVE to confirm. Nothing has been changed.".into());
+        }
+        if !app.custody.is_unlocked() {
+            return Err(
+                "No key is unlocked in this session. Import and unlock one before arming live \
+                 trading."
+                    .into(),
+            );
+        }
+        let limits = config::read_limits(&app.paths.config()).map_err(|e| e.to_string())?;
+        limits.validate()?;
+        if !config::EXECUTION_IMPLEMENTED {
+            // Refused rather than allowed-with-a-warning. Writing mode = "live" here
+            // would produce a config the bot declines to start with, and an operator
+            // staring at a stopped instrument wondering which of the two things they
+            // just did broke it.
+            return Err(
+                "Live execution is not implemented in this build: no swap instructions are \
+                 encoded and cb-bot links no signing code. Arming live mode would only stop \
+                 the bot from starting. Demo mode is the whole of what currently works."
+                    .into(),
+            );
+        }
+    } else if mode != "paper" {
+        return Err(format!("unknown mode {mode:?}"));
+    }
+
+    let runner = Arc::clone(&app.runner);
+    let paths = app.paths.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let was_running = matches!(runner.probe(), RunState::Running | RunState::Starting);
+        if was_running {
+            runner.stop().map_err(|e| e.to_string())?;
+        }
+        // Archive before the write, so a crash in between leaves the old rows filed
+        // under the mode that produced them rather than orphaned beside a new config.
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let archived = archive::archive_ledger(&paths.ledger(), &paths.archive_dir(), &stamp)
+            .map_err(|e| e.to_string())?;
+        config::write_mode(&paths.config(), &mode).map_err(|e| e.to_string())?;
+
+        let mut restarted = false;
+        let mut restart_error = None;
+        if was_running {
+            match runner.start() {
+                Ok(()) => restarted = true,
+                Err(e) => restart_error = Some(e.to_string()),
+            }
+        }
+        Ok(serde_json::json!({
+            "mode": mode,
+            "archived": archived.map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
+            "wasRunning": was_running,
+            "restarted": restarted,
+            "restartError": restart_error,
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// # Errors
+/// If the config cannot be read or parsed.
+#[tauri::command]
 pub fn read_limits(app: tauri::State<'_, App>) -> Result<cb_executor::risk::Limits, String> {
     config::read_limits(&app.paths.config()).map_err(|e| e.to_string())
 }

@@ -49,6 +49,8 @@ fn main() {
             app::wallet_import,
             app::wallet_unlock,
             app::wallet_forget,
+            app::read_mode,
+            app::set_mode,
             app::read_limits,
             app::save_limits,
         ])
@@ -140,9 +142,20 @@ fn build_tray(tauri_app: &tauri::App) -> tauri::Result<()> {
 /// Also performs the opt-in restart. `Failed` specifically, never `Stopped`: a run the
 /// operator stopped deliberately must stay stopped, and only a process that exited on
 /// its own is a candidate for resurrection.
+/// The restart is also bounded, which it did not used to be.
+///
+/// `runner.start()` returns as soon as the spawn succeeds, so a bot that exits
+/// immediately — a config it refuses, a missing binary, a held port — reads as `Failed`
+/// again four seconds later and is restarted forever, writing a log line each time and
+/// never recovering. A cause that survives several restarts is not one restarting fixes.
+/// After [`RESTART_ATTEMPTS`] consecutive failures the watcher stops trying and leaves
+/// the state visible in the tray; anything that reaches `Running` clears the count.
+const RESTART_ATTEMPTS: u32 = 3;
+
 fn spawn_watcher(handle: tauri::AppHandle) {
     std::thread::spawn(move || {
         let mut last = None;
+        let mut consecutive_restarts: u32 = 0;
         loop {
             std::thread::sleep(Duration::from_secs(WATCH_SECS));
             let state = handle.state::<app::App>();
@@ -165,8 +178,25 @@ fn spawn_watcher(handle: tauri::AppHandle) {
                 last = Some(now);
             }
 
+            if now == RunState::Running {
+                consecutive_restarts = 0;
+            }
+
             if now == RunState::Failed && state.auto_restart.load(Ordering::Relaxed) {
-                let _ = state.runner.start();
+                if consecutive_restarts >= RESTART_ATTEMPTS {
+                    // Said once, at the point it gives up, rather than every four
+                    // seconds for as long as the application is open.
+                    if consecutive_restarts == RESTART_ATTEMPTS {
+                        eprintln!(
+                            "the bot has failed {RESTART_ATTEMPTS} restarts in a row; \
+                             not trying again until it is started deliberately"
+                        );
+                        consecutive_restarts += 1;
+                    }
+                } else {
+                    consecutive_restarts += 1;
+                    let _ = state.runner.start();
+                }
             }
         }
     });

@@ -91,6 +91,88 @@ pub fn write_params(path: &Path, p: &Params) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Everything the operator needs to know about which mode this machine is actually in.
+///
+/// `mode` is what the file says. `effective` is what the bot will use, which is not the
+/// same thing: `Config::load` merges `Env::prefixed("CRYPTOBOT_")` over the TOML, so
+/// `CRYPTOBOT_MODE=live` in the environment beats anything written here. A control that
+/// showed only the file would be telling the operator the opposite of the truth in
+/// exactly the case that matters, so both are reported and the UI says when they differ.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModeStatus {
+    /// What `config.toml` says.
+    pub mode: String,
+    /// What the bot will actually run as, after the environment is applied.
+    pub effective: String,
+    /// Present when `CRYPTOBOT_MODE` is set and therefore overriding the file.
+    pub env_override: Option<String>,
+    /// Whether `CRYPTOBOT_ALLOW_LIVE=1` — the half of the guard that lives outside
+    /// this application and which it deliberately does not set.
+    pub allow_live_set: bool,
+    /// Whether this build can actually execute a trade. Reported rather than assumed,
+    /// because selecting Live while this is false means the bot refuses to start, and
+    /// an operator deserves to know that before they flip it rather than after.
+    pub execution_implemented: bool,
+}
+
+/// Live execution is not built. No swap instructions are encoded, and `cb-bot` links
+/// neither `cb-executor` nor `cb-wallet` nor `solana-sdk`, so there is no path from
+/// that binary to a signature at all.
+///
+/// This constant is the single place that claim is made, so that implementing execution
+/// is a change that has to come here and be argued for.
+pub const EXECUTION_IMPLEMENTED: bool = false;
+
+/// # Errors
+/// If the file cannot be read or parsed.
+pub fn read_mode(path: &Path) -> anyhow::Result<ModeStatus> {
+    let text = std::fs::read_to_string(path)?;
+    let doc: toml_edit::DocumentMut = text.parse()?;
+    let from_file = doc
+        .get("mode")
+        .and_then(toml_edit::Item::as_str)
+        .unwrap_or("paper")
+        .to_string();
+
+    let env_override = std::env::var("CRYPTOBOT_MODE").ok().filter(|v| !v.is_empty());
+    let effective = env_override.clone().unwrap_or_else(|| from_file.clone());
+    let allow_live_set =
+        std::env::var(cb_core::config::LIVE_ENV_VAR).ok().as_deref() == Some("1");
+
+    Ok(ModeStatus {
+        mode: from_file,
+        effective,
+        env_override,
+        allow_live_set,
+        execution_implemented: EXECUTION_IMPLEMENTED,
+    })
+}
+
+/// Write `mode`, and nothing else.
+///
+/// This is the mechanism whose *absence* used to be the guarantee. It exists now
+/// because the operator asked for a control, so the guarantee has to be carried by
+/// something real instead: the second switch still lives outside this application, the
+/// bot refuses any live config outright while execution is unbuilt, and every mode
+/// indicator is now derived rather than hardcoded so a live run cannot present as paper.
+///
+/// # Errors
+/// If the mode is not one of the two the config understands, or the file cannot be
+/// read, parsed or written.
+pub fn write_mode(path: &Path, mode: &str) -> anyhow::Result<()> {
+    // Only the two strings serde will parse. Anything else deserialises to an error at
+    // the bot's next start, which would present as "the app saved it and the bot broke".
+    if mode != "paper" && mode != "live" {
+        anyhow::bail!("mode must be \"paper\" or \"live\", not {mode:?}");
+    }
+    let text = std::fs::read_to_string(path)?;
+    let mut doc: toml_edit::DocumentMut = text.parse()?;
+    doc["mode"] = toml_edit::value(mode);
+    std::fs::write(path, doc.to_string())?;
+    Ok(())
+}
+
 /// Read the risk limits, falling back to the conservative defaults for anything the
 /// file does not mention.
 ///
@@ -242,5 +324,76 @@ max_position_lamports = 20000000
             Params { capital_usd: -1.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 3 };
         let _ = write_params(&p, &bad);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
+    }
+
+    // ── mode ────────────────────────────────────────────────────────────────
+
+    fn mode_file(name: &str, body: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join("cb-desk-mode-tests").join(name);
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("config.toml");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn mode_round_trips_through_the_file() {
+        let p = mode_file("roundtrip", "mode = \"paper\"\ncapital_usd = 100.0\n");
+        assert_eq!(read_mode(&p).unwrap().mode, "paper");
+        write_mode(&p, "live").unwrap();
+        assert_eq!(read_mode(&p).unwrap().mode, "live");
+        write_mode(&p, "paper").unwrap();
+        assert_eq!(read_mode(&p).unwrap().mode, "paper");
+    }
+
+    /// Anything the bot's serde cannot parse would present as "the app saved it and the
+    /// bot broke", so it is refused at the point of writing instead.
+    #[test]
+    fn a_mode_the_config_cannot_parse_is_refused_and_nothing_is_written() {
+        let p = mode_file("badmode", "mode = \"paper\"\n");
+        let before = std::fs::read_to_string(&p).unwrap();
+        for bad in ["Live", "LIVE", "real", "", "true", "papers"] {
+            assert!(write_mode(&p, bad).is_err(), "{bad:?} should not be accepted");
+        }
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
+    }
+
+    /// The file is mostly prose explaining every number in it. A mode switch must not
+    /// be the thing that deletes it.
+    #[test]
+    fn switching_mode_keeps_the_rest_of_the_file_intact() {
+        let body = "# why this is paper\nmode = \"paper\"\n\n# the capital note\ncapital_usd = 100.0\n";
+        let p = mode_file("comments", body);
+        write_mode(&p, "live").unwrap();
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(after.contains("# why this is paper"));
+        assert!(after.contains("# the capital note"));
+        assert!(after.contains("capital_usd = 100.0"));
+        assert!(after.contains("mode = \"live\""));
+    }
+
+    /// A config with no `mode` key deserialises to Paper in cb-core, so reading one
+    /// must agree rather than inventing a different default.
+    #[test]
+    fn a_config_without_a_mode_key_reads_as_paper() {
+        let p = mode_file("nomode", "capital_usd = 100.0\n");
+        assert_eq!(read_mode(&p).unwrap().mode, "paper");
+    }
+
+    /// A canary, not a preference. If someone implements execution and flips this
+    /// constant, this test fails and points at the places that have to change with it:
+    /// the refusal in `set_mode`, the bail in `crates/bot/src/main.rs`, the UI copy,
+    /// and HANDOVER's invariant list.
+    // Asserting on a constant is normally pointless, which is what the lint is for.
+    // Here the constant is the subject: the test exists to fail the moment it changes.
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn execution_is_still_unimplemented_and_several_things_say_so() {
+        assert!(
+            !EXECUTION_IMPLEMENTED,
+            "execution is now implemented — update set_mode's refusal, the bot's startup \
+             bail, the Mode panel copy, and HANDOVER invariant 1 in the same change"
+        );
     }
 }

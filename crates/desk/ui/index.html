@@ -245,11 +245,25 @@
         </div>
       </div>
       <h2 style="margin-top:20px">Mode</h2>
-      <p class="note">
-        <b>Paper.</b> There is no control here that can change it. Live execution needs
-        both a config edit and an environment switch, and this application implements
-        neither — the guarantee is the absence of a mechanism, not a dialog.
-      </p>
+      <div class="field">
+        <label><input type="radio" name="mode" id="modeDemo" value="paper" style="width:auto">
+          <b>Demo</b> — price every cycle and record what would have cleared. Signs nothing.</label>
+        <label style="margin-top:8px"><input type="radio" name="mode" id="modeLive" value="live" style="width:auto">
+          <b>Live</b> — sign and submit real transactions with the configured key.</label>
+      </div>
+      <p class="note" id="modeState">Checking…</p>
+      <div class="field" id="modeConfirmWrap" hidden>
+        <label for="fModeConfirm">Type <code>LIVE</code> to confirm</label>
+        <input type="text" id="fModeConfirm" autocomplete="off" spellcheck="false">
+        <div class="hint">
+          Switching either way archives the current run. The ledger has no column saying
+          which mode produced a row, so a run that changed mode part way through would
+          leave a P&amp;L that is part simulation and part real money with no way to
+          separate them.
+        </div>
+      </div>
+      <button id="btnSetMode">Apply mode</button>
+      <p class="note" id="modeResult"></p>
 
       <h2 style="margin-top:20px">Wallet</h2>
       <div class="warn">
