@@ -15,6 +15,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 cb-dex = { workspace = true }
+cb-executor = { workspace = true }
+cb-wallet = { workspace = true }
+solana-sdk = { workspace = true }
 cb-feed = { workspace = true }
 bs58 = { workspace = true }
 reqwest = { workspace = true }

@@ -29,4 +29,5 @@ chrono = { workspace = true }
 cb-wallet = { workspace = true }
 cb-executor = { workspace = true }
 solana-sdk = { workspace = true }
+zeroize = "1.8"
 bs58 = { workspace = true }

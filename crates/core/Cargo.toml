@@ -11,3 +11,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 figment = { workspace = true }
 ruint = { workspace = true }
+
+[dev-dependencies]
+# Only the tests parse TOML directly; the crate itself goes through figment.
+toml = "0.8"

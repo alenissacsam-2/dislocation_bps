@@ -172,6 +172,12 @@ impl RiskGate {
         }
     }
 
+    /// Why trading is stopped, if it is.
+    #[must_use]
+    pub fn halted(&self) -> Option<String> {
+        self.halted.clone()
+    }
+
     /// Clear a halt. Requires an explicit act, and says so in the log.
     pub fn resume(&mut self) {
         if let Some(prev) = self.halted.take() {

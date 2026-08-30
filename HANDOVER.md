@@ -10,9 +10,15 @@ way it is probably lying right now.
 
 ## 1. What this is, and what it has concluded
 
-A **measurement instrument** for Solana AMM arbitrage, running in paper mode against
-live mainnet. It has never signed a transaction and has no key material. It is not a
-money-maker and the measurements say it cannot become one at this capital.
+A **measurement instrument** for Solana AMM arbitrage, running against live mainnet. It
+is not a money-maker and the measurements say it cannot become one at this capital.
+
+**As of 2026-08-30 it can also trade.** Live execution was built on request: swap
+encoders for Orca Whirlpool and Raydium CLMM, transaction assembly, and a risk-gated
+submission path. Nothing about the measurement changed — the edge is still negative
+against the 2 bps cost floor, and §4's fee-tier question is still open. What changed is
+that the instrument is now capable of acting on a number it says not to act on. Invariant
+1 in §8 is the thing to read before touching any of it.
 
 The answer it has produced, in three numbers:
 
@@ -102,10 +108,22 @@ cb-bot --verify                 # audit decoders against an independent router
 The API is on `http://127.0.0.1:8787` while running: `/api/health`, `/api/stream`,
 `/api/equity`. It no longer serves a UI.
 
-`config.toml` — `mode = "paper"`. **Leave it there.** Nothing here should be given keys
-on the strength of these measurements. There is no execution code to give them to: the
-placeholder `crates/executor` was deleted on 2026-08-23 precisely so that nobody mistakes
-an empty crate with a confident name for something that was ever built or tested.
+`config.toml` — `mode` and `dry_run`. **The measurements do not justify moving either.**
+
+`mode = "live"` arms execution: it loads a key, builds routes, signs, and simulates
+against live state. `dry_run = false` is what lets the last step happen. They are
+separate on purpose, and both default to safe. Arming live also needs
+`CRYPTOBOT_ALLOW_LIVE=1` in the environment and the wallet passphrase fed to `cb-bot`'s
+stdin, which `cryptobot-desk` does — a `cb-bot` started by hand in live mode blocks
+waiting for one.
+
+```powershell
+cb-verify-encode                      # check the encoders against mainnet; no key, no funds
+cb-verify-encode --as <address>       # and the account order, using a public address
+```
+
+Run the first before trusting anything under §8 invariant 1b, and the second before
+setting `dry_run = false`.
 
 ### The installer, and the two shapes of install — added 2026-08-24
 
@@ -529,32 +547,74 @@ leaves the most recent writes behind.
 
 ## 8. Invariants — do not break these
 
-1. **Paper mode.** `mode = "paper"`. **Revised 2026-08-30** — the original wording was
-   "no key material anywhere", and that half is deliberately no longer true: the
-   application takes a key, encrypts it under a passphrase, and stores it at
-   `keypair-encrypted.json` (matched by the `keypair*.json` rule `.gitignore` has carried
-   since the first commit). The Mode control can now write `mode`, so the guarantee is
-   no longer "there is no mechanism". What carries it instead, and what must not be
-   weakened without an argument:
-   - `cb-bot` depends on neither `cb-executor`, `cb-wallet`, nor `solana-sdk`. **That
-     binary contains no code that can sign.** This is the strongest property in the
-     workspace and the only one that holds regardless of any config, any environment
-     variable, and any mistake in the application. Adding one of those dependencies is
-     the change that needs justifying.
-   - `crates/bot/src/main.rs` refuses to start against `mode = "live"` at all — not only
-     when both switches are set. It used to warn and continue in the half-armed case,
-     which was harmless while nothing could write `mode` and is the most likely mistake
-     now that something can.
-   - Every mode indicator is derived from the config. They were all hardcoded `"paper"`
-     literals — the startup log, `/api/health`, the status the footer renders, and
-     `Execution.paper` — so a live run could not have announced itself.
-   - `CRYPTOBOT_ALLOW_LIVE=1` is set outside the application, which does not set it.
-   - `cb_desk::config::EXECUTION_IMPLEMENTED` is the single place the "not built" claim
-     is made, and a test fails when it flips.
+1. **Live execution exists. Read this before changing anything under it.**
+   **Rewritten 2026-08-30**, for the second time in one day, because the thing the
+   previous version rested on is gone.
+
+   That version said: *`cb-bot` depends on neither `cb-executor`, `cb-wallet`, nor
+   `solana-sdk` — that binary contains no code that can sign. This is the strongest
+   property in the workspace and the only one that holds regardless of any config, any
+   environment variable, and any mistake in the application.* It also said that adding
+   one of those dependencies was the change that needed justifying.
+
+   All three are now dependencies of `cb-bot`, and `crates/bot/src/execute.rs` builds
+   real swaps. **The strongest property in the workspace has been deleted on request.**
+   Nothing brings it back except deleting that module, and no amount of care in what
+   follows is equivalent to it — the difference between "cannot" and "will not" is the
+   whole of what was lost. Say so plainly to whoever asks next.
+
+   What carries the guarantee now, in the order a mistake meets it. None of these is
+   absolute and all of them are checkable:
+
+   - **Two switches, owned by different parties.** `mode = "live"` in the config, which
+     the application writes, **and** `CRYPTOBOT_ALLOW_LIVE=1` in the environment, which
+     it deliberately does not set. `main.rs` refuses to start half-armed rather than
+     warning and continuing in paper.
+   - **A passphrase that arrives on stdin at spawn.** The key is encrypted at rest, and
+     a live config on its own loads nothing and signs nothing. Not a config value, not
+     an environment variable, not a file beside the key — stdin is the only channel that
+     closes after start-up and never appears in a process listing. The consequence is
+     deliberate: `cryptobot-desk` must feed it, and a `cb-bot` started by hand in live
+     mode blocks waiting for one.
+   - **`dry_run`, defaulting to true**, and separate from `mode` so that arming
+     execution and spending money are two decisions. A config that does not mention it
+     is a dry run; `cb-core` has a test that fails if that stops being true.
+   - **The risk gate**, checked before the chain is asked anything. A non-positive size
+     is refused, which is not a formality: the first version of `Trader::attempt` passed
+     zero and was refused at the gate before it ever reached mainnet, and every unit
+     test passed while it was broken.
+   - **Simulation against live state, every time, with the profit read from the
+     resulting balance** rather than from the quote. `Plan::execute` has no path that
+     submits without simulating first. This is what makes an unverified account order
+     survivable — a wrong instruction fails in simulation and costs a round trip.
+   - **The route's two floor invariants** (`crates/executor/src/route.rs`): each hop's
+     output floor must cover the next hop's input, and the last must exceed the first's
+     input. A route violating either refuses to encode. So a transaction that lands is
+     profitable by construction, enforced by the AMM programs rather than by this
+     codebase's arithmetic.
+
+   `cb_desk::config::EXECUTION_IMPLEMENTED` is now `true` and no longer carries a safety
+   claim; it says only that the machinery exists, which is why `set_mode` stopped
+   refusing on it and started checking the environment switch instead.
 
    Note that `Config::load` merges `Env::prefixed("CRYPTOBOT_")` over the file, so
-   `CRYPTOBOT_MODE=live` overrides `config.toml` and the application cannot prevent it.
-   The Mode panel reports the effective mode and says when the environment is winning.
+   `CRYPTOBOT_MODE=live` and `CRYPTOBOT_DRY_RUN=false` both override `config.toml` and
+   the application cannot prevent it. The Mode panel reports the effective mode and says
+   when the environment is winning.
+
+1b. **What is verified, and what is not.** `cb-verify-encode` checked every pool in the
+   registry against mainnet: **154 of 154 vault checks and 53 of 53 readable tick arrays
+   agree**, with no contradictions. That establishes the account offsets and the PDA
+   derivations. It does **not** establish the account *order* inside an instruction.
+
+   Simulating as a real address got the program to dispatch `Swap` and accept every
+   account up to position 3 of 11 — where it stopped, because that address holds no
+   token account for the pool's mints. So the discriminator and three accounts are
+   confirmed and the other eight are not. Completing it needs an address that holds both
+   mints; `cb-verify-encode --as <address>` runs it, and only the public address is
+   needed. **Until that column is clean, treat the account orders as unproven and leave
+   `dry_run = true`.**
+
 2. **Every priced number comes from chain.** Venue APIs are a directory only. No
    hardcoded price of anything, SOL included — the USD index walks the pool graph out
    from USDC/USDT and nothing else is assumed to be a dollar.

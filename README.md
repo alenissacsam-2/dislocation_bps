@@ -3,17 +3,19 @@
 **A measurement instrument for Solana AMM arbitrage.** It watches live mainnet, prices
 every arbitrage cycle it can see, and records what *would* have cleared.
 
-It has never signed a transaction, and the binary that does the measuring still cannot —
-`cb-bot` links no signing code at all. It exists to answer one question honestly:
-**is there a tradeable edge, and how big is it?** The answer so far is no, and the
-execution machinery described below was built to be ready if that ever changes, not
-because it has.
+It exists to answer one question honestly: **is there a tradeable edge, and how big is
+it?** The answer so far is **no** — the median opportunity is worth $0.0013 and the
+cheapest round trip costs 2 bps.
+
+It can also trade, as of 2026-08-30. That is a different thing from the answer being
+yes: live execution was built on request, it is off behind four switches, and the
+instrument's own measurements still say not to use it.
 
 [![ci](https://github.com/alenissacsam-2/dislocation_bps/actions/workflows/ci.yml/badge.svg)](https://github.com/alenissacsam-2/dislocation_bps/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/alenissacsam-2/dislocation_bps?color=e0b341)](https://github.com/alenissacsam-2/dislocation_bps/releases/latest)
 [![licence](https://img.shields.io/badge/licence-MIT-blue)](LICENSE)
 ![platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey)
-![mode](https://img.shields.io/badge/mode-paper%20only-brightgreen)
+![mode](https://img.shields.io/badge/default-paper%20%2B%20dry%20run-brightgreen)
 
 ![The application, showing a completed run](docs/app.png)
 
@@ -97,8 +99,9 @@ the very process it was observing, so a stopped bot showed no history at all.
 **`cb-bot`** is the instrument itself, and runs headless:
 
 ```powershell
-cb-bot --report     # read the ledger without stopping the run
-cb-bot --verify     # audit every decoder against an independent router
+cb-bot --report        # read the ledger without stopping the run
+cb-bot --verify        # audit every decoder against an independent router
+cb-verify-encode       # audit every swap encoder against live mainnet
 ```
 
 > Run `cb-bot` from the repository root. It creates its ledger in the working directory,
@@ -121,7 +124,7 @@ crates/bot        the event loop, venue dispatch, --report and --verify
 crates/server     event bus and three read-only API endpoints
 crates/desk       the Windows application (Tauri v2)
 crates/wallet     encrypted key custody — Argon2id, ChaCha20-Poly1305
-crates/executor   swap encoding, transaction assembly, risk limits. Not linked by cb-bot
+crates/executor   swap encoding, PDA derivation, transaction assembly, risk limits
 ```
 
 **The central mathematical fact**, in `crates/core/src/clmm.rs`: a concentrated-liquidity
@@ -197,10 +200,56 @@ worth more than the quote that motivated the trade.
 
 ## Safety
 
-Live trading requires **two independent switches** — `mode = "live"` in config *and*
-`CRYPTOBOT_ALLOW_LIVE=1` in the environment — and neither does anything, because nothing
-wires the executor to the bot. The swap encoders exist and are verified at the address
-level; no code path reaches them from a running measurement.
+Live trading is armed by **three independent things, owned by different parties**:
+
+| | |
+|---|---|
+| `mode = "live"` in `config.toml` | the app writes it |
+| `CRYPTOBOT_ALLOW_LIVE=1` | the environment; the app deliberately does not set it |
+| the wallet passphrase, on `cb-bot`'s stdin | only you have it |
+
+Two of the three are not enough. A `cb-bot` started by hand in live mode blocks waiting
+for a passphrase, and a live config on its own loads no key.
+
+Past that there is a fourth switch, `dry_run`, which **defaults to true**. While it is
+true the bot builds, signs and simulates real transactions and submits none. Arming
+execution and spending money are deliberately two decisions.
+
+And past *that*, every trade is simulated against live state before submission, with the
+profit read from the resulting balance rather than from the quote — so a wrong
+instruction fails in simulation and costs a round trip. The route also refuses to encode
+any cycle whose last output floor does not exceed its first input, which means a
+transaction that lands is profitable by construction, enforced by the AMM programs
+rather than by this codebase's arithmetic.
+
+**What was given up to get here:** until 2026-08-30 `cb-bot` linked no signing code at
+all, so no config and no mistake could produce a transaction. That property is gone —
+the guarantees above are runtime checks, and the difference between *cannot* and *will
+not* is real. See §8 invariant 1 of [`HANDOVER.md`](HANDOVER.md).
+
+A key is encrypted under a passphrase you choose, stored outside the repository's
+tracked files, and never committed.
+
+### If you do arm it
+
+In this order, and not out of it:
+
+1. **Fund the address.** Every token account a cycle opens costs ~0.00204 SOL in rent,
+   permanently locked while it exists, and a three-hop cycle touches three mints. The
+   floor is roughly **0.0062 SOL before a single instruction runs** — about 400× the
+   transaction fee, and the part that surprises people. The Wallet panel reports the
+   binding constraint by name rather than making you work it out.
+2. **Finish the verification.** `cb-verify-encode --as <your address>` only reaches
+   account 3 of 11 while the address holds none of the pools' mints. Once funded it runs
+   to completion, and that is the account-order proof.
+3. **Set `CRYPTOBOT_ALLOW_LIVE=1`** in the environment `cryptobot-desk` runs in, and
+   restart it. The app will not set this for you and refuses to arm Live without it.
+4. **Unlock the key**, then switch Mode to Live and type `LIVE` to confirm. The panel
+   shows the address that will sign and what it holds before you commit.
+5. **Leave `dry_run = true` and watch.** The bot will build, sign and simulate real
+   transactions and submit none, logging what it would have done. Read that for a while.
+6. Only then consider `dry_run = false` — against an edge the instrument measures as
+   negative.
 
 The application **does** now expose a Mode control, so the guarantee is no longer the
 absence of a mechanism. It is carried by four things that are: the second switch still

@@ -789,13 +789,16 @@ dependencies = [
  "bs58",
  "cb-core",
  "cb-dex",
+ "cb-executor",
  "cb-feed",
  "cb-ledger",
  "cb-scanner",
  "cb-server",
+ "cb-wallet",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "solana-sdk",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -810,6 +813,7 @@ dependencies = [
  "ruint",
  "serde",
  "thiserror 2.0.20",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -830,6 +834,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-autostart",
  "toml_edit 0.22.27",
+ "zeroize",
 ]
 
 [[package]]

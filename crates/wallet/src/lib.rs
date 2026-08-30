@@ -450,4 +450,22 @@ mod tests {
         let msg = b"a transaction would go here";
         assert!(w.sign(msg).verify(&w.pubkey().to_bytes(), msg));
     }
+
+    /// Mint a throwaway encrypted key at `CB_TEST_KEY_OUT`, for integration runs.
+    ///
+    /// Ignored by default and run explicitly. This exists so that an end-to-end live
+    /// dry run can be exercised without touching an operator's real key — the wallet
+    /// it produces holds nothing and its passphrase is in this file, so it is useless
+    /// for anything except proving the pipeline arms.
+    #[test]
+    #[ignore = "writes a file; run explicitly with CB_TEST_KEY_OUT set"]
+    fn mint_a_throwaway_key_for_integration_runs() {
+        let Ok(out) = std::env::var("CB_TEST_KEY_OUT") else {
+            panic!("set CB_TEST_KEY_OUT to the path to write");
+        };
+        let secret = a_keypair();
+        let sealed = EncryptedKey::seal(secret.as_slice(), "integration").unwrap();
+        sealed.save(std::path::Path::new(&out)).unwrap();
+        println!("wrote {out} for {}", sealed.pubkey);
+    }
 }

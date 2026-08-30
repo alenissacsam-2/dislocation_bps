@@ -631,14 +631,19 @@ async function paintMode() {
       + `This application cannot change that — unset the variable and restart it.`);
   }
   if (!m.executionImplemented) {
-    lines.push("<b>Live execution is not implemented in this build.</b> No swap instructions are "
-      + "encoded, and <code>cb-bot</code> links no signing code, so Live cannot be armed. "
-      + "Demo is the whole of what currently works.");
+    lines.push("<b>Live execution is not built in this binary.</b> Demo is the whole of what "
+      + "works here.");
+  } else if (m.effective === "live") {
+    lines.push("<b>Live is armed.</b> Whether anything is actually submitted depends on "
+      + "<code>dry_run</code> in <code>config.toml</code>: while it is true the bot builds, "
+      + "signs and simulates real transactions and sends none. That is a second, separate "
+      + "decision from this switch.");
   }
   lines.push(m.allowLiveSet
     ? "<code>CRYPTOBOT_ALLOW_LIVE=1</code> is set — the outside half of the guard is open."
-    : "<code>CRYPTOBOT_ALLOW_LIVE</code> is not set. That is the half of the guard that lives "
-      + "outside this application, and it deliberately does not set it for you.");
+    : "<code>CRYPTOBOT_ALLOW_LIVE</code> is not set, so Live cannot be armed and the bot "
+      + "would refuse to start against a live config. That is the half of the guard that "
+      + "lives outside this application, and it deliberately does not set it for you.");
   $("modeState").innerHTML = lines.join("<br><br>");
 }
 

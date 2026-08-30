@@ -39,6 +39,19 @@ pub struct WalletStatus {
 #[derive(Default)]
 pub struct Custody {
     unlocked: Mutex<Option<Wallet>>,
+    /// The passphrase, kept only so it can be handed to the bot process at spawn.
+    ///
+    /// # Why this is not a step backwards
+    ///
+    /// This process already holds the *decrypted key* in memory a few bytes away. A
+    /// passphrase is strictly less dangerous than the thing it unlocks, so keeping it
+    /// adds no exposure that unlocking had not already created — and the alternative is
+    /// worse: handing the child the key bytes themselves, or asking the operator to
+    /// retype it every time the bot restarts, which for an auto-restarting supervisor
+    /// means a live run that silently stops trading.
+    ///
+    /// It is zeroized on drop and cleared by [`Custody::forget`] along with the key.
+    passphrase: Mutex<Option<zeroize::Zeroizing<String>>>,
 }
 
 impl Custody {
@@ -47,14 +60,28 @@ impl Custody {
         self.unlocked.lock().is_ok_and(|g| g.is_some())
     }
 
-    pub fn store(&self, w: Wallet) {
+    pub fn store(&self, w: Wallet, passphrase: &str) {
         if let Ok(mut g) = self.unlocked.lock() {
             *g = Some(w);
         }
+        if let Ok(mut g) = self.passphrase.lock() {
+            *g = Some(zeroize::Zeroizing::new(passphrase.to_string()));
+        }
+    }
+
+    /// The passphrase, for handing to the bot at spawn. `None` unless unlocked.
+    #[must_use]
+    pub fn passphrase(&self) -> Option<String> {
+        self.passphrase.lock().ok()?.as_ref().map(|p| p.to_string())
     }
 
     pub fn forget(&self) {
         if let Ok(mut g) = self.unlocked.lock() {
+            *g = None;
+        }
+        // Both, always. A passphrase outliving the key it unlocks is a secret kept for
+        // nothing.
+        if let Ok(mut g) = self.passphrase.lock() {
             *g = None;
         }
     }
@@ -122,7 +149,7 @@ pub fn unlock(
     let stored = EncryptedKey::load(path).map_err(|e| e.to_string())?;
     let w = stored.unseal(passphrase).map_err(|e| e.to_string())?;
     let pubkey = w.pubkey().to_string();
-    custody.store(w);
+    custody.store(w, passphrase);
     Ok(WalletStatus { configured: true, pubkey: Some(pubkey), unlocked: true })
 }
 

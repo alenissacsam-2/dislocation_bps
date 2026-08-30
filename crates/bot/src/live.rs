@@ -196,6 +196,14 @@ pub struct LiveOpportunity {
     pub profit_at_capital_usd: [f64; 3],
     pub edge_bps: f64,
     pub fee_bps: f64,
+    /// Everything execution needs to rebuild this cycle as instructions.
+    ///
+    /// Built here, from the legs that produced the quote, because re-deriving it later
+    /// from the recorded USD figures would be a guess about which pools were involved —
+    /// and a swap against the wrong pool is not a rounding error. `None` when a leg
+    /// would not quote at the chosen size, which is the same condition that makes the
+    /// opportunity untradeable anyway.
+    pub plan: Option<crate::execute::CyclePlan>,
     pub slot: u64,
     /// Slots between the freshest and stalest leg of this loop.
     ///
@@ -675,9 +683,36 @@ impl LiveMarket {
                         * usd_per_unit;
                 }
 
+                // Quote each leg in turn at the size actually chosen. `chain_quote`
+                // returns only the final amount, and execution needs the intermediate
+                // ones: each hop's floor is derived from its own quote, and a floor
+                // taken from the wrong leg is a floor the pool cannot meet.
+                let plan = (|| {
+                    let mut leg_out = Vec::with_capacity(p.cycle.legs.len());
+                    let mut amt = p.capped_in;
+                    for leg in &p.cycle.legs {
+                        let out = leg.quote(amt)?;
+                        leg_out.push(out);
+                        amt = out;
+                    }
+                    let pools: Vec<_> = p
+                        .cycle
+                        .pools
+                        .iter()
+                        .map(|id| snap.get(id).map(|st| (id.0, st.dex)))
+                        .collect::<Option<Vec<_>>>()?;
+                    Some(crate::execute::CyclePlan {
+                        pools,
+                        mints: p.cycle.mints.clone(),
+                        amount_in: p.capped_in,
+                        leg_out,
+                    })
+                })();
+
                 opportunities.push(LiveOpportunity {
                     route: self.route_label(&p.cycle.mints),
                     cycle_key: p.cycle.canonical_key(),
+                    plan,
                     venues: self.venue_label(&p.cycle.pools),
                     hops: p.cycle.hops(),
                     size_usd: p.capped_in as f64 * usd_per_unit,

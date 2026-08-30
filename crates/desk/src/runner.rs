@@ -50,7 +50,14 @@ pub trait BotRunner: Send + Sync {
     /// # Errors
     /// If a child is already tracked, the port is held by someone else, the binary is
     /// missing, or the spawn itself fails.
-    fn start(&self) -> anyhow::Result<()>;
+    /// Start the instrument.
+    ///
+    /// `passphrase` is `Some` only when the config asks for live mode and the key is
+    /// unlocked in this session. It is written to the child's stdin and dropped; it is
+    /// never an argument, never an environment variable, and never touches disk. An
+    /// argument appears in every process listing on the machine, and an environment
+    /// variable is inherited by everything the child spawns.
+    fn start(&self, passphrase: Option<String>) -> anyhow::Result<()>;
     /// # Errors
     /// If the child cannot be reaped.
     fn stop(&self) -> anyhow::Result<()>;
@@ -72,7 +79,7 @@ impl NativeRunner {
 }
 
 impl BotRunner for NativeRunner {
-    fn start(&self) -> anyhow::Result<()> {
+    fn start(&self, passphrase: Option<String>) -> anyhow::Result<()> {
         let mut guard = self.child.lock().unwrap();
         if guard.is_some() {
             anyhow::bail!("the instrument is already running");
@@ -91,12 +98,34 @@ impl BotRunner for NativeRunner {
         }
         let out = std::fs::OpenOptions::new().create(true).append(true).open(&self.log)?;
         let err = out.try_clone()?;
-        let child = Command::new(&self.exe)
+        let mut child = Command::new(&self.exe)
             .current_dir(&self.cwd)
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))
-            .stdin(Stdio::null())
+            // Piped even in paper mode. A bot that finds a live config blocks reading
+            // this, and a null stdin would give it EOF and a confusing "no passphrase
+            // arrived" instead of the wait it is supposed to do.
+            .stdin(Stdio::piped())
             .spawn()?;
+
+        // Write it and close the pipe. Closing matters: the child reads one line, and a
+        // pipe left open would leave a paper-mode bot holding a handle it never reads.
+        if let Some(mut sink) = child.stdin.take() {
+            use std::io::Write;
+            if let Some(secret) = passphrase {
+                let line = format!("{secret}\n");
+                let wrote = sink.write_all(line.as_bytes()).and_then(|()| sink.flush());
+                if let Err(e) = wrote {
+                    // The child is alive and waiting for something it will never get.
+                    // Kill it rather than leaving a process that looks started.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!("could not hand the passphrase to the instrument: {e}");
+                }
+            }
+            drop(sink);
+        }
+
         *guard = Some(child);
         Ok(())
     }
@@ -157,7 +186,7 @@ mod tests {
             PathBuf::from("."),
             std::env::temp_dir().join("cbdesk-test.log"),
         );
-        assert!(r.start().is_err(), "a missing binary must be an error, not a silent no-op");
+        assert!(r.start(None).is_err(), "a missing binary must be an error, not a silent no-op");
     }
 
     /// Spawns the real `cb-bot.exe` and stops it again.
@@ -189,14 +218,14 @@ mod tests {
         let r = NativeRunner::new(exe, root.clone(), root.join("cb-bot.log"));
 
         if already {
-            let err = r.start().expect_err("a bound port must be refused, not raced");
+            let err = r.start(None).expect_err("a bound port must be refused, not raced");
             eprintln!("correctly refused: {err}");
             assert!(err.to_string().contains("refusing"));
             assert_eq!(r.probe(), RunState::Foreign, "a port we did not claim is Foreign");
             return;
         }
 
-        r.start().expect("start the bot");
+        r.start(None).expect("start the bot");
         // Give it time to bind. It reads a pool registry and opens a websocket first,
         // so it is not instant.
         let mut state = r.probe();

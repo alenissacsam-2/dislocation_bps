@@ -6,6 +6,7 @@
 //!
 //! See `docs/superpowers/specs/` for the design and `docs/research/` for the numbers.
 
+mod execute;
 mod live;
 mod registry;
 mod sim;
@@ -47,6 +48,9 @@ const BASE_FEE_SOL: f64 = 0.000_005;
 
 /// Where the measurement goes. The dashboard is a window; this is the record.
 const LEDGER_PATH: &str = "cryptobot.db";
+/// The encrypted key, beside the ledger and the config. Never read without a
+/// passphrase, and never written by this binary.
+const WALLET_FILE: &str = "keypair-encrypted.json";
 
 /// What this run should call itself, everywhere it says so.
 ///
@@ -125,6 +129,102 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+
+/// Load the key and build the executor. Only ever called with both switches set.
+///
+/// # The passphrase does not come from the config, the environment, or a file
+///
+/// It is read from **stdin**, once, at startup. That is not ceremony. A config value
+/// would put it in a file the application writes and the repository could swallow; an
+/// environment variable is visible to anything that can read this process's environment
+/// and is inherited by every child; a file beside the key defeats encrypting the key.
+/// Stdin is the one channel that is closed after start-up and never appears in a
+/// process listing.
+///
+/// The consequence is deliberate and worth stating: **`cryptobot-desk` must feed the
+/// passphrase to this process, and a `cb-bot` started by hand in live mode will block
+/// waiting for one.** A live config on its own cannot trade.
+///
+/// # Errors
+/// If no passphrase arrives, the key is missing, or the passphrase is wrong.
+async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
+    use std::io::BufRead;
+
+    let key_path = std::path::Path::new(WALLET_FILE);
+    if !key_path.exists() {
+        anyhow::bail!(
+            "mode = \"live\" but there is no key at {WALLET_FILE}. Import one in \
+             cryptobot-desk under Parameters -> Wallet."
+        );
+    }
+
+    tracing::info!("live mode: waiting for the wallet passphrase on stdin");
+    let mut passphrase = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut passphrase)
+        .map_err(|e| anyhow::anyhow!("could not read the passphrase from stdin: {e}"))?;
+    let passphrase = passphrase.trim_end_matches(['\r', '\n']).to_string();
+    if passphrase.is_empty() {
+        anyhow::bail!(
+            "no passphrase arrived on stdin. cryptobot-desk supplies it when it starts \
+             the bot in live mode; started by hand, pipe it in."
+        );
+    }
+
+    let sealed = cb_wallet::EncryptedKey::load(key_path)?;
+    let wallet = sealed.unseal(&passphrase)?;
+    // Dropped here rather than left on the stack for the rest of start-up.
+    drop(passphrase);
+
+    let address = wallet.pubkey();
+    let rpc = execute::rpc_for(&cfg.rpc_http_url)?;
+    let limits = cb_executor::risk::Limits::default();
+    let opts = execute::TradeOptions {
+        slippage_bps: cfg.slippage_bps,
+        priority_micro_lamports: cfg.priority_micro_lamports,
+        compute_units: 400_000,
+        dry_run: cfg.dry_run,
+        create_token_accounts: true,
+    };
+    let exec = cb_executor::Executor::new(wallet, rpc, limits, cfg.dry_run)?;
+
+    if cfg.dry_run {
+        tracing::warn!(
+            "LIVE ARMED, DRY RUN: {address} will build and simulate real transactions and \
+             submit none. Set dry_run = false in config.toml to spend."
+        );
+    } else {
+        tracing::error!(
+            "LIVE ARMED, SUBMITTING: {address} will sign and send real transactions. \
+             Every trade is still simulated first and abandoned unless the simulated \
+             balance clears the profit floor."
+        );
+    }
+    // A cycle longer than this cannot be executed atomically, so searching for them in
+    // live mode finds opportunities that can only be refused. Worth saying out loud:
+    // the leaderboard will show cycles the executor will decline, and that is the packet
+    // limit rather than a defect.
+    if cfg.max_hops > execute::MAX_EXECUTABLE_HOPS {
+        tracing::warn!(
+            "max_hops = {} but only {} hops fit in one transaction — longer cycles will \
+             be found, priced, and refused at build time",
+            cfg.max_hops,
+            execute::MAX_EXECUTABLE_HOPS
+        );
+    }
+
+    let trader = execute::Trader::new(exec, opts);
+    tracing::info!(
+        "live executor armed for {} — {} bps slippage floor, {} priority",
+        trader.address(),
+        cfg.slippage_bps,
+        cfg.priority_micro_lamports
+    );
+    Ok(trader)
+}
+
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Reading the measurement should not require starting a feed, a socket, or a
@@ -159,41 +259,74 @@ async fn main() -> anyhow::Result<()> {
             fee_buffer_usd: 0.20,
             min_trade_usd: 10.0,
             max_hops: 3,
+            slippage_bps: 30,
+            priority_micro_lamports: 0,
+            dry_run: true,
         }
     });
 
-    // The guard. Any request to trade for real is refused, not just the fully-armed one.
+    // The guard.
     //
-    // This used to bail only when *both* switches were set, and merely warn when the
-    // config asked for live without the environment switch — "staying in paper mode".
-    // That was safe while nothing could write `mode`. The application can now, which
-    // makes the half-armed state the most likely outcome of a mistake rather than an
-    // unreachable one, and it is precisely the state where the operator believes one
-    // thing and the process is doing another. There is no reading of `mode = "live"`
-    // under which continuing is the helpful answer, so both halves refuse.
+    // This used to refuse `mode = "live"` outright, because execution did not exist and
+    // the binary linked nothing that could sign. Both of those are now false: `crates/
+    // execute.rs` builds real swap instructions and this binary links `cb-executor`,
+    // `cb-wallet` and `solana-sdk`. The strongest property this project had — that no
+    // argument about flags could produce a signature, because the code was absent — is
+    // gone, and what replaces it has to be checked here rather than asserted.
     //
-    // The deeper guarantee is not this check. It is that this binary links nothing that
-    // can sign: cb-bot depends on neither `cb-executor` nor `cb-wallet` nor `solana-sdk`,
-    // so there is no code path from here to a signature regardless of what any config
-    // says. Adding one of those to Cargo.toml is the change that needs an argument.
-    if matches!(cfg.mode, Mode::Live) {
-        anyhow::bail!(
-            "live execution is not implemented, so this refuses to start with mode = \"live\". \
-             No swap instructions are built and this binary contains no signing code. \
-             Switch the Mode control back to Demo in cryptobot-desk, or set \
-             mode = \"paper\" in config.toml."
-        );
-    }
+    // Three things must all be true before a key is ever loaded, and each is owned by a
+    // different party: the config (the application writes it), the environment (the
+    // operator sets it, and the application deliberately does not), and the passphrase
+    // (only the person who chose it has it). Two of the three are not enough.
+    let trader = if matches!(cfg.mode, Mode::Live) {
+        let armed = std::env::var(cb_core::config::LIVE_ENV_VAR)
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if !armed {
+            anyhow::bail!(
+                "config asks for mode = \"live\" but {} is not set to 1. That switch lives \
+                 outside this application on purpose and it does not set it for you. \
+                 Refusing to start half-armed: a process that believes it is trading and \
+                 is not is worse than one that will not start.",
+                cb_core::config::LIVE_ENV_VAR
+            );
+        }
+        Some(arm_live(&cfg).await?)
+    } else {
+        None
+    };
 
     let bus = EventBus::new();
     let addr: SocketAddr = LISTEN.parse()?;
 
     match cfg.feed {
         FeedSource::Simulated => spawn_simulated(bus.clone()),
-        FeedSource::Live => spawn_live(bus.clone(), &cfg).await?,
+        FeedSource::Live => spawn_live(bus.clone(), &cfg, trader).await?,
     }
 
-    tracing::info!("mode: {} — no transaction will be signed or sent", mode_label(&cfg).to_uppercase());
+    // Derived, not asserted. This line said "no transaction will be signed or sent"
+    // unconditionally, which was true while execution did not exist and became a lie the
+    // moment it did — printed, in capitals, in the one mode where it mattered. It is the
+    // same failure as the hardcoded "paper" indicators, in the same file, found by
+    // reading the log of the first live-armed run rather than by a test.
+    match (&cfg.mode, cfg.dry_run) {
+        (Mode::Paper, _) => {
+            tracing::info!("mode: PAPER — no transaction will be signed or sent");
+        }
+        (Mode::Live, true) => {
+            tracing::warn!(
+                "mode: LIVE, dry_run = true — transactions will be built, signed and \
+                 simulated against live state, and none will be submitted"
+            );
+        }
+        (Mode::Live, false) => {
+            tracing::error!(
+                "mode: LIVE, dry_run = false — transactions will be SUBMITTED. Every one \
+                 is simulated first and abandoned unless the simulated balance clears the \
+                 profit floor, but money can move from here"
+            );
+        }
+    }
     tracing::info!("api: http://127.0.0.1:8787 — the window is cryptobot-desk");
 
     // The app reads history from this same ledger directly, rather than through the
@@ -218,7 +351,11 @@ fn spawn_simulated(bus: EventBus) {
     });
 }
 
-async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
+async fn spawn_live(
+    bus: EventBus,
+    cfg: &Config,
+    trader: Option<execute::Trader>,
+) -> anyhow::Result<()> {
     let registry = registry::Registry::embedded()?;
 
     // Report the universe before any data arrives, so the run's headline constraint
@@ -356,6 +493,10 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
     let paper_run = matches!(cfg.mode, Mode::Paper);
 
     tokio::spawn(async move {
+        // Owned by the sweep task, because the risk gate is per-run state and there is
+        // exactly one place trades are decided. `None` in paper mode, and then no code
+        // below can reach a signature no matter what the rest of the loop does.
+        let mut trader = trader;
         let mut next_id: u64 = 1;
         let mut evaluated_total: u64 = 0;
         let mut sweep_n: u32 = 0;
@@ -512,6 +653,8 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                     }
 
                     let sol_price = market.sol_price_usd().unwrap_or(0.0);
+                    // Reset every sweep: one attempt per pass, not one per run.
+                    let mut attempted_this_sweep = false;
                     for opp in sweep.opportunities {
                         let id = next_id;
                         next_id += 1;
@@ -601,8 +744,30 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                             ts_ms: now_ms(),
                         });
 
-                        if skipped.is_none() {
-                            // Paper mode: record what would have happened, sign nothing.
+                        if skipped.is_some() {
+                            continue;
+                        }
+
+                        // At most one attempt per sweep, and it is the first survivor of
+                        // a list already sorted by gross profit. Trying every opportunity
+                        // would submit a dozen transactions against overlapping pools in
+                        // the same slot, each invalidating the next, and would exhaust
+                        // the day's trade budget on one sweep's worth of noise.
+                        // A cycle through a venue with no encoder must not consume the
+                        // sweep's one attempt. Checked before the trader is borrowed, so
+                        // an unencodable best opportunity falls through to the next one
+                        // rather than burning the pass on a refusal we can predict.
+                        let live_attempt = match trader.as_mut() {
+                            Some(t) if !attempted_this_sweep => opp
+                                .plan
+                                .as_ref()
+                                .filter(|plan| plan.encodable())
+                                .map(|plan| (t, plan)),
+                            _ => None,
+                        };
+
+                        let Some((t, plan)) = live_attempt else {
+                            // Paper: record what would have happened, sign nothing.
                             bus.publish(Event::Execution {
                                 id,
                                 opportunity_id: id,
@@ -615,7 +780,57 @@ async fn spawn_live(bus: EventBus, cfg: &Config) -> anyhow::Result<()> {
                                 reason: Some("paper — uncontested, assumed landed".into()),
                                 ts_ms: now_ms(),
                             });
+                            continue;
+                        };
+
+                        attempted_this_sweep = true;
+                        let started = std::time::Instant::now();
+                        let outcome = t.attempt(plan, opp.size_usd, net).await;
+                        let latency_ms = started.elapsed().as_millis() as u64;
+
+                        let (landed, realised, signature, reason) = match outcome {
+                            Ok(cb_executor::Attempt::Submitted { signature, .. }) => {
+                                // Submitted is not landed. The signature is a receipt for
+                                // having asked, and the ledger must not record a profit
+                                // nobody has confirmed — so the realised figure stays at
+                                // zero until a confirmation path fills it in.
+                                t.record(cb_executor::risk::Outcome::Landed { net_usd: 0.0 });
+                                tracing::info!("submitted {signature}");
+                                (true, 0.0, Some(signature), Some("submitted; not yet confirmed".to_string()))
+                            }
+                            Ok(cb_executor::Attempt::SimulationRejected { reason, .. }) => {
+                                tracing::warn!("simulation rejected: {reason}");
+                                (false, 0.0, None, Some(format!("simulation rejected: {reason}")))
+                            }
+                            Ok(cb_executor::Attempt::Refused(why)) => {
+                                tracing::debug!("refused: {why}");
+                                (false, 0.0, None, Some(format!("refused: {why}")))
+                            }
+                            Err(e) => {
+                                // An RPC failure is not a defect in what was built, so it
+                                // must not trip the breaker that exists to catch defects.
+                                t.record(cb_executor::risk::Outcome::Missed);
+                                tracing::warn!("execution could not reach the chain: {e:#}");
+                                (false, 0.0, None, Some(format!("rpc error: {e}")))
+                            }
+                        };
+
+                        if let Some(why) = t.halted() {
+                            tracing::error!("trading halted: {why}");
                         }
+
+                        bus.publish(Event::Execution {
+                            id,
+                            opportunity_id: id,
+                            paper: paper_run,
+                            landed,
+                            realised_usd: realised,
+                            tip_paid_usd: est_tip_usd,
+                            latency_ms,
+                            signature,
+                            reason,
+                            ts_ms: now_ms(),
+                        });
                     }
                 }
             }

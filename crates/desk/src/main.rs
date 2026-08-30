@@ -69,7 +69,7 @@ fn main() {
             // decision, and it must not be a side effect of logging in.
             if std::env::args().any(|a| a == "--start") {
                 let state = tauri_app.state::<app::App>();
-                if let Err(e) = state.runner.start() {
+                if let Err(e) = state.runner.start(app::live_passphrase(&state)) {
                     eprintln!("--start failed: {e}");
                 }
             }
@@ -120,7 +120,7 @@ fn build_tray(tauri_app: &tauri::App) -> tauri::Result<()> {
                     }
                 }
                 "start" => {
-                    let _ = state.runner.start();
+                    let _ = state.runner.start(app::live_passphrase(&state));
                 }
                 "stop" => {
                     let _ = state.runner.stop();
@@ -196,7 +196,7 @@ fn spawn_watcher(handle: tauri::AppHandle) {
                     }
                 } else {
                     consecutive_restarts += 1;
-                    let _ = state.runner.start();
+                    let _ = state.runner.start(app::live_passphrase(&state));
                 }
             }
         }

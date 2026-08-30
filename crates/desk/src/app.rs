@@ -83,9 +83,24 @@ pub async fn bot_status(app: tauri::State<'_, App>) -> Result<serde_json::Value,
 #[tauri::command]
 pub async fn bot_start(app: tauri::State<'_, App>) -> Result<(), String> {
     let runner = Arc::clone(&app.runner);
-    tauri::async_runtime::spawn_blocking(move || runner.start().map_err(|e| e.to_string()))
+    let secret = live_passphrase(&app);
+    tauri::async_runtime::spawn_blocking(move || runner.start(secret).map_err(|e| e.to_string()))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// The passphrase to hand the bot, or `None`.
+///
+/// `Some` only when the config's effective mode is live *and* the key is unlocked in
+/// this session. Deliberately not "whenever we have one": a paper run has no use for it
+/// and should not be given it, and a live run that cannot get it should block on stdin
+/// rather than start and quietly do nothing.
+pub fn live_passphrase(app: &App) -> Option<String> {
+    let mode = config::read_mode(&app.paths.config()).ok()?;
+    if mode.effective != "live" {
+        return None;
+    }
+    app.custody.passphrase()
 }
 
 /// # Errors
@@ -127,6 +142,8 @@ pub async fn save_config(
     config::validate(&params)?;
     let runner = Arc::clone(&app.runner);
     let paths = app.paths.clone();
+    // Captured out here: `app` is a borrow and cannot cross into a 'static task.
+    let secret = live_passphrase(&app);
     // Off the main thread: archiving moves the database and its WAL, which are hundreds
     // of megabytes, and doing that on the event loop freezes the window for the duration.
     tauri::async_runtime::spawn_blocking(move || {
@@ -141,7 +158,7 @@ pub async fn save_config(
         let mut restarted = false;
         let mut restart_error = None;
         if restart && was_running {
-            match runner.start() {
+            match runner.start(secret) {
                 Ok(()) => restarted = true,
                 Err(e) => restart_error = Some(e.to_string()),
             }
@@ -354,17 +371,22 @@ pub async fn set_mode(
         }
         let limits = config::read_limits(&app.paths.config()).map_err(|e| e.to_string())?;
         limits.validate()?;
-        if !config::EXECUTION_IMPLEMENTED {
-            // Refused rather than allowed-with-a-warning. Writing mode = "live" here
-            // would produce a config the bot declines to start with, and an operator
-            // staring at a stopped instrument wondering which of the two things they
-            // just did broke it.
-            return Err(
-                "Live execution is not implemented in this build: no swap instructions are \
-                 encoded and cb-bot links no signing code. Arming live mode would only stop \
-                 the bot from starting. Demo mode is the whole of what currently works."
-                    .into(),
-            );
+
+        // The environment switch, checked here rather than left to fail at spawn.
+        //
+        // The bot refuses to start against a live config without it, by design. Writing
+        // the config anyway would stop the instrument and leave the operator looking at
+        // a dead process wondering which of the two things they just did killed it —
+        // which is the exact failure this refusal used to prevent for a different
+        // reason. Same refusal, real cause.
+        if std::env::var(cb_core::config::LIVE_ENV_VAR).ok().as_deref() != Some("1") {
+            return Err(format!(
+                "{} is not set to 1 in this application's environment, and the bot refuses \
+                 to start against a live config without it. That switch lives outside the \
+                 app on purpose and it does not set it for you. Set it, restart \
+                 cryptobot-desk, then arm live. Nothing has been changed.",
+                cb_core::config::LIVE_ENV_VAR
+            ));
         }
     } else if mode != "paper" {
         return Err(format!("unknown mode {mode:?}"));
@@ -372,6 +394,10 @@ pub async fn set_mode(
 
     let runner = Arc::clone(&app.runner);
     let paths = app.paths.clone();
+    // From the mode being *set*, not the one on disk. `live_passphrase` reads the file,
+    // which still says the old mode here — using it would start a live run with no
+    // passphrase, and the bot would sit blocked on stdin looking like a hang.
+    let secret = if going_live { app.custody.passphrase() } else { None };
     tauri::async_runtime::spawn_blocking(move || {
         let was_running = matches!(runner.probe(), RunState::Running | RunState::Starting);
         if was_running {
@@ -387,7 +413,7 @@ pub async fn set_mode(
         let mut restarted = false;
         let mut restart_error = None;
         if was_running {
-            match runner.start() {
+            match runner.start(secret) {
                 Ok(()) => restarted = true,
                 Err(e) => restart_error = Some(e.to_string()),
             }

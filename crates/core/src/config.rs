@@ -77,6 +77,31 @@ pub struct Config {
     /// live among the majors.
     #[serde(default = "default_max_hops")]
     pub max_hops: usize,
+
+    /// How far below each hop's quote its output floor is set, in basis points.
+    ///
+    /// Deliberately generous against an edge measured in single bps. The floor exists
+    /// to stop a *bad* fill; what stops a *pointless* one is the route's refusal to
+    /// encode a cycle whose last floor does not exceed its first input. A floor tight
+    /// enough to be the binding constraint converts wins into reverts and pays the fee
+    /// for both.
+    #[serde(default = "default_slippage_bps")]
+    pub slippage_bps: u32,
+
+    /// Priority bid, in micro-lamports per compute unit. Zero pays the base fee only.
+    #[serde(default)]
+    pub priority_micro_lamports: u64,
+
+    /// Simulate every trade and submit none.
+    ///
+    /// **Defaults to true, and that is not a placeholder.** `mode = "live"` arms the
+    /// machinery: keys are loaded, routes are built, transactions are signed and run
+    /// against live state. This is the switch that decides whether the last step
+    /// happens. Turning it off is the moment real money can move, and it is separate
+    /// from `mode` so that arming live execution and spending are two decisions rather
+    /// than one.
+    #[serde(default = "default_dry_run")]
+    pub dry_run: bool,
 }
 
 fn default_capital() -> f64 {
@@ -94,6 +119,14 @@ fn default_min_trade() -> f64 {
 }
 fn default_max_hops() -> usize {
     3
+}
+/// Thirty basis points. See the field's own documentation for why it is not tighter.
+fn default_slippage_bps() -> u32 {
+    30
+}
+/// True. The only safe default for a field whose false value spends money.
+fn default_dry_run() -> bool {
+    true
 }
 
 impl Config {
@@ -157,6 +190,9 @@ mod tests {
             fee_buffer_usd: 0.20,
             min_trade_usd: 10.0,
             max_hops: 3,
+            slippage_bps: 30,
+            priority_micro_lamports: 0,
+            dry_run: true,
         }
     }
 
@@ -235,5 +271,50 @@ mod tests {
         let mut c = cfg(Mode::Paper);
         c.feed = FeedSource::Live;
         assert!(!c.is_live_enabled_with(Some("1")));
+    }
+
+    /// The last thing between an armed live config and a real transaction.
+    ///
+    /// A config written without the key — by an older build, by hand, by a partial
+    /// write — must read as dry. The failure direction of getting this wrong is
+    /// spending money nobody asked to spend, so the default is not a convenience.
+    #[test]
+    fn a_config_that_does_not_mention_dry_run_is_a_dry_run() {
+        let cfg: Config = toml::from_str(
+            "mode = \"live\"
+rpc_ws_url = \"wss://x\"
+min_profit_lamports = 0
+             max_position_lamports = 1
+",
+        )
+        .expect("a config without the optional keys must still parse");
+        assert!(cfg.dry_run, "a config with no dry_run key must not submit transactions");
+        assert_eq!(cfg.slippage_bps, 30);
+        assert_eq!(cfg.priority_micro_lamports, 0);
+    }
+
+    /// And the value is honoured when it *is* written, in both directions — a default
+    /// that ignored the file would be worse than no default.
+    #[test]
+    fn an_explicit_dry_run_setting_is_honoured_both_ways() {
+        let live: Config = toml::from_str(
+            "rpc_ws_url = \"wss://x\"
+min_profit_lamports = 0
+max_position_lamports = 1
+             dry_run = false
+",
+        )
+        .unwrap();
+        assert!(!live.dry_run);
+
+        let dry: Config = toml::from_str(
+            "rpc_ws_url = \"wss://x\"
+min_profit_lamports = 0
+max_position_lamports = 1
+             dry_run = true
+",
+        )
+        .unwrap();
+        assert!(dry.dry_run);
     }
 }
