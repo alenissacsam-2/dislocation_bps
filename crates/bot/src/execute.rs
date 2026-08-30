@@ -98,6 +98,8 @@ pub struct TradeOptions {
     pub dry_run: bool,
     /// Emit idempotent account creations for every mint the route touches.
     pub create_token_accounts: bool,
+    /// How wrapped SOL is handled.
+    pub wsol: WsolPolicy,
 }
 
 impl Default for TradeOptions {
@@ -112,6 +114,22 @@ impl Default for TradeOptions {
             compute_units: 400_000,
             dry_run: true,
             create_token_accounts: true,
+            // Wrap and close inside the transaction rather than expecting a standing
+            // wSOL balance.
+            //
+            // A wallet holds *native* SOL; a swap moves SPL tokens, and the two are not
+            // the same thing. `Reuse` assumes somebody has already wrapped some, which
+            // is a manual step, an idle balance, and a thing to forget. WrapAndClose
+            // makes it part of the cycle: lamports in at the start, account closed and
+            // rent refunded at the end, all atomic — if any leg fails the wrap never
+            // happened either.
+            //
+            // It costs three instructions and *no additional accounts*, because the
+            // owner and the wSOL account are already in the list. The profit is then
+            // read from the lamport balance rather than a token balance, which is
+            // stricter in the right direction: the fee comes out of the same balance, so
+            // a trade must beat its own fee to pass rather than merely beat zero.
+            wsol: WsolPolicy::WrapAndClose,
         }
     }
 }
@@ -274,27 +292,32 @@ impl Trader {
             Err(e) => return Ok(Attempt::Refused(e.to_string())),
         };
 
-        // The balance the profit is measured from. Read now, so the threshold the
-        // simulation is judged against includes whatever is already sitting there.
+        // The balance the profit is measured from, read from wherever this route will
+        // actually report it. Reading a token account for a route that ends by closing
+        // that account would measure the wrong thing entirely — and would do it
+        // quietly, since both are just numbers.
         let base_mint = to_pubkey(&plan.mints[0]);
-        let base_ata = associated_token_address(&self.owner, &base_mint, &token_program);
-        let pre_balance = rpc
-            .accounts_full(&[base_ata])
-            .await?
-            .into_iter()
-            .next()
-            .flatten()
-            .and_then(|a| cb_executor::verify::token_account_mint(&a.data).ok().map(|_| a.data))
-            .and_then(|d| d.get(64..72).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes))
-            .unwrap_or(0);
+        let wsol = pk(programs::WSOL_MINT);
+        let wrapping = self.opts.wsol == WsolPolicy::WrapAndClose && base_mint == wsol;
+
+        let pre_balance = if wrapping {
+            rpc.balance(&self.owner).await?
+        } else {
+            let base_ata = associated_token_address(&self.owner, &base_mint, &token_program);
+            rpc.accounts_full(&[base_ata])
+                .await?
+                .into_iter()
+                .next()
+                .flatten()
+                .and_then(|a| a.data.get(64..72).and_then(|b| b.try_into().ok()))
+                .map(u64::from_le_bytes)
+                .unwrap_or(0)
+        };
 
         let opts = RouteOptions {
             compute_units: self.opts.compute_units,
             priority_micro_lamports: self.opts.priority_micro_lamports,
-            // Reuse, never wrap-and-close: closing the base account would leave the
-            // simulation with no token balance to read, and the proof of profit is that
-            // balance. See `cb_executor::route::WsolPolicy`.
-            wsol: WsolPolicy::Reuse,
+            wsol: self.opts.wsol,
             create_token_accounts: self.opts.create_token_accounts,
             venue: VenueExtra { token_program, bitmap_policy: BitmapPolicy::Include },
         };
@@ -532,7 +555,7 @@ mod tests {
 
     /// `hops_for` never touches the executor, so the tests do not need a wallet or a
     /// network. Constructing one that would panic if used documents that.
-    fn unreachable_executor() -> Executor {
+    pub(super) fn unreachable_executor() -> Executor {
         use cb_executor::risk::Limits;
         use solana_sdk::signer::keypair::Keypair;
         let bytes = Keypair::new().to_bytes();
@@ -677,5 +700,121 @@ mod mainnet {
             );
             assert!(chosen.found > 0, "{b58} has no tick arrays to swap through");
         }
+    }
+
+    /// Wrap-and-close, simulated against a **funded** address.
+    ///
+    /// The other mainnet test signs with a keypair generated in the test, which has
+    /// never been funded and so has no account at all — the runtime rejects it before
+    /// the program loads, which proves the pipeline runs but says nothing about whether
+    /// the wrap itself works. This one compiles unsigned and simulates as an address
+    /// that really holds SOL, which is the only way to see the wrap execute.
+    ///
+    /// No key is involved: `sigVerify` is off, so a placeholder signature is as good as
+    /// a real one and only the public address is needed.
+    ///
+    /// ```text
+    /// CB_SIM_AS=<funded pubkey> cargo test -p cb-bot wrap_and_close -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "hits mainnet; needs CB_SIM_AS"]
+    async fn wrap_and_close_builds_and_runs_against_a_funded_address() {
+        use cb_executor::tx;
+        let Ok(who) = std::env::var("CB_SIM_AS") else {
+            println!("set CB_SIM_AS to a funded public address; skipping");
+            return;
+        };
+        let owner: Pubkey = who.parse().expect("CB_SIM_AS must be a public key");
+        let rpc = Rpc::new("https://api.mainnet-beta.solana.com").expect("client");
+
+        // Read the balance first. The public endpoint closes keep-alive connections
+        // after a handful of calls, and this one failed reliably when it came last —
+        // a transport error, not a 429, so the client does not retry it. It must not:
+        // retrying a dropped `sendTransaction` could submit the same trade twice.
+        let pre = rpc.balance(&owner).await.expect("rpc");
+
+        let plan = CyclePlan {
+            pools: vec![
+                (raw(ORCA_SOL_USDC), Dex::OrcaWhirlpool),
+                (raw(RAY_SOL_USDC), Dex::RaydiumClmm),
+            ],
+            mints: vec![raw(WSOL), raw(USDC), raw(WSOL)],
+            // 0.002 SOL. Small enough to be affordable, large enough not to be dust.
+            amount_in: 2_000_000,
+            leg_out: vec![180_000, 2_010_000],
+        };
+
+        // Resolve tick arrays the way the executor does.
+        let keys: Vec<Pubkey> = plan.pools.iter().map(|(k, _)| to_pubkey(k)).collect();
+        let fetched = rpc.accounts_full(&keys).await.expect("rpc");
+        let pool_data: Vec<Vec<u8>> =
+            fetched.into_iter().map(|a| a.expect("pool exists").data).collect();
+
+        let mut arrays = Vec::new();
+        for (i, (praw, dex)) in plan.pools.iter().enumerate() {
+            let pool = to_pubkey(praw);
+            let program = match dex {
+                Dex::OrcaWhirlpool => pk(cb_dex::orca_whirlpool::PROGRAM_ID),
+                _ => pk(cb_dex::raydium_clmm::PROGRAM_ID),
+            };
+            let (tick, spacing) = tick_and_spacing(*dex, &pool_data[i]).expect("decodes");
+            let falling = input_is_token_a(*dex, &pool_data[i], &plan.mints[i]).expect("mint");
+            let chosen = ticks::resolve(&rpc, *dex, &pool, &program, tick, spacing, falling)
+                .await
+                .expect("rpc");
+            assert!(chosen.found > 0, "no arrays for {pool}");
+            arrays.push(chosen.arrays);
+        }
+
+        let t = Trader {
+            exec: super::tests::unreachable_executor(),
+            opts: TradeOptions { slippage_bps: 30, ..Default::default() },
+            owner,
+        };
+        let hops = t.hops_for(&plan, &pool_data, &arrays).expect("hops");
+
+        let opts = RouteOptions {
+            compute_units: 600_000,
+            priority_micro_lamports: 0,
+            wsol: WsolPolicy::WrapAndClose,
+            create_token_accounts: true,
+            venue: VenueExtra {
+                token_program: pk(programs::SPL_TOKEN),
+                bitmap_policy: BitmapPolicy::Include,
+            },
+        };
+        let built = route::build(&owner, &hops, pre, &opts).expect("route builds");
+        assert!(
+            matches!(built.profit, route::Profit::Lamports(k) if k == owner),
+            "wrapping must measure profit in lamports, not a token account it just closed"
+        );
+
+        let (bh, _) = rpc.latest_blockhash().await.expect("rpc");
+        let compiled = tx::compile_unsigned(&owner, &built.instructions, bh).expect("fits");
+        println!(
+            "wrap-and-close route: {} instructions, {} accounts, {} bytes of {}",
+            built.instructions.len(),
+            compiled.account_count,
+            compiled.size_bytes,
+            tx::PACKET_LIMIT
+        );
+
+        let sim = rpc.simulate(&compiled.tx_base64, &[owner]).await.expect("rpc");
+        match &sim.err {
+            None => println!(
+                "simulated clean: {} CU, post-lamports {:?}",
+                sim.units_consumed.unwrap_or(0),
+                sim.post_lamports.first()
+            ),
+            Some(e) => {
+                for l in sim.logs.iter().rev().take(10).rev() {
+                    println!("  log: {l}");
+                }
+                println!("rejected: {e}");
+            }
+        }
+        // The assertion is structural: it must fit and it must measure lamports. Whether
+        // this particular cycle profits is a market question, not an encoding one.
+        assert!(compiled.size_bytes <= tx::PACKET_LIMIT);
     }
 }

@@ -186,6 +186,7 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
         compute_units: 400_000,
         dry_run: cfg.dry_run,
         create_token_accounts: true,
+        wsol: cb_executor::route::WsolPolicy::WrapAndClose,
     };
     let exec = cb_executor::Executor::new(wallet, rpc, limits, cfg.dry_run)?;
 

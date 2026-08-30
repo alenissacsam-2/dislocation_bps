@@ -16,6 +16,12 @@ use std::time::Duration;
 /// it was submitted for, whatever it eventually says.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long an unused connection may sit in the pool before it is discarded.
+///
+/// Shorter than any endpoint's own keep-alive, so this side closes first and never
+/// writes into a socket the far end has already dropped.
+const POOL_IDLE: Duration = Duration::from_secs(3);
+
 pub struct Rpc {
     url: String,
     http: reqwest::Client,
@@ -48,7 +54,24 @@ impl Rpc {
     pub fn new(url: impl Into<String>) -> Result<Self> {
         Ok(Self {
             url: url.into(),
-            http: reqwest::Client::builder().timeout(TIMEOUT).build()?,
+            http: reqwest::Client::builder()
+                .timeout(TIMEOUT)
+                // Drop idle connections well before the server does.
+                //
+                // reqwest keeps them for 90 s by default and public Solana endpoints
+                // close them far sooner, so a burst of calls with a pause in the middle
+                // reuses a socket the far end has already hung up: "connection closed
+                // before message completed", a *transport* error rather than an HTTP
+                // one. It surfaced as the fourth call in a sequence failing every time
+                // while the first three succeeded, and it would have hit the running bot
+                // the same way — intermittently, mid-trade, on whichever call happened
+                // to land after a quiet moment.
+                //
+                // Deliberately not solved by retrying. `send` is on this client too, and
+                // a retried `sendTransaction` that actually arrived the first time
+                // submits the same trade twice.
+                .pool_idle_timeout(POOL_IDLE)
+                .build()?,
         })
     }
 
