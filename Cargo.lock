@@ -846,8 +846,10 @@ name = "cb-executor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "bs58",
  "cb-core",
+ "cb-dex",
  "cb-wallet",
  "reqwest 0.12.28",
  "serde",

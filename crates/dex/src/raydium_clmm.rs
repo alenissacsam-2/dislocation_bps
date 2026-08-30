@@ -37,6 +37,15 @@ pub const CONFIG_LEN: usize = 117;
 const OFF_AMM_CONFIG: usize = 9;
 const OFF_MINT_0: usize = 73;
 const OFF_MINT_1: usize = 105;
+// The three accounts a swap needs that a quote does not. These are not independently
+// measured the way the pricing offsets were — they are *forced*. `token_mint_1` ends at
+// 137 and `mint_decimals_0` begins at 233, a gap of exactly 96 bytes, and the layout
+// puts exactly three pubkeys there in this order. Any other assignment would leave the
+// gap the wrong size, which is why `the_account_offsets_tile_the_gap_exactly` asserts
+// the arithmetic rather than the values.
+const OFF_VAULT_0: usize = 137;
+const OFF_VAULT_1: usize = 169;
+const OFF_OBSERVATION: usize = 201;
 const OFF_DECIMALS_0: usize = 233;
 const OFF_DECIMALS_1: usize = 234;
 const OFF_TICK_SPACING: usize = 235;
@@ -88,6 +97,13 @@ pub struct ClmmPool {
     pub liquidity: u128,
     pub sqrt_price_x64: u128,
     pub tick_current: i32,
+    /// The pool's own token accounts, and the observation account it writes its price
+    /// history into. None of the three are used to price anything — a swap instruction
+    /// names all three, and reading them from the same account load that produced the
+    /// quote is what stops an instruction naming vaults from a state nobody priced.
+    pub vault_0: Pubkey32,
+    pub vault_1: Pubkey32,
+    pub observation: Pubkey32,
 }
 
 /// Decode the pool account.
@@ -124,6 +140,9 @@ pub fn decode(data: &[u8]) -> Result<ClmmPool> {
         liquidity: u128_at(data, OFF_LIQUIDITY),
         sqrt_price_x64: u128_at(data, OFF_SQRT_PRICE),
         tick_current,
+        vault_0: pubkey_at(data, OFF_VAULT_0),
+        vault_1: pubkey_at(data, OFF_VAULT_1),
+        observation: pubkey_at(data, OFF_OBSERVATION),
     })
 }
 
@@ -305,5 +324,58 @@ mod tests {
         assert!(decode(&account(0, 1, 1, 0, (9, 6), (1, 2))).is_err(), "zero tick spacing");
         assert!(decode(&account(1, 1, 1, i32::MIN, (9, 6), (1, 2))).is_err(), "tick out of range");
         assert!(decode(&account(1, 1, 1, 0, (99, 6), (1, 2))).is_err(), "implausible decimals");
+    }
+
+    /// The load-bearing check on the three swap-only offsets. They were not measured
+    /// against a router the way the pricing offsets were; they are derived from the
+    /// gap between two offsets that *were*. So assert the arithmetic, not the numbers:
+    /// if `OFF_MINT_1` or `OFF_DECIMALS_0` is ever corrected, this fails rather than
+    /// leaving three addresses silently pointing into the middle of other fields.
+    #[test]
+    fn the_account_offsets_tile_the_gap_exactly() {
+        const KEY: usize = 32;
+        assert_eq!(OFF_VAULT_0, OFF_MINT_1 + KEY, "vault_0 must begin where mint_1 ends");
+        assert_eq!(OFF_VAULT_1, OFF_VAULT_0 + KEY);
+        assert_eq!(OFF_OBSERVATION, OFF_VAULT_1 + KEY);
+        assert_eq!(
+            OFF_OBSERVATION + KEY,
+            OFF_DECIMALS_0,
+            "the three accounts must exactly fill the gap before mint_decimals_0"
+        );
+    }
+
+    #[test]
+    fn the_swap_accounts_decode_from_their_own_offsets() {
+        let mut d = sol_usdc();
+        d[OFF_VAULT_0..OFF_VAULT_0 + 32].copy_from_slice(&[0xA1; 32]);
+        d[OFF_VAULT_1..OFF_VAULT_1 + 32].copy_from_slice(&[0xB2; 32]);
+        d[OFF_OBSERVATION..OFF_OBSERVATION + 32].copy_from_slice(&[0xC3; 32]);
+
+        let p = decode(&d).expect("real captured state must decode");
+        assert_eq!(p.vault_0, [0xA1; 32]);
+        assert_eq!(p.vault_1, [0xB2; 32]);
+        assert_eq!(p.observation, [0xC3; 32]);
+        // And the fields that were already verified must not have moved.
+        assert_eq!(p.tick_current, -23941);
+        assert_eq!(p.decimals_0, 9);
+        assert_eq!(p.decimals_1, 6);
+    }
+
+    /// Writing any one of the three must not disturb the other two, which is what a
+    /// one-byte offset error would look like.
+    #[test]
+    fn the_three_accounts_do_not_overlap_each_other_or_the_priced_fields() {
+        for (name, off) in [("vault_0", OFF_VAULT_0), ("vault_1", OFF_VAULT_1), ("obs", OFF_OBSERVATION)] {
+            let mut d = sol_usdc();
+            let before = decode(&d).expect("baseline");
+            d[off..off + 32].copy_from_slice(&[0xFF; 32]);
+            let after = decode(&d).expect("still decodes");
+            assert_eq!(before.mint_0, after.mint_0, "{name} overlaps mint_0");
+            assert_eq!(before.mint_1, after.mint_1, "{name} overlaps mint_1");
+            assert_eq!(before.liquidity, after.liquidity, "{name} overlaps liquidity");
+            assert_eq!(before.sqrt_price_x64, after.sqrt_price_x64, "{name} overlaps sqrt_price");
+            assert_eq!(before.tick_current, after.tick_current, "{name} overlaps tick");
+            assert_eq!(before.amm_config, after.amm_config, "{name} overlaps amm_config");
+        }
     }
 }

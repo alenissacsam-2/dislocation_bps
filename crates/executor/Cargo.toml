@@ -13,6 +13,8 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 solana-sdk = { workspace = true }
+bincode = { workspace = true }
+cb-dex = { workspace = true }
 reqwest = { workspace = true }
 bs58 = { workspace = true }
 tracing = { workspace = true }

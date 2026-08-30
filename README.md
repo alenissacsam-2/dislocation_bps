@@ -3,9 +3,11 @@
 **A measurement instrument for Solana AMM arbitrage.** It watches live mainnet, prices
 every arbitrage cycle it can see, and records what *would* have cleared.
 
-It is not a trading bot and has never signed a transaction. There is no execution code,
-no key handling, and no path from this repository to a real order. It exists to answer
-one question honestly: **is there a tradeable edge, and how big is it?**
+It has never signed a transaction, and the binary that does the measuring still cannot —
+`cb-bot` links no signing code at all. It exists to answer one question honestly:
+**is there a tradeable edge, and how big is it?** The answer so far is no, and the
+execution machinery described below was built to be ready if that ever changes, not
+because it has.
 
 [![ci](https://github.com/alenissacsam-2/dislocation_bps/actions/workflows/ci.yml/badge.svg)](https://github.com/alenissacsam-2/dislocation_bps/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/alenissacsam-2/dislocation_bps?color=e0b341)](https://github.com/alenissacsam-2/dislocation_bps/releases/latest)
@@ -118,6 +120,8 @@ crates/ledger     SQLite — every sample, every clearing cycle, and the queries
 crates/bot        the event loop, venue dispatch, --report and --verify
 crates/server     event bus and three read-only API endpoints
 crates/desk       the Windows application (Tauri v2)
+crates/wallet     encrypted key custody — Argon2id, ChaCha20-Poly1305
+crates/executor   swap encoding, transaction assembly, risk limits. Not linked by cb-bot
 ```
 
 **The central mathematical fact**, in `crates/core/src/clmm.rs`: a concentrated-liquidity
@@ -128,11 +132,75 @@ there is no second implementation to disagree with the first.
 Currently decoding Orca Whirlpool, Raydium CLMM, Raydium CP-Swap, Raydium AMM v4, and
 Meteora DAMM v2 — 84 pools live.
 
+## Building a swap, and checking it against the chain
+
+`crates/executor` encodes swaps for Orca Whirlpool and Raydium CLMM — 82 of the 90 pools
+in the registry. The other three venues refuse by name rather than guessing; Raydium AMM
+v4 alone would need nine OpenBook accounts this codebase has never read, to reach five
+pools.
+
+None of it can be verified from a development machine, so there is a tool that verifies
+it against mainnet and **needs no key and no funds**:
+
+```powershell
+cb-verify-encode                      # account offsets and PDA derivations
+cb-verify-encode --as <your address>  # and the instruction itself
+```
+
+`--as` takes a **public** address. Simulation runs with signature verification off, so a
+placeholder signature is as good as a real one — a diagnostic never needs the wallet it
+is diagnosing. Current result over the whole registry: **154 of 154 vault checks and 53
+of 53 readable tick arrays agree with live mainnet, with no contradictions.**
+
+Three things it found that reading documentation would not have:
+
+- **A fresh keypair cannot be a fee payer.** The first version signed with a throwaway
+  key, reasoning that an empty balance would stop before anything happened. An unfunded
+  keypair has no account at all, so the runtime rejected every transaction before
+  loading the program — 82 pools reporting `AccountNotFound` with no logs, which looks
+  exactly like a broken encoder.
+- **The tick array at the current price often does not exist.** An array stores position
+  *boundaries*, not the liquidity between them, so a deep pool can have nothing at its
+  own tick. Naming three consecutive arrays from the current price — the obvious
+  encoding — was wrong for 23 of 48 Raydium pools. The executor now sweeps and asks the
+  chain which exist.
+- **21 pools hold liquidity and cannot be traded at all**, having no tick arrays
+  anywhere. See §4 of [`HANDOVER.md`](HANDOVER.md); one of them is reachable from a base
+  mint and has been entering measurements.
+
+What a clean run establishes is the account offsets and the derivations. What it does
+not establish is the account *order* inside an instruction, or the arithmetic of a
+trade. Only `--as` speaks to the first, and only a funded simulation of a real cycle
+speaks to the second.
+
+### Two limits that decide what an arbitrage can be
+
+A transaction is 1232 bytes and every account costs 32 of them. Measured, with real
+account sharing between legs:
+
+| cycle | bytes | |
+|---|---|---|
+| 2 hops | 800 | fits |
+| 3 hops | 1048 | fits |
+| 4 hops | 1296 | **64 over — two accounts** |
+
+So three hops is the ceiling without an address lookup table, and `assemble` refuses
+rather than truncating.
+
+The second limit is the one that makes a signed cycle safe: **the last hop's output
+floor must exceed the first hop's input**, and each hop's floor must cover the next
+hop's input. Both are enforced in `route::build`, which refuses to encode a route that
+violates either. If they hold, a transaction that lands is profitable by construction —
+the programs enforce it, and a cycle that goes stale reverts instead of filling. Neither
+check depends on this codebase's own arithmetic being right, which is what makes them
+worth more than the quote that motivated the trade.
+
 ## Safety
 
 Live trading requires **two independent switches** — `mode = "live"` in config *and*
-`CRYPTOBOT_ALLOW_LIVE=1` in the environment — and neither does anything, because live
-execution is not implemented.
+`CRYPTOBOT_ALLOW_LIVE=1` in the environment — and neither does anything, because nothing
+wires the executor to the bot. The swap encoders exist and are verified at the address
+level; no code path reaches them from a running measurement.
 
 The application **does** now expose a Mode control, so the guarantee is no longer the
 absence of a mechanism. It is carried by four things that are: the second switch still

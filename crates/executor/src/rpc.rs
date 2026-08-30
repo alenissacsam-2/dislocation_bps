@@ -52,26 +52,49 @@ impl Rpc {
         })
     }
 
+    /// How many times a rate-limited request is retried before giving up.
+    ///
+    /// Only a 429 is retried, and only with a growing delay. Retrying anything else
+    /// would be wrong here: this client is used to submit transactions, and a request
+    /// that failed for an unknown reason may have been received.
+    const RATE_LIMIT_RETRIES: u32 = 4;
+
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-        let resp: Value = self
-            .http
-            .post(&self.url)
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("{method} request failed"))?
-            .json()
-            .await
-            .with_context(|| format!("{method} returned something that is not JSON"))?;
 
-        if let Some(e) = resp.get("error") {
-            // The node's own message is more useful than anything wrapped around it.
-            bail!("{method} failed: {e}");
+        let mut backoff = Duration::from_millis(400);
+        for attempt in 0..=Self::RATE_LIMIT_RETRIES {
+            let resp: Value = self
+                .http
+                .post(&self.url)
+                .json(&body)
+                .send()
+                .await
+                .with_context(|| format!("{method} request failed"))?
+                .json()
+                .await
+                .with_context(|| format!("{method} returned something that is not JSON"))?;
+
+            if let Some(e) = resp.get("error") {
+                // A public endpoint rate-limits a whole-registry sweep part way through,
+                // and a run that stops at pool 26 of 82 reports the remaining 56 as
+                // unknown — which reads like a fleet of broken pools rather than one
+                // tired endpoint.
+                let rate_limited = e.get("code").and_then(Value::as_i64) == Some(429);
+                if rate_limited && attempt < Self::RATE_LIMIT_RETRIES {
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                    continue;
+                }
+                // The node's own message is more useful than anything wrapped around it.
+                bail!("{method} failed: {e}");
+            }
+            return resp
+                .get("result")
+                .cloned()
+                .ok_or_else(|| anyhow!("{method} returned neither a result nor an error"));
         }
-        resp.get("result")
-            .cloned()
-            .ok_or_else(|| anyhow!("{method} returned neither a result nor an error"))
+        bail!("{method} was rate limited {} times running", Self::RATE_LIMIT_RETRIES + 1)
     }
 
     /// # Errors
@@ -180,6 +203,100 @@ impl Rpc {
         }))
     }
 
+    /// Fetch several accounts in one round trip.
+    ///
+    /// `None` where the account does not exist, which is a normal answer rather than an
+    /// error — a tick array that has never been initialised is absent, not broken.
+    ///
+    /// # Errors
+    /// If the call fails or the response is not the expected shape.
+    pub async fn accounts(&self, keys: &[Pubkey]) -> Result<Vec<Option<Vec<u8>>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let addresses: Vec<String> = keys.iter().map(ToString::to_string).collect();
+        let r = self
+            .call(
+                "getMultipleAccounts",
+                json!([addresses, {"encoding": "base64", "commitment": "confirmed"}]),
+            )
+            .await?;
+        let arr = r["value"]
+            .as_array()
+            .ok_or_else(|| anyhow!("getMultipleAccounts returned no account array"))?;
+        Ok(arr
+            .iter()
+            .map(|a| {
+                if a.is_null() {
+                    return None;
+                }
+                a["data"]
+                    .as_array()
+                    .and_then(|d| d.first())
+                    .and_then(Value::as_str)
+                    .and_then(base64_decode)
+            })
+            .collect())
+    }
+
+    /// Fetch several accounts with their owning programs, in one round trip.
+    ///
+    /// The owner is what distinguishes a real token account from arbitrary bytes that
+    /// happen to be the right length, and fetching it alongside the data rather than in
+    /// a second call matters: a verification pass over the whole registry is four round
+    /// trips per pool if these are separate, which is both slow and enough traffic to
+    /// be rate-limited off a public endpoint part way through.
+    ///
+    /// # Errors
+    /// If the call fails or the response is not the expected shape.
+    pub async fn accounts_full(&self, keys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let addresses: Vec<String> = keys.iter().map(ToString::to_string).collect();
+        let r = self
+            .call(
+                "getMultipleAccounts",
+                json!([addresses, {"encoding": "base64", "commitment": "confirmed"}]),
+            )
+            .await?;
+        let arr = r["value"]
+            .as_array()
+            .ok_or_else(|| anyhow!("getMultipleAccounts returned no account array"))?;
+        Ok(arr
+            .iter()
+            .map(|a| {
+                if a.is_null() {
+                    return None;
+                }
+                let data = a["data"]
+                    .as_array()
+                    .and_then(|d| d.first())
+                    .and_then(Value::as_str)
+                    .and_then(base64_decode)?;
+                let owner = a["owner"].as_str().and_then(|o| Pubkey::from_str(o).ok())?;
+                Some(Account { owner, data, lamports: a["lamports"].as_u64().unwrap_or(0) })
+            })
+            .collect())
+    }
+
+    /// The owner program of an account, which is how a mint's token program is known.
+    ///
+    /// # Errors
+    /// If the call fails.
+    pub async fn owner_of(&self, key: &Pubkey) -> Result<Option<Pubkey>> {
+        let r = self
+            .call(
+                "getAccountInfo",
+                json!([key.to_string(), {"encoding": "base64", "commitment": "confirmed"}]),
+            )
+            .await?;
+        let Some(owner) = r["value"]["owner"].as_str() else {
+            return Ok(None);
+        };
+        Ok(Pubkey::from_str(owner).ok())
+    }
+
     /// # Errors
     /// If the call fails.
     pub async fn balance(&self, who: &Pubkey) -> Result<u64> {
@@ -188,6 +305,15 @@ impl Rpc {
             .await?;
         Ok(r["value"].as_u64().unwrap_or(0))
     }
+}
+
+/// An account as the node returned it.
+#[derive(Debug, Clone)]
+pub struct Account {
+    /// The program that owns it. For a token account, a token program.
+    pub owner: Pubkey,
+    pub data: Vec<u8>,
+    pub lamports: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -248,6 +374,13 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Decode, for tests in sibling modules that need to inspect their own output.
+#[cfg(test)]
+#[must_use]
+pub fn base64_decode_for_test(s: &str) -> Option<Vec<u8>> {
+    base64_decode(s)
 }
 
 /// Base64 encode, for putting a serialised transaction on the wire.

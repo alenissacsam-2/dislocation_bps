@@ -302,7 +302,32 @@ Until it is explained, **value concentrated in high-fee routes is unproven** —
 archived run that is most of the value the instrument reported. What settles it is a long
 run on the current build, then `--report`'s two simultaneity sections read together.
 
-The pattern in all seven: **an internal check cannot catch an error in what the code
+**Pools that hold liquidity and cannot be traded — found 2026-08-30.** Building the swap
+encoders required, for the first time, asking the chain for the accounts a *trade* needs
+rather than the ones a *quote* needs. That found 21 of the 48 Raydium CLMM pools in the
+registry with **no tick arrays at any of the 24 addresses swept in both directions**,
+while reporting non-zero liquidity in the pool account. A concentrated-liquidity pool
+cannot be swapped through without a tick array. These pools are not tradeable by anyone,
+and the registry has been feeding them to the scanner as though they were.
+
+Twenty of the twenty-one are harmless: they are `STA/ST` and `ST/STB` pairs whose mints
+never appear in a pool with a base mint, so no cycle from SOL, USDC or USDT can reach
+them and none ever entered a measurement. **The twenty-first is not.** `WSOL/ALNOOR` on
+Raydium CLMM has no tick arrays and *does* pair with a `WSOL/ALNOOR` CP-Swap pool, which
+makes a two-hop cycle the scanner can enumerate, price, and record as an opportunity —
+through a leg no transaction could have executed.
+
+> **The pool account says `liquidity: 35720662117822` and the pool cannot be swapped.**
+> Every decoder check passes, because the decoder is reading the field correctly. The
+> field simply does not mean what "there is liquidity here" means. Whether a venue can
+> be *quoted* and whether it can be *traded* are separate questions, and this codebase
+> had only ever asked the first.
+
+This does not overturn the headline — one pool out of ninety, on an exotic pair. It is
+here because it is the same shape as the other seven and because the fix is not a code
+change: the registry needs a tradeability filter, and nothing currently applies one.
+
+The pattern in all eight: **an internal check cannot catch an error in what the code
 believes about the outside world** — including what it believes its own numbers mean.
 Every new decoder must be pinned against a value the decoder itself did not produce,
 and every headline must name which search produced it.

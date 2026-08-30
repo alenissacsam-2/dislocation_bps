@@ -19,8 +19,15 @@
 //! Everywhere else, the quote is the answer. Here the quote is only a reason to ask the
 //! chain, and the chain's answer is what decides.
 
+pub mod encode;
+pub mod pda;
 pub mod risk;
+pub mod route;
 pub mod rpc;
+pub mod ticks;
+pub mod tx;
+pub mod venue;
+pub mod verify;
 
 use anyhow::{bail, Result};
 use cb_wallet::Wallet;
@@ -43,9 +50,16 @@ pub enum Attempt {
 pub struct Plan {
     pub size_usd: f64,
     pub expected_net_usd: f64,
-    /// The token account whose balance should grow, and by how much at minimum.
-    pub profit_account: Pubkey,
-    pub min_gain_native: u64,
+    /// Where the proof of profit is read from, and what it must reach.
+    pub profit: route::Profit,
+    /// The balance `profit` must show **after** execution.
+    ///
+    /// A post-balance, not a gain. The distinction is load-bearing: a token account
+    /// that already held a balance satisfies a gain-shaped threshold without the trade
+    /// having earned anything, and the account we trade from is exactly the account
+    /// that already holds a balance. [`route::build`] computes this from a measured
+    /// pre-balance so the caller cannot supply the wrong one by omission.
+    pub min_post_balance: u64,
     /// The serialised, signed transaction, base64 for the wire.
     pub tx_base64: String,
 }
@@ -72,7 +86,7 @@ impl Plan {
         }
 
         // The chain's opinion, before anything irreversible.
-        let sim = rpc.simulate(&self.tx_base64, &[self.profit_account]).await?;
+        let sim = rpc.simulate(&self.tx_base64, &[self.profit.address()]).await?;
         if !sim.succeeded() {
             let reason = sim.err.unwrap_or_else(|| "unknown".into());
             // A simulation failure is a defect in what was built, not a lost race, so it
@@ -81,7 +95,13 @@ impl Plan {
             return Ok(Attempt::SimulationRejected { reason, observed_net_usd: None });
         }
 
-        let observed = sim.post_token_amounts.first().copied().flatten();
+        // Read the balance from whichever place this route's profit lands in. Reading a
+        // token amount for a route that ends by closing its token account would find
+        // nothing, and "nothing" must never be mistaken for "no profit is fine".
+        let observed = match self.profit {
+            route::Profit::TokenAccount(_) => sim.post_token_amounts.first().copied().flatten(),
+            route::Profit::Lamports(_) => sim.post_lamports.first().copied(),
+        };
         let Some(after) = observed else {
             gate.record(Outcome::Failed);
             return Ok(Attempt::SimulationRejected {
@@ -90,11 +110,12 @@ impl Plan {
             });
         };
 
-        if after < self.min_gain_native {
+        if after < self.min_post_balance {
             return Ok(Attempt::SimulationRejected {
                 reason: format!(
-                    "simulated balance {after} is below the {} required to profit",
-                    self.min_gain_native
+                    "simulated balance {after} is below the {} this trade must reach \
+                     to have profited",
+                    self.min_post_balance
                 ),
                 observed_net_usd: None,
             });

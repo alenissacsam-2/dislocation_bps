@@ -33,6 +33,7 @@ cb-executor  = { path = "crates/executor" }
 
 # solana
 solana-sdk    = "4.1"
+bincode       = "1.3"
 solana-client = "4.2"
 
 # async
