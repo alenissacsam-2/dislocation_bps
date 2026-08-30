@@ -278,3 +278,57 @@ pre.log b{color:var(--neg);font-weight:400}
 .acct-actions{display:flex;align-items:center;gap:11px;flex-wrap:wrap}
 .acct-actions .note{margin:0}
 button.ghost{background:transparent;padding:3px 8px;font-size:11px}
+
+/* RAIL: MODE AND MONEY
+ * Beside the Start button, because "will this sign anything" and "what with" are the
+ * two facts that belong next to the control that starts a run. The rail is narrow, so
+ * the address wraps and the balances stack rather than competing for one line. */
+.rail-mode{
+  background:var(--raise);border:1px solid var(--line);border-radius:var(--r);
+  padding:10px 11px;margin:0 0 12px;
+}
+.rail-mode-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.rail-label{
+  font-size:10px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em;
+}
+.badge{
+  font-size:9.5px;font-weight:600;letter-spacing:.07em;padding:2px 6px;border-radius:3px;
+  font-family:var(--mono);
+}
+.badge-demo{background:var(--accent-soft);color:var(--accent)}
+.badge-live{background:var(--neg);color:#fff}
+
+/* Segmented control. Two states, mutually exclusive, and the selected one is obvious
+ * without reading — a radio pair in a 200px rail is not. */
+.seg{display:flex;border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+.seg-btn{
+  flex:1;border:0;border-radius:0;background:var(--panel);color:var(--muted);
+  font-size:11.5px;padding:5px 0;
+}
+.seg-btn:hover:not(:disabled){background:var(--hair)}
+.seg-btn.on{background:var(--accent);color:var(--accent-ink)}
+#segLive.on{background:var(--neg);color:#fff}
+
+.rail-hint{
+  display:block;font-size:10px;color:var(--faint);line-height:1.45;margin:8px 0 4px;
+}
+#railConfirm{
+  width:100%;font-family:var(--mono);font-size:11px;padding:4px 6px;
+  background:var(--raise);color:var(--ink);border:1px solid var(--line);
+  border-radius:var(--r);
+}
+.rail-actions{display:flex;gap:6px;margin-top:6px}
+.rail-actions button{flex:1;font-size:11px;padding:4px 0}
+
+.rail-wallet{margin-top:11px;padding-top:10px;border-top:1px solid var(--hair)}
+.rail-addr{
+  font-family:var(--mono);font-size:9.5px;line-height:1.4;color:var(--muted);
+  word-break:break-all;cursor:pointer;margin:4px 0 7px;
+}
+.rail-addr:hover{color:var(--ink)}
+.rail-bal{font-family:var(--mono);font-size:11px;line-height:1.6;color:var(--ink)}
+.rail-bal .sym{color:var(--muted)}
+.rail-ready{font-size:10px;line-height:1.45;margin:7px 0 8px}
+.rail-ready.ok{color:var(--pos)}
+.rail-ready.no{color:var(--accent)}
+.rail-wallet .ghost{width:100%;font-size:10.5px;padding:3px 0}

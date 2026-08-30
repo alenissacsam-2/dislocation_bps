@@ -33,6 +33,41 @@
     </div>
   </div>
 
+  <!-- Mode and money, beside the Start button rather than three screens away.
+       Whether this run signs anything and what it would sign with are the two facts
+       that belong next to the control that starts it. -->
+  <div class="rail-mode">
+    <div class="rail-mode-head">
+      <span class="rail-label">Mode</span>
+      <span id="railModeBadge" class="badge badge-demo">DEMO</span>
+    </div>
+
+    <div class="seg" role="group" aria-label="Trading mode">
+      <button id="segDemo" class="seg-btn on" type="button">Demo</button>
+      <button id="segLive" class="seg-btn" type="button">Live</button>
+    </div>
+
+    <div id="railArm" hidden>
+      <label for="railConfirm" class="rail-hint">Type <code>LIVE</code> to confirm</label>
+      <input type="text" id="railConfirm" autocomplete="off" spellcheck="false"
+             placeholder="LIVE">
+      <div class="rail-actions">
+        <button id="railApply" class="primary" type="button">Arm live</button>
+        <button id="railCancel" type="button">Cancel</button>
+      </div>
+    </div>
+
+    <div id="railArmedNote" class="rail-hint" hidden></div>
+
+    <div class="rail-wallet">
+      <div class="rail-label">Wallet</div>
+      <div id="railAddr" class="rail-addr" title="Click to copy">no key</div>
+      <div id="railBal" class="rail-bal">—</div>
+      <div id="railReady" class="rail-ready"></div>
+      <button id="railRefresh" class="ghost" type="button">Refresh balance</button>
+    </div>
+  </div>
+
   <nav>
     <button data-view="live" class="on">Live</button>
     <button data-view="history">History</button>

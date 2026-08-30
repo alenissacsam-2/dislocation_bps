@@ -643,8 +643,12 @@ async function paintMode() {
     ? "<code>CRYPTOBOT_ALLOW_LIVE=1</code> is set — the outside half of the guard is open."
     : "<code>CRYPTOBOT_ALLOW_LIVE</code> is not set, so Live cannot be armed and the bot "
       + "would refuse to start against a live config. That is the half of the guard that "
-      + "lives outside this application, and it deliberately does not set it for you.");
+      + "lives outside this application, and it deliberately does not set it for you. "
+      + "In PowerShell:<br><br><code>setx CRYPTOBOT_ALLOW_LIVE 1</code><br><br>"
+      + "then close and reopen this application — a process inherits its environment at "
+      + "start, so a variable set after launch is invisible to it.");
   $("modeState").innerHTML = lines.join("<br><br>");
+  paintRail();
 }
 
 function syncModeConfirm() {
@@ -738,6 +742,7 @@ async function paintWallet() {
     window.__address = null;
     window.__holdings = null;
     paintLiveAccount();
+    paintRailWallet();
     return;
   }
   setup.hidden = true; unlock.hidden = false;
@@ -760,6 +765,7 @@ async function paintWallet() {
     window.__balancesFetched = true;
     paintBalances(true);
   }
+  paintRailWallet();
 }
 
 // Balances are fetched on demand rather than on a timer. A poll would put this app on
@@ -795,8 +801,9 @@ async function paintBalances(quiet) {
     + h.readiness.reason;
   $("accSource").textContent = "from " + h.rpc;
 
-  // The mode panel quotes these numbers, so keep the two in step.
+  // Both panels quote these numbers, so keep all three in step.
   paintLiveAccount();
+  paintRailWallet();
 }
 
 $("btnRefreshBalances").onclick = () => paintBalances(false);
@@ -982,7 +989,134 @@ markStale();
 refreshStatus();
 loadHistory(null);
 connect();
+// The rail is visible on every view, so its state cannot wait for the Parameters tab
+// to be opened. `paintWallet` fetches balances once on first paint; both are also
+// repainted whenever the Parameters tab reloads, from the same two commands.
+paintMode();
+paintWallet();
 setInterval(refreshStatus, 2000);
 setInterval(sampleDivergence, 1000);
 setInterval(() => { if (S.view === "history") loadHistory(S.viewingArchive); }, 20000);
 window.addEventListener("resize", () => requestAnimationFrame(drawAll));
+
+// ---------------------------------------------------------------------------
+// The rail's mode and wallet panel.
+//
+// The same three commands the Parameters tab uses — read_mode, set_mode,
+// wallet_balances — rendered next to the Start button, because whether a run will
+// sign anything and what it would sign with are the two facts that belong beside
+// the control that starts it. Both places repaint from the same state, so they
+// cannot disagree.
+//
+// The typed LIVE confirmation is kept here rather than simplified into a click.
+// The rail is the *convenient* place to arm live trading, which is exactly why it
+// must not also be the easy place to do it by accident.
+// ---------------------------------------------------------------------------
+
+function paintRail() {
+  const m = window.__mode;
+  const badge = $("railModeBadge");
+  if (!m) { badge.textContent = "…"; return; }
+
+  const live = m.effective === "live";
+  badge.textContent = live ? "LIVE" : "DEMO";
+  badge.className = "badge " + (live ? "badge-live" : "badge-demo");
+  $("segDemo").classList.toggle("on", !live);
+  $("segLive").classList.toggle("on", live);
+
+  // What the operator most needs to know once armed is not that it is armed — the
+  // badge says that — but whether anything can actually leave the machine.
+  const note = $("railArmedNote");
+  if (live) {
+    note.hidden = false;
+    note.innerHTML = "Armed. Whether anything is <b>submitted</b> depends on "
+      + "<code>dry_run</code> in config.toml.";
+  } else if (!m.allowLiveSet) {
+    note.hidden = false;
+    note.innerHTML = "<code>CRYPTOBOT_ALLOW_LIVE</code> is not set, so Live cannot be armed.";
+  } else {
+    note.hidden = true;
+  }
+}
+
+function paintRailWallet() {
+  const addr = window.__address;
+  $("railAddr").textContent = addr || "no key — import one under Parameters";
+
+  const h = window.__holdings;
+  const bal = $("railBal"), ready = $("railReady");
+  if (!h) { bal.textContent = "—"; ready.textContent = ""; ready.className = "rail-ready"; return; }
+
+  const rows = [`<div>${h.sol} <span class="sym">SOL</span></div>`];
+  for (const t of h.tokens) {
+    const label = t.symbol || t.mint.slice(0, 4) + "…" + t.mint.slice(-4);
+    rows.push(`<div>${t.amount} <span class="sym">${label}</span></div>`);
+  }
+  bal.innerHTML = rows.join("");
+
+  ready.className = "rail-ready " + (h.readiness.canTrade ? "ok" : "no");
+  ready.textContent = h.readiness.canTrade
+    ? "Can trade."
+    : "Cannot trade — " + h.readiness.reason;
+}
+
+$("railAddr").onclick = async () => {
+  if (!window.__address) return;
+  try {
+    await navigator.clipboard.writeText(window.__address);
+    $("railAddr").textContent = "copied";
+    setTimeout(paintRailWallet, 900);
+  } catch { /* a rail with no clipboard is not worth an error box */ }
+};
+
+$("railRefresh").onclick = () => paintBalances(false);
+
+function railShowArm(show) {
+  $("railArm").hidden = !show;
+  if (show) { $("railConfirm").value = ""; $("railConfirm").focus(); }
+}
+
+$("segDemo").onclick = async () => {
+  railShowArm(false);
+  if (window.__mode && window.__mode.effective === "paper") return;
+  await applyMode("paper", "");
+};
+
+// Selecting Live only *offers* to arm. Nothing is written until the word is typed
+// and Arm live is pressed, so a stray click on a narrow rail costs nothing.
+$("segLive").onclick = () => {
+  if (window.__mode && window.__mode.effective === "live") return;
+  railShowArm(true);
+};
+
+$("railCancel").onclick = () => railShowArm(false);
+
+$("railApply").onclick = async () => {
+  await applyMode("live", $("railConfirm").value);
+};
+
+/// One path for both controls, so the rail and the Parameters tab cannot drift.
+async function applyMode(mode, confirm) {
+  const note = $("railArmedNote");
+  note.hidden = false;
+  note.textContent = "Applying…";
+  try {
+    const r = await invoke("set_mode", { mode, confirm });
+    railShowArm(false);
+    await paintMode();
+    paintRail();
+    if ($("modeResult")) {
+      const bits = [`Mode is now ${r.mode}.`];
+      if (r.archived) bits.push(`Previous run archived as ${r.archived}.`);
+      if (r.restartError) bits.push(`The bot did not restart: ${r.restartError}`);
+      else if (r.restarted) bits.push("The bot restarted.");
+      $("modeResult").textContent = bits.join(" ");
+    }
+  } catch (e) {
+    // Shown in the rail, where the button was pressed. A refusal that only appears
+    // on another tab reads as nothing having happened.
+    note.hidden = false;
+    note.className = "rail-hint";
+    note.textContent = "" + e;
+  }
+}
