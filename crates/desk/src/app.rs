@@ -327,6 +327,55 @@ pub async fn wallet_balances(app: tauri::State<'_, App>) -> Result<crate::balanc
 /// # Errors
 /// If the config cannot be read or parsed.
 #[tauri::command]
+pub fn read_dry_run(app: tauri::State<'_, App>) -> Result<config::DryRunStatus, String> {
+    config::read_dry_run(&app.paths.config()).map_err(|e| e.to_string())
+}
+
+/// Turn real submission on or off.
+///
+/// Its own command rather than a field on [`save_config`], because a form that writes
+/// six values at once must not be able to arm spending as a side effect of changing the
+/// capital. Turning it *off* — that is, allowing submission — needs the typed word, the
+/// same treatment the mode switch gets. Turning it back on is always allowed and never
+/// asks: making the safe direction cheap is the whole point.
+///
+/// # Errors
+/// If the confirmation is missing, or the file cannot be written.
+#[tauri::command]
+pub async fn set_dry_run(
+    app: tauri::State<'_, App>,
+    dry_run: bool,
+    confirm: String,
+) -> Result<config::DryRunStatus, String> {
+    if !dry_run {
+        if confirm.trim() != "SPEND" {
+            return Err("Type SPEND to allow real transactions. Nothing has been changed.".into());
+        }
+        let mode = config::read_mode(&app.paths.config()).map_err(|e| e.to_string())?;
+        if mode.effective != "live" {
+            return Err(
+                "Mode is Demo, so nothing would be submitted anyway. Arm Live first —                  then this switch is the one that matters."
+                    .into(),
+            );
+        }
+        if !app.custody.is_unlocked() {
+            return Err("No key is unlocked in this session. Nothing could be signed.".into());
+        }
+        let limits = config::read_limits(&app.paths.config()).map_err(|e| e.to_string())?;
+        limits.validate()?;
+    }
+    let paths = app.paths.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        config::write_dry_run(&paths.config(), dry_run).map_err(|e| e.to_string())?;
+        config::read_dry_run(&paths.config()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// # Errors
+/// If the config cannot be read or parsed.
+#[tauri::command]
 pub fn read_mode(app: tauri::State<'_, App>) -> Result<config::ModeStatus, String> {
     config::read_mode(&app.paths.config()).map_err(|e| e.to_string())
 }

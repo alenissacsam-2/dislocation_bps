@@ -51,6 +51,8 @@ fn main() {
             app::wallet_forget,
             app::wallet_balances,
             app::read_mode,
+            app::read_dry_run,
+            app::set_dry_run,
             app::set_mode,
             app::read_limits,
             app::save_limits,

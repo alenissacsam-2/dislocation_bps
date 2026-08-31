@@ -1,4 +1,4 @@
-//! Reading and rewriting the four numbers the operator is allowed to change.
+//! Reading and rewriting the settings the operator is allowed to change.
 //!
 //! # Why `toml_edit` and not serde
 //!
@@ -9,11 +9,12 @@
 //! result looks wrong. `toml_edit` mutates the value in place and leaves the document
 //! alone.
 //!
-//! # What is deliberately absent
+//! # What is deliberately *not* in `Params`
 //!
-//! `mode`. No code path in this application writes it. HANDOVER invariant #1 is
-//! enforced by there being no mechanism, rather than by a dialog someone can click
-//! through.
+//! `mode` and `dry_run`. Both decide whether real money can move, and both have their
+//! own commands with a typed confirmation. `Params` is saved as one blob from a form of
+//! six fields, and a form that can arm spending as a side effect of changing the capital
+//! is a form that will eventually do exactly that.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -25,6 +26,12 @@ pub struct Params {
     pub fee_buffer_usd: f64,
     pub min_trade_usd: f64,
     pub max_hops: usize,
+    /// Output floor per hop, in basis points below the quote, written into the swap
+    /// instruction. Bounded above by the edge divided by the hop count — see
+    /// [`validate`], which refuses a value that makes every route unbuildable.
+    pub slippage_bps: u32,
+    /// Priority bid in micro-lamports per compute unit.
+    pub priority_micro_lamports: u64,
 }
 
 /// # Errors
@@ -45,6 +52,8 @@ pub fn read_params(path: &Path) -> anyhow::Result<Params> {
         fee_buffer_usd: num("fee_buffer_usd", 0.20),
         min_trade_usd: num("min_trade_usd", 10.0),
         max_hops: usize::try_from(int("max_hops", 3)).unwrap_or(3),
+        slippage_bps: u32::try_from(int("slippage_bps", 1)).unwrap_or(1),
+        priority_micro_lamports: u64::try_from(int("priority_micro_lamports", 0)).unwrap_or(0),
     })
 }
 
@@ -71,6 +80,26 @@ pub fn validate(p: &Params) -> Result<(), String> {
     if p.max_hops > 4 {
         return Err("Above 4 hops the search explodes for very little added reach.".into());
     }
+
+    // The constraint that cost a whole dry run to discover. A route builds only if its
+    // last output floor exceeds its first input, so for `n` hops at edge `e` the
+    // requirement is `s < e / n`. At 30 bps over two hops every cycle was refused as a
+    // guaranteed loss.
+    //
+    // Checked against the *total* floor rather than a per-hop ceiling derived from an
+    // assumed edge. Baking one measurement into validation rejects settings that are
+    // fine on a fatter day, and it rejected this instrument's own default of 1 bp over
+    // 3 hops, which sits exactly on a 3 bp boundary. What is never defensible is a total
+    // wider than any edge recorded here: the widest was about 12 bps on expensive routes
+    // and the typical figure is 2 to 3.
+    const WIDEST_DEFENSIBLE_TOTAL_BPS: u32 = 10;
+    let total = p.slippage_bps.saturating_mul(u32::try_from(p.max_hops).unwrap_or(u32::MAX));
+    if total > WIDEST_DEFENSIBLE_TOTAL_BPS {
+        return Err(format!(
+            "A floor of {} bps over {} hops gives away {total} bps in total, wider than any edge this instrument has recorded. A route only builds when its last floor beats its first input, so every cycle would be refused as a guaranteed loss. Keep the total under {WIDEST_DEFENSIBLE_TOTAL_BPS} bps.",
+            p.slippage_bps, p.max_hops
+        ));
+    }
     Ok(())
 }
 
@@ -87,6 +116,9 @@ pub fn write_params(path: &Path, p: &Params) -> anyhow::Result<()> {
     doc["fee_buffer_usd"] = toml_edit::value(p.fee_buffer_usd);
     doc["min_trade_usd"] = toml_edit::value(p.min_trade_usd);
     doc["max_hops"] = toml_edit::value(i64::try_from(p.max_hops).unwrap_or(3));
+    doc["slippage_bps"] = toml_edit::value(i64::from(p.slippage_bps));
+    doc["priority_micro_lamports"] =
+        toml_edit::value(i64::try_from(p.priority_micro_lamports).unwrap_or(0));
     std::fs::write(path, doc.to_string())?;
     Ok(())
 }
@@ -137,6 +169,51 @@ pub struct ModeStatus {
 /// This constant now says only that the machinery exists, which is why the UI stopped
 /// using it to refuse and started using it to warn.
 pub const EXECUTION_IMPLEMENTED: bool = true;
+
+/// Whether the bot will submit anything, and whether the environment is overriding it.
+///
+/// Separate from [`Params`] on purpose. A form that saves six fields at once must not be
+/// able to arm real spending as a side effect of changing the capital, so this has its
+/// own command and its own typed confirmation — the same treatment as the mode switch.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DryRunStatus {
+    /// What the file says.
+    pub dry_run: bool,
+    /// What the bot will actually do once the environment is merged over the file.
+    pub effective: bool,
+    /// Set when `CRYPTOBOT_DRY_RUN` is overriding the file.
+    pub env_override: Option<String>,
+}
+
+/// # Errors
+/// If the file cannot be read or parsed.
+pub fn read_dry_run(path: &Path) -> anyhow::Result<DryRunStatus> {
+    let text = std::fs::read_to_string(path)?;
+    let doc: toml_edit::DocumentMut = text.parse()?;
+    // Absent means dry, matching `cb_core::config::default_dry_run`. A config written by
+    // an older build, by hand, or half-way through must never read as "will submit".
+    let from_file = doc.get("dry_run").and_then(toml_edit::Item::as_bool).unwrap_or(true);
+
+    let env_override = std::env::var("CRYPTOBOT_DRY_RUN").ok().filter(|v| !v.trim().is_empty());
+    let effective = match env_override.as_deref() {
+        Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0"),
+        None => from_file,
+    };
+    Ok(DryRunStatus { dry_run: from_file, effective, env_override })
+}
+
+/// Write `dry_run`, and nothing else.
+///
+/// # Errors
+/// If the file cannot be read or written.
+pub fn write_dry_run(path: &Path, dry_run: bool) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path)?;
+    let mut doc: toml_edit::DocumentMut = text.parse()?;
+    doc["dry_run"] = toml_edit::value(dry_run);
+    std::fs::write(path, doc.to_string())?;
+    Ok(())
+}
 
 /// # Errors
 /// If the file cannot be read or parsed.
@@ -336,21 +413,21 @@ max_position_lamports = 20000000
     #[test]
     fn a_negative_book_is_refused_rather_than_written() {
         let bad =
-            Params { capital_usd: -1.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 3 };
+            Params { capital_usd: -1.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 3, slippage_bps: 1, priority_micro_lamports: 0 };
         assert!(validate(&bad).is_err());
     }
 
     #[test]
     fn zero_hops_is_refused_because_a_cycle_needs_at_least_two() {
         let bad =
-            Params { capital_usd: 100.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 0 };
+            Params { capital_usd: 100.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 0, slippage_bps: 1, priority_micro_lamports: 0 };
         assert!(validate(&bad).is_err());
     }
 
     #[test]
     fn a_buffer_larger_than_the_book_is_refused() {
         let bad =
-            Params { capital_usd: 1.0, fee_buffer_usd: 5.0, min_trade_usd: 10.0, max_hops: 3 };
+            Params { capital_usd: 1.0, fee_buffer_usd: 5.0, min_trade_usd: 10.0, max_hops: 3, slippage_bps: 1, priority_micro_lamports: 0 };
         assert!(validate(&bad).is_err());
     }
 
@@ -359,7 +436,7 @@ max_position_lamports = 20000000
         let p = tmp("reject", SAMPLE);
         let before = std::fs::read_to_string(&p).unwrap();
         let bad =
-            Params { capital_usd: -1.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 3 };
+            Params { capital_usd: -1.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 3, slippage_bps: 1, priority_micro_lamports: 0 };
         let _ = write_params(&p, &bad);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
     }
@@ -449,5 +526,31 @@ max_position_lamports = 20000000
         let bare = tmp("rpc-bare", "mode = \"paper\"
 ");
         assert!(read_rpc_url(&bare).unwrap().contains("mainnet"));
+    }
+
+    /// The floor that made trading impossible must not be settable, and the one that
+    /// works must not be refused. Both directions, because a validator that only
+    /// rejects is as bad as one that only accepts.
+    #[test]
+    fn a_slippage_floor_wider_than_any_recorded_edge_is_refused() {
+        let ok = Params {
+            capital_usd: 14.1,
+            fee_buffer_usd: 0.8,
+            min_trade_usd: 10.0,
+            max_hops: 3,
+            slippage_bps: 1,
+            priority_micro_lamports: 0,
+        };
+        assert!(validate(&ok).is_ok(), "1 bp over 3 hops is the shipped default: {:?}", validate(&ok));
+
+        // The value that refused every cycle in a live dry run.
+        let broken = Params { slippage_bps: 30, ..ok };
+        let e = validate(&broken).unwrap_err();
+        assert!(e.contains("guaranteed loss"), "{e}");
+
+        // And the boundary is on the total, not the per-hop figure: 3 bps over 3 hops
+        // is 9 and allowed, 4 over 3 is 12 and not.
+        assert!(validate(&Params { slippage_bps: 3, ..ok }).is_ok());
+        assert!(validate(&Params { slippage_bps: 4, ..ok }).is_err());
     }
 }

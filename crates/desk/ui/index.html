@@ -261,8 +261,46 @@
           added reach.
         </div>
       </div>
+      <div class="field">
+        <label for="fSlippage">Output floor per hop (bps)</label>
+        <input type="number" id="fSlippage" step="1" min="0" max="100">
+        <div class="hint">
+          How far below its quote each hop's floor is written into the swap instruction.
+          <b>Must be smaller than the edge divided by the hop count</b> — a route only
+          builds when its last floor beats its first input. This was 30, which made every
+          route refuse as a guaranteed loss; you cannot tolerate more slippage than the
+          profit you are chasing.
+        </div>
+      </div>
+      <div class="field">
+        <label for="fPriority">Priority bid (micro-lamports per compute unit)</label>
+        <input type="number" id="fPriority" step="1" min="0">
+        <div class="hint">
+          0 pays the base fee only. Raising it buys inclusion against competing
+          searchers, out of the same profit the trade was worth.
+        </div>
+      </div>
       <button id="btnSave" class="primary">Save, archive and restart</button>
       <p class="note" id="saveResult"></p>
+    </div>
+
+    <div class="panel span6">
+      <h2>Submission</h2>
+      <div class="warn">
+        <b>This is the last switch before real money moves.</b> It is separate from Mode
+        on purpose: arming Live and allowing spending are two decisions, and this is the
+        second one.
+      </div>
+      <p class="note" id="dryState">Checking…</p>
+      <div class="field" id="spendConfirmWrap" hidden>
+        <label for="fSpendConfirm">Type <code>SPEND</code> to allow real transactions</label>
+        <input type="text" id="fSpendConfirm" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="acct-actions">
+        <button id="btnAllowSpend">Allow real transactions</button>
+        <button id="btnDryRun" class="primary">Back to dry run</button>
+      </div>
+      <p class="note" id="dryResult"></p>
     </div>
 
     <div class="panel span6">

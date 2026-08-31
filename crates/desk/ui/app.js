@@ -593,6 +593,8 @@ async function loadConfig() {
     $("fBuffer").value = p.feeBufferUsd;
     $("fMinTrade").value = p.minTradeUsd;
     $("fHops").value = p.maxHops;
+    $("fSlippage").value = p.slippageBps;
+    $("fPriority").value = p.priorityMicroLamports;
   } catch (e) {
     $("saveResult").textContent = "Could not read config.toml: " + e;
   }
@@ -605,7 +607,63 @@ async function loadConfig() {
   await paintWallet();
   await paintLimits();
   await paintMode();
+  await paintDryRun();
 }
+
+// ── submission ──────────────────────────────────────────────────────────────
+//
+// Deliberately not a field in the parameters form. That form writes six values at
+// once, and a form which can arm real spending as a side effect of changing the
+// capital is a form that will eventually do exactly that.
+
+async function paintDryRun() {
+  let d;
+  try { d = await invoke("read_dry_run"); }
+  catch (e) { $("dryState").textContent = "Could not read dry_run: " + e; return; }
+  window.__dry = d;
+
+  const lines = [];
+  if (d.envOverride) {
+    lines.push(`<b>CRYPTOBOT_DRY_RUN=${d.envOverride} is set and overrides the file.</b> `
+      + `The file says <code>${d.dryRun}</code>; the bot will use <code>${d.effective}</code>.`);
+  }
+  lines.push(d.effective
+    ? "<b>Dry run.</b> Transactions are built, signed and simulated against live state, "
+      + "and none are submitted."
+    : "<b>Real transactions will be submitted.</b> Every one is still simulated first and "
+      + "abandoned unless the simulated balance clears the profit floor — but money can "
+      + "move from here.");
+  $("dryState").innerHTML = lines.join("<br><br>");
+
+  $("btnAllowSpend").disabled = !d.effective;
+  $("btnDryRun").disabled = d.effective;
+  $("spendConfirmWrap").hidden = !d.effective;
+}
+
+$("btnAllowSpend").onclick = async () => {
+  $("dryResult").textContent = "Applying…";
+  try {
+    await invoke("set_dry_run", { dryRun: false, confirm: $("fSpendConfirm").value });
+    $("fSpendConfirm").value = "";
+    $("dryResult").textContent = "Real transactions are now allowed.";
+  } catch (e) {
+    $("dryResult").textContent = "" + e;
+  }
+  await paintDryRun();
+};
+
+// Never asks. Making the safe direction cheap is the whole point of asking on the
+// other one.
+$("btnDryRun").onclick = async () => {
+  $("dryResult").textContent = "Applying…";
+  try {
+    await invoke("set_dry_run", { dryRun: true, confirm: "" });
+    $("dryResult").textContent = "Back to dry run. Nothing will be submitted.";
+  } catch (e) {
+    $("dryResult").textContent = "" + e;
+  }
+  await paintDryRun();
+};
 
 // ── mode ────────────────────────────────────────────────────────────────────
 //
@@ -907,6 +965,8 @@ $("btnSave").onclick = async () => {
     feeBufferUsd: parseFloat($("fBuffer").value),
     minTradeUsd: parseFloat($("fMinTrade").value),
     maxHops: parseInt($("fHops").value, 10),
+    slippageBps: parseInt($("fSlippage").value, 10),
+    priorityMicroLamports: parseInt($("fPriority").value, 10),
   };
   $("saveResult").textContent = "Saving…";
   try {
