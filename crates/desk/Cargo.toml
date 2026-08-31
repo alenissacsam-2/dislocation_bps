@@ -31,3 +31,7 @@ cb-executor = { workspace = true }
 solana-sdk = { workspace = true }
 zeroize = "1.8"
 bs58 = { workspace = true }
+
+[dev-dependencies]
+# Only a test parses TOML directly; the crate uses toml_edit to preserve prose.
+toml = "0.8"

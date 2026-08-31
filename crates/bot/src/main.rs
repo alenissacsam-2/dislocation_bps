@@ -178,7 +178,14 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
     drop(passphrase);
 
     let address = wallet.pubkey();
-    let rpc = execute::rpc_for(&cfg.rpc_http_url)?;
+    let endpoints = cfg.http_endpoints();
+    if endpoints.len() > 1 {
+        tracing::info!(
+            "{} RPC endpoints configured; reads fail over between them, sends never do",
+            endpoints.len()
+        );
+    }
+    let rpc = cb_executor::rpc::Rpc::with_fallbacks(endpoints)?;
     // From the file, not from Default. The application's Risk Limits panel writes these
     // and the operator expects them to bind.
     let limits = cb_executor::risk::Limits {
@@ -271,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
             mode: Mode::Paper,
             feed: FeedSource::Live,
             rpc_http_url: "https://api.mainnet-beta.solana.com".into(),
+            rpc_http_fallbacks: Vec::new(),
             rpc_ws_url: "wss://api.mainnet-beta.solana.com".into(),
             min_profit_lamports: 0,
             max_position_lamports: 20_000_000,

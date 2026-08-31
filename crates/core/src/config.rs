@@ -44,6 +44,13 @@ pub struct Config {
     pub feed: FeedSource,
     #[serde(default = "default_rpc_http")]
     pub rpc_http_url: String,
+    /// Further HTTP endpoints, tried in order when the primary fails.
+    ///
+    /// Reads fail over down this list; a **send never does**. A transaction that timed
+    /// out may still have been received, and re-sending it elsewhere is how one trade
+    /// becomes two.
+    #[serde(default)]
+    pub rpc_http_fallbacks: Vec<String>,
     pub rpc_ws_url: String,
     /// Minimum gross profit, in lamports, for an opportunity to be recorded as actionable.
     pub min_profit_lamports: u64,
@@ -185,6 +192,15 @@ fn default_max_daily_trades() -> u32 {
 }
 
 impl Config {
+    /// Every HTTP endpoint, in preference order, primary first.
+    #[must_use]
+    pub fn http_endpoints(&self) -> Vec<String> {
+        let mut all = vec![self.rpc_http_url.clone()];
+        all.extend(self.rpc_http_fallbacks.iter().cloned());
+        all.retain(|u| !u.trim().is_empty());
+        all
+    }
+
     /// Load from a TOML file, with `CRYPTOBOT_` prefixed environment overrides.
     pub fn load(path: &str) -> anyhow::Result<Self> {
         use figment::{
@@ -238,6 +254,7 @@ mod tests {
             mode,
             feed: FeedSource::Simulated,
             rpc_http_url: "https://x".into(),
+            rpc_http_fallbacks: Vec::new(),
             rpc_ws_url: "wss://x".into(),
             min_profit_lamports: 1000,
             max_position_lamports: 10_000_000,

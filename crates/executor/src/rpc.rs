@@ -5,7 +5,7 @@
 //! mainnet over `reqwest` and `tokio-tungstenite` directly. Five methods is less code
 //! than the adapter would be.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use solana_sdk::{hash::Hash, pubkey::Pubkey};
@@ -23,7 +23,11 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 const POOL_IDLE: Duration = Duration::from_secs(3);
 
 pub struct Rpc {
-    url: String,
+    /// Endpoints in preference order. Reads fail over down this list; sends never do.
+    endpoints: Vec<String>,
+    /// Which endpoint reads start from, so a provider that has just failed is not
+    /// retried first on every subsequent call.
+    cursor: std::sync::atomic::AtomicUsize,
     http: reqwest::Client,
 }
 
@@ -52,8 +56,20 @@ impl Rpc {
     /// # Errors
     /// If the HTTP client cannot be constructed.
     pub fn new(url: impl Into<String>) -> Result<Self> {
+        Self::with_fallbacks(vec![url.into()])
+    }
+
+    /// Build a client that fails over across several endpoints.
+    ///
+    /// # Errors
+    /// If the list is empty or the HTTP client cannot be constructed.
+    pub fn with_fallbacks(endpoints: Vec<String>) -> Result<Self> {
+        let endpoints: Vec<String> =
+            endpoints.into_iter().map(|e| e.trim().to_string()).filter(|e| !e.is_empty()).collect();
+        ensure!(!endpoints.is_empty(), "an RPC client needs at least one endpoint");
         Ok(Self {
-            url: url.into(),
+            endpoints,
+            cursor: std::sync::atomic::AtomicUsize::new(0),
             http: reqwest::Client::builder()
                 .timeout(TIMEOUT)
                 // Drop idle connections well before the server does.
@@ -82,42 +98,90 @@ impl Rpc {
     /// that failed for an unknown reason may have been received.
     const RATE_LIMIT_RETRIES: u32 = 4;
 
-    async fn call(&self, method: &str, params: Value) -> Result<Value> {
+    /// How many endpoints deep a read will go before giving up.
+    ///
+    /// Every endpoint gets one chance per call. Going round twice would turn a
+    /// provider-wide outage into a long stall on a loop that runs at 5 Hz.
+    fn endpoint_count(&self) -> usize {
+        self.endpoints.len()
+    }
+
+    /// One attempt against one endpoint.
+    async fn call_on(&self, url: &str, method: &str, params: &Value) -> Result<Value> {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
 
         let mut backoff = Duration::from_millis(400);
         for attempt in 0..=Self::RATE_LIMIT_RETRIES {
-            let resp: Value = self
+            let resp = self
                 .http
-                .post(&self.url)
+                .post(url)
                 .json(&body)
                 .send()
                 .await
-                .with_context(|| format!("{method} request failed"))?
-                .json()
-                .await
-                .with_context(|| format!("{method} returned something that is not JSON"))?;
+                .with_context(|| format!("{method} request failed"))?;
 
-            if let Some(e) = resp.get("error") {
-                // A public endpoint rate-limits a whole-registry sweep part way through,
-                // and a run that stops at pool 26 of 82 reports the remaining 56 as
-                // unknown — which reads like a fleet of broken pools rather than one
-                // tired endpoint.
+            // A provider under load answers with an HTML error page, and serde's
+            // complaint about that is unreadable. Measured: 48 execution attempts died
+            // on `getMultipleAccounts returned something that is not JSON`, which was
+            // the public endpoint rate-limiting mid-trade.
+            let status = resp.status();
+            let text = resp.text().await.with_context(|| format!("{method}: no body"))?;
+            let parsed: Value = serde_json::from_str(&text).map_err(|_| {
+                anyhow!(
+                    "{method} returned {} rather than JSON ({} bytes) — the endpoint is \
+                     probably rate limiting",
+                    status,
+                    text.len()
+                )
+            })?;
+
+            if let Some(e) = parsed.get("error") {
                 let rate_limited = e.get("code").and_then(Value::as_i64) == Some(429);
                 if rate_limited && attempt < Self::RATE_LIMIT_RETRIES {
                     tokio::time::sleep(backoff).await;
                     backoff *= 2;
                     continue;
                 }
-                // The node's own message is more useful than anything wrapped around it.
                 bail!("{method} failed: {e}");
             }
-            return resp
+            return parsed
                 .get("result")
                 .cloned()
                 .ok_or_else(|| anyhow!("{method} returned neither a result nor an error"));
         }
         bail!("{method} was rate limited {} times running", Self::RATE_LIMIT_RETRIES + 1)
+    }
+
+    /// A read, failing over across the configured endpoints.
+    ///
+    /// Starts from whichever endpoint last worked, so one bad provider is skipped
+    /// rather than re-tried first on every call.
+    async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        use std::sync::atomic::Ordering;
+        let n = self.endpoint_count();
+        let start = self.cursor.load(Ordering::Relaxed) % n;
+        let mut last: Option<anyhow::Error> = None;
+
+        for step in 0..n {
+            let idx = (start + step) % n;
+            match self.call_on(&self.endpoints[idx], method, &params).await {
+                Ok(v) => {
+                    if step > 0 {
+                        // Remember the one that worked. Announced, because a silent
+                        // switch hides a provider that has quietly stopped answering.
+                        self.cursor.store(idx, Ordering::Relaxed);
+                        tracing::warn!(
+                            "rpc failed over to endpoint {} of {n} for {method}",
+                            idx + 1
+                        );
+                    }
+                    return Ok(v);
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow!("{method}: no endpoints configured")))
+            .with_context(|| format!("all {n} endpoint(s) failed"))
     }
 
     /// # Errors
@@ -194,7 +258,17 @@ impl Rpc {
             "maxRetries": 0,
             "preflightCommitment": "confirmed",
         });
-        let r = self.call("sendTransaction", json!([tx_base64, cfg])).await?;
+        // Deliberately NOT `call`: no failover, and no retry.
+        //
+        // A transaction that times out may still have been received. Sending it again
+        // to a second endpoint is how the same trade gets submitted twice, and the
+        // second copy is not free — it is a second real transaction against a wallet
+        // that has already moved. A failed send is reported as failed; deciding what
+        // to do about it needs the signature status, not another attempt.
+        use std::sync::atomic::Ordering;
+        let idx = self.cursor.load(Ordering::Relaxed) % self.endpoint_count();
+        let params = json!([tx_base64, cfg]);
+        let r = self.call_on(&self.endpoints[idx], "sendTransaction", &params).await?;
         r.as_str()
             .map(String::from)
             .ok_or_else(|| anyhow!("sendTransaction did not return a signature"))
@@ -524,5 +598,43 @@ mod tests {
         raw[64..72].copy_from_slice(&1_234_567_890u64.to_le_bytes());
         let acc = json!({"data": [base64_encode(&raw), "base64"]});
         assert_eq!(token_amount_of(&acc), Some(1_234_567_890));
+    }
+
+    /// Failover exists for reads. It must never apply to a send: a transaction that
+    /// timed out may still have been received, and a second copy is a second real
+    /// trade against a wallet that has already moved.
+    #[test]
+    fn send_is_pinned_to_one_endpoint_while_reads_are_not() {
+        let src = include_str!("rpc.rs");
+        let send_fn = &src[src.find("pub async fn send(").expect("send exists")..];
+        let body = &send_fn[..send_fn.find("\n    }").expect("body ends")];
+        assert!(
+            body.contains("call_on("),
+            "send must use the single-endpoint path"
+        );
+        assert!(
+            !body.contains("self.call(\""),
+            "send must not use the failing-over path"
+        );
+    }
+
+    #[test]
+    fn a_client_needs_at_least_one_endpoint() {
+        assert!(Rpc::with_fallbacks(vec![]).is_err());
+        assert!(Rpc::with_fallbacks(vec!["   ".into(), String::new()]).is_err());
+        // Blanks are dropped, not counted.
+        let r = Rpc::with_fallbacks(vec!["https://a.example".into(), "  ".into()]).unwrap();
+        assert_eq!(r.endpoint_count(), 1);
+    }
+
+    #[test]
+    fn endpoints_keep_their_order_and_duplicates_are_the_callers_business() {
+        let r = Rpc::with_fallbacks(vec![
+            " https://one.example ".into(),
+            "https://two.example".into(),
+        ])
+        .unwrap();
+        assert_eq!(r.endpoint_count(), 2);
+        assert_eq!(r.endpoints[0], "https://one.example", "whitespace is trimmed");
     }
 }

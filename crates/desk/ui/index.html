@@ -289,10 +289,34 @@
         endpoint does not create edge. It deletes the fake edge that bad data invents.
       </div>
       <div class="field">
-        <label for="fRpcHttp">RPC endpoint</label>
-        <input type="text" id="fRpcHttp" autocomplete="off" spellcheck="false"
-               placeholder="https://api.mainnet-beta.solana.com">
-        <div class="hint">Leave blank for the public endpoint.</div>
+        <label for="fRpcHttp">RPC endpoints — one per line, best first</label>
+        <textarea id="fRpcHttp" rows="3" autocomplete="off" spellcheck="false"
+                  placeholder="https://api.mainnet-beta.solana.com"></textarea>
+        <div class="providers" id="rpcProviders">
+          <span class="rail-label">Add</span>
+          <button type="button" data-rpc="https://lb.drpc.org/ogrpc?network=solana&amp;dkey=YOUR_KEY">dRPC</button>
+          <button type="button" data-rpc="https://solana-mainnet.g.alchemy.com/v2/YOUR_KEY">Alchemy</button>
+          <button type="button" data-rpc="https://mainnet.helius-rpc.com/?api-key=YOUR_KEY">Helius</button>
+          <button type="button" data-rpc="https://solana-mainnet.core.chainstack.com/YOUR_KEY">Chainstack</button>
+          <button type="button" data-rpc="https://rpc.ankr.com/solana">Ankr</button>
+          <button type="button" data-rpc="https://api.mainnet-beta.solana.com">Public</button>
+        </div>
+        <div class="hint">
+          Free tiers, as advertised: <b>dRPC</b> ~50M CU/mo · <b>Alchemy</b> 30M CU/mo ·
+          <b>QuickNode</b> 10M credits/mo · <b>Chainstack</b> 3M req/mo · <b>Helius</b>
+          1M credits at 10 rps · <b>Ankr</b> 30 rps. For this bot the <i>rate</i> limit
+          binds before the monthly quota does — it sweeps at 5 Hz and reads a hundred
+          accounts a time — so a generous rps matters more than a big monthly number.
+          Each button inserts that provider's URL shape; replace <code>YOUR_KEY</code>
+          with the endpoint from its dashboard, which is the authority on the exact form.
+        </div>
+        <div class="hint">
+          Reads fail over down the list when one stops answering — 48 execution attempts
+          died on the public endpoint returning an error page mid-trade. <b>A send never
+          fails over</b>: a transaction that timed out may still have been received, and
+          re-sending it elsewhere is how one trade becomes two. Leave blank for the
+          public endpoint.
+        </div>
       </div>
       <div class="field">
         <label for="fRpcWs">WebSocket endpoint</label>

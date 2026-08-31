@@ -332,3 +332,15 @@ button.ghost{background:transparent;padding:3px 8px;font-size:11px}
 .rail-ready.ok{color:var(--pos)}
 .rail-ready.no{color:var(--accent)}
 .rail-wallet .ghost{width:100%;font-size:10.5px;padding:3px 0}
+
+/* The RPC list. A textarea so several endpoints fit, styled as its siblings. */
+textarea{
+  width:100%;background:var(--raise);color:var(--ink);border:1px solid var(--line);
+  border-radius:var(--r);padding:6px 8px;font-family:var(--mono);font-size:11.5px;
+  line-height:1.5;resize:vertical;
+}
+textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* Provider shortcuts above the endpoint list. */
+.providers{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:7px 0}
+.providers button{font-size:10.5px;padding:3px 8px;background:var(--panel)}

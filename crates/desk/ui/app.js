@@ -968,6 +968,24 @@ $("fAutostart").onchange = async (e) => {
 };
 $("fAutorestart").onchange = (e) => invoke("set_auto_restart", { on: e.target.checked });
 
+// Provider shortcuts. They insert a URL *shape*, not a working endpoint — the key has
+// to come from that provider's dashboard, which is the only authority on the exact
+// form. Appended rather than replacing, because the point of the list is having more
+// than one.
+for (const b of document.querySelectorAll("#rpcProviders button")) {
+  b.onclick = () => {
+    const box = $("fRpcHttp");
+    const lines = box.value.split("\n").map(l => l.trim()).filter(Boolean);
+    const url = b.dataset.rpc;
+    if (!lines.includes(url)) lines.push(url);
+    box.value = lines.join("\n") + "\n";
+    box.focus();
+    // Land the caret on the placeholder so the key can be typed straight over it.
+    const at = box.value.indexOf("YOUR_KEY");
+    if (at >= 0) box.setSelectionRange(at, at + "YOUR_KEY".length);
+  };
+}
+
 $("btnSave").onclick = async () => {
   const params = {
     capitalUsd: parseFloat($("fCapital").value),

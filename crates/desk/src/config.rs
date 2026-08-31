@@ -32,7 +32,10 @@ pub struct Params {
     pub slippage_bps: u32,
     /// Priority bid in micro-lamports per compute unit.
     pub priority_micro_lamports: u64,
-    /// The JSON-RPC endpoint. Empty means the public one.
+    /// JSON-RPC endpoints, newline-separated, in preference order.
+    ///
+    /// Reads fail over down the list. A send never does — see
+    /// `cb_executor::rpc::Rpc::send`.
     pub rpc_http_url: String,
     /// The WebSocket endpoint the pool feed subscribes on. Empty means the public one.
     ///
@@ -67,7 +70,13 @@ pub fn read_params(path: &Path) -> anyhow::Result<Params> {
         max_hops: usize::try_from(int("max_hops", 3)).unwrap_or(3),
         slippage_bps: u32::try_from(int("slippage_bps", 1)).unwrap_or(1),
         priority_micro_lamports: u64::try_from(int("priority_micro_lamports", 0)).unwrap_or(0),
-        rpc_http_url: text("rpc_http_url", PUBLIC_HTTP),
+        rpc_http_url: {
+            let mut all = vec![text("rpc_http_url", PUBLIC_HTTP)];
+            if let Some(arr) = doc.get("rpc_http_fallbacks").and_then(toml_edit::Item::as_array) {
+                all.extend(arr.iter().filter_map(|v| v.as_str().map(str::to_string)));
+            }
+            all.join("\n")
+        },
         rpc_ws_url: text("rpc_ws_url", PUBLIC_WS),
     })
 }
@@ -119,9 +128,21 @@ pub fn validate(p: &Params) -> Result<(), String> {
             p.slippage_bps, p.max_hops
         ));
     }
-    let http = p.rpc_http_url.trim();
-    if !http.is_empty() && !http.starts_with("https://") && !http.starts_with("http://") {
-        return Err("The RPC endpoint must start with https:// (or http:// for a local node).".into());
+    for line in p.rpc_http_url.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if line.contains("YOUR_KEY") {
+            // The provider buttons insert a shape, not a working endpoint. Saving one
+            // unedited would configure a URL that authenticates as nobody, and the
+            // failure would arrive later as an opaque 401 from inside a sweep.
+            return Err(format!(
+                "This endpoint still has the placeholder in it — replace YOUR_KEY with                  the key from that provider's dashboard: {line}"
+            ));
+        }
+        if !line.starts_with("https://") && !line.starts_with("http://") {
+            return Err(format!(
+                "RPC endpoints must start with https:// (or http:// for a local node). \
+                 This one does not: {line}"
+            ));
+        }
     }
     let ws = p.rpc_ws_url.trim();
     if !ws.is_empty() && !ws.starts_with("wss://") && !ws.starts_with("ws://") {
@@ -148,9 +169,21 @@ pub fn write_params(path: &Path, p: &Params) -> anyhow::Result<()> {
         toml_edit::value(i64::try_from(p.priority_micro_lamports).unwrap_or(0));
     // Blank means "use the public one" rather than "write an empty string", which the
     // bot would fail to parse as a URL at the least helpful possible moment.
-    let http = if p.rpc_http_url.trim().is_empty() { PUBLIC_HTTP } else { p.rpc_http_url.trim() };
+    // One endpoint per line in the field; the first is primary and the rest are
+    // fallbacks, written as a TOML array so the file stays readable.
+    let mut lines: Vec<&str> =
+        p.rpc_http_url.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        lines.push(PUBLIC_HTTP);
+    }
+    doc["rpc_http_url"] = toml_edit::value(lines[0]);
+    let mut arr = toml_edit::Array::new();
+    for extra in &lines[1..] {
+        arr.push(*extra);
+    }
+    doc["rpc_http_fallbacks"] = toml_edit::value(arr);
+
     let ws = if p.rpc_ws_url.trim().is_empty() { PUBLIC_WS } else { p.rpc_ws_url.trim() };
-    doc["rpc_http_url"] = toml_edit::value(http);
     doc["rpc_ws_url"] = toml_edit::value(ws);
     std::fs::write(path, doc.to_string())?;
     Ok(())
@@ -587,5 +620,94 @@ max_position_lamports = 20000000
         // is 9 and allowed, 4 over 3 is 12 and not.
         assert!(validate(&Params { slippage_bps: 3, ..ok.clone() }).is_ok());
         assert!(validate(&Params { slippage_bps: 4, ..ok.clone() }).is_err());
+    }
+
+    /// Several endpoints survive the trip through the file and back.
+    ///
+    /// The field is newline-separated and the file is a primary plus a TOML array, so
+    /// this crosses two representations. A round trip that silently dropped the
+    /// fallbacks would leave an operator believing they had redundancy they did not.
+    #[test]
+    fn a_list_of_endpoints_round_trips_through_the_file() {
+        let p = tmp(
+            "rpcs",
+            "capital_usd = 14.1
+rpc_ws_url = \"wss://x\"
+min_profit_lamports = 0
+             max_position_lamports = 1
+",
+        );
+        let mut params = read_params(&p).unwrap();
+        params.rpc_http_url =
+            "https://one.example
+  https://two.example  
+
+https://three.example
+".into();
+        write_params(&p, &params).unwrap();
+
+        let back = read_params(&p).unwrap();
+        let lines: Vec<&str> = back.rpc_http_url.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["https://one.example", "https://two.example", "https://three.example"],
+            "blank lines dropped, whitespace trimmed, order kept"
+        );
+
+        // And the file itself is readable: a primary plus an array, not one blob.
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("rpc_http_url = \"https://one.example\""), "{text}");
+        assert!(text.contains("rpc_http_fallbacks = ["), "{text}");
+
+        // cb-core must agree about the order when it loads the same file.
+        let cfg: cb_core::config::Config = toml::from_str(&text).expect("cb-core parses it");
+        assert_eq!(
+            cfg.http_endpoints(),
+            vec!["https://one.example", "https://two.example", "https://three.example"]
+        );
+    }
+
+    #[test]
+    fn an_endpoint_without_a_scheme_is_refused_and_names_itself() {
+        let mut p = read_params(&tmp("sch", "capital_usd = 14.1
+")).unwrap();
+        p.rpc_http_url = "https://ok.example
+not-a-url
+".into();
+        let e = validate(&p).unwrap_err();
+        assert!(e.contains("not-a-url"), "the refusal must name the offender: {e}");
+    }
+
+    /// Blank means the public endpoint, not an empty string the bot cannot parse.
+    #[test]
+    fn clearing_the_field_falls_back_to_the_public_endpoint() {
+        let f = tmp("blank", "capital_usd = 14.1
+rpc_ws_url = \"wss://x\"
+");
+        let mut p = read_params(&f).unwrap();
+        p.rpc_http_url = "   
+
+".into();
+        p.rpc_ws_url = String::new();
+        write_params(&f, &p).unwrap();
+        let back = read_params(&f).unwrap();
+        assert_eq!(back.rpc_http_url, PUBLIC_HTTP);
+        assert_eq!(back.rpc_ws_url, PUBLIC_WS);
+    }
+
+    /// The provider buttons insert a shape, not an endpoint. Saving one unedited would
+    /// configure a URL that authenticates as nobody, and the failure would surface much
+    /// later as an opaque 401 from inside a sweep.
+    #[test]
+    fn an_unedited_provider_template_is_refused() {
+        let mut p = read_params(&tmp("tpl", "capital_usd = 14.1
+")).unwrap();
+        p.rpc_http_url = "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY".into();
+        let e = validate(&p).unwrap_err();
+        assert!(e.contains("YOUR_KEY"), "{e}");
+
+        // Replaced, it is accepted.
+        p.rpc_http_url = "https://mainnet.helius-rpc.com/?api-key=abc123".into();
+        assert!(validate(&p).is_ok(), "{:?}", validate(&p));
     }
 }

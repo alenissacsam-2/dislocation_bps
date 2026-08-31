@@ -45,7 +45,6 @@ use cb_core::types::{Dex, Pubkey32};
 use cb_executor::encode::{pk, programs, to_pubkey};
 use cb_executor::pda::associated_token_address;
 use cb_executor::route::{self, Hop, RouteOptions, WsolPolicy};
-use cb_executor::rpc::Rpc;
 use cb_executor::venue::raydium::BitmapPolicy;
 use cb_executor::venue::VenueExtra;
 use cb_executor::{ticks, tx, Attempt, Executor, Plan};
@@ -400,17 +399,10 @@ fn input_is_token_a(dex: Dex, data: &[u8], mint: &Pubkey32) -> Result<bool> {
     }
 }
 
-/// Build a [`Rpc`] for execution.
-///
-/// # Errors
-/// If the HTTP client cannot be constructed.
-pub fn rpc_for(url: &str) -> Result<Rpc> {
-    Rpc::new(url)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cb_executor::rpc::Rpc;
 
     /// Mint `i` of a cycle. Distinct per hop, and the last equals the first so the
     /// cycle closes the way `route::build` insists on.
@@ -583,6 +575,7 @@ mod tests {
 #[cfg(test)]
 mod mainnet {
     use super::*;
+    use cb_executor::rpc::Rpc;
     use cb_core::types::Dex;
 
     const WSOL: &str = "So11111111111111111111111111111111111111112";
