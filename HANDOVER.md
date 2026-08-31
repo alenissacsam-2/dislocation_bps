@@ -345,7 +345,49 @@ This does not overturn the headline — one pool out of ninety, on an exotic pai
 here because it is the same shape as the other seven and because the fix is not a code
 change: the registry needs a tradeability filter, and nothing currently applies one.
 
-The pattern in all eight: **an internal check cannot catch an error in what the code
+**The fee-tier gradient was stale prices — resolved 2026-08-31.** §5's open question is
+closed, and the answer is the unflattering one. Measured over a 1,241,443-opportunity
+archive (`cryptobot-20260831-132830.db`), grouping by `slot_spread` — how many slots
+apart the two legs of a cycle were observed:
+
+| slot spread | opportunities | avg edge | total value |
+|---|---|---|---|
+| 0 (simultaneous) | 185,052 | 1.96 bp | $141.12 |
+| 1–4 | 349,738 | 1.80 bp | $226.58 |
+| 5–19 | 331,308 | 1.86 bp | $103.02 |
+| 20–99 | 245,998 | 2.21 bp | $114.98 |
+| **100+** | **109,374** | **5.76 bp** | **$521.55** |
+
+**8.8% of opportunities produced 46% of the value, and their defining feature is that
+their legs were minutes apart.** Of $1,128.99 reported, **$141.12 — 12.5% — came from
+legs observed in the same slot.** The other 87.5% is a price from now compared against a
+price from before.
+
+The single most valuable venue pair in the archive, `RAY-CL 25bp · RAY-CL 5bp` at
+$122.96, is one cycle repeated: `SOL → RAY → SOL`, edge 33.19 bp, **slot spread 502** —
+about 3.3 minutes between observing the two legs. Of the thousand most valuable
+opportunities, 102 had simultaneous legs.
+
+And the fee gradient itself, restricted to simultaneous legs, largely collapses: 1.51,
+1.98, 3.66, 2.83 bp across the four fee bands, against 2.16 → 11.95 unrestricted. The
+mechanism is now obvious in hindsight: **an expensive pool is a thinly traded pool, a
+thinly traded pool updates rarely, and a stale cached price compared against a fresh one
+shows a gap that nobody can trade.** Fee was never the cause; it was a proxy for
+staleness.
+
+> **The earlier investigation measured this and dismissed it.** §5 recorded clock skew
+> as "real but far too small — −9%, −6%, +11% by tier". That measured the *average* cost
+> of requiring simultaneity across all opportunities, where the 91% with fresh legs swamp
+> the 9% without. Conditioning on the spread instead of averaging over it reverses the
+> conclusion. The number was right and the question it answered was the wrong one.
+
+**Consequences.** The instrument's own headline is now known to be ~87% artifact, and the
+honest figure is the simultaneous-leg subset: about 2 bp of average edge against a 2 bp
+floor — break-even before tips. This also settles the venue-expansion question in the
+negative: adding thinly traded venues adds stale pools, and stale pools are what
+manufactured the phantom edge in the first place.
+
+The pattern in all nine: **an internal check cannot catch an error in what the code
 believes about the outside world** — including what it believes its own numbers mean.
 Every new decoder must be pinned against a value the decoder itself did not produce,
 and every headline must name which search produced it.
