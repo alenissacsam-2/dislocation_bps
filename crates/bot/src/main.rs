@@ -718,6 +718,122 @@ async fn spawn_live(
                             None
                         };
 
+                        // Decide what actually happened BEFORE anything is recorded.
+                        //
+                        // This used to write the fill first, with `taken: skipped.is_none()`,
+                        // and only then try to execute. In paper mode that is exactly right:
+                        // "taken" means "would have been taken" and there is nothing else it
+                        // could mean. In live mode it was a lie — a row saying `taken` with a
+                        // realised P&L, written before a single byte had left the machine.
+                        //
+                        // It showed up as the History panel reporting 9 trades and $0.0251
+                        // realised against a wallet whose balance had not moved and whose
+                        // explorer showed no transactions. The instrument was reporting money
+                        // it had not made, while live. That is the §4 failure mode, in the
+                        // one place where believing it costs real money.
+                        let mut landed = false;
+                        let mut realised = 0.0f64;
+                        let mut signature: Option<String> = None;
+                        let mut latency_ms: u64 = 0;
+                        let mut outcome_reason = skipped.clone();
+
+                        if skipped.is_none() {
+                            match trader.as_mut() {
+                                // Paper: nothing is submitted and nothing pretends to be.
+                                // `landed` stays what it has always been for the paper
+                                // measurement — the assumption the whole archive rests on.
+                                None => {
+                                    landed = true;
+                                    realised = net;
+                                    outcome_reason =
+                                        Some("paper — uncontested, assumed landed".into());
+                                }
+                                Some(t) => {
+                                    // One attempt per sweep, on the first encodable survivor
+                                    // of a list already sorted by gross profit. Submitting a
+                                    // dozen transactions against overlapping pools in one slot
+                                    // would have each invalidate the next.
+                                    let candidate = if attempted_this_sweep {
+                                        None
+                                    } else {
+                                        opp.plan.as_ref().filter(|pl| pl.encodable())
+                                    };
+                                    match candidate {
+                                        None => {
+                                            outcome_reason = Some(
+                                                "not attempted — one trade per sweep, or no \
+                                                 encoder for this route"
+                                                    .into(),
+                                            );
+                                        }
+                                        Some(plan) => {
+                                            attempted_this_sweep = true;
+                                            let started = std::time::Instant::now();
+                                            let r = t.attempt(plan, opp.size_usd, net).await;
+                                            latency_ms = started.elapsed().as_millis() as u64;
+                                            match r {
+                                                Ok(cb_executor::Attempt::Submitted {
+                                                    signature: sig,
+                                                    ..
+                                                }) => {
+                                                    // Submitted is not confirmed. The signature
+                                                    // is a receipt for having asked, so the
+                                                    // realised figure stays zero until a
+                                                    // confirmation path fills it in — a P&L
+                                                    // nobody has confirmed is not a P&L.
+                                                    t.record(
+                                                        cb_executor::risk::Outcome::Landed {
+                                                            net_usd: 0.0,
+                                                        },
+                                                    );
+                                                    tracing::info!("submitted {sig}");
+                                                    landed = true;
+                                                    outcome_reason = Some(
+                                                        "submitted; not yet confirmed".into(),
+                                                    );
+                                                    signature = Some(sig);
+                                                }
+                                                Ok(cb_executor::Attempt::SimulationRejected {
+                                                    reason,
+                                                    ..
+                                                }) => {
+                                                    tracing::warn!(
+                                                        "simulation rejected: {reason}"
+                                                    );
+                                                    outcome_reason =
+                                                        Some(format!("simulation: {reason}"));
+                                                }
+                                                Ok(cb_executor::Attempt::Refused(why)) => {
+                                                    // Logged at info, not debug. A live run
+                                                    // that refuses everything must say so in
+                                                    // the log the operator actually reads;
+                                                    // at debug this was invisible and looked
+                                                    // like nothing happening at all.
+                                                    tracing::info!("refused: {why}");
+                                                    outcome_reason =
+                                                        Some(format!("refused: {why}"));
+                                                }
+                                                Err(e) => {
+                                                    // An RPC failure is not a defect in what
+                                                    // was built, so it must not trip the
+                                                    // breaker that exists to catch defects.
+                                                    t.record(cb_executor::risk::Outcome::Missed);
+                                                    tracing::warn!(
+                                                        "execution could not reach the chain: {e:#}"
+                                                    );
+                                                    outcome_reason =
+                                                        Some(format!("rpc error: {e}"));
+                                                }
+                                            }
+                                            if let Some(why) = t.halted() {
+                                                tracing::error!("trading halted: {why}");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if let (Some(l), false) = (ledger.as_ref(), feed_stalled) {
                             let rec = cb_ledger::FillRecord {
                                 slot: opp.slot,
@@ -732,15 +848,18 @@ async fn spawn_live(
                                 gross_usd: opp.gross_profit_usd,
                                 profit_at_optimal_usd: opp.profit_at_optimal_usd,
                                 tip_usd: est_tip_usd,
-                                net_usd: net,
-                                taken: skipped.is_none(),
-                                skipped_reason: skipped.clone(),
+                                // The realised figure, not the hoped-for one. In paper these
+                                // are the same number; in live they are not, and the whole
+                                // point of the run is the difference.
+                                net_usd: realised,
+                                taken: landed,
+                                skipped_reason: outcome_reason.clone(),
                                 cycle_key: opp.cycle_key.clone(),
                                 profit_at_capital_usd: Some(opp.profit_at_capital_usd),
                                 slot_spread: Some(opp.slot_spread),
                             };
                             if let Err(e) = l.record_fill(&rec) {
-                                tracing::warn!("could not record fill: {e:#}");
+                                tracing::warn!("could not record fill: {e}");
                             }
                         }
 
@@ -773,77 +892,6 @@ async fn spawn_live(
                             continue;
                         }
 
-                        // At most one attempt per sweep, and it is the first survivor of
-                        // a list already sorted by gross profit. Trying every opportunity
-                        // would submit a dozen transactions against overlapping pools in
-                        // the same slot, each invalidating the next, and would exhaust
-                        // the day's trade budget on one sweep's worth of noise.
-                        // A cycle through a venue with no encoder must not consume the
-                        // sweep's one attempt. Checked before the trader is borrowed, so
-                        // an unencodable best opportunity falls through to the next one
-                        // rather than burning the pass on a refusal we can predict.
-                        let live_attempt = match trader.as_mut() {
-                            Some(t) if !attempted_this_sweep => opp
-                                .plan
-                                .as_ref()
-                                .filter(|plan| plan.encodable())
-                                .map(|plan| (t, plan)),
-                            _ => None,
-                        };
-
-                        let Some((t, plan)) = live_attempt else {
-                            // Paper: record what would have happened, sign nothing.
-                            bus.publish(Event::Execution {
-                                id,
-                                opportunity_id: id,
-                                paper: paper_run,
-                                landed: true,
-                                realised_usd: net,
-                                tip_paid_usd: est_tip_usd,
-                                latency_ms: 0,
-                                signature: None,
-                                reason: Some("paper — uncontested, assumed landed".into()),
-                                ts_ms: now_ms(),
-                            });
-                            continue;
-                        };
-
-                        attempted_this_sweep = true;
-                        let started = std::time::Instant::now();
-                        let outcome = t.attempt(plan, opp.size_usd, net).await;
-                        let latency_ms = started.elapsed().as_millis() as u64;
-
-                        let (landed, realised, signature, reason) = match outcome {
-                            Ok(cb_executor::Attempt::Submitted { signature, .. }) => {
-                                // Submitted is not landed. The signature is a receipt for
-                                // having asked, and the ledger must not record a profit
-                                // nobody has confirmed — so the realised figure stays at
-                                // zero until a confirmation path fills it in.
-                                t.record(cb_executor::risk::Outcome::Landed { net_usd: 0.0 });
-                                tracing::info!("submitted {signature}");
-                                (true, 0.0, Some(signature), Some("submitted; not yet confirmed".to_string()))
-                            }
-                            Ok(cb_executor::Attempt::SimulationRejected { reason, .. }) => {
-                                tracing::warn!("simulation rejected: {reason}");
-                                (false, 0.0, None, Some(format!("simulation rejected: {reason}")))
-                            }
-                            Ok(cb_executor::Attempt::Refused(why)) => {
-                                tracing::debug!("refused: {why}");
-                                (false, 0.0, None, Some(format!("refused: {why}")))
-                            }
-                            Err(e) => {
-                                // An RPC failure is not a defect in what was built, so it
-                                // must not trip the breaker that exists to catch defects.
-                                t.record(cb_executor::risk::Outcome::Missed);
-                                tracing::warn!("execution could not reach the chain: {e:#}");
-                                (false, 0.0, None, Some(format!("rpc error: {e}")))
-                            }
-                        };
-
-                        if let Some(why) = t.halted() {
-                            tracing::error!("trading halted: {why}");
-                        }
-
                         bus.publish(Event::Execution {
                             id,
                             opportunity_id: id,
@@ -853,7 +901,7 @@ async fn spawn_live(
                             tip_paid_usd: est_tip_usd,
                             latency_ms,
                             signature,
-                            reason,
+                            reason: outcome_reason,
                             ts_ms: now_ms(),
                         });
                     }
