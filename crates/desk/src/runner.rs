@@ -171,12 +171,25 @@ mod tests {
         assert!(port_is_bound(port), "a port we are holding open must read as bound");
     }
 
+    /// Retried, because the single-shot version is a race it loses on a busy machine.
+    ///
+    /// Binding port 0 asks the OS for an ephemeral port, and once it is dropped the OS
+    /// is free to hand the same number to anything else — including the browser, the
+    /// app, or another test in the same run. It failed exactly once here, during a
+    /// workspace run with the instrument live, and passed five times alone afterwards.
+    /// A flake that only fires under load is one that will fire in CI and be blamed on
+    /// whatever landed that day.
     #[test]
     fn a_released_port_is_not_mistaken_for_a_running_instrument() {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        assert!(!port_is_bound(port), "a released port must read as free");
+        for attempt in 0..8 {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            if !port_is_bound(port) {
+                return;
+            }
+            assert!(attempt < 7, "eight freshly released ports all read as bound");
+        }
     }
 
     #[test]

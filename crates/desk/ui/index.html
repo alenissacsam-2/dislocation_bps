@@ -280,6 +280,33 @@
           searchers, out of the same profit the trade was worth.
         </div>
       </div>
+      <h2 style="margin-top:20px">Data source</h2>
+      <div class="hint" style="margin-bottom:10px">
+        <b>The setting that most affects what this instrument measures.</b> A dropped
+        subscription looks exactly like a quiet pool, so a lossy feed inflates the gap
+        between when a cycle's two legs were seen — and stale legs were measured to
+        account for <b>87% of the profit this instrument used to report</b>. A better
+        endpoint does not create edge. It deletes the fake edge that bad data invents.
+      </div>
+      <div class="field">
+        <label for="fRpcHttp">RPC endpoint</label>
+        <input type="text" id="fRpcHttp" autocomplete="off" spellcheck="false"
+               placeholder="https://api.mainnet-beta.solana.com">
+        <div class="hint">Leave blank for the public endpoint.</div>
+      </div>
+      <div class="field">
+        <label for="fRpcWs">WebSocket endpoint</label>
+        <input type="text" id="fRpcWs" autocomplete="off" spellcheck="false"
+               placeholder="wss://api.mainnet-beta.solana.com">
+        <div class="hint">
+          Where pool updates arrive. Leave blank for the public one. A provider URL
+          carries your API key in it: it is stored in plain text in
+          <code>config.toml</code> (which is gitignored), and the panels show the host
+          with the key masked. Set <code>CRYPTOBOT_RPC_HTTP_URL</code> and
+          <code>CRYPTOBOT_RPC_WS_URL</code> in the environment instead if you would
+          rather it never touched the file.
+        </div>
+      </div>
       <button id="btnSave" class="primary">Save, archive and restart</button>
       <p class="note" id="saveResult"></p>
     </div>

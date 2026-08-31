@@ -35,6 +35,29 @@ pub const TOKEN_ACCOUNT_RENT: u64 = 2_039_280;
 /// A generous allowance for signature and priority fees on one cycle.
 pub const FEE_ALLOWANCE: u64 = 100_000;
 
+/// Hide the credential in an endpoint before it is shown to anyone.
+///
+/// A provider URL carries its API key as a query parameter, so printing the endpoint
+/// prints the key — into the window, into any screenshot of the window, and into
+/// anything the operator pastes while asking for help. The panel needs to say *which*
+/// node reported a balance; it does not need to say how to authenticate as you.
+#[must_use]
+pub fn redact_endpoint(url: &str) -> String {
+    match url.split_once('?') {
+        None => url.to_string(),
+        Some((base, query)) => {
+            let scrubbed: Vec<String> = query
+                .split('&')
+                .map(|kv| match kv.split_once('=') {
+                    Some((k, v)) if !v.is_empty() => format!("{k}=****"),
+                    _ => kv.to_string(),
+                })
+                .collect();
+            format!("{base}?{}", scrubbed.join("&"))
+        }
+    }
+}
+
 /// The only mints this app names. Everything else is shown by its address.
 ///
 /// A three-entry table rather than the pool registry: these are the base mints every
@@ -199,7 +222,7 @@ pub async fn fetch(rpc_url: &str, address: &str, mints_needed: usize) -> anyhow:
         sol: format_amount(lamports, 9),
         tokens,
         readiness,
-        rpc: rpc_url.to_string(),
+        rpc: redact_endpoint(rpc_url),
     })
 }
 
@@ -294,5 +317,28 @@ mod tests {
             include_str!("balances.rs").contains("SPL_TOKEN_2022"),
             "fetch() must query Token-2022 as well as the classic program"
         );
+    }
+
+    /// A provider URL carries its key in the query string, and this panel's endpoint
+    /// line has been screenshotted and pasted into a chat more than once already.
+    #[test]
+    fn an_endpoint_is_shown_without_its_credential() {
+        let r = redact_endpoint("https://mainnet.helius-rpc.com/?api-key=9e062393-dead-beef");
+        assert!(r.contains("helius-rpc.com"), "the host must survive: {r}");
+        assert!(!r.contains("9e062393"), "the key must not: {r}");
+        assert!(!r.contains("dead-beef"), "including the rest of it: {r}");
+        assert_eq!(r, "https://mainnet.helius-rpc.com/?api-key=****");
+
+        // Several parameters, and one with no value, must all survive intact in shape.
+        let multi = redact_engpoint_helper();
+        assert!(!multi.contains("secret"), "{multi}");
+
+        // A plain URL with no query is unchanged.
+        let plain = "https://api.mainnet-beta.solana.com";
+        assert_eq!(redact_endpoint(plain), plain);
+    }
+
+    fn redact_engpoint_helper() -> String {
+        redact_endpoint("https://x.example/?api-key=secret&flag&mode=fast")
     }
 }

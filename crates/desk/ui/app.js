@@ -10,6 +10,11 @@
 
 const invoke = window.__TAURI__.core.invoke;
 
+// The endpoints used when nothing is configured. Kept in step with
+// cb_desk::config::PUBLIC_HTTP / PUBLIC_WS.
+const PUBLIC_HTTP = "https://api.mainnet-beta.solana.com";
+const PUBLIC_WS = "wss://api.mainnet-beta.solana.com";
+
 const S = {
   status: null,
   history: null,
@@ -595,6 +600,10 @@ async function loadConfig() {
     $("fHops").value = p.maxHops;
     $("fSlippage").value = p.slippageBps;
     $("fPriority").value = p.priorityMicroLamports;
+    // Blank when it is the public default, so the placeholder shows through and the
+    // field reads as "not set" rather than as a choice someone made.
+    $("fRpcHttp").value = p.rpcHttpUrl === PUBLIC_HTTP ? "" : p.rpcHttpUrl;
+    $("fRpcWs").value = p.rpcWsUrl === PUBLIC_WS ? "" : p.rpcWsUrl;
   } catch (e) {
     $("saveResult").textContent = "Could not read config.toml: " + e;
   }
@@ -967,6 +976,8 @@ $("btnSave").onclick = async () => {
     maxHops: parseInt($("fHops").value, 10),
     slippageBps: parseInt($("fSlippage").value, 10),
     priorityMicroLamports: parseInt($("fPriority").value, 10),
+    rpcHttpUrl: $("fRpcHttp").value.trim(),
+    rpcWsUrl: $("fRpcWs").value.trim(),
   };
   $("saveResult").textContent = "Saving…";
   try {

@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Params {
     pub capital_usd: f64,
@@ -32,6 +32,16 @@ pub struct Params {
     pub slippage_bps: u32,
     /// Priority bid in micro-lamports per compute unit.
     pub priority_micro_lamports: u64,
+    /// The JSON-RPC endpoint. Empty means the public one.
+    pub rpc_http_url: String,
+    /// The WebSocket endpoint the pool feed subscribes on. Empty means the public one.
+    ///
+    /// This is the setting that most affects what the instrument measures. A dropped
+    /// subscription is indistinguishable from a quiet pool, so a lossy feed inflates
+    /// `slot_spread` — and stale legs were measured to account for 87% of the profit
+    /// this instrument used to report. A better endpoint does not create edge; it
+    /// deletes the fake edge that bad data manufactures.
+    pub rpc_ws_url: String,
 }
 
 /// # Errors
@@ -47,6 +57,9 @@ pub fn read_params(path: &Path) -> anyhow::Result<Params> {
             .unwrap_or(d)
     };
     let int = |k: &str, d: i64| doc.get(k).and_then(toml_edit::Item::as_integer).unwrap_or(d);
+    let text = |k: &str, d: &str| -> String {
+        doc.get(k).and_then(toml_edit::Item::as_str).unwrap_or(d).to_string()
+    };
     Ok(Params {
         capital_usd: num("capital_usd", 100.0),
         fee_buffer_usd: num("fee_buffer_usd", 0.20),
@@ -54,8 +67,14 @@ pub fn read_params(path: &Path) -> anyhow::Result<Params> {
         max_hops: usize::try_from(int("max_hops", 3)).unwrap_or(3),
         slippage_bps: u32::try_from(int("slippage_bps", 1)).unwrap_or(1),
         priority_micro_lamports: u64::try_from(int("priority_micro_lamports", 0)).unwrap_or(0),
+        rpc_http_url: text("rpc_http_url", PUBLIC_HTTP),
+        rpc_ws_url: text("rpc_ws_url", PUBLIC_WS),
     })
 }
+
+/// The endpoints used when the operator has not supplied their own.
+pub const PUBLIC_HTTP: &str = "https://api.mainnet-beta.solana.com";
+pub const PUBLIC_WS: &str = "wss://api.mainnet-beta.solana.com";
 
 /// Returns the reason it is unacceptable, phrased so the UI can print it verbatim.
 ///
@@ -100,6 +119,14 @@ pub fn validate(p: &Params) -> Result<(), String> {
             p.slippage_bps, p.max_hops
         ));
     }
+    let http = p.rpc_http_url.trim();
+    if !http.is_empty() && !http.starts_with("https://") && !http.starts_with("http://") {
+        return Err("The RPC endpoint must start with https:// (or http:// for a local node).".into());
+    }
+    let ws = p.rpc_ws_url.trim();
+    if !ws.is_empty() && !ws.starts_with("wss://") && !ws.starts_with("ws://") {
+        return Err("The WebSocket endpoint must start with wss:// (or ws:// for a local node).".into());
+    }
     Ok(())
 }
 
@@ -119,6 +146,12 @@ pub fn write_params(path: &Path, p: &Params) -> anyhow::Result<()> {
     doc["slippage_bps"] = toml_edit::value(i64::from(p.slippage_bps));
     doc["priority_micro_lamports"] =
         toml_edit::value(i64::try_from(p.priority_micro_lamports).unwrap_or(0));
+    // Blank means "use the public one" rather than "write an empty string", which the
+    // bot would fail to parse as a URL at the least helpful possible moment.
+    let http = if p.rpc_http_url.trim().is_empty() { PUBLIC_HTTP } else { p.rpc_http_url.trim() };
+    let ws = if p.rpc_ws_url.trim().is_empty() { PUBLIC_WS } else { p.rpc_ws_url.trim() };
+    doc["rpc_http_url"] = toml_edit::value(http);
+    doc["rpc_ws_url"] = toml_edit::value(ws);
     std::fs::write(path, doc.to_string())?;
     Ok(())
 }
@@ -413,21 +446,21 @@ max_position_lamports = 20000000
     #[test]
     fn a_negative_book_is_refused_rather_than_written() {
         let bad =
-            Params { capital_usd: -1.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 3, slippage_bps: 1, priority_micro_lamports: 0 };
+            Params { capital_usd: -1.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 3, slippage_bps: 1, priority_micro_lamports: 0, rpc_http_url: String::new(), rpc_ws_url: String::new() };
         assert!(validate(&bad).is_err());
     }
 
     #[test]
     fn zero_hops_is_refused_because_a_cycle_needs_at_least_two() {
         let bad =
-            Params { capital_usd: 100.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 0, slippage_bps: 1, priority_micro_lamports: 0 };
+            Params { capital_usd: 100.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 0, slippage_bps: 1, priority_micro_lamports: 0, rpc_http_url: String::new(), rpc_ws_url: String::new() };
         assert!(validate(&bad).is_err());
     }
 
     #[test]
     fn a_buffer_larger_than_the_book_is_refused() {
         let bad =
-            Params { capital_usd: 1.0, fee_buffer_usd: 5.0, min_trade_usd: 10.0, max_hops: 3, slippage_bps: 1, priority_micro_lamports: 0 };
+            Params { capital_usd: 1.0, fee_buffer_usd: 5.0, min_trade_usd: 10.0, max_hops: 3, slippage_bps: 1, priority_micro_lamports: 0, rpc_http_url: String::new(), rpc_ws_url: String::new() };
         assert!(validate(&bad).is_err());
     }
 
@@ -436,7 +469,7 @@ max_position_lamports = 20000000
         let p = tmp("reject", SAMPLE);
         let before = std::fs::read_to_string(&p).unwrap();
         let bad =
-            Params { capital_usd: -1.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 3, slippage_bps: 1, priority_micro_lamports: 0 };
+            Params { capital_usd: -1.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 3, slippage_bps: 1, priority_micro_lamports: 0, rpc_http_url: String::new(), rpc_ws_url: String::new() };
         let _ = write_params(&p, &bad);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
     }
@@ -540,17 +573,19 @@ max_position_lamports = 20000000
             max_hops: 3,
             slippage_bps: 1,
             priority_micro_lamports: 0,
+            rpc_http_url: String::new(),
+            rpc_ws_url: String::new(),
         };
         assert!(validate(&ok).is_ok(), "1 bp over 3 hops is the shipped default: {:?}", validate(&ok));
 
         // The value that refused every cycle in a live dry run.
-        let broken = Params { slippage_bps: 30, ..ok };
+        let broken = Params { slippage_bps: 30, ..ok.clone() };
         let e = validate(&broken).unwrap_err();
         assert!(e.contains("guaranteed loss"), "{e}");
 
         // And the boundary is on the total, not the per-hop figure: 3 bps over 3 hops
         // is 9 and allowed, 4 over 3 is 12 and not.
-        assert!(validate(&Params { slippage_bps: 3, ..ok }).is_ok());
-        assert!(validate(&Params { slippage_bps: 4, ..ok }).is_err());
+        assert!(validate(&Params { slippage_bps: 3, ..ok.clone() }).is_ok());
+        assert!(validate(&Params { slippage_bps: 4, ..ok.clone() }).is_err());
     }
 }
