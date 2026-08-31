@@ -122,7 +122,11 @@ async fn run_once(
     stats: &FeedStats,
 ) -> Result<()> {
     let (mut socket, _) = tokio_tungstenite::connect_async(url).await?;
-    tracing::info!("feed connected to {url}, subscribing to {} accounts", accounts.len());
+    tracing::info!(
+        "feed connected to {}, subscribing to {} accounts",
+        cb_core::redact::redact_endpoint(url),
+        accounts.len()
+    );
 
     // Map JSON-RPC subscription id -> pubkey. The notification carries only the
     // subscription id, so without this table we cannot tell which account changed.

@@ -37,26 +37,12 @@ pub const FEE_ALLOWANCE: u64 = 100_000;
 
 /// Hide the credential in an endpoint before it is shown to anyone.
 ///
-/// A provider URL carries its API key as a query parameter, so printing the endpoint
-/// prints the key — into the window, into any screenshot of the window, and into
-/// anything the operator pastes while asking for help. The panel needs to say *which*
-/// node reported a balance; it does not need to say how to authenticate as you.
-#[must_use]
-pub fn redact_endpoint(url: &str) -> String {
-    match url.split_once('?') {
-        None => url.to_string(),
-        Some((base, query)) => {
-            let scrubbed: Vec<String> = query
-                .split('&')
-                .map(|kv| match kv.split_once('=') {
-                    Some((k, v)) if !v.is_empty() => format!("{k}=****"),
-                    _ => kv.to_string(),
-                })
-                .collect();
-            format!("{base}?{}", scrubbed.join("&"))
-        }
-    }
-}
+/// The shared implementation now lives in `cb_core::redact` — a provider URL leaked in
+/// plain text through two *other* log lines this codebase had, and one function reused
+/// at every site is what makes "no key in a log" a property of the codebase rather than
+/// a habit someone has to remember per call site. Re-exported here so callers already
+/// importing it from this module do not need to change.
+pub use cb_core::redact::redact_endpoint;
 
 /// The only mints this app names. Everything else is shown by its address.
 ///
@@ -319,26 +305,11 @@ mod tests {
         );
     }
 
-    /// A provider URL carries its key in the query string, and this panel's endpoint
-    /// line has been screenshotted and pasted into a chat more than once already.
+    /// Not re-tested here: `cb_core::redact` owns the behaviour and its own tests, and
+    /// this module only re-exports it. A re-export test would just be testing `use`.
     #[test]
-    fn an_endpoint_is_shown_without_its_credential() {
-        let r = redact_endpoint("https://mainnet.helius-rpc.com/?api-key=9e062393-dead-beef");
-        assert!(r.contains("helius-rpc.com"), "the host must survive: {r}");
-        assert!(!r.contains("9e062393"), "the key must not: {r}");
-        assert!(!r.contains("dead-beef"), "including the rest of it: {r}");
-        assert_eq!(r, "https://mainnet.helius-rpc.com/?api-key=****");
-
-        // Several parameters, and one with no value, must all survive intact in shape.
-        let multi = redact_engpoint_helper();
-        assert!(!multi.contains("secret"), "{multi}");
-
-        // A plain URL with no query is unchanged.
-        let plain = "https://api.mainnet-beta.solana.com";
-        assert_eq!(redact_endpoint(plain), plain);
-    }
-
-    fn redact_engpoint_helper() -> String {
-        redact_endpoint("https://x.example/?api-key=secret&flag&mode=fast")
+    fn the_redaction_used_here_is_the_shared_one() {
+        let r = redact_endpoint("https://x.example/?api-key=secret");
+        assert!(!r.contains("secret"));
     }
 }

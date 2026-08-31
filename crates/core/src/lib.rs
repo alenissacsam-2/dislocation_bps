@@ -8,6 +8,7 @@ pub mod amm;
 pub mod clmm;
 pub mod config;
 pub mod path;
+pub mod redact;
 pub mod types;
 
 /// Basis points. Fees are carried in parts per million (see [`amm::FeePpm`]); bps is

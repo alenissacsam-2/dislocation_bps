@@ -415,7 +415,7 @@ async fn spawn_live(
             p.tvl_usd
         );
     }
-    tracing::info!("feed: LIVE mainnet via {}", cfg.rpc_ws_url);
+    tracing::info!("feed: LIVE mainnet via {}", cb_core::redact::redact_endpoint(&cfg.rpc_ws_url));
 
     let mut market = live::LiveMarket::bootstrap(&cfg.rpc_http_url, registry).await?;
     tracing::info!(

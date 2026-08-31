@@ -112,20 +112,36 @@ impl Rpc {
 
         let mut backoff = Duration::from_millis(400);
         for attempt in 0..=Self::RATE_LIMIT_RETRIES {
-            let resp = self
-                .http
-                .post(url)
-                .json(&body)
-                .send()
-                .await
-                .with_context(|| format!("{method} request failed"))?;
+            let resp = match self.http.post(url).json(&body).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Not `.with_context(...)?`. reqwest embeds the destination URL —
+                    // API key included — directly in the error's own `Display`, and
+                    // `with_context` only wraps: anyhow's `{:#}` still walks the source
+                    // chain and prints the original message underneath the wrapper. A
+                    // Helius key reached `cb-bot.log` this way. Building a fresh error
+                    // from redacted text, rather than chaining the original, is the only
+                    // way to be sure the raw URL cannot resurface later from a `{:#}` or
+                    // a `.source()` walk anywhere downstream.
+                    bail!(
+                        "{method} request failed: {}",
+                        cb_core::redact::redact_urls_in(&e.to_string())
+                    );
+                }
+            };
 
             // A provider under load answers with an HTML error page, and serde's
             // complaint about that is unreadable. Measured: 48 execution attempts died
             // on `getMultipleAccounts returned something that is not JSON`, which was
             // the public endpoint rate-limiting mid-trade.
             let status = resp.status();
-            let text = resp.text().await.with_context(|| format!("{method}: no body"))?;
+            let text = match resp.text().await {
+                Ok(t) => t,
+                Err(e) => bail!(
+                    "{method}: no body: {}",
+                    cb_core::redact::redact_urls_in(&e.to_string())
+                ),
+            };
             let parsed: Value = serde_json::from_str(&text).map_err(|_| {
                 anyhow!(
                     "{method} returned {} rather than JSON ({} bytes) — the endpoint is \
@@ -636,5 +652,25 @@ mod tests {
         .unwrap();
         assert_eq!(r.endpoint_count(), 2);
         assert_eq!(r.endpoints[0], "https://one.example", "whitespace is trimmed");
+    }
+
+    /// End to end, not just unit-level: a real connection failure against a URL
+    /// carrying a fake credential must not surface that credential anywhere in the
+    /// resulting error's text, including through `{:#}` which walks the whole chain.
+    ///
+    /// Port 1 is reserved and nothing listens there, so this fails fast without
+    /// needing the network to be reachable or unreachable in any particular way.
+    #[tokio::test]
+    async fn a_real_connection_failure_does_not_leak_the_endpoints_key() {
+        let rpc = Rpc::with_fallbacks(vec![
+            "http://127.0.0.1:1/?api-key=SUPER-SECRET-VALUE".to_string(),
+        ])
+        .unwrap();
+        let err = rpc.balance(&Pubkey::new_unique()).await.unwrap_err();
+        let full = format!("{err:#}");
+        assert!(
+            !full.contains("SUPER-SECRET-VALUE"),
+            "the key leaked into a real connection error: {full}"
+        );
     }
 }
