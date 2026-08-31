@@ -113,6 +113,32 @@ function onEvent(ev) {
   if (ev.type === "status") return onStatus(ev);
   if (ev.type === "routes") return onRoutes(ev);
   if (ev.type === "poolUpdate") return onPool(ev);
+  if (ev.type === "logLine") return onLogLine(ev);
+}
+
+// A line pushed the instant it is written, over the same live connection as
+// everything else — this is what makes the Log tab real-time rather than a poll of
+// the file. The file and the periodic poll remain the source of truth: this is a
+// live echo layered on top, so a connection drop or a tab opened before the bot
+// started still gets the true content from loadLog() rather than depending on this.
+function onLogLine(ev) {
+  if (S.view !== "log") return; // loadLog() catches this tab up on connect / on switch
+  const body = $("logBody");
+
+  // A refused opportunity can repeat the identical reason every sweep — a risk-gate
+  // refusal is the shape that does this most, and unthrottled that is one new line a
+  // second forever. Collapsing an exact repeat into a counter on the same line is
+  // what keeps a real-time view meaningful instead of a flood of copies.
+  if (S.lastLogLine && S.lastLogLine.text === ev.line) {
+    S.lastLogLine.count += 1;
+    const text = body.textContent;
+    const cut = text.lastIndexOf("\n", Math.max(text.length - 2, 0));
+    body.textContent = text.slice(0, cut + 1) + ev.line + "  (x" + S.lastLogLine.count + ")\n";
+  } else {
+    body.textContent += (body.textContent ? "\n" : "") + ev.line;
+    S.lastLogLine = { text: ev.line, count: 1 };
+  }
+  body.scrollTop = body.scrollHeight;
 }
 
 function onStatus(e) {
@@ -1090,7 +1116,11 @@ setInterval(() => { if (S.view === "history") loadHistory(S.viewingArchive); }, 
 // refreshes after a minute" complaint was really "it never refreshes at all unless
 // you leave and come back". 3s keeps a live run's output visibly moving without
 // polling faster than a sweep produces anything new to show.
-setInterval(() => { if (S.view === "log") loadLog(); }, 3000);
+// A slower fallback now that lines arrive live the instant they are written — this
+// exists only to resync if the WebSocket drops, or to backfill history the live feed
+// was not connected for. 5s is often enough for that job without being the thing
+// carrying real-time-ness, which onLogLine now does.
+setInterval(() => { if (S.view === "log") loadLog(); }, 5000);
 window.addEventListener("resize", () => requestAnimationFrame(drawAll));
 
 // ---------------------------------------------------------------------------

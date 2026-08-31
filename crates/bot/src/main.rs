@@ -8,6 +8,7 @@
 
 mod execute;
 mod live;
+mod live_log;
 mod registry;
 mod sim;
 
@@ -127,6 +128,63 @@ struct SweepSummary {
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Whether a cycle refused within `cooldown` should be skipped rather than
+/// re-attempted this sweep.
+///
+/// Pure, so the window itself is testable without running a sweep. The cycle this
+/// exists for: a sizing that cannot fit the wallet's real balance refuses identically
+/// every time nothing about the wallet or the market has changed, and without this a
+/// live run re-fetches, re-builds and re-refuses it once a sweep — a fresh round trip
+/// to every configured RPC endpoint and an identical log line, roughly once a second,
+/// forever. A live run did exactly that for over an hour before this existed.
+#[must_use]
+fn on_refusal_cooldown(
+    recent: &std::collections::HashMap<String, std::time::Instant>,
+    cycle_key: &str,
+    cooldown: Duration,
+) -> bool {
+    recent.get(cycle_key).is_some_and(|at| at.elapsed() < cooldown)
+}
+
+#[cfg(test)]
+mod refusal_cooldown_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn a_cycle_refused_moments_ago_is_on_cooldown() {
+        let mut recent = std::collections::HashMap::new();
+        recent.insert("SOL-USDC-SOL".to_string(), Instant::now());
+        assert!(on_refusal_cooldown(&recent, "SOL-USDC-SOL", Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn a_cycle_never_refused_is_never_on_cooldown() {
+        let recent = std::collections::HashMap::new();
+        assert!(!on_refusal_cooldown(&recent, "anything", Duration::from_secs(20)));
+    }
+
+    /// The whole point: once the window has genuinely elapsed, retrying resumes. A
+    /// stuck cycle must eventually be re-checked, not silenced forever — the wallet's
+    /// balance or the market's price may have moved since.
+    #[test]
+    fn a_cycle_refused_before_the_window_is_not_on_cooldown() {
+        let mut recent = std::collections::HashMap::new();
+        let long_ago = Instant::now() - Duration::from_secs(30);
+        recent.insert("SOL-USDC-SOL".to_string(), long_ago);
+        assert!(!on_refusal_cooldown(&recent, "SOL-USDC-SOL", Duration::from_secs(20)));
+    }
+
+    /// A different cycle sharing nothing with the refused one must be unaffected — the
+    /// cooldown is per-loop, not a global "stop trying anything" switch.
+    #[test]
+    fn a_different_cycle_is_not_covered_by_anothers_cooldown() {
+        let mut recent = std::collections::HashMap::new();
+        recent.insert("SOL-USDC-SOL".to_string(), Instant::now());
+        assert!(!on_refusal_cooldown(&recent, "SOL-USDT-SOL", Duration::from_secs(20)));
+    }
 }
 
 
@@ -265,11 +323,21 @@ async fn main() -> anyhow::Result<()> {
         return report(path.map_or(LEDGER_PATH, String::as_str));
     }
 
+    // The channel a connected dashboard's Log tab reads from in real time. Created
+    // before the subscriber so the very first line logged already has somewhere live
+    // to go; the receiving end is wired up once `bus` exists, a few lines below.
+    let (log_tap_tx, log_tap_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,cb_server=info,cb_feed=info".into()),
         )
+        // No console window has existed to render colour in since cryptobot-desk
+        // stopped giving this process one of its own; ANSI codes past that point are
+        // pure noise sitting in the log file and in the Log tab's live preview.
+        .with_ansi(false)
+        .with_writer(live_log::TeeMakeWriter::new(log_tap_tx))
         .init();
 
     let cfg = Config::load("config.toml").unwrap_or_else(|_| {
@@ -330,6 +398,19 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let bus = EventBus::new();
+
+    // The other end of the tap: turn every line the subscriber just wrote into a live
+    // event on the same bus everything else uses, so the desk app sees it in the same
+    // round trip as an Opportunity or a Status heartbeat rather than on its own timer.
+    {
+        let log_bus = bus.clone();
+        let mut log_tap_rx = log_tap_rx;
+        tokio::spawn(async move {
+            while let Some(line) = log_tap_rx.recv().await {
+                log_bus.publish(Event::LogLine { line, ts_ms: now_ms() });
+            }
+        });
+    }
     let addr: SocketAddr = LISTEN.parse()?;
 
     match cfg.feed {
@@ -531,6 +612,25 @@ async fn spawn_live(
         // below can reach a signature no matter what the rest of the loop does.
         let mut trader = trader;
         let mut next_id: u64 = 1;
+        // A cycle whose execution attempt was refused very recently, keyed by the
+        // identity of the loop rather than by which mint it was entered at — the same
+        // cycle re-detected a moment later is the same refusal, not a new question.
+        //
+        // Without this, a cycle whose sizing cannot fit the wallet's real balance (see
+        // `execute::wrap_shortfall`) gets re-fetched, re-built and re-refused on every
+        // sweep for as long as it keeps being the best thing on the board — a fresh
+        // round trip to three RPC providers and an identical log line roughly once a
+        // second, forever, learning nothing the first refusal did not already
+        // establish. A live run did exactly this for over an hour before the cooldown
+        // below existed.
+        let mut recent_refusals: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
+        const REFUSAL_COOLDOWN: Duration = Duration::from_secs(20);
+        // The gate being halted, separately throttled from the per-cycle map above: it is
+        // one fact about the whole run, not one fact per cycle, so it gets one shared
+        // timestamp rather than a fresh cooldown entry for every distinct cycle that
+        // happens to ask while it is true.
+        let mut last_halt_announced: Option<std::time::Instant> = None;
         let mut evaluated_total: u64 = 0;
         let mut sweep_n: u32 = 0;
         // The sweep is a full pass over the cycle graph, not a reaction to one pool.
@@ -688,6 +788,12 @@ async fn spawn_live(
                     let sol_price = market.sol_price_usd().unwrap_or(0.0);
                     // Reset every sweep: one attempt per pass, not one per run.
                     let mut attempted_this_sweep = false;
+                    // Bounded, the same way the event bus is: a cycle refused once and
+                    // never seen again must not sit in this map for the life of the
+                    // process. Five times the cooldown is generous headroom for a cycle
+                    // that is still actively being retried; anything older than that is
+                    // history, not state.
+                    recent_refusals.retain(|_, at| at.elapsed() < REFUSAL_COOLDOWN * 5);
                     for opp in sweep.opportunities {
                         let id = next_id;
                         next_id += 1;
@@ -760,19 +866,27 @@ async fn spawn_live(
                                     // One attempt per sweep, on the first encodable survivor
                                     // of a list already sorted by gross profit. Submitting a
                                     // dozen transactions against overlapping pools in one slot
-                                    // would have each invalidate the next.
-                                    let candidate = if attempted_this_sweep {
+                                    // would have each invalidate the next. And not a cycle
+                                    // that was already refused within the cooldown window —
+                                    // see `recent_refusals`'s own comment for why.
+                                    let on_cooldown =
+                                        on_refusal_cooldown(&recent_refusals, &opp.cycle_key, REFUSAL_COOLDOWN);
+                                    let candidate = if attempted_this_sweep || on_cooldown {
                                         None
                                     } else {
                                         opp.plan.as_ref().filter(|pl| pl.encodable())
                                     };
                                     match candidate {
                                         None => {
-                                            outcome_reason = Some(
+                                            outcome_reason = Some(if on_cooldown {
+                                                "not attempted — refused within the last \
+                                                 20s and nothing has changed"
+                                                    .to_string()
+                                            } else {
                                                 "not attempted — one trade per sweep, or no \
                                                  encoder for this route"
-                                                    .into(),
-                                            );
+                                                    .to_string()
+                                            });
                                         }
                                         Some(plan) => {
                                             attempted_this_sweep = true;
@@ -810,16 +924,44 @@ async fn spawn_live(
                                                     );
                                                     outcome_reason =
                                                         Some(format!("simulation: {reason}"));
+                                                    recent_refusals.insert(
+                                                        opp.cycle_key.clone(),
+                                                        std::time::Instant::now(),
+                                                    );
                                                 }
                                                 Ok(cb_executor::Attempt::Refused(why)) => {
                                                     // Logged at info, not debug. A live run
                                                     // that refuses everything must say so in
                                                     // the log the operator actually reads;
                                                     // at debug this was invisible and looked
-                                                    // like nothing happening at all.
-                                                    tracing::info!("refused: {why}");
+                                                    // like nothing happening at all. Logged
+                                                    // once per cooldown window rather than
+                                                    // once per sweep — see `recent_refusals`.
+                                                    //
+                                                    // "Halted" is the one exception: it is a
+                                                    // fact about the gate, not about this
+                                                    // cycle, so a *different* cycle found next
+                                                    // sweep would otherwise re-announce it under
+                                                    // its own, separate cooldown entry. Shared
+                                                    // with the ERROR-level announce below so
+                                                    // both move together.
+                                                    let is_halt_refusal =
+                                                        why.starts_with("trading is halted");
+                                                    let should_log = !is_halt_refusal
+                                                        || last_halt_announced.is_none_or(
+                                                            |at: std::time::Instant| {
+                                                                at.elapsed() >= REFUSAL_COOLDOWN
+                                                            },
+                                                        );
+                                                    if should_log {
+                                                        tracing::info!("refused: {why}");
+                                                    }
                                                     outcome_reason =
                                                         Some(format!("refused: {why}"));
+                                                    recent_refusals.insert(
+                                                        opp.cycle_key.clone(),
+                                                        std::time::Instant::now(),
+                                                    );
                                                 }
                                                 Err(e) => {
                                                     // An RPC failure is not a defect in what
@@ -833,8 +975,25 @@ async fn spawn_live(
                                                         Some(format!("rpc error: {e}"));
                                                 }
                                             }
+                                            // The gate being halted is a global state, not
+                                            // a fact about this one cycle, so it does not
+                                            // fit the per-cycle-key cooldown above — every
+                                            // distinct cycle the sweep finds would otherwise
+                                            // re-announce the same halt once each. Throttled
+                                            // on its own timer instead: announced once, then
+                                            // at most once more per cooldown window for as
+                                            // long as it stays true, however many different
+                                            // cycles keep asking in between.
                                             if let Some(why) = t.halted() {
-                                                tracing::error!("trading halted: {why}");
+                                                let should_announce = last_halt_announced
+                                                    .is_none_or(|at: std::time::Instant| {
+                                                        at.elapsed() >= REFUSAL_COOLDOWN
+                                                    });
+                                                if should_announce {
+                                                    tracing::error!("trading halted: {why}");
+                                                    last_halt_announced =
+                                                        Some(std::time::Instant::now());
+                                                }
                                             }
                                         }
                                     }

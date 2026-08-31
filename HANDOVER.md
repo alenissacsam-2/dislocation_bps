@@ -320,6 +320,35 @@ Until it is explained, **value concentrated in high-fee routes is unproven** —
 archived run that is most of the value the instrument reported. What settles it is a long
 run on the current build, then `--report`'s two simultaneity sections read together.
 
+**The 3-strike breaker halts on ordinary market movement, not just on defects — found
+2026-08-31.** At `slippage_bps = 1` — already the tightest floor the maths allows for a
+~2 bp measured edge over two hops — a live run hit `simulation rejected:
+{"InstructionError":[6,{"Custom":6018}]}` three times and halted. Instruction index 6 is
+the second swap; 6018 is Raydium CLMM's `TooLittleOutputReceived`. The cycle was
+profitable when detected. By the time the built, signed transaction reached simulation
+— one sweep of latency later — the second leg's real price had moved past a floor with
+essentially no slack, and the simulation correctly refused rather than filling badly.
+
+The breaker's own justification, stated in `risk.rs`, is that `Failed` covers outcomes
+that "mean something is wrong that retrying will not fix." A slippage-floor miss at a
+1 bp tolerance does not meet that bar — retrying can straightforwardly succeed the next
+time the market sits still for one round trip, which is not evidence of a defect in
+what was built. Treating it as `Failed` anyway means the breaker fires on the ordinary
+cost of running with zero slack, which is most of the time at this edge size, and a run
+can spend its whole session halted having built nothing that was actually wrong.
+
+No code changed to fix this — reclassifying by matching a bare, log-free error code was
+considered and rejected: `Custom(6018)` is confirmed here by cross-referencing this
+session's own earlier `cb-verify-encode` run, but a wrong guess at a different Anchor
+user-error number would silently turn a real encoder defect into a shrugged-off `Missed`
+for years before anyone caught it, and this codebase already carries a working
+`classify()` for exactly this ambiguity in `cb_executor::verify` — one built against
+logs the live path does not have, and not yet worth wiring in for one confirmed number.
+`max_consecutive_failures` was raised from 3 to 6 instead: enough tolerance for a
+transient miss or two before assuming something structural, not so much that a real
+defect goes uncaught. This is a config choice, not a fix, and revisit it if the reason
+in the log ever stops being 6018.
+
 **Pools that hold liquidity and cannot be traded — found 2026-08-30.** Building the swap
 encoders required, for the first time, asking the chain for the accounts a *trade* needs
 rather than the ones a *quote* needs. That found 21 of the 48 Raydium CLMM pools in the

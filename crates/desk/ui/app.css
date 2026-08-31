@@ -142,7 +142,12 @@ nav button.on::after{content:"";width:3px;height:14px;background:var(--accent);b
   display:grid;gap:13px;grid-template-columns:repeat(12,1fr);align-content:start;
 }
 .view{display:contents}
-.view[hidden]{display:none}
+/* !important: `.view[hidden]` must always win over `.view`'s own `display:contents`,
+ * not just usually. A hidden view whose content briefly renders during a heavy DOM
+ * update — the log tab, replacing hundreds of lines on every poll, was the one that
+ * did this — has been seen bleeding its content past its own box into whichever view
+ * actually is visible, so this is not a specificity nicety, it is what stops that. */
+.view[hidden]{display:none!important}
 
 .panel{
   background:var(--panel);border:1px solid var(--line);border-radius:var(--r);
@@ -238,6 +243,11 @@ pre.log{
   background:var(--ground);border:1px solid var(--line);border-radius:var(--r);
   padding:11px 12px;max-height:520px;overflow:auto;white-space:pre-wrap;
   word-break:break-word;user-select:text;
+  /* Nothing painted inside this box may ever be visible outside it, and nothing
+   * outside can affect its layout — a hard guarantee, not a consequence of
+   * max-height/overflow that a mid-update reflow could momentarily violate. This
+   * is what a live run's log content bleeding into another tab's panel needed. */
+  contain:layout paint;
 }
 pre.log b{color:var(--neg);font-weight:400}
 

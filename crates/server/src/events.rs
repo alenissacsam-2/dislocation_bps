@@ -198,6 +198,18 @@ pub enum Event {
         reason: Option<String>,
         ts_ms: u64,
     },
+
+    /// One line of the bot's own log, pushed the instant it is written.
+    ///
+    /// This is what makes the Log tab real-time rather than a poll of the file: a
+    /// `tracing` writer taps every formatted line as it is emitted and forwards it here
+    /// alongside writing it to disk as normal, so a connected dashboard sees it in the
+    /// same round trip as any other live event — no interval, no delay tied to how
+    /// often anyone asks. The file remains the durable copy and the source of truth;
+    /// this is a live echo of it, not a replacement — a client that was not connected
+    /// when a line was written still gets it from the file once it asks.
+    #[serde(rename_all = "camelCase")]
+    LogLine { line: String, ts_ms: u64 },
 }
 
 /// One route on the leaderboard.
@@ -337,5 +349,34 @@ mod tests {
         let json = serde_json::to_string(&status()).unwrap();
         assert!(json.contains("\"type\":\"status\""), "got: {json}");
         assert!(json.contains("\"solPriceUsd\""), "fields must be camelCase: {json}");
+    }
+
+    /// The tag app.js actually switches on for a live log line, pinned the same way
+    /// the other variants are — this is the one where a silent rename is easiest to
+    /// miss, because nothing about a log tab looking merely "a bit slow" points back
+    /// at a JSON tag mismatch.
+    #[test]
+    fn a_log_line_serialises_with_the_tag_the_frontend_expects() {
+        let json = serde_json::to_string(&Event::LogLine {
+            line: "INFO cb_bot: refused: net negative after tip".into(),
+            ts_ms: 1,
+        })
+        .unwrap();
+        assert!(json.contains("\"type\":\"logLine\""), "got: {json}");
+        assert!(json.contains("\"line\":"), "got: {json}");
+    }
+
+    #[tokio::test]
+    async fn a_log_line_travels_the_same_bus_as_everything_else() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        bus.publish(Event::LogLine { line: "hello".into(), ts_ms: 42 });
+        match rx.recv().await.unwrap() {
+            Event::LogLine { line, ts_ms } => {
+                assert_eq!(line, "hello");
+                assert_eq!(ts_ms, 42);
+            }
+            other => panic!("expected LogLine, got {other:?}"),
+        }
     }
 }

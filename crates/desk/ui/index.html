@@ -237,7 +237,12 @@
         <input type="number" id="fCapital" step="1" min="1">
         <div class="hint">
           Caps every trade size. The ladder opposite measures what larger books would
-          have taken from the identical opportunities.
+          have taken from the identical opportunities. <b>Maximum position, under Risk
+          limits, should match this number</b> — that field is a second, independent
+          cap enforced right before signing, and if it is set looser than this one it
+          never actually binds; if it is set tighter, this field is not really the cap
+          it claims to be. One relationship, so it is worth stating rather than leaving
+          two numbers to look unrelated.
         </div>
       </div>
       <div class="field">
@@ -459,7 +464,13 @@
       <div class="field">
         <label for="fMaxPos">Maximum position (USD)</label>
         <input type="number" id="fMaxPos" step="1" min="0.01">
-        <div class="hint">The most any single trade may carry.</div>
+        <div class="hint">
+          The most any single trade may carry, checked by the risk gate right before
+          signing. <b>Keep this equal to Working capital</b>, under Trading Parameters —
+          looser and it never binds because sizing never proposes that much; tighter and
+          it silently overrides what sizing already capped, refusing trades that looked
+          fine when they were found.
+        </div>
       </div>
       <div class="field">
         <label for="fMaxLoss">Maximum daily loss (USD)</label>

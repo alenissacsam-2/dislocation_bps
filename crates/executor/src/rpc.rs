@@ -168,14 +168,31 @@ impl Rpc {
         bail!("{method} was rate limited {} times running", Self::RATE_LIMIT_RETRIES + 1)
     }
 
-    /// A read, failing over across the configured endpoints.
+    /// The endpoint index the next call should start from, advancing the shared
+    /// rotation by one on every call — including a call that goes on to succeed.
     ///
-    /// Starts from whichever endpoint last worked, so one bad provider is skipped
-    /// rather than re-tried first on every call.
-    async fn call(&self, method: &str, params: Value) -> Result<Value> {
+    /// This is the difference between rotation and failover. The first version of this
+    /// client only advanced on *failure*, which is sticky: once endpoint 0 answers
+    /// once, every subsequent call keeps going to endpoint 0 forever, and the other two
+    /// configured keys sit completely idle unless it breaks. That concentrates every
+    /// request — and every free-tier rate limit — onto whichever provider happened to
+    /// answer first. Advancing here regardless of outcome means three configured keys
+    /// each carry roughly a third of the read traffic, which is what actually reduces
+    /// the chance of hitting any one provider's limit rather than merely reacting to it
+    /// once it has already happened.
+    ///
+    /// A single atomic counter, so concurrent callers each get a distinct, correctly
+    /// incrementing start index rather than racing to read-then-write the same value.
+    fn next_start(&self) -> usize {
         use std::sync::atomic::Ordering;
+        self.cursor.fetch_add(1, Ordering::Relaxed) % self.endpoint_count()
+    }
+
+    /// A read, rotating across the configured endpoints and failing over within one
+    /// call if the one it started on does not answer.
+    async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let n = self.endpoint_count();
-        let start = self.cursor.load(Ordering::Relaxed) % n;
+        let start = self.next_start();
         let mut last: Option<anyhow::Error> = None;
 
         for step in 0..n {
@@ -183,9 +200,8 @@ impl Rpc {
             match self.call_on(&self.endpoints[idx], method, &params).await {
                 Ok(v) => {
                     if step > 0 {
-                        // Remember the one that worked. Announced, because a silent
-                        // switch hides a provider that has quietly stopped answering.
-                        self.cursor.store(idx, Ordering::Relaxed);
+                        // Announced, because a silent skip hides a provider that has
+                        // quietly stopped answering.
                         tracing::warn!(
                             "rpc failed over to endpoint {} of {n} for {method}",
                             idx + 1
@@ -274,15 +290,18 @@ impl Rpc {
             "maxRetries": 0,
             "preflightCommitment": "confirmed",
         });
-        // Deliberately NOT `call`: no failover, and no retry.
+        // Deliberately NOT `call`: no failover, and no retry, on this one call. Which
+        // endpoint carries it still rotates — `next_start` advances the same shared
+        // counter reads use, so sends spread across the configured providers over time
+        // exactly as reads do — but once chosen, that single endpoint gets exactly one
+        // attempt.
         //
         // A transaction that times out may still have been received. Sending it again
         // to a second endpoint is how the same trade gets submitted twice, and the
         // second copy is not free — it is a second real transaction against a wallet
         // that has already moved. A failed send is reported as failed; deciding what
         // to do about it needs the signature status, not another attempt.
-        use std::sync::atomic::Ordering;
-        let idx = self.cursor.load(Ordering::Relaxed) % self.endpoint_count();
+        let idx = self.next_start();
         let params = json!([tx_base64, cfg]);
         let r = self.call_on(&self.endpoints[idx], "sendTransaction", &params).await?;
         r.as_str()
@@ -632,6 +651,53 @@ mod tests {
             !body.contains("self.call(\""),
             "send must not use the failing-over path"
         );
+    }
+
+    /// The actual point of rotation: it advances on every call, including calls that
+    /// go on to succeed. The previous version only advanced on failure, which left one
+    /// endpoint carrying all traffic forever once it had answered once — the other two
+    /// configured keys sitting idle unless the first one broke.
+    #[test]
+    fn rotation_advances_on_every_call_not_only_on_failure() {
+        let rpc = Rpc::with_fallbacks(vec![
+            "https://a.example".into(),
+            "https://b.example".into(),
+            "https://c.example".into(),
+        ])
+        .unwrap();
+        let seq: Vec<usize> = (0..6).map(|_| rpc.next_start()).collect();
+        assert_eq!(seq, vec![0, 1, 2, 0, 1, 2], "three endpoints must cycle evenly: {seq:?}");
+    }
+
+    /// A single configured endpoint must not panic the modulo, and must keep handing
+    /// back the only index there is.
+    #[test]
+    fn rotation_with_one_endpoint_always_returns_it() {
+        let rpc = Rpc::with_fallbacks(vec!["https://only.example".into()]).unwrap();
+        for _ in 0..5 {
+            assert_eq!(rpc.next_start(), 0);
+        }
+    }
+
+    /// Concurrent callers must each get a distinct, correctly-wrapping index rather
+    /// than racing to read-then-write the same counter and duplicating one.
+    #[tokio::test]
+    async fn concurrent_rotation_still_visits_every_endpoint_evenly() {
+        let rpc = std::sync::Arc::new(
+            Rpc::with_fallbacks(vec!["https://a.example".into(), "https://b.example".into()])
+                .unwrap(),
+        );
+        let mut tasks = Vec::new();
+        for _ in 0..40 {
+            let r = rpc.clone();
+            tasks.push(tokio::spawn(async move { r.next_start() }));
+        }
+        let mut counts = [0usize; 2];
+        for t in tasks {
+            counts[t.await.unwrap()] += 1;
+        }
+        assert_eq!(counts[0] + counts[1], 40, "every call must land on a real index");
+        assert_eq!(counts[0], counts[1], "an even split across the two endpoints: {counts:?}");
     }
 
     #[test]
