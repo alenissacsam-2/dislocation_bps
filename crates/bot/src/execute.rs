@@ -146,6 +146,32 @@ impl Default for TradeOptions {
 /// refusal happens before three RPC round trips are spent building one.
 pub const MAX_EXECUTABLE_HOPS: usize = 3;
 
+/// The same fee headroom `cb_desk::balances::FEE_ALLOWANCE` reserves, for the same
+/// reason: a generous allowance for signature and priority fees on one cycle.
+const FEE_ALLOWANCE_LAMPORTS: u64 = 100_000;
+
+/// Whether wrapping `amount_in` lamports leaves enough for account rent and fees.
+///
+/// Returns the reserved amount when it does *not* fit, `None` when it does. Reserves
+/// for every distinct mint the cycle touches regardless of whether that mint's account
+/// already exists — confirming which do would cost another round trip, and refusing a
+/// fundable trade is far cheaper than sending one that fails mid-transaction.
+///
+/// This is the check a live run was missing. A wrap-transfer sized against the full
+/// quoted `capital_usd`, with nothing held back for the rent the same transaction also
+/// pays to create token accounts, failed in simulation with the System Program's
+/// `ResultWithNegativeLamports` three times before the risk gate's own breaker halted
+/// trading. The exact case is pinned in `the_live_failure_is_caught_before_it_repeats`.
+#[must_use]
+pub fn wrap_shortfall(amount_in: u64, distinct_mints: usize, balance: u64) -> Option<u64> {
+    let reserved = distinct_mints as u64 * route::TOKEN_ACCOUNT_RENT + FEE_ALLOWANCE_LAMPORTS;
+    if amount_in.saturating_add(reserved) > balance {
+        Some(reserved)
+    } else {
+        None
+    }
+}
+
 /// Apply a slippage haircut, rounding down.
 ///
 /// Rounding down is the only safe direction: a floor rounded *up* is a floor the pool
@@ -303,7 +329,35 @@ impl Trader {
         let wrapping = self.opts.wsol == WsolPolicy::WrapAndClose && base_mint == wsol;
 
         let pre_balance = if wrapping {
-            rpc.balance(&self.owner).await?
+            let bal = rpc.balance(&self.owner).await?;
+
+            // Reserve rent for every distinct mint this cycle touches, plus fee
+            // headroom, before trusting the plan's amount_in as affordable.
+            //
+            // This is the bug a live run found. The wrap-transfer moves `amount_in`
+            // lamports from the owner into the wSOL account, and that instruction runs
+            // *after* the transaction has already paid rent to create any ATA that did
+            // not exist yet — out of the same balance. Sizing that only knew about
+            // `capital_usd` had no idea those two payments were about to compete for
+            // the same lamports, and a route built against the full quoted amount
+            // failed in simulation with the System Program's `ResultWithNegativeLamports`
+            // (Custom(1)) on the transfer instruction: three times, on real mainnet
+            // state, until the risk gate's own three-strike breaker halted trading.
+            //
+            // Conservative on purpose: it reserves for every distinct mint regardless
+            // of whether that mint's account already exists, because confirming which
+            // do would cost another round trip and refusing a fundable trade is far
+            // cheaper than sending one that fails mid-transaction. "Refuse rather than
+            // extrapolate" is this codebase's first design principle for exactly this
+            // reason — overstating what is affordable is the direction that loses.
+            let distinct_mints = plan.mints.iter().collect::<std::collections::HashSet<_>>().len();
+            let amount_in_u64 = u64::try_from(plan.amount_in).unwrap_or(u64::MAX);
+            if let Some(reserved) = wrap_shortfall(amount_in_u64, distinct_mints, bal) {
+                return Ok(Attempt::Refused(format!(
+                    "wrapping {amount_in_u64} lamports would leave less than the                      {reserved} lamports this transaction needs for account rent and                      fees, against a balance of {bal} — sizing must leave that headroom,                      not spend into it"
+                )));
+            }
+            bal
         } else {
             let base_ata = associated_token_address(&self.owner, &base_mint, &token_program);
             rpc.accounts_full(&[base_ata])
@@ -812,5 +866,36 @@ mod mainnet {
         // The assertion is structural: it must fit and it must measure lamports. Whether
         // this particular cycle profits is a market question, not an encoding one.
         assert!(compiled.size_bytes <= tx::PACKET_LIMIT);
+    }
+
+    /// The exact numbers from the live run this fix came from: a wallet holding
+    /// 132,746,877 lamports, a 2-mint wrapping cycle sized to spend 128,808,539 — which
+    /// the old code approved and the chain rejected with `ResultWithNegativeLamports`
+    /// on the wrap transfer, three times, until the risk gate halted trading.
+    #[test]
+    fn the_live_failure_is_caught_before_it_repeats() {
+        let shortfall = wrap_shortfall(128_808_539, 2, 132_746_877);
+        assert!(shortfall.is_some(), "the sizing that failed on mainnet must now be refused");
+        let reserved = shortfall.unwrap();
+        assert_eq!(reserved, 2 * 2_039_280 + 100_000);
+        // And it must actually be a shortfall by the numbers, not a coincidence.
+        assert!(128_808_539 + reserved > 132_746_877);
+    }
+
+    #[test]
+    fn a_wrap_with_real_headroom_is_not_refused() {
+        // Same wallet, a size that leaves the reserve intact.
+        assert!(wrap_shortfall(100_000_000, 2, 132_746_877).is_none());
+    }
+
+    /// More mints touched means more rent reserved: a wallet with exactly the reserve
+    /// for two mints has room to spare for one and none at all for two.
+    #[test]
+    fn more_distinct_mints_reserve_more() {
+        let bal_for_two = 2 * 2_039_280 + 100_000;
+        assert!(wrap_shortfall(0, 1, bal_for_two).is_none(), "1 mint fits inside 2 mints' reserve");
+        assert!(wrap_shortfall(0, 2, bal_for_two).is_none(), "exactly enough is enough");
+        assert!(wrap_shortfall(0, 2, bal_for_two - 1).is_some(), "one lamport short must refuse");
+        assert!(wrap_shortfall(0, 3, bal_for_two).is_some(), "3 mints must not fit 2 mints' reserve");
     }
 }

@@ -1086,6 +1086,11 @@ paintWallet();
 setInterval(refreshStatus, 2000);
 setInterval(sampleDivergence, 1000);
 setInterval(() => { if (S.view === "history") loadHistory(S.viewingArchive); }, 20000);
+// The Log tab used to load once on switching in and never again — the "log only
+// refreshes after a minute" complaint was really "it never refreshes at all unless
+// you leave and come back". 3s keeps a live run's output visibly moving without
+// polling faster than a sweep produces anything new to show.
+setInterval(() => { if (S.view === "log") loadLog(); }, 3000);
 window.addEventListener("resize", () => requestAnimationFrame(drawAll));
 
 // ---------------------------------------------------------------------------

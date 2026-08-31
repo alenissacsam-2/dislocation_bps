@@ -78,6 +78,20 @@ impl NativeRunner {
     }
 }
 
+/// Windows flag that stops a spawned process from getting its own console window.
+///
+/// `cryptobot-desk` is built with `windows_subsystem = "windows"` and has no console of
+/// its own. `cb-bot.exe` has no such declaration, so it is an ordinary console-subsystem
+/// binary — and spawning one of those from a windowless parent makes Windows allocate a
+/// brand new console for it, empty because stdout and stderr are redirected to the log
+/// file, but visible. That console is not part of this application: closing it sends
+/// the child a close signal Windows will act on if the process does not react in time,
+/// which is a way to kill a live, money-moving bot with one misplaced click on a window
+/// that was never meant to be there. The Log tab already shows the same output; this
+/// flag is what stops the redundant, dangerous copy of it from ever appearing.
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 impl BotRunner for NativeRunner {
     fn start(&self, passphrase: Option<String>) -> anyhow::Result<()> {
         let mut guard = self.child.lock().unwrap();
@@ -98,10 +112,14 @@ impl BotRunner for NativeRunner {
         }
         let out = std::fs::OpenOptions::new().create(true).append(true).open(&self.log)?;
         let err = out.try_clone()?;
-        let mut child = Command::new(&self.exe)
-            .current_dir(&self.cwd)
-            .stdout(Stdio::from(out))
-            .stderr(Stdio::from(err))
+        let mut cmd = Command::new(&self.exe);
+        cmd.current_dir(&self.cwd).stdout(Stdio::from(out)).stderr(Stdio::from(err));
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = cmd
             // Piped even in paper mode. A bot that finds a live config blocks reading
             // this, and a null stdin would give it EOF and a confusing "no passphrase
             // arrived" instead of the wait it is supposed to do.

@@ -32,6 +32,13 @@ use cb_core::types::Dex;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 
+/// Rent-exempt minimum for a 165-byte SPL token account, in lamports.
+///
+/// The same figure `cb_desk::balances` uses for the same reason: it is fixed by the
+/// rent schedule and does not move, so a round trip to `getMinimumBalanceForRentExemption`
+/// would ask the chain a question whose answer this codebase already knows.
+pub const TOKEN_ACCOUNT_RENT: u64 = 2_039_280;
+
 /// One leg of a cycle, with the pool account bytes that priced it.
 #[derive(Debug, Clone)]
 pub struct Hop {
