@@ -50,6 +50,53 @@ impl Simulation {
     pub fn succeeded(&self) -> bool {
         self.err.is_none()
     }
+
+    /// What the failing program itself said, condensed to the lines that carry meaning.
+    ///
+    /// A bare `Custom(6018)` says a floor was missed and nothing else. The AMMs log
+    /// their own numbers next to it — the amount required against the amount the pool
+    /// would actually deliver — and the difference between a two-basis-point miss and a
+    /// hundredfold one is the difference between a race to re-enter and a defect to fix.
+    /// Both arrive as the same error code, so the code alone cannot tell them apart.
+    ///
+    /// Keeps `Program log:` lines that mention an error or an amount, plus the final
+    /// `failed:` line, and caps the result so one rejection cannot flood a log line.
+    #[must_use]
+    pub fn error_context(&self) -> Option<String> {
+        const MAX_LINES: usize = 6;
+        const MAX_CHARS: usize = 400;
+        let interesting = |l: &&String| {
+            let low = l.to_lowercase();
+            (low.starts_with("program log:")
+                && (low.contains("error")
+                    || low.contains("amount")
+                    || low.contains("require")
+                    || low.contains("expected")
+                    || low.contains("insufficient")
+                    || low.contains("liquidity")))
+                || low.contains("failed:")
+        };
+        let mut kept: Vec<&str> = self
+            .logs
+            .iter()
+            .filter(interesting)
+            .map(|l| l.trim_start_matches("Program log:").trim())
+            .collect();
+        if kept.is_empty() {
+            return None;
+        }
+        // The last lines are the ones next to the failure; earlier ones are the
+        // successful hops narrating themselves.
+        if kept.len() > MAX_LINES {
+            kept.drain(..kept.len() - MAX_LINES);
+        }
+        let mut joined = kept.join(" | ");
+        if joined.len() > MAX_CHARS {
+            joined.truncate(MAX_CHARS);
+            joined.push('…');
+        }
+        Some(joined)
+    }
 }
 
 impl Rpc {
@@ -738,5 +785,54 @@ mod tests {
             !full.contains("SUPER-SECRET-VALUE"),
             "the key leaked into a real connection error: {full}"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_context_tests {
+    use super::Simulation;
+
+    fn sim(logs: &[&str]) -> Simulation {
+        Simulation {
+            err: Some("{\"InstructionError\":[6,{\"Custom\":6018}]}".into()),
+            logs: logs.iter().map(|s| (*s).to_string()).collect(),
+            units_consumed: None,
+            post_lamports: Vec::new(),
+            post_token_amounts: Vec::new(),
+        }
+    }
+
+    /// The whole reason this exists: the error code is identical whether the floor was
+    /// missed by a hair or by a hundredfold, and only the program's own numbers say
+    /// which. One is a race worth re-entering; the other is a defect in what was built.
+    #[test]
+    fn the_amounts_next_to_the_failure_survive() {
+        let s = sim(&[
+            "Program whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc invoke [1]",
+            "Program log: Instruction: Swap",
+            "Program log: amount_in: 90200000, amount_out: 90180000",
+            "Program log: Error: TooLittleOutputReceived required 90210000 got 90180000",
+            "Program failed: custom program error: 0x1782",
+        ]);
+        let ctx = s.error_context().expect("logs carry an error line");
+        assert!(ctx.contains("required 90210000 got 90180000"), "got {ctx}");
+    }
+
+    #[test]
+    fn a_simulation_with_nothing_to_add_says_nothing() {
+        assert!(sim(&["Program whirL invoke [1]", "Program log: Instruction: Swap"])
+            .error_context()
+            .is_none());
+    }
+
+    /// A rejection must not be able to flood the operator's log with a whole trace.
+    #[test]
+    fn a_runaway_trace_is_capped() {
+        let many: Vec<String> =
+            (0..200).map(|i| format!("Program log: Error: something {i} amount {i}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let ctx = sim(&refs).error_context().expect("there are error lines");
+        assert!(ctx.len() <= 401, "capped, got {}", ctx.len());
+        assert!(ctx.contains("199"), "keeps the lines nearest the failure: {ctx}");
     }
 }

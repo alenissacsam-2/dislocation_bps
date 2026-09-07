@@ -88,7 +88,20 @@ impl Plan {
         // The chain's opinion, before anything irreversible.
         let sim = rpc.simulate(&self.tx_base64, &[self.profit.address()]).await?;
         if !sim.succeeded() {
-            let reason = sim.err.unwrap_or_else(|| "unknown".into());
+            // Read the context before `err` is moved out of `sim`.
+            let context = sim.error_context();
+            let err = sim.err.unwrap_or_else(|| "unknown".into());
+            // Carry the program's own account of what went wrong, not just the error
+            // code. `{"InstructionError":[6,{"Custom":6018}]}` says a floor was missed;
+            // it does not say by how much, and those are entirely different findings —
+            // a miss of two basis points is a race worth re-entering, a miss of two
+            // orders of magnitude is a defect in what this code built. A live run spent
+            // days at a 100% rejection rate unable to tell those apart, because the
+            // logs the chain already returned were being dropped on this line.
+            let reason = match context {
+                Some(ctx) => format!("{err} — {ctx}"),
+                None => err,
+            };
             // A simulation failure is a defect in what was built, not a lost race, so it
             // counts toward the breaker. Three of these in a row means stop.
             gate.record(Outcome::Failed);

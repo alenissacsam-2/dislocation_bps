@@ -64,7 +64,18 @@ pub struct CyclePlan {
     /// What the first hop spends, in the base mint's own units.
     pub amount_in: u128,
     /// The quoted output of each hop, in that hop's output-mint units.
+    ///
+    /// **Detection-time.** Kept for the record and for comparison, but no longer what
+    /// the floors are built from — see [`Trader::hops_for`].
     pub leg_out: Vec<u128>,
+    /// Each pool's fee tier, in parts per million.
+    ///
+    /// Carried from detection because it is pool *configuration*, not pool *price*: it
+    /// lives in a separate config account that a swap does not touch, so unlike a
+    /// reserve or a sqrt-price it does not go stale between detection and execution.
+    /// Re-pricing a Raydium CLMM leg needs it and re-fetching it would be a round trip
+    /// spent on a number that cannot have changed.
+    pub fee_ppm: Vec<u32>,
 }
 
 impl CyclePlan {
@@ -201,10 +212,39 @@ impl Trader {
         self.owner
     }
 
+    /// What this hop would actually return, priced against state read moments ago.
+    ///
+    /// `None` for a venue with no encoder — those never reach here, because a route
+    /// carrying one refuses to build long before this — and for a pool whose account
+    /// will not decode, which is a pool this code has no business swapping through.
+    ///
+    /// The fee tier comes from the plan rather than the account: it lives in a separate
+    /// config account a swap does not touch, so it cannot have gone stale. Everything
+    /// else — liquidity, the sqrt price, the reserves — is read fresh, which is the
+    /// entire point.
+    fn fresh_quote(
+        dex: Dex,
+        address: Pubkey32,
+        data: &[u8],
+        input_mint: &Pubkey32,
+        fee_ppm: u32,
+        amount_in: u128,
+    ) -> Option<u128> {
+        let state = match dex {
+            Dex::OrcaWhirlpool => cb_dex::orca_whirlpool::to_pool_state(address, data, 0).ok()?,
+            Dex::RaydiumClmm => {
+                cb_dex::raydium_clmm::to_pool_state(address, data, fee_ppm, 0).ok()?
+            }
+            _ => return None,
+        };
+        state.leg_for_input(input_mint)?.quote(amount_in)
+    }
+
     /// Build the hops for a cycle, with each hop funded by the previous one's floor.
     ///
     /// # Errors
-    /// If the plan is malformed, or a hop's floor collapses to zero under slippage.
+    /// If the plan is malformed, if a hop cannot be re-priced against the state just
+    /// fetched, or if a hop's floor collapses to zero under slippage.
     pub fn hops_for(&self, plan: &CyclePlan, pool_data: &[Vec<u8>], arrays: &[[Pubkey; 3]]) -> Result<Vec<Hop>> {
         let n = plan.pools.len();
         if n < 2 || plan.mints.len() != n + 1 || plan.leg_out.len() != n {
@@ -217,7 +257,36 @@ impl Trader {
         let mut hops = Vec::with_capacity(n);
         let mut spend = plan.amount_in;
         for i in 0..n {
-            let floor = haircut(plan.leg_out[i], self.opts.slippage_bps);
+            // Price this hop against the state fetched moments ago, not against the
+            // quote that motivated the detection.
+            //
+            // This is the line the run turned on. `pool_data` was already being
+            // re-read every attempt — the comment at the fetch even says building from
+            // anything else "just widens the gap between what we ask for and what the
+            // chain will do" — and then the floor was taken from `plan.leg_out`, a
+            // number computed when the websocket last spoke. So the transaction
+            // demanded, on chain, a profit derived from a price that no longer existed,
+            // with one basis point of tolerance. Every attempt for days reverted at the
+            // hop where the stale number ran out: 236,496 opportunities recorded, zero
+            // ever filled, a 100% simulation-rejection rate that no market condition
+            // explains and no amount of retrying could have fixed.
+            //
+            // Re-quoting does not manufacture an edge that has gone. It does something
+            // better: it finds out *before* building a transaction, so a vanished edge
+            // costs a decode instead of a revert, a breaker strike, and a halt.
+            let fresh = Self::fresh_quote(
+                plan.pools[i].1,
+                plan.pools[i].0,
+                &pool_data[i],
+                &plan.mints[i],
+                plan.fee_ppm[i],
+                spend,
+            )
+            .with_context(|| {
+                format!("hop {i} could not be re-priced against the state just fetched")
+            })?;
+
+            let floor = haircut(fresh, self.opts.slippage_bps);
             if floor == 0 {
                 bail!("hop {i} floors at zero after {} bps of slippage", self.opts.slippage_bps);
             }
@@ -484,19 +553,20 @@ mod tests {
         [if i == n { 0xA0 } else { 0xA0 + i as u8 }; 32]
     }
 
-    fn plan(n: usize) -> CyclePlan {
+    pub(super) fn plan(n: usize) -> CyclePlan {
         CyclePlan {
             pools: (0..n).map(|i| ([i as u8 + 1; 32], Dex::OrcaWhirlpool)).collect(),
             mints: (0..=n).map(|i| mint(i, n)).collect(),
             amount_in: 1_000_000,
             leg_out: (0..n).map(|_| 1_010_000).collect(),
+            fee_ppm: (0..n).map(|_| 3_000).collect(),
         }
     }
 
     /// Pool accounts that actually trade the mints the plan names. A fixture whose
     /// mints disagree with its plan is rejected by `input_is_token_a`, which is the
     /// check working rather than the test being awkward.
-    fn pools_for(p: &CyclePlan) -> Vec<Vec<u8>> {
+    pub(super) fn pools_for(p: &CyclePlan) -> Vec<Vec<u8>> {
         let n = p.pools.len();
         (0..n).map(|i| whirlpool_with(p.mints[i], p.mints[i + 1])).collect()
     }
@@ -613,8 +683,19 @@ mod tests {
         d[43..45].copy_from_slice(&spacing.to_le_bytes());
         d[45..47].copy_from_slice(&400u16.to_le_bytes());
         d[49..65].copy_from_slice(&1_000_000_000_000u128.to_le_bytes());
-        d[65..81].copy_from_slice(&(1u128 << 64).to_le_bytes());
-        d[81..85].copy_from_slice(&0i32.to_le_bytes());
+        // Parked *inside* a tick range, not on its edge.
+        //
+        // This used to sit at tick 0 with sqrt price exactly 1<<64 — the boundary — and
+        // `bounds` deliberately shrinks to zero capacity in the pinned direction there,
+        // so the pool decoded fine and then quoted nothing. Harmless while the fixture
+        // was only asked which mint was token A; the moment floors started being priced
+        // against real state it became a pool that cannot trade. Tick 32 with spacing 64
+        // sits mid-range, where both directions quote.
+        let tick: i32 = 32;
+        let sqrt_price =
+            cb_core::clmm::sqrt_price_at_tick(tick).expect("tick 32 has a sqrt price");
+        d[65..81].copy_from_slice(&sqrt_price.to_le_bytes());
+        d[81..85].copy_from_slice(&tick.to_le_bytes());
         d[101..133].copy_from_slice(&mint_a);
         d[133..165].copy_from_slice(&[0xA1; 32]);
         d[181..213].copy_from_slice(&mint_b);
@@ -702,6 +783,8 @@ mod mainnet {
             // Rough, and it does not need to be right: the route refuses if the last
             // floor does not clear the first input, which is the check being exercised.
             leg_out: vec![90_000, 1_010_000],
+            // Orca 0.3% and Raydium CLMM 0.25%, the tiers these two pools actually run.
+            fee_ppm: vec![3_000, 2_500],
         };
 
         // Real USD figures: a zero size is refused by the gate before anything is
@@ -812,6 +895,7 @@ mod mainnet {
             // 0.002 SOL. Small enough to be affordable, large enough not to be dust.
             amount_in: 2_000_000,
             leg_out: vec![180_000, 2_010_000],
+            fee_ppm: vec![3_000, 2_500],
         };
 
         // Resolve tick arrays the way the executor does.
@@ -917,5 +1001,88 @@ mod mainnet {
         assert!(wrap_shortfall(0, 2, bal_for_two).is_none(), "exactly enough is enough");
         assert!(wrap_shortfall(0, 2, bal_for_two - 1).is_some(), "one lamport short must refuse");
         assert!(wrap_shortfall(0, 3, bal_for_two).is_some(), "3 mints must not fit 2 mints' reserve");
+    }
+}
+
+#[cfg(test)]
+mod fresh_quote_tests {
+    use super::tests::unreachable_executor;
+    use super::*;
+    use solana_sdk::pubkey::Pubkey;
+
+    /// The bug this was written for, stated as a test.
+    ///
+    /// A plan carries a detection-time quote. If the pool has moved since — which is
+    /// the normal case, because a websocket update and a transaction are separated by
+    /// several RPC round trips — the floors must follow the *pool*, not the plan.
+    /// Building them from `leg_out` demanded, on chain, a price that no longer existed,
+    /// and every attempt for days reverted at exactly that hop.
+    #[test]
+    fn floors_follow_the_pool_and_not_the_stale_quote_in_the_plan() {
+        let t = Trader {
+            exec: unreachable_executor(),
+            opts: TradeOptions { slippage_bps: 0, ..Default::default() },
+            owner: Pubkey::new_unique(),
+        };
+
+        let mut p = tests::plan(2);
+        let data = tests::pools_for(&p);
+        let arrays = vec![[Pubkey::new_unique(); 3]; 2];
+
+        let honest = t.hops_for(&p, &data, &arrays).expect("a well formed plan");
+
+        // Now claim, in the plan only, that every leg returns a hundred times more.
+        // The pools handed to `hops_for` are unchanged, so nothing about what the chain
+        // would actually pay has moved.
+        for q in &mut p.leg_out {
+            *q *= 100;
+        }
+        let inflated = t.hops_for(&p, &data, &arrays).expect("a well formed plan");
+
+        assert_eq!(
+            honest.iter().map(|h| h.min_amount_out).collect::<Vec<_>>(),
+            inflated.iter().map(|h| h.min_amount_out).collect::<Vec<_>>(),
+            "a floor moved when only the plan's stale quote changed — it is being read \
+             from the plan rather than priced against the pool"
+        );
+    }
+
+    /// The chaining rule still has to hold once the numbers come from the pool: each
+    /// hop spends exactly what the hop before it guarantees, so none can be underfunded.
+    #[test]
+    fn each_hop_still_spends_exactly_what_the_previous_one_guarantees() {
+        let t = Trader {
+            exec: unreachable_executor(),
+            opts: TradeOptions { slippage_bps: 10, ..Default::default() },
+            owner: Pubkey::new_unique(),
+        };
+        let p = tests::plan(3);
+        let hops = t
+            .hops_for(&p, &tests::pools_for(&p), &vec![[Pubkey::new_unique(); 3]; 3])
+            .expect("a well formed plan");
+
+        assert_eq!(u128::from(hops[0].amount_in), p.amount_in);
+        for w in hops.windows(2) {
+            assert_eq!(
+                w[1].amount_in, w[0].min_amount_out,
+                "a hop must spend exactly what the one before it guaranteed"
+            );
+        }
+    }
+
+    /// A venue with no encoder has no quote math reachable here either. It must fail
+    /// loudly rather than fall back to the stale number, which is how the original bug
+    /// would quietly reappear.
+    #[test]
+    fn a_venue_without_an_encoder_cannot_be_re_priced() {
+        assert!(Trader::fresh_quote(
+            Dex::RaydiumAmmV4,
+            [7u8; 32],
+            &[0u8; 300],
+            &[1u8; 32],
+            2_500,
+            1_000_000,
+        )
+        .is_none());
     }
 }

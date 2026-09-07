@@ -701,11 +701,21 @@ impl LiveMarket {
                         .iter()
                         .map(|id| snap.get(id).map(|st| (id.0, st.dex)))
                         .collect::<Option<Vec<_>>>()?;
+                    // Configuration, not price: carried so execution can re-price a
+                    // concentrated leg against fresh state without a round trip for a
+                    // number a swap cannot change. See `CyclePlan::fee_ppm`.
+                    let fee_ppm: Vec<u32> = p
+                        .cycle
+                        .pools
+                        .iter()
+                        .map(|id| snap.get(id).map(|st| st.fee_ppm))
+                        .collect::<Option<Vec<_>>>()?;
                     Some(crate::execute::CyclePlan {
                         pools,
                         mints: p.cycle.mints.clone(),
                         amount_in: p.capped_in,
                         leg_out,
+                        fee_ppm,
                     })
                 })();
 
