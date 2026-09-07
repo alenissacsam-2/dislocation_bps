@@ -493,6 +493,17 @@
           is wrong that retrying will not fix.
         </div>
       </div>
+      <div class="field">
+        <label for="fHaltCooldown">Halt cooldown (seconds)</label>
+        <input type="number" id="fHaltCooldown" step="1" min="0">
+        <div class="hint">
+          How long a stop above stands before trading tries again on its own. This is
+          not a claim that whatever tripped it is fixed — only a bound on how long the
+          bot sits idle before finding out by trying again.
+          <b>0 disables this</b> — a stop then stands until the app is restarted, which
+          used to be the only way out, since nothing ever called resume automatically.
+        </div>
+      </div>
       <button id="btnSaveLimits" class="primary">Save limits</button>
       <p class="note" id="limitsResult"></p>
 

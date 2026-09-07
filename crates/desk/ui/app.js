@@ -781,6 +781,7 @@ const LIMIT_FIELDS = {
   fMaxLoss:  "maxDailyLossUsd",
   fMinNet:   "minNetProfitUsd",
   fMaxFails: "maxConsecutiveFailures",
+  fHaltCooldown: "haltCooldownSecs",
 };
 
 async function paintLimits() {

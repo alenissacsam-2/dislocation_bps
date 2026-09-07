@@ -141,6 +141,12 @@ pub struct Config {
     pub max_consecutive_failures: u32,
     #[serde(default = "default_max_daily_trades")]
     pub max_daily_trades: u32,
+    /// How long a breaker trip stands before the gate clears it on its own. Zero
+    /// disables auto-resume; the halt then stands until the app is restarted, which
+    /// is what every halt did before this field existed — nothing ever called the
+    /// gate's own `resume()`.
+    #[serde(default = "default_halt_cooldown_secs")]
+    pub halt_cooldown_secs: u64,
 }
 
 fn default_capital() -> f64 {
@@ -189,6 +195,13 @@ fn default_max_consecutive_failures() -> u32 {
 }
 fn default_max_daily_trades() -> u32 {
     500
+}
+/// Ten minutes. Long enough that a burst of failures gets a real cooldown rather than
+/// retrying into the same market condition seconds later; short enough that a live run
+/// does not sit idle for hours doing nothing, which is what happened before this field
+/// existed — a trip had no reachable resume path at all.
+fn default_halt_cooldown_secs() -> u64 {
+    600
 }
 
 impl Config {
@@ -271,6 +284,7 @@ mod tests {
             max_slippage_bps: 30.0,
             max_consecutive_failures: 3,
             max_daily_trades: 500,
+            halt_cooldown_secs: 600,
         }
     }
 

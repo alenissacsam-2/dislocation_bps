@@ -264,6 +264,16 @@ impl Trader {
         size_usd: f64,
         expected_net_usd: f64,
     ) -> Result<Attempt> {
+        // Cheapest and most fatal first, same principle as the gate itself: a halted
+        // run used to still pay for a full account fetch, tick-array resolution, and
+        // a blockhash — several RPC round trips — only to be refused at the very last
+        // step inside `execute()`. Checked here too so a halt costs nothing while it
+        // stands, however long the cooldown before it clears itself.
+        self.exec.gate.tick_auto_resume();
+        if let Some(why) = self.exec.gate.halted() {
+            return Ok(Attempt::Refused(format!("trading is halted: {why}")));
+        }
+
         if let Some(dex) = plan.blocking_venue() {
             return Ok(Attempt::Refused(format!("{} has no encoder", dex.name())));
         }
@@ -409,6 +419,16 @@ impl Trader {
     #[must_use]
     pub fn halted(&self) -> Option<String> {
         self.exec.gate.halted()
+    }
+
+    /// Clear a halt on its own once the configured cooldown has elapsed.
+    ///
+    /// `attempt()` already does this before doing any work, but only when a cycle is
+    /// actually up for consideration. Called once per sweep too so a halt clears on
+    /// schedule — and the status the UI reads reflects it — even during a sweep that
+    /// finds nothing worth attempting.
+    pub fn tick_auto_resume(&mut self) {
+        self.exec.gate.tick_auto_resume();
     }
 }
 

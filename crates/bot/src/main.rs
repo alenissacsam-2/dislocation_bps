@@ -47,6 +47,18 @@ const JITO_TIP_FLOOR_SOL: f64 = 0.000_007_5;
 /// Solana base transaction fee, in SOL.
 const BASE_FEE_SOL: f64 = 0.000_005;
 
+/// How long a cycle refused because *the price moved* is left alone. Roughly four
+/// slots: long enough that another cycle gets the next sweep's one attempt, short
+/// enough to come back while the gap may still be open. See `refusal_cooldown_for`.
+const PRICE_MOVED_COOLDOWN: Duration = Duration::from_millis(1500);
+/// How long a cycle refused for a reason *the market cannot change* is left alone —
+/// a size that will not fit the wallet refuses identically until the wallet moves.
+const STRUCTURAL_COOLDOWN: Duration = Duration::from_secs(20);
+/// How often the same refusal may reach the log, tracked separately from how often it
+/// may be retried. Retrying a cycle four times a second is correct; saying so four
+/// times a second is not.
+const LOG_COOLDOWN: Duration = Duration::from_secs(20);
+
 /// Where the measurement goes. The dashboard is a window; this is the record.
 const LEDGER_PATH: &str = "cryptobot.db";
 /// The encrypted key, beside the ledger and the config. Never read without a
@@ -130,22 +142,49 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-/// Whether a cycle refused within `cooldown` should be skipped rather than
-/// re-attempted this sweep.
+/// How long a cycle refused for `reason` should be left alone before retrying.
 ///
-/// Pure, so the window itself is testable without running a sweep. The cycle this
-/// exists for: a sizing that cannot fit the wallet's real balance refuses identically
-/// every time nothing about the wallet or the market has changed, and without this a
-/// live run re-fetches, re-builds and re-refuses it once a sweep — a fresh round trip
-/// to every configured RPC endpoint and an identical log line, roughly once a second,
-/// forever. A live run did exactly that for over an hour before this existed.
+/// `None` means do not hold it off at all.
+///
+/// The distinction this draws is the whole point. A refusal that depends on *this
+/// instant's price* - a simulation that came back `TooLittleOutputReceived`, a net that
+/// landed under the floor - says nothing about the next slot, and slots are ~400ms. A
+/// refusal that depends on the wallet's *shape* - a size that cannot fit the balance
+/// once rent is reserved - refuses identically until something outside the market
+/// changes, and re-deriving it once a sweep is a wasted round trip to every endpoint.
+///
+/// This started life as one flat 20s window for both, which measured badly: over one
+/// 3.9h live run, **1,586 of 2,064 detections** of cycles that were genuinely
+/// encodable, simultaneous and net-positive were skipped by a cooldown earned by a
+/// price that had since moved. Twenty seconds is ~50 slots; the opportunities being
+/// waited out live 0.1-5s. The log spam that motivated the window is throttled
+/// separately now - how often a thing is *said* and how often it is *retried* were
+/// never the same question.
+#[must_use]
+fn refusal_cooldown_for(reason: &str) -> Option<Duration> {
+    // Global, not a fact about this cycle: it has its own announce throttle, and
+    // holding every cycle seen during a halt would leave them all still held for the
+    // window *after* the halt lifts, which is exactly when they should be retried.
+    if reason.starts_with("trading is halted") {
+        return None;
+    }
+    // Structural: true until the wallet or the limits change, not until the price does.
+    let structural = reason.contains("would leave less than")
+        || reason.contains("exceeds")
+        || reason.contains("has no encoder");
+    Some(if structural { STRUCTURAL_COOLDOWN } else { PRICE_MOVED_COOLDOWN })
+}
+
+/// A cycle held off until its own deadline should be skipped rather than re-attempted.
+///
+/// Pure, so the window itself is testable without running a sweep. Each entry carries
+/// the cooldown it earned - see [`refusal_cooldown_for`].
 #[must_use]
 fn on_refusal_cooldown(
-    recent: &std::collections::HashMap<String, std::time::Instant>,
+    recent: &std::collections::HashMap<String, (std::time::Instant, Duration)>,
     cycle_key: &str,
-    cooldown: Duration,
 ) -> bool {
-    recent.get(cycle_key).is_some_and(|at| at.elapsed() < cooldown)
+    recent.get(cycle_key).is_some_and(|(at, window)| at.elapsed() < *window)
 }
 
 #[cfg(test)]
@@ -153,17 +192,20 @@ mod refusal_cooldown_tests {
     use super::*;
     use std::time::Instant;
 
+    const SHORT: Duration = Duration::from_millis(1500);
+    const LONG: Duration = Duration::from_secs(20);
+
     #[test]
     fn a_cycle_refused_moments_ago_is_on_cooldown() {
         let mut recent = std::collections::HashMap::new();
-        recent.insert("SOL-USDC-SOL".to_string(), Instant::now());
-        assert!(on_refusal_cooldown(&recent, "SOL-USDC-SOL", Duration::from_secs(20)));
+        recent.insert("SOL-USDC-SOL".to_string(), (Instant::now(), LONG));
+        assert!(on_refusal_cooldown(&recent, "SOL-USDC-SOL"));
     }
 
     #[test]
     fn a_cycle_never_refused_is_never_on_cooldown() {
         let recent = std::collections::HashMap::new();
-        assert!(!on_refusal_cooldown(&recent, "anything", Duration::from_secs(20)));
+        assert!(!on_refusal_cooldown(&recent, "anything"));
     }
 
     /// The whole point: once the window has genuinely elapsed, retrying resumes. A
@@ -173,8 +215,8 @@ mod refusal_cooldown_tests {
     fn a_cycle_refused_before_the_window_is_not_on_cooldown() {
         let mut recent = std::collections::HashMap::new();
         let long_ago = Instant::now() - Duration::from_secs(30);
-        recent.insert("SOL-USDC-SOL".to_string(), long_ago);
-        assert!(!on_refusal_cooldown(&recent, "SOL-USDC-SOL", Duration::from_secs(20)));
+        recent.insert("SOL-USDC-SOL".to_string(), (long_ago, LONG));
+        assert!(!on_refusal_cooldown(&recent, "SOL-USDC-SOL"));
     }
 
     /// A different cycle sharing nothing with the refused one must be unaffected — the
@@ -182,8 +224,52 @@ mod refusal_cooldown_tests {
     #[test]
     fn a_different_cycle_is_not_covered_by_anothers_cooldown() {
         let mut recent = std::collections::HashMap::new();
-        recent.insert("SOL-USDC-SOL".to_string(), Instant::now());
-        assert!(!on_refusal_cooldown(&recent, "SOL-USDT-SOL", Duration::from_secs(20)));
+        recent.insert("SOL-USDC-SOL".to_string(), (Instant::now(), LONG));
+        assert!(!on_refusal_cooldown(&recent, "SOL-USDT-SOL"));
+    }
+
+    /// Each entry is judged against the window it earned, not one shared constant. A
+    /// price-moved refusal two seconds old is finished; a structural one is not.
+    #[test]
+    fn each_entry_expires_on_its_own_window() {
+        let mut recent = std::collections::HashMap::new();
+        let two_secs_ago = Instant::now() - Duration::from_secs(2);
+        recent.insert("moved".to_string(), (two_secs_ago, SHORT));
+        recent.insert("structural".to_string(), (two_secs_ago, LONG));
+        assert!(!on_refusal_cooldown(&recent, "moved"), "1.5s window, 2s ago: over");
+        assert!(on_refusal_cooldown(&recent, "structural"), "20s window, 2s ago: still held");
+    }
+
+    /// The measured failure this classifier exists for. Over one 3.9h live run, 1,586 of
+    /// 2,064 detections of genuinely takeable cycles were skipped because a *price* had
+    /// moved twenty seconds — fifty slots — earlier. Slippage rejections and profit-floor
+    /// misses describe one instant and must come back quickly.
+    #[test]
+    fn a_price_that_moved_is_retried_far_sooner_than_a_wallet_that_cannot_fit_the_trade() {
+        assert_eq!(
+            refusal_cooldown_for("expected net $0.000073 is below the $0.000100 floor"),
+            Some(PRICE_MOVED_COOLDOWN)
+        );
+        assert_eq!(
+            refusal_cooldown_for(
+                "wrapping 128808539 lamports would leave less than the 4178560 lamports \
+                 this transaction needs for account rent and fees"
+            ),
+            Some(STRUCTURAL_COOLDOWN)
+        );
+        assert_eq!(
+            refusal_cooldown_for("size $14.00 exceeds the $10.00 per-trade limit"),
+            Some(STRUCTURAL_COOLDOWN)
+        );
+        assert!(PRICE_MOVED_COOLDOWN < STRUCTURAL_COOLDOWN);
+    }
+
+    /// A halt is one fact about the gate, not about any cycle. Holding cycles for it
+    /// would leave every one of them still held for the window *after* the halt lifts,
+    /// which is exactly the moment they should all be retried.
+    #[test]
+    fn a_halt_holds_no_individual_cycle_off() {
+        assert_eq!(refusal_cooldown_for("trading is halted: 6 trades failed in a row"), None);
     }
 }
 
@@ -253,15 +339,18 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
         max_slippage_bps: cfg.max_slippage_bps,
         max_consecutive_failures: cfg.max_consecutive_failures,
         max_daily_trades: cfg.max_daily_trades,
+        halt_cooldown_secs: cfg.halt_cooldown_secs,
     };
     limits.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
     tracing::info!(
-        "risk limits from config.toml: max position ${:.2}, min net ${:.4}, daily loss ${:.2}, {} consecutive failures, {} trades/day",
+        "risk limits from config.toml: max position ${:.2}, min net ${:.4}, daily loss ${:.2}, {} consecutive failures, {} trades/day, halt cooldown {}s{}",
         limits.max_position_usd,
         limits.min_net_profit_usd,
         limits.max_daily_loss_usd,
         limits.max_consecutive_failures,
-        limits.max_daily_trades
+        limits.max_daily_trades,
+        limits.halt_cooldown_secs,
+        if limits.halt_cooldown_secs == 0 { " (auto-resume disabled — a halt needs a restart)" } else { "" }
     );
     let opts = execute::TradeOptions {
         slippage_bps: cfg.slippage_bps,
@@ -363,6 +452,7 @@ async fn main() -> anyhow::Result<()> {
             max_slippage_bps: 30.0,
             max_consecutive_failures: 3,
             max_daily_trades: 500,
+            halt_cooldown_secs: 600,
         }
     });
 
@@ -623,9 +713,12 @@ async fn spawn_live(
         // second, forever, learning nothing the first refusal did not already
         // establish. A live run did exactly this for over an hour before the cooldown
         // below existed.
-        let mut recent_refusals: std::collections::HashMap<String, std::time::Instant> =
+        let mut recent_refusals: std::collections::HashMap<
+            String,
+            (std::time::Instant, Duration),
+        > = std::collections::HashMap::new();
+        let mut recent_logged: std::collections::HashMap<String, std::time::Instant> =
             std::collections::HashMap::new();
-        const REFUSAL_COOLDOWN: Duration = Duration::from_secs(20);
         // The gate being halted, separately throttled from the per-cycle map above: it is
         // one fact about the whole run, not one fact per cycle, so it gets one shared
         // timestamp rather than a fresh cooldown entry for every distinct cycle that
@@ -685,6 +778,12 @@ async fn spawn_live(
                     }
                 }
                 _ = sweep_timer.tick() => {
+                    // Ahead of anything else this sweep does: a halt clears itself on
+                    // its own cooldown, and a sweep that finds no candidate to attempt
+                    // must not be the reason that takes longer to notice.
+                    if let Some(t) = trader.as_mut() {
+                        t.tick_auto_resume();
+                    }
                     let sweep = market.sweep(tradable_usd, min_depth_usd, max_hops);
                     evaluated_total = evaluated_total.saturating_add(sweep.evaluated);
 
@@ -793,7 +892,8 @@ async fn spawn_live(
                     // process. Five times the cooldown is generous headroom for a cycle
                     // that is still actively being retried; anything older than that is
                     // history, not state.
-                    recent_refusals.retain(|_, at| at.elapsed() < REFUSAL_COOLDOWN * 5);
+                    recent_refusals.retain(|_, (at, window)| at.elapsed() < *window * 5);
+                    recent_logged.retain(|_, at| at.elapsed() < LOG_COOLDOWN * 5);
                     for opp in sweep.opportunities {
                         let id = next_id;
                         next_id += 1;
@@ -870,7 +970,7 @@ async fn spawn_live(
                                     // that was already refused within the cooldown window —
                                     // see `recent_refusals`'s own comment for why.
                                     let on_cooldown =
-                                        on_refusal_cooldown(&recent_refusals, &opp.cycle_key, REFUSAL_COOLDOWN);
+                                        on_refusal_cooldown(&recent_refusals, &opp.cycle_key);
                                     let candidate = if attempted_this_sweep || on_cooldown {
                                         None
                                     } else {
@@ -919,14 +1019,37 @@ async fn spawn_live(
                                                     reason,
                                                     ..
                                                 }) => {
-                                                    tracing::warn!(
-                                                        "simulation rejected: {reason}"
-                                                    );
+                                                    // A rejection here is the chain saying the
+                                                    // price moved between the quote and the
+                                                    // simulation — the most transient fact
+                                                    // there is, and no reason to stop watching
+                                                    // this cycle for fifty slots. Held off
+                                                    // briefly so another cycle gets this
+                                                    // sweep's one attempt, and logged on the
+                                                    // long window so a cycle failing all
+                                                    // minute does not fill the log.
+                                                    let quiet = recent_logged
+                                                        .get(&opp.cycle_key)
+                                                        .is_some_and(|at: &std::time::Instant| {
+                                                            at.elapsed() < LOG_COOLDOWN
+                                                        });
+                                                    if !quiet {
+                                                        tracing::warn!(
+                                                            "simulation rejected: {reason}"
+                                                        );
+                                                        recent_logged.insert(
+                                                            opp.cycle_key.clone(),
+                                                            std::time::Instant::now(),
+                                                        );
+                                                    }
                                                     outcome_reason =
                                                         Some(format!("simulation: {reason}"));
                                                     recent_refusals.insert(
                                                         opp.cycle_key.clone(),
-                                                        std::time::Instant::now(),
+                                                        (
+                                                            std::time::Instant::now(),
+                                                            PRICE_MOVED_COOLDOWN,
+                                                        ),
                                                     );
                                                 }
                                                 Ok(cb_executor::Attempt::Refused(why)) => {
@@ -947,21 +1070,44 @@ async fn spawn_live(
                                                     // both move together.
                                                     let is_halt_refusal =
                                                         why.starts_with("trading is halted");
-                                                    let should_log = !is_halt_refusal
-                                                        || last_halt_announced.is_none_or(
+                                                    let quiet = recent_logged
+                                                        .get(&opp.cycle_key)
+                                                        .is_some_and(|at: &std::time::Instant| {
+                                                            at.elapsed() < LOG_COOLDOWN
+                                                        });
+                                                    let should_log = if is_halt_refusal {
+                                                        last_halt_announced.is_none_or(
                                                             |at: std::time::Instant| {
-                                                                at.elapsed() >= REFUSAL_COOLDOWN
+                                                                at.elapsed() >= LOG_COOLDOWN
                                                             },
-                                                        );
+                                                        )
+                                                    } else {
+                                                        !quiet
+                                                    };
                                                     if should_log {
                                                         tracing::info!("refused: {why}");
+                                                        if !is_halt_refusal {
+                                                            recent_logged.insert(
+                                                                opp.cycle_key.clone(),
+                                                                std::time::Instant::now(),
+                                                            );
+                                                        }
                                                     }
                                                     outcome_reason =
                                                         Some(format!("refused: {why}"));
-                                                    recent_refusals.insert(
-                                                        opp.cycle_key.clone(),
-                                                        std::time::Instant::now(),
-                                                    );
+                                                    // A halt earns no per-cycle hold: it is one
+                                                    // fact about the gate, and holding every
+                                                    // cycle seen during it would leave them all
+                                                    // still held for the window *after* the halt
+                                                    // lifts — precisely when they should be
+                                                    // retried.
+                                                    if let Some(window) = refusal_cooldown_for(&why)
+                                                    {
+                                                        recent_refusals.insert(
+                                                            opp.cycle_key.clone(),
+                                                            (std::time::Instant::now(), window),
+                                                        );
+                                                    }
                                                 }
                                                 Err(e) => {
                                                     // An RPC failure is not a defect in what
@@ -987,7 +1133,7 @@ async fn spawn_live(
                                             if let Some(why) = t.halted() {
                                                 let should_announce = last_halt_announced
                                                     .is_none_or(|at: std::time::Instant| {
-                                                        at.elapsed() >= REFUSAL_COOLDOWN
+                                                        at.elapsed() >= LOG_COOLDOWN
                                                     });
                                                 if should_announce {
                                                     tracing::error!("trading halted: {why}");

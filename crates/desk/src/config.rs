@@ -354,6 +354,12 @@ pub fn read_limits(path: &Path) -> anyhow::Result<cb_executor::risk::Limits> {
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(fallback)
     };
+    let int64 = |k: &str, fallback: u64| -> u64 {
+        doc.get(k)
+            .and_then(toml_edit::Item::as_integer)
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(fallback)
+    };
     Ok(cb_executor::risk::Limits {
         max_position_usd: num("max_position_usd", d.max_position_usd),
         max_daily_loss_usd: num("max_daily_loss_usd", d.max_daily_loss_usd),
@@ -361,6 +367,7 @@ pub fn read_limits(path: &Path) -> anyhow::Result<cb_executor::risk::Limits> {
         max_slippage_bps: num("max_slippage_bps", d.max_slippage_bps),
         max_consecutive_failures: int("max_consecutive_failures", d.max_consecutive_failures),
         max_daily_trades: int("max_daily_trades", d.max_daily_trades),
+        halt_cooldown_secs: int64("halt_cooldown_secs", d.halt_cooldown_secs),
     })
 }
 
@@ -386,6 +393,8 @@ pub fn write_limits(path: &Path, l: &cb_executor::risk::Limits) -> anyhow::Resul
     doc["max_consecutive_failures"] =
         toml_edit::value(i64::from(l.max_consecutive_failures));
     doc["max_daily_trades"] = toml_edit::value(i64::from(l.max_daily_trades));
+    doc["halt_cooldown_secs"] =
+        toml_edit::value(i64::try_from(l.halt_cooldown_secs).unwrap_or(i64::MAX));
     std::fs::write(path, doc.to_string())?;
     Ok(())
 }

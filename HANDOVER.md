@@ -349,6 +349,77 @@ transient miss or two before assuming something structural, not so much that a r
 defect goes uncaught. This is a config choice, not a fix, and revisit it if the reason
 in the log ever stops being 6018.
 
+**`Custom(6036)` is a second, distinct flavor of the same race — found 2026-08-31.**
+`{"InstructionError":[5,{"Custom":6036}]}`, verified against Raydium CLMM's actual
+`error.rs` on GitHub (not guessed — see the caution two paragraphs up about wrong error
+numbers): `Insufficient liquidity for this direction`. Same root cause as 6018 — the
+book had moved, in this case thinned, between quote and simulation — just a different
+symptom of the pool disagreeing with the plan by the time it was checked.
+
+**A halt had no reachable resume path at all, and sat idle for 6+ hours — found
+2026-09-01.** `RiskGate::resume()` (`crates/executor/src/risk.rs`) existed but nothing
+in the whole app ever called it outside a unit test: no API route, no desk UI control,
+no CLI flag. The comment above `halt()` even said the lack of auto-recovery was
+deliberate ("whatever caused it is still true until someone has looked") — true in
+principle, except there was no *way* for someone to say they'd looked, short of killing
+and restarting the whole `cb-bot` process. That accidental restart-as-resume is why
+every restart this session appeared to "fix" a halt: it wasn't fixing anything, it was
+building a fresh `RiskGate` with `halted: None`. Confirmed live: a burst of five
+`Custom(6018)`s tripped the (already-raised) 6-strike breaker at `16:02:39 UTC` on
+2026-08-31, and the bot was still halted, having done nothing but log reconcile
+heartbeats, when this was found at `22:23:49 UTC` — over six hours later.
+
+Fixed by adding `RiskGate::tick_auto_resume()` and a new `halt_cooldown_secs` limit
+(config default 600s = 10 minutes; `0` disables it and restores the exact old
+behavior). Called from three places: once per sweep unconditionally (so the UI's
+notion of halted state clears on schedule even on a sweep that finds no candidate),
+and at the top of `Trader::attempt()` before any RPC work (so a halt, while it stands,
+costs nothing — previously every sweep still paid for a full account fetch, tick-array
+resolution and a blockhash only to be refused at the very last step). `resume()` itself
+is untouched and still the deliberate manual override; the cooldown is not a claim that
+whatever tripped the breaker is fixed, only a bound on how long the instrument sits
+idle before it is allowed to find out by trying again. Given how thin this book's
+opportunities are (see `--report`: 246 distinct opportunities in 2.2h, 0 taken), expect
+it to sometimes halt, cool down, and halt again on the same underlying condition — that
+repeated cycling is the correct behavior for a structural mismatch, not a bug in the
+cooldown.
+
+**The refusal cooldown was skipping most of what it should have taken — found
+2026-09-01.** The 20s per-cycle cooldown added the day before (to stop a wrap-shortfall
+refusal re-deriving itself once a second, forever) was applied to *every* refusal
+including simulation rejections. Those are the opposite case: `Custom(6018)` means the
+price moved between the quote and the simulation, which describes one instant and says
+nothing about the next slot. Twenty seconds is ~50 slots, and the opportunities being
+waited out live 0.1-5s.
+
+Measured over one 3.9h live run, on the subset that was genuinely takeable — encodable
+venues, `slot_spread <= 1` so not a stale-price artifact, net-positive after the modeled
+tip — **1,586 of 2,064 detections (77%) were skipped by a cooldown earned by a price
+that had already moved.** Fixed by classifying the refusal (`refusal_cooldown_for`):
+price-moved reasons get 1.5s, structural ones (a size that cannot fit the wallet) keep
+20s, and a halt gets none at all — it is one fact about the gate, and holding every
+cycle seen during it left them all still held for the window *after* the halt lifted,
+exactly when they should have been retried. Log throttling was split out into its own
+map on the long window: how often a thing is *said* and how often it is *retried* were
+never the same question. Retrying is free to be wrong here — `Plan::execute` simulates
+before it submits, so a rejected retry costs a round trip and nothing on chain.
+
+**Where the money actually is, at $10 — measured 2026-09-01.** Same run, deduplicated to
+distinct opportunities, `slot_spread <= 1`, net of the modeled tip:
+
+| | count | total net |
+|---|---|---|
+| encodable + simultaneous (takeable today) | 11 | $0.0585 |
+| **blocked by a missing encoder** | 9 | **$0.2353** |
+
+Behind each missing encoder: **RAY-V4 $0.1794**, RAY-CP $0.0878, MET-D2 $0.0102. The
+single best opportunity of the run was `RAY-V4 25bp · ORCA 16bp`, net $0.1070 at
+`slot_spread 0`, and it cannot be built. So the largest available lever at this book
+size is not capital and not latency — it is a **Raydium AMM v4 swap encoder**, which
+would roughly 4x the takeable money on this sample. Note the concentration caveat before
+believing the ranking: the biggest blocked names are memecoin pairs (Fartcoin, USELESS),
+and one route was 79% of the sample.
+
 **Pools that hold liquidity and cannot be traded — found 2026-08-30.** Building the swap
 encoders required, for the first time, asking the chain for the accounts a *trade* needs
 rather than the ones a *quote* needs. That found 21 of the 48 Raydium CLMM pools in the

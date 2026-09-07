@@ -19,6 +19,7 @@
 //! any control at all.
 
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 /// Operator-set bounds. Every one of these is a hard stop, not a target.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -40,6 +41,15 @@ pub struct Limits {
     pub max_slippage_bps: f64,
     /// Upper bound on trades per day, whatever they are worth.
     pub max_daily_trades: u32,
+    /// How long a breaker trip stands before the gate clears it on its own.
+    ///
+    /// Zero disables this: the halt then stands until an operator calls
+    /// [`RiskGate::resume`], exactly as before this field existed. A live run found
+    /// this halt had no reachable resume path at all — nothing in the app ever called
+    /// `resume()`, so a trip was in practice permanent until the whole process was
+    /// restarted. A cooldown is not a claim that whatever tripped it is fixed; it is
+    /// only a bound on how long the instrument sits idle before trying again.
+    pub halt_cooldown_secs: u64,
 }
 
 impl Default for Limits {
@@ -54,6 +64,7 @@ impl Default for Limits {
             min_net_profit_usd: 0.01,
             max_slippage_bps: 30.0,
             max_daily_trades: 500,
+            halt_cooldown_secs: 600,
         }
     }
 }
@@ -145,6 +156,9 @@ pub struct RiskGate {
     consecutive_failures: u32,
     trades_today: u32,
     halted: Option<String>,
+    /// When the current halt started, for [`Self::tick_auto_resume`] to measure
+    /// against. `None` whenever `halted` is `None`.
+    halted_at: Option<Instant>,
 }
 
 impl RiskGate {
@@ -156,19 +170,21 @@ impl RiskGate {
             consecutive_failures: 0,
             trades_today: 0,
             halted: None,
+            halted_at: None,
         }
     }
 
-    /// Stop trading immediately and stay stopped.
+    /// Stop trading immediately and stay stopped until [`Self::resume`] is called, or
+    /// until [`Self::tick_auto_resume`] finds the configured cooldown has elapsed.
     ///
     /// The operator's kill switch, and also what the gate does to itself when a limit
-    /// is breached. There is deliberately no automatic recovery: whatever caused it is
-    /// still true until someone has looked.
+    /// is breached.
     pub fn halt(&mut self, reason: impl Into<String>) {
         let reason = reason.into();
         if self.halted.is_none() {
             tracing::error!("trading halted: {reason}");
             self.halted = Some(reason);
+            self.halted_at = Some(Instant::now());
         }
     }
 
@@ -183,7 +199,34 @@ impl RiskGate {
         if let Some(prev) = self.halted.take() {
             tracing::warn!("trading resumed by operator; was halted for: {prev}");
         }
+        self.halted_at = None;
         self.consecutive_failures = 0;
+    }
+
+    /// Clear a halt on its own once it has stood for the configured cooldown.
+    ///
+    /// Cheap to call on every sweep: it is a no-op unless a halt is both active and
+    /// older than `limits.halt_cooldown_secs`. A cooldown of zero disables this
+    /// entirely, leaving `resume()` as the only way out — the pre-cooldown behaviour.
+    ///
+    /// This does not mean whatever tripped the breaker is confirmed fixed; it only
+    /// bounds how long the instrument sits idle before it is allowed to find out by
+    /// trying again. The next trade is judged on its own merits like any other.
+    pub fn tick_auto_resume(&mut self) {
+        if self.limits.halt_cooldown_secs == 0 {
+            return;
+        }
+        let Some(at) = self.halted_at else { return };
+        if at.elapsed() >= Duration::from_secs(self.limits.halt_cooldown_secs) {
+            if let Some(prev) = self.halted.take() {
+                tracing::warn!(
+                    "trading resumed automatically after a {}s cooldown; was halted for: {prev}",
+                    self.limits.halt_cooldown_secs
+                );
+            }
+            self.halted_at = None;
+            self.consecutive_failures = 0;
+        }
     }
 
     /// A new day: the daily counters reset, a halt does not.
@@ -327,6 +370,9 @@ mod tests {
             min_net_profit_usd: 0.01,
             max_slippage_bps: 30.0,
             max_daily_trades: 5,
+            // Disabled here so the existing "stays halted until resume()" tests keep
+            // meaning exactly what they say. Auto-resume gets its own gate below.
+            halt_cooldown_secs: 0,
         })
     }
 
@@ -447,6 +493,41 @@ mod tests {
             Decision::Halt(r) => assert!(r.contains("kill switch")),
             other => panic!("a halted gate must refuse everything, got {other:?}"),
         }
+    }
+
+    /// The exact bug found on a live run: nothing in the app ever called `resume()`,
+    /// so a trip was permanent until the process was restarted. `tick_auto_resume`
+    /// exists so a cooldown, not a restart, is what ends a halt.
+    #[test]
+    fn a_halt_clears_itself_once_the_cooldown_elapses() {
+        let mut g = RiskGate::new(Limits { halt_cooldown_secs: 1, ..Limits::default() });
+        g.halt("simulation rejected three times in a row");
+        assert!(g.is_halted());
+
+        g.tick_auto_resume();
+        assert!(g.is_halted(), "the cooldown has not elapsed yet");
+
+        std::thread::sleep(Duration::from_millis(1100));
+        g.tick_auto_resume();
+        assert!(!g.is_halted(), "the cooldown elapsed; nothing should still be holding it");
+        assert_eq!(g.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn a_zero_cooldown_disables_auto_resume_entirely() {
+        let mut g = RiskGate::new(Limits { halt_cooldown_secs: 0, ..Limits::default() });
+        g.halt("kill switch");
+        std::thread::sleep(Duration::from_millis(50));
+        g.tick_auto_resume();
+        assert!(g.is_halted(), "a zero cooldown must behave exactly like resume()-only");
+    }
+
+    #[test]
+    fn ticking_auto_resume_while_not_halted_does_nothing() {
+        let mut g = gate();
+        g.tick_auto_resume();
+        assert!(!g.is_halted());
+        assert_eq!(g.consecutive_failures(), 0);
     }
 
     #[test]

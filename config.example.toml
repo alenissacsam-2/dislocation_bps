@@ -81,6 +81,12 @@ max_consecutive_failures = 3
 # Upper bound on trades per day, whatever they are worth.
 max_daily_trades = 500
 
+# How long a breaker trip stands before the gate clears it and tries again on its
+# own. This does not mean whatever tripped it is confirmed fixed — it only bounds
+# how long the instrument sits idle before finding out by trying again. Zero
+# disables auto-resume entirely; a halt then stands until the app is restarted.
+halt_cooldown_secs = 600
+
 # ---------------------------------------------------------------------------
 # Live execution. None of this does anything while mode = "paper".
 # ---------------------------------------------------------------------------
