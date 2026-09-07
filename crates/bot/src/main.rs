@@ -47,6 +47,25 @@ const JITO_TIP_FLOOR_SOL: f64 = 0.000_007_5;
 /// Solana base transaction fee, in SOL.
 const BASE_FEE_SOL: f64 = 0.000_005;
 
+/// How far apart, in slots, a cycle's two legs may have been priced and still be worth
+/// trading.
+///
+/// One slot of tolerance, not zero: the two legs can straddle a slot boundary for
+/// reasons that have nothing to do with the market, and requiring a single shared slot
+/// would throw away real simultaneous cycles to no purpose.
+///
+/// This bounds the *artifact*, not the risk. An edge computed from two prices observed
+/// seconds apart is partly the market moving between the observations, and that part was
+/// never simultaneously on offer to anyone. `--report` has argued this since the
+/// artifact was found; until now nothing stopped execution acting on it.
+const MAX_EXECUTABLE_SLOT_SPREAD: u64 = 1;
+
+/// Whether a cycle's legs were priced too far apart in time to be worth trading.
+#[must_use]
+fn too_skewed_to_trade(slot_spread: u64) -> bool {
+    slot_spread > MAX_EXECUTABLE_SLOT_SPREAD
+}
+
 /// How long a cycle refused because *the price moved* is left alone. Roughly four
 /// slots: long enough that another cycle gets the next sweep's one attempt, short
 /// enough to come back while the gap may still be open. See `refusal_cooldown_for`.
@@ -971,7 +990,29 @@ async fn spawn_live(
                                     // see `recent_refusals`'s own comment for why.
                                     let on_cooldown =
                                         on_refusal_cooldown(&recent_refusals, &opp.cycle_key);
-                                    let candidate = if attempted_this_sweep || on_cooldown {
+                                    // Legs priced too far apart in time are not an
+                                    // opportunity, they are the clock.
+                                    //
+                                    // `slot_spread` has been measured on every cycle
+                                    // since the artifact was first found, and `--report`
+                                    // has a whole section arguing that an edge which
+                                    // grows with the gap between two observations was
+                                    // never simultaneously on offer. It was never wired
+                                    // to execution, and the omission was worse than
+                                    // neutral: candidates are taken best-gross-first, and
+                                    // gross grows with skew, so the selection walked
+                                    // straight up the artifact every sweep. One live run
+                                    // measured it — mean detected edge by spread band,
+                                    // 1.27 bps at 0-1 slots against 3.42 bps at 21+ — and
+                                    // all 26 of that run's attempts came from the skewed
+                                    // bands, none from the simultaneous one. Every one was
+                                    // refused for a loss once re-priced against fresh
+                                    // state, by 0.3 to 4.7 bps.
+                                    let too_skewed = too_skewed_to_trade(opp.slot_spread);
+                                    let candidate = if attempted_this_sweep
+                                        || on_cooldown
+                                        || too_skewed
+                                    {
                                         None
                                     } else {
                                         opp.plan.as_ref().filter(|pl| pl.encodable())
@@ -979,9 +1020,17 @@ async fn spawn_live(
                                     match candidate {
                                         None => {
                                             outcome_reason = Some(if on_cooldown {
-                                                "not attempted — refused within the last \
-                                                 20s and nothing has changed"
+                                                "not attempted — refused recently and \
+                                                 nothing has changed"
                                                     .to_string()
+                                            } else if too_skewed {
+                                                format!(
+                                                    "not attempted — legs priced {} slots \
+                                                     apart, over the {MAX_EXECUTABLE_SLOT_SPREAD} \
+                                                     this will trade on; the gap is the clock, \
+                                                     not a disagreement between venues",
+                                                    opp.slot_spread
+                                                )
                                             } else {
                                                 "not attempted — one trade per sweep, or no \
                                                  encoder for this route"
@@ -1966,5 +2015,36 @@ mod tests {
         assert_eq!(q.venues(), "Orca (Whirlpools)", "a repeated venue reads once");
         let q = quote(1, &[("Orca (Whirlpools)", "a"), ("Raydium CLMM", "b")]);
         assert_eq!(q.venues(), "Orca (Whirlpools)+Raydium CLMM");
+    }
+}
+
+#[cfg(test)]
+mod slot_spread_gate_tests {
+    use super::too_skewed_to_trade;
+
+    /// Both legs from one slot is the case this exists to admit, and one slot of
+    /// straddle must not be thrown away with the artifact.
+    #[test]
+    fn simultaneous_legs_are_tradeable() {
+        assert!(!too_skewed_to_trade(0), "both legs from one slot is the case to trade");
+        assert!(!too_skewed_to_trade(1), "a boundary straddle is not an artifact");
+    }
+
+    /// The bands a live run actually measured, and what they were worth. Mean detected
+    /// edge rose with the gap between the two observations — 1.27 bps at 0-1 slots,
+    /// 2.09 at 6-20, 3.42 at 21+ — which is the market moving, not two venues
+    /// disagreeing. Every attempt that run made came from the skewed bands, and every
+    /// one was refused for a loss once re-priced against fresh state.
+    ///
+    /// This fails if the ceiling is ever loosened back over those bands.
+    #[test]
+    fn the_bands_that_measured_as_artifact_are_excluded() {
+        for spread in [2u64, 6, 13, 17, 21, 27, 100] {
+            assert!(
+                too_skewed_to_trade(spread),
+                "{spread} slots of skew is inside the ceiling — that band measured as \
+                 the clock, not as an edge"
+            );
+        }
     }
 }
