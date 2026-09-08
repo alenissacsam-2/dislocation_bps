@@ -12,6 +12,7 @@ cb-scanner = { workspace = true }
 cb-ledger = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 cb-dex = { workspace = true }

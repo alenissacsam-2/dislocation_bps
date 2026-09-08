@@ -361,8 +361,20 @@ impl Trader {
         // priced against — but more importantly the simulation is about to price this
         // against *current* state anyway, so building from anything else just widens
         // the gap between what we ask for and what the chain will do.
+        // Everything that does not depend on the pools is fetched *beside* them, and
+        // everything that does is fetched all at once.
+        //
+        // What matters is not the number of round trips but how many of them sit
+        // between reading a price and asking the chain to honour it. That window used
+        // to be the pool read, then one tick-array fetch per hop in sequence, then a
+        // blockhash — four serial trips for a two-hop cycle, several hundred
+        // milliseconds during which the price this trade was built on kept moving. The
+        // floors then missed by about a basis point, which is precisely the size of
+        // what moves in that window. The blockhash never needed to be in there at all:
+        // it depends on nothing here, and simulation replaces it anyway.
         let keys: Vec<Pubkey> = plan.pools.iter().map(|(k, _)| to_pubkey(k)).collect();
-        let fetched = rpc.accounts_full(&keys).await?;
+        let (fetched, (blockhash, _)) =
+            tokio::try_join!(rpc.accounts_full(&keys), rpc.latest_blockhash())?;
         let mut pool_data = Vec::with_capacity(keys.len());
         for (i, acc) in fetched.into_iter().enumerate() {
             let Some(a) = acc else {
@@ -375,7 +387,12 @@ impl Trader {
         // price. Measured per attempt rather than cached: an array is created the
         // moment somebody opens a position, so a cached answer goes stale in the
         // direction that matters.
-        let mut arrays = Vec::with_capacity(plan.pools.len());
+        //
+        // Resolved for every hop concurrently. The hops do not depend on each other —
+        // each needs only its own pool's current tick — so doing them in sequence spent
+        // one full round trip per hop widening the very gap that then made the floors
+        // unreachable.
+        let mut pending = Vec::with_capacity(plan.pools.len());
         for (i, (pool_raw, dex)) in plan.pools.iter().enumerate() {
             let pool = to_pubkey(pool_raw);
             let program = match dex {
@@ -384,8 +401,16 @@ impl Trader {
             };
             let (tick, spacing) = tick_and_spacing(*dex, &pool_data[i])?;
             let falling = input_is_token_a(*dex, &pool_data[i], &plan.mints[i])?;
-            let chosen =
-                ticks::resolve(rpc, *dex, &pool, &program, tick, spacing, falling).await?;
+            pending.push(async move {
+                let chosen =
+                    ticks::resolve(rpc, *dex, &pool, &program, tick, spacing, falling).await?;
+                anyhow::Ok((pool, chosen))
+            });
+        }
+        let resolved = futures::future::try_join_all(pending).await?;
+
+        let mut arrays = Vec::with_capacity(plan.pools.len());
+        for (pool, chosen) in resolved {
             if chosen.found == 0 {
                 return Ok(Attempt::Refused(format!(
                     "pool {pool} has no initialised tick arrays to swap through"
@@ -463,7 +488,6 @@ impl Trader {
             Err(e) => return Ok(Attempt::Refused(e.to_string())),
         };
 
-        let (blockhash, _) = rpc.latest_blockhash().await?;
         let assembled = match tx::assemble(&self.exec.wallet, &built.instructions, blockhash) {
             Ok(a) => a,
             Err(e) => return Ok(Attempt::Refused(e.to_string())),

@@ -349,12 +349,25 @@ transient miss or two before assuming something structural, not so much that a r
 defect goes uncaught. This is a config choice, not a fix, and revisit it if the reason
 in the log ever stops being 6018.
 
-**`Custom(6036)` is a second, distinct flavor of the same race — found 2026-08-31.**
-`{"InstructionError":[5,{"Custom":6036}]}`, verified against Raydium CLMM's actual
-`error.rs` on GitHub (not guessed — see the caution two paragraphs up about wrong error
-numbers): `Insufficient liquidity for this direction`. Same root cause as 6018 — the
-book had moved, in this case thinned, between quote and simulation — just a different
-symptom of the pool disagreeing with the plan by the time it was checked.
+**`Custom(6036)` — and the error-table mistake that named it wrong, corrected
+2026-09-08.** This section previously said 6036 was Raydium CLMM's `Insufficient
+liquidity for this direction`, claiming it was verified rather than guessed. It was
+neither: the code was matched against the wrong program's table. Once the simulation's
+own logs were carried through (see below), the chain named it directly:
+
+```
+{"InstructionError":[5,{"Custom":6036}]} — AnchorError occurred.
+Error Code: AmountOutBelowMinimum. Error Number: 6036.
+Program whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc failed
+```
+
+`whirLb…` is **Orca Whirlpool**, not Raydium, and 6036 there is `AmountOutBelowMinimum`.
+So 6018 and 6036 are not two different failures at all — they are the same failure at
+two venues: the output floor written into the instruction was not met. The lesson is the
+one this file already gave two paragraphs up and then did not follow: an Anchor user
+error number means nothing without the program that raised it, because every program
+numbers its own from 6000. Reading it off the wrong table produced a plausible,
+confident, wrong story about liquidity that survived a week.
 
 **A halt had no reachable resume path at all, and sat idle for 6+ hours — found
 2026-09-01.** `RiskGate::resume()` (`crates/executor/src/risk.rs`) existed but nothing
