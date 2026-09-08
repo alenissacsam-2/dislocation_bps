@@ -527,16 +527,30 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
     //
     // Only the base mints, which is where every executable cycle starts and ends and is
     // the shortest list that unblocks all of them.
+    // Retried, because it runs exactly once per run and everything downstream depends
+    // on it. A single RPC hiccup here would leave the wallet without an account it
+    // needs and every cycle through that mint quietly failing its profit check for the
+    // rest of the session — which is precisely the failure this call exists to end.
+    // Idempotent, so a retry after a send that actually succeeded finds nothing to do.
     let base_mints = registry::Registry::embedded()?.base_mints;
-    if let Err(e) = trader.ensure_token_accounts(&base_mints).await {
-        // Not fatal. A book that can still trade its existing accounts is worth more
-        // than a process that refuses to start, and the log says exactly what is
-        // missing so it can be fixed deliberately.
-        tracing::error!(
-            "could not open the token accounts this book needs: {e:#}. Cycles through any \
-             mint the wallet has no account for will keep failing their profit check by \
-             the price of the rent."
-        );
+    for attempt in 1..=3u32 {
+        match trader.ensure_token_accounts(&base_mints).await {
+            Ok(_) => break,
+            Err(e) if attempt == 3 => {
+                // Not fatal. A book that can still trade its existing accounts is worth
+                // more than a process that refuses to start, and the log says exactly
+                // what is missing so it can be fixed deliberately.
+                tracing::error!(
+                    "could not open the token accounts this book needs, after {attempt} \
+                     attempts: {e:#}. Cycles through any mint the wallet has no account for \
+                     will keep failing their profit check by the price of the rent."
+                );
+            }
+            Err(e) => {
+                tracing::warn!("opening token accounts failed ({e:#}); retrying");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
     }
     Ok(trader)
 }
