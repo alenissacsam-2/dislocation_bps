@@ -605,13 +605,34 @@ What is left, in order of what the measurements support:
 
 1. **Fill rate.** 23% of attempts on this band survived re-pricing. Halving the round
    trips (§4.10's follow-up) should raise it; nothing else measured will.
-2. **More cheap pairs.** All 12 moments an hour come from four venue pairs, all
-   `RAY-CL 1bp`/`2bp` against `ORCA 2bp`/`4bp`. The moment count should scale roughly
-   with the number of sub-4-bps pairs in the registry, and the registry currently
-   carries 20 pools of `STA/ST`/`ST/STB` that connect to no base mint and can never
-   produce a cycle. That is a registry problem, not a code problem, and it is the only
-   remaining lever with a multiple in it.
-3. Nothing else. Venue expansion adds thin pools, which §4.9 already showed manufacture
+2. **More cheap pairs — and there are almost none to have.** Checked against the venue
+   directories: of 744 pools listed, exactly **seven pairs** anywhere on Solana offer a
+   sub-4-bps encodable round trip, and the registry already carried all seven. Lowering
+   the TVL floor from $150k to $25k adds not one more. Six of the seven have exactly two
+   pools, so they contribute one round trip each and there is nothing to add.
+
+   SOL/USDC is the exception and the busiest, and a $125k floor admits an Orca 2 bp pool
+   at $133k that takes it from one cheap combination to three. Together with dropping
+   the 20 `STA/ST`/`ST/STB` pools that reach no base mint, the registry now offers **18
+   directed cheap round trips against 12**, at 106 subscriptions against 104. That is
+   the whole of the expansion available.
+
+   Four of the seven produce **nothing**: `SOL/JitoSOL`, `USX/USDC`, `JupUSD/USDC` and
+   `USD1/USDC` have zero simultaneous detections in 19 hours, because their two pools
+   agree to 0.00 bps. `SOL/mSOL` produces 117 detections whose best is $0.00009. Every
+   moment worth having comes from SOL/USDC and SOL/USDT.
+
+3. **Not the stablecoin triangle.** `SOL → USDC → USDT → SOL` costs 3 bps on three 1 bp
+   pools and is enumerated: it led the sweep 3,333 times with edges up to 71.84 bps. It
+   has never once become an opportunity, and the reason is not a bug. Its edge is
+   positive only 12.5% of the time with a median of −0.93 bps; when it is strongly
+   positive the moment is slot-skewed (the 71.84 bps reading sat beside two-hop rows at
+   the same second with slot spreads of 107, 129 and 473); and a three-leg cycle needs
+   all three legs to have capacity in the right direction at once, which on
+   tick-spacing-1 stable pools parked at a boundary is often zero. The two-hop view of
+   the same dislocation is cheaper and deeper every time.
+
+4. Nothing else. Venue expansion adds thin pools, which §4.9 already showed manufacture
    phantom edge rather than real edge.
 
 The pattern in all eleven: **an internal check cannot catch an error in what the code

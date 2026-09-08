@@ -341,15 +341,47 @@ def usable(p: dict, min_tvl: float) -> str | None:
     return None
 
 
+def reachable_from_base(pools: list[dict]) -> list[dict]:
+    """Drop pools in a component that contains no base mint.
+
+    A cycle has to start and end somewhere the wallet can hold a balance, so it has to
+    start and end at a base mint. A group of pools that trade only among themselves,
+    however well connected, can never produce one — there is no way in and no way out.
+
+    This is not hypothetical. A live registry carried twenty `STA/ST` and `ST/STB`
+    pools across ten fee tiers, all mutually connected and none touching SOL, USDC or
+    USDT. Every one passed the degree test below, occupied a WebSocket subscription for
+    weeks, and produced exactly zero rows in the ledger, because no cycle through them
+    could ever close.
+    """
+    adj: dict[str, set[str]] = defaultdict(set)
+    for p in pools:
+        adj[p["mint_a"]].add(p["mint_b"])
+        adj[p["mint_b"]].add(p["mint_a"])
+    seen = {m for m in BASE_MINTS if m in adj}
+    queue = list(seen)
+    while queue:
+        for nxt in adj[queue.pop()]:
+            if nxt not in seen:
+                seen.add(nxt)
+                queue.append(nxt)
+    return [p for p in pools if p["mint_a"] in seen and p["mint_b"] in seen]
+
+
 def prune_to_cycles(pools: list[dict]) -> list[dict]:
     """Drop pools whose mints cannot participate in any closed cycle.
 
-    A mint reachable through exactly one pool is a dead end: a cycle entering it has
-    no second road out. Removing such mints can strand others, so this repeats until
-    the graph stops changing.
+    Two ways a pool fails that. A mint reachable through exactly one pool is a dead
+    end: a cycle entering it has no second road out. And a pool with no path to a base
+    mint is unreachable however well connected it is to its own neighbours — see
+    [`reachable_from_base`].
+
+    Removing either kind can strand others, so this repeats until the graph stops
+    changing.
     """
     pools = list(pools)
     while True:
+        pools = reachable_from_base(pools)
         degree: dict[str, set[str]] = defaultdict(set)
         for p in pools:
             degree[p["mint_a"]].add(p["address"])
@@ -397,7 +429,16 @@ def choose(pools: list[dict], budget: int, max_v4: int) -> list[dict]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--budget", type=int, default=120, help="websocket subscription budget")
-    ap.add_argument("--min-tvl", type=float, default=150_000.0)
+    # 125k rather than 150k, for one specific pool and with the rest as measurement.
+    #
+    # The only round trips that have ever survived re-pricing cost 4 bps or less, and
+    # only seven pairs on Solana offer one. Six of them have exactly two pools, so the
+    # pair contributes one round trip and there is nothing to add. SOL/USDC is the
+    # exception and the busiest: at a 150k floor it offered one cheap combination, and
+    # dropping to 125k admits an Orca 2 bp pool at $133k that gives it three. That is
+    # the whole reason for the number — the directed cheap round trips this registry
+    # can see go from 12 to 18.
+    ap.add_argument("--min-tvl", type=float, default=125_000.0)
     ap.add_argument("--pages", type=int, default=3)
     ap.add_argument("--max-v4", type=int, default=6, help="cap on Raydium AMM v4 pools")
     ap.add_argument("--out", default="crates/bot/pools.json")
