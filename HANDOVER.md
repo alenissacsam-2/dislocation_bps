@@ -703,6 +703,18 @@ to hand, it was the wrong one, and nothing internal would have said so. A live s
 replaying the new logic against mainnet found zero buildable moments in half an hour,
 which is what prompted the re-check.
 
+**Size is the cheapest lever on reachability, and `config.toml` is not in the
+repository, so the reasoning lives here.** The margin the fee comes out of is
+`size × haircut`, so a bigger book buys the same margin from a smaller haircut, and a
+smaller haircut needs less edge to build. `capital_usd` went from $10.00 to $12.40 on
+2026-09-09 against a wallet holding 0.1327 SOL, with `max_position_usd` at $13.00 so
+the book rather than the limit is what caps a trade. That moves the re-priced edge a
+route needs from about 1.41 bps to about 1.12, which over the same nineteen hours is
+the difference between four buildable moments and six. It does not raise the downside:
+a landed trade cannot lose its principal, and a failure costs the 5,000-lamport fee
+whatever the size. `wrap_shortfall` still leaves 4,088,560 lamports of rent and fee
+headroom, against which $11.60 of tradable capital fits with $1.40 to spare.
+
 The pattern in all twelve: **an internal check cannot catch an error in what the code
 believes about the outside world** — including what it believes its own numbers mean.
 Three of the four blocks above were arithmetic this code did to itself and then declined
