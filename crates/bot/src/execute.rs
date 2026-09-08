@@ -948,7 +948,10 @@ impl Trader {
             missing.len()
         );
 
-        let mut ixs = vec![tx::set_compute_limit(60_000)];
+        // Generous: creating an associated token account costs on the order of 25,000
+        // compute units and this runs once. A limit set too low reverts a transaction
+        // that had nothing wrong with it, which is a silly way to stay blocked.
+        let mut ixs = vec![tx::set_compute_limit(120_000)];
         for (mint, ata) in &missing {
             ixs.push(tx::create_ata_idempotent(&self.owner, ata, &self.owner, mint, &token_program));
         }
