@@ -690,8 +690,18 @@ Two more found in the same audit:
   as defects, and pushed the run toward a halt. Refused now, which frees the sweep's one
   attempt for the same loop entered from SOL.
 
-Replayed over the ledger: **1,368 SOL-entered moments** clear every gate in nineteen
-hours, of which **997** carry twice the fee in margin.
+**And the headroom over that fee was calibrated on the wrong distribution first.** It
+was set at double the fee from the median *detected* edge of 2.81 bps. The number that
+decides whether a route can be built is the edge it still has when re-priced against
+fresh state, and that tops out at **1.93 bps**. Checked against all twenty-one moments
+that re-priced positive over nineteen hours: at double the fee, **none of them build**;
+at a quarter over, four do — the same four as at the bare fee, with a cushion for drift
+instead of none. Corrected to 1.25×.
+
+This is §4's whole pattern turning up inside the fix for §4: the optimistic number was
+to hand, it was the wrong one, and nothing internal would have said so. A live sampler
+replaying the new logic against mainnet found zero buildable moments in half an hour,
+which is what prompted the re-check.
 
 The pattern in all twelve: **an internal check cannot catch an error in what the code
 believes about the outside world** — including what it believes its own numbers mean.

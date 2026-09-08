@@ -748,9 +748,29 @@ impl Trader {
 
         // What the last hop's margin must cover before the profit check can pass. On a
         // wSOL cycle the fee leaves the same balance the profit is read from, so the
-        // margin has to absorb it; on a token cycle it does not. Doubled, so a trade is
-        // not built to clear its own cost by a single lamport.
-        let fee_headroom = if wrapping { BASE_FEE_LAMPORTS * 2 } else { 0 };
+        // margin has to absorb it; on a token cycle it does not.
+        //
+        // A quarter over the fee, and the quarter is measured rather than chosen. This
+        // was first set at double, on the median *detected* edge of 2.81 bps — which is
+        // the wrong distribution, and the mistake this file's history is mostly made of.
+        // What decides whether a trade can be built is the edge it still has when
+        // re-priced against fresh state, and over nineteen hours that number reached
+        // 1.93 bps at its very best. Every one of the twenty-one moments that re-priced
+        // positive, against the margin its own edge could produce:
+        //
+        // | re-priced edge | margin it allows | 1.00× | 1.25× | 2.00× |
+        // |----------------|------------------|-------|-------|-------|
+        // | 1.93 bps       | 7,033 lamports   | ok    | ok    | fails |
+        // | 1.69 bps       | 7,461            | ok    | ok    | fails |
+        // | 1.61 bps       | 7,003            | ok    | ok    | fails |
+        // | 1.49 bps       | 6,564            | ok    | ok    | fails |
+        // | the other 17   | under 5,000      | fails | fails | fails |
+        //
+        // At double, **none of them build**. At a quarter over, the same four do as at
+        // the bare fee, with a cushion for the price moving between the re-price and
+        // the simulation instead of none at all. Raising it further buys nothing that
+        // exists to be bought.
+        let fee_headroom = if wrapping { BASE_FEE_LAMPORTS * 5 / 4 } else { 0 };
         let (hops, spent) = match self.hops_for(plan, &pool_data, &arrays, fee_headroom) {
             Ok(h) => h,
             Err(e) => return Ok(Attempt::Refused(e.to_string())),
