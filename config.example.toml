@@ -63,11 +63,24 @@ max_position_usd = 25.0
 
 # Realised losses reaching this halt trading for the day. A halt survives midnight —
 # a breaker still tripped in the morning was tripped by something the night did not fix.
+#
+# Read it honestly: this measures *realised* profit and loss, and a submitted
+# transaction is recorded as zero until something confirms it, which nothing yet does.
+# So it is a backstop rather than the binding constraint. What actually bounds a bad
+# day is max_daily_trades below times the cost of one trade going wrong — a transaction
+# that lands and reverts costs the 5,000-lamport base fee, and one abandoned at
+# simulation costs nothing at all.
 max_daily_loss_usd = 5.0
 
 # Expected net below which a trade is not worth its own risk. Deliberately not zero:
 # a trade expected to net a hundredth of a cent is indistinguishable from noise in the
 # estimate that produced it, and that estimate is what is trusted when it signs.
+#
+# Not the real bar either, and it cannot be: it is a dollar figure and it does not know
+# the trade's size. The bar that matters is enforced in `hops_for`, which refuses to
+# build unless the margin between what the last hop delivers and what it guarantees
+# covers the transaction fee — see slippage_tenth_bps below for why that margin is one
+# hop's haircut rather than all of them.
 min_net_profit_usd = 0.01
 
 # How far the simulated result may fall short of the quote before it is refused.
@@ -76,6 +89,13 @@ max_slippage_bps = 30.0
 # Consecutive reverts or rejections before the breaker trips. A lost race does not
 # count: losing races is what racing is, and counting it would stop trading on a busy
 # day rather than a broken one.
+#
+# That was the intent from the beginning and the code did not honour it. Every
+# simulation rejection was recorded as a defect, including the two that mean "the pool
+# could not pay the floor" — which is precisely a lost race. Losing is the normal
+# outcome, so six in a row arrived quickly and halted trading for the full cooldown,
+# over and over: 372 halt announcements in one log. Fixed by matching on the program's
+# own error name; anything unrecognised still counts.
 max_consecutive_failures = 3
 
 # Upper bound on trades per day, whatever they are worth.
@@ -119,6 +139,24 @@ halt_cooldown_secs = 600
 #
 # Not the same number as max_slippage_bps above: that one judges the simulated result
 # after the fact, this one is written into the instruction the pool must honour.
+#
+# This is now a FLOOR on the search rather than the value used. The haircut is pulled
+# in two directions and no constant satisfies both:
+#
+#   downward, because the route only builds while its last floor beats its first input,
+#   which for n hops at edge e needs n*s < e, and the edge here is 1 to 2 bps;
+#
+#   upward, because each hop spends what the one before it *guaranteed* rather than what
+#   it delivered. So the route ends holding the last hop's quote having promised that
+#   quote less ONE haircut — not n of them — and on a wSOL cycle the transaction fee
+#   comes out of the very balance the profit is read from. That single haircut is all
+#   there is to absorb it. At $9.20 the fee is 5,000 lamports against an input of
+#   89,000,000, so s must be at least 0.56 bps. This was 0.3, and every trade that got
+#   as far as the profit check failed it, silently, for the life of the run.
+#
+# So `hops_for` now picks the width per trade: the widest the edge will bear, which is
+# at once the widest margin for the fee, the lowest floors for the AMMs to satisfy, and
+# the most tolerance for the price moving before it lands.
 slippage_tenth_bps = 3
 
 # Priority bid in micro-lamports per compute unit. 0 pays the base fee only.

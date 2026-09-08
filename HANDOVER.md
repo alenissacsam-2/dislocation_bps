@@ -635,8 +635,62 @@ What is left, in order of what the measurements support:
 4. Nothing else. Venue expansion adds thin pools, which §4.9 already showed manufacture
    phantom edge rather than real edge.
 
-The pattern in all eleven: **an internal check cannot catch an error in what the code
+### 4.12 — Three walls, none of which wrote a log line — **fixed 2026-09-08**
+
+Nothing had ever been submitted. Not rejected on chain — **never sent**: `grep -c
+"submitted "` over the entire log returns 0, and the wallet's last five signatures are
+all funding transfers from July and August. Six hours of the current build produced
+143,877 detections, 91 attempts, 19 simulations and no transaction.
+
+Three separate blocks, each sufficient on its own, and none of which announced itself.
+
+**1. A lost race counted as a defect.** `Outcome` draws the line in its own doc comment
+— `Missed` is "lost the race, costs nothing but time", `Failed` is "rejected for a
+reason that suggests a defect rather than competition" — and `config.example.toml` says
+it again: *"A lost race does not count: losing races is what racing is."* `Plan::execute`
+recorded every simulation rejection as `Failed`. That was right while floors came from
+detection-time quotes; since `hops_for` began re-pricing against fresh state a missed
+floor means the price moved in one round trip, which is competition exactly. Losing is
+the normal outcome, so six in a row arrived fast and halted trading for the full
+ten-minute cooldown, repeatedly — **372 halt announcements**.
+
+**2. The wallet had no token account for USDT.** A cycle's profit is read from the
+owner's lamport balance and must clear `pre_balance + guaranteed gain`. Opening an ATA
+costs 2,039,280 lamports out of that same balance, so a trade that opens one is asked to
+show a **twenty-one cent** gain on a cycle worth a tenth of a cent — short by a factor
+of **383**, every time. The USDC account existed; USDT did not; roughly seventy per cent
+of everything that cleared the other gates ran SOL↔USDT.
+
+**3. The output floor could not cover the transaction fee.** Each hop spends what the
+one before it *guaranteed*, so the route ends holding the last hop's quote having
+promised that quote less **one** haircut, not `n` of them. On a wSOL cycle the fee
+leaves the same balance the profit is read from, so that single haircut is the entire
+margin. At $9.20 the fee is 5,000 lamports against 89,000,000 of input: the haircut must
+be at least **0.56 bps** and the shipped value was **0.3**. Every trade that survived to
+the profit check failed it — and silently, because a balance short of its floor is not
+an error the chain reports, it is a comparison this code makes and rejects.
+
+A constant cannot serve: the floor is pushed down by `n·s < e` and up by the fee. It is
+chosen per trade now, the widest the edge will bear.
+
+Two more found in the same audit:
+
+- Routes were refused outright when a leg's tick held less than the plan asked for —
+  **35 of 91 attempts**, all on cycles that were profitable and merely too big. Sized
+  down now, with the USD figures scaled to match.
+- Cycles entered at USDC or USDT — **195 of 232** — asked to spend nine dollars of a
+  token the wallet does not hold. They would have failed as insufficient funds, counted
+  as defects, and pushed the run toward a halt. Refused now, which frees the sweep's one
+  attempt for the same loop entered from SOL.
+
+Replayed over the ledger: **1,368 SOL-entered moments** clear every gate in nineteen
+hours, of which **997** carry twice the fee in margin.
+
+The pattern in all twelve: **an internal check cannot catch an error in what the code
 believes about the outside world** — including what it believes its own numbers mean.
+Three of the four blocks above were arithmetic this code did to itself and then declined
+to explain. A refusal that does not say *which* number failed is a refusal nobody can
+act on, and four of them stacked end to end look exactly like a quiet market.
 Every new decoder must be pinned against a value the decoder itself did not produce,
 every headline must name which search produced it, and every threshold must be stated in
 a unit finer than the thing it is thresholding.
