@@ -575,38 +575,44 @@ every gate — 12.0 an hour. Their capital ladder:
 **Identical from $100 up.** Every rung above $100 is capped by the same thing, and the
 optimal sizes say what it is: median $8, p75 $18, **max $26** across all 230.
 
-It is not the market. [`clmm::capacity_for_input`] refuses to quote past the current
-tick interval, by design — past a boundary the pool's liquidity changes and the
-constant-product equivalence this crate prices with breaks, so the quote is refused
-rather than extrapolated. On the pools that matter that bound is brutal:
+The first explanation reached for was the model. [`clmm::capacity_for_input`] refuses to
+quote past the current tick interval by design, so the suspicion was that the cap is an
+artifact of that conservatism and real depth is far larger. **It is not.** Measured on
+chain, at one moment, for the pools these cycles run through — one tick is 1 bps:
 
-| pool | spacing | price band the model will quote inside | max in |
+| pool | spacing | a whole tick holds | quotable at this instant |
 |---|---|---|---|
-| RAY-CL 1bp WSOL/USDC | 1 | **0.01 bps** | **$0.16** USDC / $4.19 SOL |
-| RAY-CL 2bp WSOL/USDC | 1 | 0.01 bps | $18.08 USDC / $21.67 SOL |
-| ORCA 4bp SOL/USDC | 4 | 0.04 bps | $22,101 USDC / $31,759 SOL |
+| RAY-CL 1bp WSOL/USDC | 1 (1 bps) | **$4.48** | $3.36 USDC / $1.12 SOL |
+| RAY-CL 2bp WSOL/USDC | 1 (1 bps) | **$39.77** | $0.59 USDC / $39.18 SOL |
+| RAY-CL 5bp WSOL/USDC | 10 (10 bps) | $291.60 | $92.21 / $199.46 |
+| ORCA 4bp SOL/USDC | 4 (4 bps) | $54,503 | $27,969 / $26,537 |
 
-The cheapest pools — the only ones whose round trips ever survive re-pricing — are
-tick-spacing 1, so the model quotes them inside a hundredth of a basis point. The
-Raydium 1 bp pool holds $498k of TVL and this instrument will not price more than
-sixteen cents through it.
+The Orca side is deep and never the constraint. The cheap Raydium pools — the only ones
+whose round trips ever survive re-pricing — hold **four to forty dollars per basis
+point of price**. Multi-tick quoting would not unlock size, because crossing ticks *is*
+moving the price: pushing $100 through the 1 bp pool walks it about 22 ticks, which is
+22 bps, against a dislocation of one to three. The optimal sizes this instrument
+already reports — median $8, max $26 — are the correct answer to "where does impact eat
+the edge", not a bound imposed by the model.
 
-So the honest ceiling today is **$0.44/day net at $9.20, rising to $0.79 with unlimited
-capital and stopping there** — and roughly a quarter of that after the fill rate. More
-money does not help. What would is pricing across tick boundaries, which means reading
-the tick arrays at *detection* rather than only at execution, and walking the swap the
-way the programs do.
+**So the ceiling is real and it is the market's.** $0.44/day net at $9.20, $0.79/day
+with unlimited capital, and roughly a quarter to a half of that once the fill rate is
+applied: **ten to forty cents a day.** More capital does not help and neither does a
+better depth model. The dislocation sits open for seconds precisely *because* it is too
+small for anyone to be paid for taking it, and that is also why it is available to us.
 
-That is a real piece of work and it is the one lever left with an order of magnitude in
-it. It is also exactly the kind of change this file exists to warn about: it makes the
-quote *more optimistic*, and every previous defect in §4 came from a number that was
-optimistic in a way nothing internal could catch. If it is built, it must be pinned
-against an outside quote — a router, or a simulation at the same size — before a single
-trade is sized from it. See §4.3.
+What is left, in order of what the measurements support:
 
-One caution against expecting too much from it: a 1.5 bp dislocation that sits open for
-seconds is sitting there *because* it is too small to be worth taking. Relaxing the
-depth bound may find that the edge shrinks with size faster than the size grows.
+1. **Fill rate.** 23% of attempts on this band survived re-pricing. Halving the round
+   trips (§4.10's follow-up) should raise it; nothing else measured will.
+2. **More cheap pairs.** All 12 moments an hour come from four venue pairs, all
+   `RAY-CL 1bp`/`2bp` against `ORCA 2bp`/`4bp`. The moment count should scale roughly
+   with the number of sub-4-bps pairs in the registry, and the registry currently
+   carries 20 pools of `STA/ST`/`ST/STB` that connect to no base mint and can never
+   produce a cycle. That is a registry problem, not a code problem, and it is the only
+   remaining lever with a multiple in it.
+3. Nothing else. Venue expansion adds thin pools, which §4.9 already showed manufacture
+   phantom edge rather than real edge.
 
 The pattern in all eleven: **an internal check cannot catch an error in what the code
 believes about the outside world** — including what it believes its own numbers mean.
