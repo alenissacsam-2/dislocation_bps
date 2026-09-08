@@ -100,8 +100,8 @@ impl CyclePlan {
 /// Tunables that are not per-trade.
 #[derive(Debug, Clone, Copy)]
 pub struct TradeOptions {
-    /// How far below the quote each hop's floor is set, in basis points.
-    pub slippage_bps: u32,
+    /// How far below the quote each hop's floor is set, in tenths of a basis point.
+    pub slippage_tenth_bps: u32,
     pub priority_micro_lamports: u64,
     pub compute_units: u32,
     /// When true, everything runs including the simulation and nothing is submitted.
@@ -115,14 +115,16 @@ pub struct TradeOptions {
 impl Default for TradeOptions {
     fn default() -> Self {
         Self {
-            // One basis point, and it has to be about this small.
+            // Three tenths of a basis point, and it has to be about this small.
             //
             // A route builds only if its last floor exceeds its first input, so for `n`
             // hops at edge `e` the requirement is `s < e / n`. At 30 bps — the first
             // value here — a live dry run refused every cycle it found, guaranteeing
             // −25 to −28 bps. You cannot tolerate more slippage than the profit you are
-            // chasing.
-            slippage_bps: 1,
+            // chasing, and this market's profit is under 2 bps: at one whole basis
+            // point per hop the two hops cost more than the edge, which refused all
+            // eight cycles that a fifteen-hour run re-priced positive.
+            slippage_tenth_bps: 3,
             priority_micro_lamports: 0,
             compute_units: 400_000,
             dry_run: true,
@@ -183,14 +185,19 @@ pub fn wrap_shortfall(amount_in: u64, distinct_mints: usize, balance: u64) -> Op
     }
 }
 
-/// Apply a slippage haircut, rounding down.
+/// Apply a slippage haircut, rounding down. The tolerance is in **tenths** of a basis
+/// point.
 ///
 /// Rounding down is the only safe direction: a floor rounded *up* is a floor the pool
 /// may be unable to meet, which turns a winning trade into a revert.
+///
+/// The unit is a tenth of a basis point because a whole one is bigger than this
+/// market's whole opportunity — see [`cb_core::config::Config::slippage_tenth_bps`]
+/// for the eight measured cycles that proved it.
 #[must_use]
-pub fn haircut(amount: u128, bps: u32) -> u128 {
-    let keep = 10_000u128.saturating_sub(u128::from(bps));
-    amount.saturating_mul(keep) / 10_000
+pub fn haircut(amount: u128, tenth_bps: u32) -> u128 {
+    let keep = 100_000u128.saturating_sub(u128::from(tenth_bps));
+    amount.saturating_mul(keep) / 100_000
 }
 
 /// Live execution, holding the wallet and the risk gate across attempts.
@@ -286,9 +293,12 @@ impl Trader {
                 format!("hop {i} could not be re-priced against the state just fetched")
             })?;
 
-            let floor = haircut(fresh, self.opts.slippage_bps);
+            let floor = haircut(fresh, self.opts.slippage_tenth_bps);
             if floor == 0 {
-                bail!("hop {i} floors at zero after {} bps of slippage", self.opts.slippage_bps);
+                bail!(
+                    "hop {i} floors at zero after {} tenths of a bp of slippage",
+                    self.opts.slippage_tenth_bps
+                );
             }
             let amount_in = u64::try_from(spend).context("hop input exceeds u64")?;
             let min_amount_out = u64::try_from(floor).context("hop floor exceeds u64")?;
@@ -598,16 +608,63 @@ mod tests {
     #[test]
     fn a_haircut_rounds_down_and_never_up() {
         assert_eq!(haircut(1_000_000, 0), 1_000_000);
-        assert_eq!(haircut(1_000_000, 30), 997_000);
-        assert_eq!(haircut(1_000_000, 10_000), 0);
+        // 300 tenths is 30 bps.
+        assert_eq!(haircut(1_000_000, 300), 997_000);
+        assert_eq!(haircut(1_000_000, 100_000), 0);
         // Rounding must not produce a floor above the quote.
         for amount in [1u128, 7, 999, 1_000_001] {
-            for bps in [1u32, 30, 500] {
-                assert!(haircut(amount, bps) <= amount, "{amount} at {bps}bps rounded up");
+            for tenths in [1u32, 3, 300, 5_000] {
+                assert!(
+                    haircut(amount, tenths) <= amount,
+                    "{amount} at {tenths} tenths of a bp rounded up"
+                );
             }
         }
         // A nonsense slippage cannot wrap around into a huge floor.
         assert_eq!(haircut(1_000_000, u32::MAX), 0);
+    }
+
+    /// The change this unit exists for, stated as the arithmetic that was failing.
+    ///
+    /// A two-hop cycle only builds when its last floor beats its first input, so the
+    /// total haircut has to fit inside the edge. Over a fifteen-hour live run the
+    /// cycles that were still profitable when re-priced against fresh state measured
+    /// +0.05, +0.09, +0.17, +1.49, +1.61, +1.69, +1.71 and +1.93 bps — and all eight
+    /// were refused, because one basis point per hop is two, and two is more than the
+    /// edge. This asserts the property in both directions: the shipped floor clears
+    /// the edges that were being thrown away, and the old one does not.
+    #[test]
+    fn the_shipped_floor_fits_inside_the_edges_that_were_being_refused() {
+        const SHIPPED: u32 = 3; // 0.3 bps per hop
+        const OLD: u32 = 10; // the whole basis point that refused all eight
+        let survives = |edge_bps: f64, tenths: u32| {
+            let input = 1_000_000_000u128;
+            let quoted = |amount: u128| {
+                // The whole edge arrives on the first hop; the second is a wash. Where
+                // it lands does not matter, only that the round trip carries it.
+                amount + (amount as f64 * edge_bps / 10_000.0) as u128
+            };
+            let after_first = haircut(quoted(input), tenths);
+            let after_second = haircut(after_first, tenths);
+            after_second > input
+        };
+
+        for edge in [1.49f64, 1.61, 1.69, 1.71, 1.93] {
+            assert!(
+                survives(edge, SHIPPED),
+                "a {edge} bp cycle must build at 0.3 bps per hop — this is one of the \
+                 eight the old floor refused"
+            );
+            assert!(
+                !survives(edge, OLD),
+                "a {edge} bp cycle cannot build at 1 bp per hop; if this passes, the \
+                 measurement that motivated the tenths unit was wrong"
+            );
+        }
+
+        // And the floor still has to bite: an edge smaller than the total haircut is
+        // refused, which is the invariant, not a regression.
+        assert!(!survives(0.5, SHIPPED), "0.5 bps does not cover 0.6 bps of floor");
     }
 
     /// The sizing rule. Each hop must spend exactly what the one before guarantees,
@@ -616,7 +673,7 @@ mod tests {
     fn each_hop_spends_exactly_what_the_previous_one_guarantees() {
         let t = Trader {
             exec: unreachable_executor(),
-            opts: TradeOptions { slippage_bps: 30, ..Default::default() },
+            opts: TradeOptions { slippage_tenth_bps: 300, ..Default::default() },
             owner: Pubkey::new_unique(),
         };
         let p = plan(3);
@@ -666,7 +723,7 @@ mod tests {
     fn a_floor_that_collapses_to_zero_is_refused() {
         let t = Trader {
             exec: unreachable_executor(),
-            opts: TradeOptions { slippage_bps: 10_000, ..Default::default() },
+            opts: TradeOptions { slippage_tenth_bps: 100_000, ..Default::default() },
             owner: Pubkey::new_unique(),
         };
         let data = pools_for(&plan(2));
@@ -946,7 +1003,7 @@ mod mainnet {
 
         let t = Trader {
             exec: super::tests::unreachable_executor(),
-            opts: TradeOptions { slippage_bps: 30, ..Default::default() },
+            opts: TradeOptions { slippage_tenth_bps: 300, ..Default::default() },
             owner,
         };
         let hops = t.hops_for(&plan, &pool_data, &arrays).expect("hops");
@@ -1045,7 +1102,7 @@ mod fresh_quote_tests {
     fn floors_follow_the_pool_and_not_the_stale_quote_in_the_plan() {
         let t = Trader {
             exec: unreachable_executor(),
-            opts: TradeOptions { slippage_bps: 0, ..Default::default() },
+            opts: TradeOptions { slippage_tenth_bps: 0, ..Default::default() },
             owner: Pubkey::new_unique(),
         };
 
@@ -1077,7 +1134,7 @@ mod fresh_quote_tests {
     fn each_hop_still_spends_exactly_what_the_previous_one_guarantees() {
         let t = Trader {
             exec: unreachable_executor(),
-            opts: TradeOptions { slippage_bps: 10, ..Default::default() },
+            opts: TradeOptions { slippage_tenth_bps: 100, ..Default::default() },
             owner: Pubkey::new_unique(),
         };
         let p = tests::plan(3);

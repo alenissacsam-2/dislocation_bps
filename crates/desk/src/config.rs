@@ -26,10 +26,10 @@ pub struct Params {
     pub fee_buffer_usd: f64,
     pub min_trade_usd: f64,
     pub max_hops: usize,
-    /// Output floor per hop, in basis points below the quote, written into the swap
-    /// instruction. Bounded above by the edge divided by the hop count — see
-    /// [`validate`], which refuses a value that makes every route unbuildable.
-    pub slippage_bps: u32,
+    /// Output floor per hop, in **tenths** of a basis point below the quote, written
+    /// into the swap instruction. Bounded above by the edge divided by the hop count —
+    /// see [`validate`], which refuses a value that makes every route unbuildable.
+    pub slippage_tenth_bps: u32,
     /// Priority bid in micro-lamports per compute unit.
     pub priority_micro_lamports: u64,
     /// JSON-RPC endpoints, newline-separated, in preference order.
@@ -68,7 +68,7 @@ pub fn read_params(path: &Path) -> anyhow::Result<Params> {
         fee_buffer_usd: num("fee_buffer_usd", 0.20),
         min_trade_usd: num("min_trade_usd", 10.0),
         max_hops: usize::try_from(int("max_hops", 3)).unwrap_or(3),
-        slippage_bps: u32::try_from(int("slippage_bps", 1)).unwrap_or(1),
+        slippage_tenth_bps: u32::try_from(int("slippage_tenth_bps", 3)).unwrap_or(3),
         priority_micro_lamports: u64::try_from(int("priority_micro_lamports", 0)).unwrap_or(0),
         rpc_http_url: {
             let mut all = vec![text("rpc_http_url", PUBLIC_HTTP)];
@@ -115,17 +115,24 @@ pub fn validate(p: &Params) -> Result<(), String> {
     // guaranteed loss.
     //
     // Checked against the *total* floor rather than a per-hop ceiling derived from an
-    // assumed edge. Baking one measurement into validation rejects settings that are
-    // fine on a fatter day, and it rejected this instrument's own default of 1 bp over
-    // 3 hops, which sits exactly on a 3 bp boundary. What is never defensible is a total
-    // wider than any edge recorded here: the widest was about 12 bps on expensive routes
-    // and the typical figure is 2 to 3.
-    const WIDEST_DEFENSIBLE_TOTAL_BPS: u32 = 10;
-    let total = p.slippage_bps.saturating_mul(u32::try_from(p.max_hops).unwrap_or(u32::MAX));
-    if total > WIDEST_DEFENSIBLE_TOTAL_BPS {
+    // assumed edge.
+    //
+    // The ceiling used to be 10 bps, on the reasoning that the widest edge ever
+    // recorded was about 12. That conflated the edge this instrument *detects* with
+    // the edge it can still *reach*: fifteen hours of live attempts, each re-priced
+    // against fresh state a moment later, put the largest survivor at 1.93 bps and the
+    // rest between 0.05 and 1.71. A floor wider than that refuses every cycle it was
+    // meant to protect — which is exactly what 1 bp over 2 hops was doing.
+    const WIDEST_DEFENSIBLE_TOTAL_TENTH_BPS: u32 = 20;
+    let total =
+        p.slippage_tenth_bps.saturating_mul(u32::try_from(p.max_hops).unwrap_or(u32::MAX));
+    if total > WIDEST_DEFENSIBLE_TOTAL_TENTH_BPS {
         return Err(format!(
-            "A floor of {} bps over {} hops gives away {total} bps in total, wider than any edge this instrument has recorded. A route only builds when its last floor beats its first input, so every cycle would be refused as a guaranteed loss. Keep the total under {WIDEST_DEFENSIBLE_TOTAL_BPS} bps.",
-            p.slippage_bps, p.max_hops
+            "A floor of {} bps over {} hops gives away {} bps in total, wider than any edge that has survived the trip to the chain here. A route only builds when its last floor beats its first input, so every cycle would be refused as a guaranteed loss. Keep the total under {} bps.",
+            f64::from(p.slippage_tenth_bps) / 10.0,
+            p.max_hops,
+            f64::from(total) / 10.0,
+            f64::from(WIDEST_DEFENSIBLE_TOTAL_TENTH_BPS) / 10.0
         ));
     }
     for line in p.rpc_http_url.lines().map(str::trim).filter(|l| !l.is_empty()) {
@@ -164,7 +171,7 @@ pub fn write_params(path: &Path, p: &Params) -> anyhow::Result<()> {
     doc["fee_buffer_usd"] = toml_edit::value(p.fee_buffer_usd);
     doc["min_trade_usd"] = toml_edit::value(p.min_trade_usd);
     doc["max_hops"] = toml_edit::value(i64::try_from(p.max_hops).unwrap_or(3));
-    doc["slippage_bps"] = toml_edit::value(i64::from(p.slippage_bps));
+    doc["slippage_tenth_bps"] = toml_edit::value(i64::from(p.slippage_tenth_bps));
     doc["priority_micro_lamports"] =
         toml_edit::value(i64::try_from(p.priority_micro_lamports).unwrap_or(0));
     // Blank means "use the public one" rather than "write an empty string", which the
@@ -488,21 +495,21 @@ max_position_lamports = 20000000
     #[test]
     fn a_negative_book_is_refused_rather_than_written() {
         let bad =
-            Params { capital_usd: -1.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 3, slippage_bps: 1, priority_micro_lamports: 0, rpc_http_url: String::new(), rpc_ws_url: String::new() };
+            Params { capital_usd: -1.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 3, slippage_tenth_bps: 3, priority_micro_lamports: 0, rpc_http_url: String::new(), rpc_ws_url: String::new() };
         assert!(validate(&bad).is_err());
     }
 
     #[test]
     fn zero_hops_is_refused_because_a_cycle_needs_at_least_two() {
         let bad =
-            Params { capital_usd: 100.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 0, slippage_bps: 1, priority_micro_lamports: 0, rpc_http_url: String::new(), rpc_ws_url: String::new() };
+            Params { capital_usd: 100.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 0, slippage_tenth_bps: 3, priority_micro_lamports: 0, rpc_http_url: String::new(), rpc_ws_url: String::new() };
         assert!(validate(&bad).is_err());
     }
 
     #[test]
     fn a_buffer_larger_than_the_book_is_refused() {
         let bad =
-            Params { capital_usd: 1.0, fee_buffer_usd: 5.0, min_trade_usd: 10.0, max_hops: 3, slippage_bps: 1, priority_micro_lamports: 0, rpc_http_url: String::new(), rpc_ws_url: String::new() };
+            Params { capital_usd: 1.0, fee_buffer_usd: 5.0, min_trade_usd: 10.0, max_hops: 3, slippage_tenth_bps: 3, priority_micro_lamports: 0, rpc_http_url: String::new(), rpc_ws_url: String::new() };
         assert!(validate(&bad).is_err());
     }
 
@@ -511,7 +518,7 @@ max_position_lamports = 20000000
         let p = tmp("reject", SAMPLE);
         let before = std::fs::read_to_string(&p).unwrap();
         let bad =
-            Params { capital_usd: -1.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 3, slippage_bps: 1, priority_micro_lamports: 0, rpc_http_url: String::new(), rpc_ws_url: String::new() };
+            Params { capital_usd: -1.0, fee_buffer_usd: 0.2, min_trade_usd: 10.0, max_hops: 3, slippage_tenth_bps: 3, priority_micro_lamports: 0, rpc_http_url: String::new(), rpc_ws_url: String::new() };
         let _ = write_params(&p, &bad);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
     }
@@ -613,22 +620,31 @@ max_position_lamports = 20000000
             fee_buffer_usd: 0.8,
             min_trade_usd: 10.0,
             max_hops: 3,
-            slippage_bps: 1,
+            slippage_tenth_bps: 3,
             priority_micro_lamports: 0,
             rpc_http_url: String::new(),
             rpc_ws_url: String::new(),
         };
-        assert!(validate(&ok).is_ok(), "1 bp over 3 hops is the shipped default: {:?}", validate(&ok));
+        assert!(
+            validate(&ok).is_ok(),
+            "0.3 bp over 3 hops is the shipped default: {:?}",
+            validate(&ok)
+        );
 
         // The value that refused every cycle in a live dry run.
-        let broken = Params { slippage_bps: 30, ..ok.clone() };
+        let broken = Params { slippage_tenth_bps: 300, ..ok.clone() };
         let e = validate(&broken).unwrap_err();
         assert!(e.contains("guaranteed loss"), "{e}");
 
-        // And the boundary is on the total, not the per-hop figure: 3 bps over 3 hops
-        // is 9 and allowed, 4 over 3 is 12 and not.
-        assert!(validate(&Params { slippage_bps: 3, ..ok.clone() }).is_ok());
-        assert!(validate(&Params { slippage_bps: 4, ..ok.clone() }).is_err());
+        // A whole basis point per hop is refused now, and that is the point of the
+        // change: over three hops it gives away 3 bps against a market whose largest
+        // survivor measured 1.93.
+        assert!(validate(&Params { slippage_tenth_bps: 10, ..ok.clone() }).is_err());
+
+        // And the boundary is on the total, not the per-hop figure: 0.6 bps over 3 hops
+        // is 1.8 and allowed, 0.7 over 3 is 2.1 and not.
+        assert!(validate(&Params { slippage_tenth_bps: 6, ..ok.clone() }).is_ok());
+        assert!(validate(&Params { slippage_tenth_bps: 7, ..ok.clone() }).is_err());
     }
 
     /// Several endpoints survive the trip through the file and back.

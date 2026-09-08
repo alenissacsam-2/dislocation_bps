@@ -47,6 +47,28 @@ const JITO_TIP_FLOOR_SOL: f64 = 0.000_007_5;
 /// Solana base transaction fee, in SOL.
 const BASE_FEE_SOL: f64 = 0.000_005;
 
+/// Whether the transactions this bot builds actually carry a Jito tip.
+///
+/// They do not. [`cb_executor::route::build`] emits a compute-budget instruction, the
+/// wrap, the swaps and the close, and nothing else — there is no transfer to a tip
+/// account anywhere in the executor, and `priority_micro_lamports` defaults to zero.
+///
+/// Charging the tip anyway is not conservatism, it is a wrong number in the one place
+/// it does the most damage. The median believable opportunity here grosses $0.00044
+/// and the tip floor is $0.00077, so a cost that is never incurred was refusing trades
+/// at nearly twice the rate the real cost would have: 879 cycles over fifteen hours
+/// were declined as "net negative after tip" while being positive against the fee the
+/// wallet actually pays.
+///
+/// The counter-argument is that the tip models *competition* — a cycle we do not bid
+/// for is a cycle somebody else wins. That is true and it is still not a cost, because
+/// a race we lose is discovered in simulation and never submitted. It costs a round
+/// trip, not money. Competition is priced where it belongs instead: see
+/// [`EXECUTABLE_FEE_CEILING_BPS`], which is measured rather than assumed.
+///
+/// Flip this the moment a tip instruction exists, and the arithmetic below follows.
+const PAYS_A_TIP: bool = false;
+
 /// How far apart, in slots, a cycle's two legs may have been priced and still be worth
 /// trading.
 ///
@@ -66,10 +88,68 @@ fn too_skewed_to_trade(slot_spread: u64) -> bool {
     slot_spread > MAX_EXECUTABLE_SLOT_SPREAD
 }
 
-/// How long a cycle refused because *the price moved* is left alone. Roughly four
-/// slots: long enough that another cycle gets the next sweep's one attempt, short
-/// enough to come back while the gap may still be open. See `refusal_cooldown_for`.
-const PRICE_MOVED_COOLDOWN: Duration = Duration::from_millis(1500);
+/// What this trade will actually pay in tips, in USD.
+///
+/// Zero while [`PAYS_A_TIP`] is false, which is the honest answer for a transaction
+/// that carries no tip instruction. The contested arithmetic is kept beside it rather
+/// than deleted, because the day a tip is attached is the day it becomes correct again.
+#[must_use]
+fn tip_cost_usd(gross_profit_usd: f64, sol_price_usd: f64) -> f64 {
+    if !PAYS_A_TIP {
+        return 0.0;
+    }
+    if gross_profit_usd > CONTESTED_USD {
+        gross_profit_usd * CONTESTED_TIP_SHARE
+    } else {
+        JITO_TIP_FLOOR_SOL * sol_price_usd
+    }
+}
+
+/// The most a route may cost in fees and still be worth spending an attempt on.
+///
+/// This is the competition model, and it is measured rather than argued. Every cycle
+/// that reached route-building over a fifteen-hour live run was re-priced against
+/// fresh state moments later, and the two numbers sorted almost perfectly by the
+/// route's own fee:
+///
+/// | round-trip fee | attempts | median re-priced edge | still positive |
+/// |----------------|----------|-----------------------|----------------|
+/// | under 4 bps    | 26       | −1.69 bps             | 6 (23%)        |
+/// | 4 – 7 bps      | 47       | −4.50 bps             | 0              |
+/// | 7 – 10 bps     | 25       | −10.77 bps            | 0              |
+/// | 20 – 40 bps    | 37       | −11.44 bps            | 2 (5%)         |
+/// | over 40 bps    | 22       | −17.30 bps            | 0              |
+///
+/// The mechanism is not subtle. A route that costs 3 bps needs a 3 bp disagreement,
+/// and disagreements that small are constantly available because nobody else can
+/// profit from them either. A route that costs 30 bps needs a 30 bp disagreement,
+/// which on a liquid pair is a transient somebody faster has already taken — and on an
+/// illiquid one is not a disagreement at all but a dead pool whose price has drifted
+/// and stayed there, priced correctly by both venues and arbitraged by neither.
+///
+/// Both look identical at detection. Only the fee separates them in advance, and with
+/// one attempt per sweep to spend, spending it on the 23% class instead of the 0%
+/// class is the whole difference between measuring this market and trading it.
+const EXECUTABLE_FEE_CEILING_BPS: f64 = 4.0;
+
+/// Whether a cycle's round trip costs more than any real dislocation ever pays for.
+#[must_use]
+fn too_expensive_to_trade(fee_bps: f64) -> bool {
+    fee_bps > EXECUTABLE_FEE_CEILING_BPS
+}
+
+/// How long a cycle refused because *the price moved* is left alone. Two sweeps: long
+/// enough that another cycle gets the next attempt, short enough to come back while
+/// the gap may still be open. See `refusal_cooldown_for`.
+///
+/// This was 1500 ms, which is seven sweeps, and it was the single largest filter on
+/// the trades worth having: of 2,494 simultaneous, encodable, cheap-fee detections
+/// over a fifteen-hour run, 1,056 were suppressed by it. That was the right window
+/// when a refusal meant a reverted transaction and a breaker strike. It stopped being
+/// the right window when `hops_for` began re-pricing against fresh state *before*
+/// building anything: a refusal now costs one RPC round trip and nothing else, so
+/// waiting out a gap that is still open is the more expensive mistake.
+const PRICE_MOVED_COOLDOWN: Duration = Duration::from_millis(400);
 /// How long a cycle refused for a reason *the market cannot change* is left alone —
 /// a size that will not fit the wallet refuses identically until the wallet moves.
 const STRUCTURAL_COOLDOWN: Duration = Duration::from_secs(20);
@@ -372,7 +452,7 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
         if limits.halt_cooldown_secs == 0 { " (auto-resume disabled — a halt needs a restart)" } else { "" }
     );
     let opts = execute::TradeOptions {
-        slippage_bps: cfg.slippage_bps,
+        slippage_tenth_bps: cfg.slippage_tenth_bps,
         priority_micro_lamports: cfg.priority_micro_lamports,
         compute_units: 400_000,
         dry_run: cfg.dry_run,
@@ -410,7 +490,7 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
     tracing::info!(
         "live executor armed for {} — {} bps slippage floor, {} priority",
         trader.address(),
-        cfg.slippage_bps,
+        f64::from(cfg.slippage_tenth_bps) / 10.0,
         cfg.priority_micro_lamports
     );
     Ok(trader)
@@ -462,7 +542,7 @@ async fn main() -> anyhow::Result<()> {
             fee_buffer_usd: 0.20,
             min_trade_usd: 10.0,
             max_hops: 3,
-            slippage_bps: 30,
+            slippage_tenth_bps: 300,
             priority_micro_lamports: 0,
             dry_run: true,
             max_position_usd: 25.0,
@@ -920,12 +1000,11 @@ async fn spawn_live(
                         // Uncontested cycles pay the tip floor; contested ones get bid
                         // up to most of the profit. A cycle worth more than a cent on
                         // a major pair will have been seen by faster searchers too.
+                        // Still recorded, because "big enough that somebody faster has
+                        // seen this too" remains a true and useful fact about a cycle.
+                        // It is no longer charged as a cost — see `tip_cost_usd`.
                         let contested = opp.gross_profit_usd > CONTESTED_USD;
-                        let est_tip_usd = if contested {
-                            opp.gross_profit_usd * CONTESTED_TIP_SHARE
-                        } else {
-                            JITO_TIP_FLOOR_SOL * sol_price
-                        };
+                        let est_tip_usd = tip_cost_usd(opp.gross_profit_usd, sol_price);
                         let base_fee_usd = BASE_FEE_SOL * sol_price;
                         let net = opp.gross_profit_usd - est_tip_usd - base_fee_usd;
 
@@ -1009,9 +1088,21 @@ async fn spawn_live(
                                     // refused for a loss once re-priced against fresh
                                     // state, by 0.3 to 4.7 bps.
                                     let too_skewed = too_skewed_to_trade(opp.slot_spread);
+                                    // A route whose own fee is larger than any
+                                    // disagreement that survives the trip to the chain.
+                                    // See `EXECUTABLE_FEE_CEILING_BPS` for the measured
+                                    // table this comes from.
+                                    let too_expensive = too_expensive_to_trade(opp.fee_bps);
+                                    // Read before the filter so the refusal can say
+                                    // *which* venue is missing an encoder, instead of
+                                    // leaving it pooled with "somebody else went first".
+                                    let blocked_by = opp.plan.as_ref().and_then(
+                                        execute::CyclePlan::blocking_venue,
+                                    );
                                     let candidate = if attempted_this_sweep
                                         || on_cooldown
                                         || too_skewed
+                                        || too_expensive
                                     {
                                         None
                                     } else {
@@ -1031,9 +1122,29 @@ async fn spawn_live(
                                                      not a disagreement between venues",
                                                     opp.slot_spread
                                                 )
+                                            } else if too_expensive {
+                                                format!(
+                                                    "not attempted — the round trip costs \
+                                                     {:.2} bps, over the \
+                                                     {EXECUTABLE_FEE_CEILING_BPS} bps above \
+                                                     which no attempt has ever re-priced \
+                                                     profitably; the gap is a pool nobody \
+                                                     arbitrages, not one we can",
+                                                    opp.fee_bps
+                                                )
+                                            } else if let Some(dex) = blocked_by {
+                                                // Its own message. Pooled with the
+                                                // sweep budget these were unreadable,
+                                                // and the two ask for opposite things:
+                                                // one is a queue, the other is an
+                                                // encoder somebody has to write.
+                                                format!(
+                                                    "not attempted — {} has no encoder",
+                                                    dex.name()
+                                                )
                                             } else {
-                                                "not attempted — one trade per sweep, or no \
-                                                 encoder for this route"
+                                                "not attempted — another cycle took this \
+                                                 sweep's one attempt"
                                                     .to_string()
                                             });
                                         }
@@ -2046,5 +2157,52 @@ mod slot_spread_gate_tests {
                  the clock, not as an edge"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fee_ceiling_tests {
+    use super::{too_expensive_to_trade, tip_cost_usd, CONTESTED_USD};
+
+    /// The fee bands a live run measured, and what each was worth once re-priced
+    /// against fresh state. Only the cheapest band ever produced a survivor.
+    ///
+    /// | round-trip fee | attempts | median re-priced | still positive |
+    /// |----------------|----------|------------------|----------------|
+    /// | under 4 bps    | 26       | −1.69 bps        | 6              |
+    /// | 4 – 7 bps      | 47       | −4.50 bps        | 0              |
+    /// | 7 – 10 bps     | 25       | −10.77 bps       | 0              |
+    /// | over 40 bps    | 22       | −17.30 bps       | 0              |
+    #[test]
+    fn only_the_band_that_ever_survived_is_worth_an_attempt() {
+        for cheap in [0.0, 1.0, 2.0, 3.0, 4.0] {
+            assert!(
+                !too_expensive_to_trade(cheap),
+                "{cheap} bps is the band that produced every survivor"
+            );
+        }
+        for dear in [4.5, 6.0, 9.0, 30.0, 104.0] {
+            assert!(
+                too_expensive_to_trade(dear),
+                "{dear} bps is a band where no attempt has ever re-priced profitably"
+            );
+        }
+    }
+
+    /// A cost that is never paid must not be charged.
+    ///
+    /// No tip instruction exists anywhere in the executor, and while that is true the
+    /// only honest tip estimate is zero. The median believable opportunity here grosses
+    /// $0.00044 against a tip floor of $0.00077, so charging it refused trades on
+    /// nearly twice the cost the wallet actually bears.
+    #[test]
+    fn a_tip_that_is_never_attached_is_never_charged() {
+        let sol = 102.7;
+        assert!((tip_cost_usd(0.0004, sol)).abs() < f64::EPSILON, "uncontested pays nothing");
+        assert!(
+            (tip_cost_usd(CONTESTED_USD * 10.0, sol)).abs() < f64::EPSILON,
+            "and neither does a contested cycle, for the same reason: there is no \
+             instruction for the tip to ride in"
+        );
     }
 }

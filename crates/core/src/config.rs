@@ -85,26 +85,36 @@ pub struct Config {
     #[serde(default = "default_max_hops")]
     pub max_hops: usize,
 
-    /// How far below each hop's quote its output floor is set, in basis points.
+    /// How far below each hop's quote its output floor is set, in **tenths** of a
+    /// basis point.
     ///
     /// # This must be smaller than the edge, divided by the hop count
     ///
     /// A route only builds if its last floor exceeds its first input, so for `n` hops
     /// with edge `e` the constraint is `(1 + e)(1 - s)^n > 1`, which for small numbers
-    /// is **`s < e / n`**. A 3 bp edge over two hops leaves room for 1.5 bp per hop and
-    /// no more.
+    /// is **`s < e / n`**.
     ///
-    /// The first version of this was 30, on the reasoning that a wide floor is cautious
-    /// and the route's own loss-check would stop anything pointless. That is backwards:
-    /// a floor this wide makes the loss-check *unsatisfiable*, and a live dry run
-    /// refused every single cycle at −25 to −28 bps guaranteed. Nothing can be traded
-    /// with a tolerance larger than the profit being chased.
+    /// The first version of this was 30 bps, on the reasoning that a wide floor is
+    /// cautious and the route's own loss-check would stop anything pointless. That is
+    /// backwards: a floor this wide makes the loss-check *unsatisfiable*, and a live
+    /// dry run refused every single cycle at −25 to −28 bps guaranteed. Nothing can be
+    /// traded with a tolerance larger than the profit being chased.
+    ///
+    /// The unit is tenths because a whole basis point turned out to be larger than the
+    /// entire opportunity. Over fifteen hours of live trading, eight cycles re-priced
+    /// *positive* against fresh state — +0.05, +0.09, +0.17, +1.49, +1.61, +1.69,
+    /// +1.71 and +1.93 bps — and every one of them was refused, because two hops at
+    /// one basis point each took 2 bps off a 2 bp edge. The whole executable market
+    /// lives under two basis points, so the floor has to be measured in a smaller unit
+    /// than that market is.
     ///
     /// The consequence of a tight floor is that an adverse tick reverts the transaction
     /// rather than filling it badly. That costs the fee, which is the correct price to
-    /// pay when the alternative is a fill that loses more than the trade was worth.
-    #[serde(default = "default_slippage_bps")]
-    pub slippage_bps: u32,
+    /// pay when the alternative is a fill that loses more than the trade was worth —
+    /// and nothing is ever submitted that has not already simulated profitably, so the
+    /// floor only has to survive the slot or two between simulation and landing.
+    #[serde(default = "default_slippage_tenth_bps")]
+    pub slippage_tenth_bps: u32,
 
     /// Priority bid, in micro-lamports per compute unit. Zero pays the base fee only.
     #[serde(default)]
@@ -165,10 +175,12 @@ fn default_min_trade() -> f64 {
 fn default_max_hops() -> usize {
     3
 }
-/// One basis point. See the field's own documentation: this is bounded above by the
-/// edge divided by the hop count, and the edge here is single digits.
-fn default_slippage_bps() -> u32 {
-    1
+/// Three tenths of a basis point. See the field's own documentation: this is bounded
+/// above by the edge divided by the hop count, and the edges that actually survive
+/// re-pricing measure between 0.05 and 1.93 bps. Two hops at this floor cost 0.6 bp,
+/// which the smallest of those still clears.
+fn default_slippage_tenth_bps() -> u32 {
+    3
 }
 /// True. The only safe default for a field whose false value spends money.
 fn default_dry_run() -> bool {
@@ -275,7 +287,7 @@ mod tests {
             fee_buffer_usd: 0.20,
             min_trade_usd: 10.0,
             max_hops: 3,
-            slippage_bps: 30,
+            slippage_tenth_bps: 300,
             priority_micro_lamports: 0,
             dry_run: true,
             max_position_usd: 25.0,
@@ -387,16 +399,19 @@ min_profit_lamports = 0
         // build. Asserted as the property rather than the number, because the number is
         // only correct while the edge is what it is — and 30 bps, the first value used
         // here, refused every cycle in a live dry run.
+        //
+        // The edge here is measured, not assumed. Over fifteen hours of live trading
+        // the smallest cycle that still re-priced *positive* against fresh state was
+        // 0.05 bps, and the largest was 1.93. Sizing the floor against a 3 bp edge —
+        // as this test used to — is sizing it against an edge this market does not
+        // offer, and one whole basis point per hop refused all eight of them.
         // Two hops, which is the common cycle and the one the cheapest round trips use.
-        // A three-hop cycle needs proportionally more edge to clear the same per-hop
-        // floor, and at this default a 3 bp edge over three hops sits exactly on the
-        // boundary — which is a fact about the strategy, not a misconfiguration.
-        let plausible_edge_bps = 3.0;
+        let plausible_edge_bps = 1.5;
         let hops = 2.0;
+        let slippage_bps = f64::from(cfg.slippage_tenth_bps) / 10.0;
         assert!(
-            f64::from(cfg.slippage_bps) < plausible_edge_bps / hops,
-            "slippage of {} bps cannot be satisfied by a {plausible_edge_bps} bp edge over              {hops} hops — every route would refuse as a guaranteed loss",
-            cfg.slippage_bps
+            slippage_bps < plausible_edge_bps / hops,
+            "slippage of {slippage_bps} bps cannot be satisfied by a {plausible_edge_bps} bp              edge over {hops} hops — every route would refuse as a guaranteed loss"
         );
 
         // The risk limits must come from the file too, not from Default. The bot ignored

@@ -500,10 +500,71 @@ floor — break-even before tips. This also settles the venue-expansion question
 negative: adding thinly traded venues adds stale pools, and stale pools are what
 manufactured the phantom edge in the first place.
 
-The pattern in all nine: **an internal check cannot catch an error in what the code
+### 4.10 — The floor was measured in a coarser unit than the market — **fixed 2026-09-08**
+
+Fifteen hours of live trading, on the build that finally re-prices against fresh state
+before building anything. 2,494 detections were simultaneous, encodable, on cheap-fee
+venues and positive after costs. **Eighteen reached simulation. Zero filled.**
+
+The reason is not the market. Every cycle that reached route-building carries its own
+answer in the refusal text — `spends X and guarantees only Y` — so the detected edge
+and the re-priced edge can be compared directly, 157 times:
+
+| detected − re-priced | min | p25 | median | p75 | max |
+|---|---|---|---|---|---|
+| bps | 0.37 | 7.00 | 12.21 | 19.50 | 74.01 |
+
+And it sorts almost perfectly by the route's own fee, which is the finding:
+
+| round-trip fee | attempts | median re-priced edge | still positive |
+|----------------|----------|-----------------------|----------------|
+| under 4 bps    | 26       | −1.69 bps             | **6 (23%)**    |
+| 4 – 7 bps      | 47       | −4.50 bps             | 0              |
+| 7 – 10 bps     | 25       | −10.77 bps            | 0              |
+| 20 – 40 bps    | 37       | −11.44 bps            | 2 (5%)         |
+| over 40 bps    | 22       | −17.30 bps            | 0              |
+
+A route that costs 3 bps needs a 3 bp disagreement, and those are permanently available
+because nobody else can profit from them either. A route that costs 30 bps needs a 30 bp
+disagreement, which on a liquid pair is a transient somebody faster already took, and on
+an illiquid one is not a disagreement at all — it is a dead pool whose price drifted and
+stayed there. Confirmed from outside: the Raydium CLMM 100 bp WSOL/USDC pool sat at
+103.4636 for 25 consecutive seconds without a single `sqrt_price` change while the Orca
+4 bp pool moved ten times, a standing 70 bp gap against a 104 bp round trip.
+
+**Eight cycles re-priced *positive*** — +0.05, +0.09, +0.17, +1.49, +1.61, +1.69, +1.71
+and +1.93 bps — **and every one was refused.** `slippage_bps` was `1`, an integer, so two
+hops cost 2 bps of floor against an edge under 2. The route-build invariant `s < e / n`
+was being honoured against an `e` this market does not offer. The unit was the bug: a
+floor cannot be measured in a coarser grain than the market it protects.
+
+Three more found in the same pass:
+
+- **A tip that is never paid was charged on every cycle.** There is no transfer to a tip
+  account anywhere in `cb-executor`, and `priority_micro_lamports` is 0 — yet the gate
+  subtracted `JITO_TIP_FLOOR_SOL × sol_price` = $0.00077 against a median believable
+  opportunity of $0.00044. 879 cycles were declined as "net negative after tip" while
+  being positive against the fee the wallet actually pays. Competition is real, but it is
+  not a cost: a race lost is caught in simulation and never submitted.
+- **The refusal cooldown was still sized for the old failure mode.** 1500 ms suppressed
+  1,056 of the 2,494 takeable detections. That was correct when a refusal meant a revert
+  and a breaker strike; it stopped being correct when re-pricing moved ahead of building.
+- **`not attempted — one trade per sweep, or no encoder`** pooled a queue with a missing
+  encoder. They ask for opposite things and could not be told apart in the ledger.
+
+**Consequences.** With the floor at 0.3 bps/hop, an execution ceiling of 4 bps of route
+fee, the phantom tip gone and the cooldown at 400 ms, the same fifteen hours contain
+**180 moments** clearing every gate, worth **$0.36 gross / $0.27 after base fees** —
+median $0.00148 against a $0.00051 fee, spread across all 15 hours, entirely on
+`RAY-CL 1bp ↔ ORCA 2bp` and `RAY-CL 1bp ↔ RAY-CL 2bp` SOL/stable round trips. At the
+23% survival rate the cheap band actually measured, that is a few cents a day on $9.20 —
+which is the first time this instrument has had a number that is small rather than fake.
+
+The pattern in all ten: **an internal check cannot catch an error in what the code
 believes about the outside world** — including what it believes its own numbers mean.
 Every new decoder must be pinned against a value the decoder itself did not produce,
-and every headline must name which search produced it.
+every headline must name which search produced it, and every threshold must be stated in
+a unit finer than the thing it is thresholding.
 
 ---
 

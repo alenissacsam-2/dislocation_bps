@@ -624,7 +624,7 @@ async function loadConfig() {
     $("fBuffer").value = p.feeBufferUsd;
     $("fMinTrade").value = p.minTradeUsd;
     $("fHops").value = p.maxHops;
-    $("fSlippage").value = p.slippageBps;
+    $("fSlippage").value = p.slippageTenthBps;
     $("fPriority").value = p.priorityMicroLamports;
     // Blank when it is the public default, so the placeholder shows through and the
     // field reads as "not set" rather than as a choice someone made.
@@ -1019,7 +1019,7 @@ $("btnSave").onclick = async () => {
     feeBufferUsd: parseFloat($("fBuffer").value),
     minTradeUsd: parseFloat($("fMinTrade").value),
     maxHops: parseInt($("fHops").value, 10),
-    slippageBps: parseInt($("fSlippage").value, 10),
+    slippageTenthBps: parseInt($("fSlippage").value, 10),
     priorityMicroLamports: parseInt($("fPriority").value, 10),
     rpcHttpUrl: $("fRpcHttp").value.trim(),
     rpcWsUrl: $("fRpcWs").value.trim(),

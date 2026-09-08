@@ -95,21 +95,31 @@ halt_cooldown_secs = 600
 #
 # THIS MUST BE SMALLER THAN THE EDGE DIVIDED BY THE HOP COUNT.
 #
+# In TENTHS of a basis point: 3 means 0.3 bps.
+#
 # A route only builds if its last floor exceeds its first input, so for n hops at edge
 # e the requirement is (1 + e)(1 - s)^n > 1, which for small numbers is s < e / n.
-# A 3 bp edge over two hops leaves room for 1.5 bp per hop and no more.
 #
-# This was 30, on the reasoning that a wide floor is cautious. That is backwards: a
+# This was 30 bps, on the reasoning that a wide floor is cautious. That is backwards: a
 # floor this wide makes the route's own loss-check unsatisfiable, and a live dry run
 # refused every cycle it found at -25 to -28 bps guaranteed. You cannot tolerate more
 # slippage than the profit you are chasing.
 #
+# It was then 1 bp, which was still too wide, and the unit itself was the problem. Over
+# fifteen hours of live trading, every cycle that reached route-building was re-priced
+# against fresh state a moment later; eight of them were still profitable, at +0.05,
+# +0.09, +0.17, +1.49, +1.61, +1.69, +1.71 and +1.93 bps. All eight were refused,
+# because two hops at 1 bp each is 2 bps and the edge was under 2. A floor cannot be
+# measured in a coarser unit than the market it is protecting.
+#
 # The cost of a tight floor is that an adverse tick reverts the transaction instead of
-# filling it badly. That is the fee, and it is the right price for the alternative.
+# filling it badly. That is the fee, and it is the right price for the alternative —
+# and nothing is submitted that has not already simulated profitably, so this floor
+# only has to survive the slot or two between simulation and landing.
 #
 # Not the same number as max_slippage_bps above: that one judges the simulated result
 # after the fact, this one is written into the instruction the pool must honour.
-slippage_bps = 1
+slippage_tenth_bps = 3
 
 # Priority bid in micro-lamports per compute unit. 0 pays the base fee only.
 priority_micro_lamports = 0

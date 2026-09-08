@@ -267,14 +267,18 @@
         </div>
       </div>
       <div class="field">
-        <label for="fSlippage">Output floor per hop (bps)</label>
+        <label for="fSlippage">Output floor per hop (tenths of a bp)</label>
         <input type="number" id="fSlippage" step="1" min="0" max="100">
         <div class="hint">
-          How far below its quote each hop's floor is written into the swap instruction.
+          How far below its quote each hop's floor is written into the swap instruction,
+          in tenths of a basis point — so <b>3 means 0.3 bps</b>.
           <b>Must be smaller than the edge divided by the hop count</b> — a route only
-          builds when its last floor beats its first input. This was 30, which made every
-          route refuse as a guaranteed loss; you cannot tolerate more slippage than the
-          profit you are chasing.
+          builds when its last floor beats its first input. This was 30 bps, which made
+          every route refuse as a guaranteed loss; you cannot tolerate more slippage than
+          the profit you are chasing. The unit is tenths because a whole basis point is
+          also too wide here: the largest edge that has ever survived the trip to the
+          chain on this instrument measured 1.93 bps, and two hops at 1 bp each took all
+          of it.
         </div>
       </div>
       <div class="field">
