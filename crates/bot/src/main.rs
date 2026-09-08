@@ -268,7 +268,13 @@ fn refusal_cooldown_for(reason: &str) -> Option<Duration> {
         return None;
     }
     // Structural: true until the wallet or the limits change, not until the price does.
+    //
+    // "of a mint the wallet holds" belongs here and would otherwise be retried every
+    // four hundred milliseconds forever. A balance in the wrong token does not become
+    // the right one because the price moved, and the same loop entered from SOL is
+    // sitting in the very same sweep waiting for the attempt this one keeps taking.
     let structural = reason.contains("would leave less than")
+        || reason.contains("of a mint the wallet holds")
         || reason.contains("exceeds")
         || reason.contains("has no encoder");
     Some(if structural { STRUCTURAL_COOLDOWN } else { PRICE_MOVED_COOLDOWN })
@@ -359,6 +365,26 @@ mod refusal_cooldown_tests {
         assert_eq!(
             refusal_cooldown_for("size $14.00 exceeds the $10.00 per-trade limit"),
             Some(STRUCTURAL_COOLDOWN)
+        );
+        // A balance in the wrong token does not become the right one because the price
+        // moved, and every retry takes the sweep's one attempt away from the same loop
+        // entered from a mint the wallet actually holds.
+        assert_eq!(
+            refusal_cooldown_for(
+                "this cycle starts by spending 9200000 of a mint the wallet holds 7904 of \
+                 — the same loop entered from SOL can be funded, this one cannot"
+            ),
+            Some(STRUCTURAL_COOLDOWN)
+        );
+        // But an edge that cannot cover the fee is a fact about the price, and the
+        // price is the thing most likely to have changed by the next sweep.
+        assert_eq!(
+            refusal_cooldown_for(
+                "the widest floor this edge allows leaves 3100 base units between what the \
+                 last hop delivers and what it guarantees, and the transaction fee needs \
+                 10000 of that"
+            ),
+            Some(PRICE_MOVED_COOLDOWN)
         );
         assert!(PRICE_MOVED_COOLDOWN < STRUCTURAL_COOLDOWN);
     }

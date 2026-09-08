@@ -793,9 +793,11 @@ impl Trader {
             // cheaper than sending one that fails mid-transaction. "Refuse rather than
             // extrapolate" is this codebase's first design principle for exactly this
             // reason — overstating what is affordable is the direction that loses.
-            // Against what the wrap will *actually* move, which is the first hop's
-            // input after any sizing down — not the plan's original figure. Checking
-            // the larger number refused trades the wallet could comfortably afford.
+            //
+            // Measured against what the wrap will *actually* move, which is the first
+            // hop's input after any sizing down rather than the plan's original figure.
+            // Checking the larger number refused trades the wallet could comfortably
+            // afford.
             let distinct_mints = plan.mints.iter().collect::<std::collections::HashSet<_>>().len();
             let amount_in_u64 = u64::try_from(spent).unwrap_or(u64::MAX);
             if let Some(reserved) = wrap_shortfall(amount_in_u64, distinct_mints, bal) {
