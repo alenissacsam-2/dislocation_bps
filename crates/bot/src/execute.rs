@@ -1006,6 +1006,41 @@ impl Trader {
         Ok(Some(signature))
     }
 
+    /// Wait briefly for a submitted signature to reach the chain, and say what happened.
+    ///
+    /// `Some(true)` landed cleanly, `Some(false)` landed and reverted, `None` still
+    /// unknown when the wait ran out — which is not the same as failed and must not be
+    /// reported as one.
+    ///
+    /// # Why this is worth blocking the sweep for
+    ///
+    /// A signature is a receipt for having asked, not for having been paid. Without
+    /// this the log's last word on the most important event this instrument can produce
+    /// is "submitted", and whether the money moved has to be looked up by hand in an
+    /// explorer. Six seconds of a sweep is a cheap price for the run being able to
+    /// answer that itself, and submissions are rare enough that it costs nothing in
+    /// aggregate — this bot has produced none at all in its history to date.
+    ///
+    /// # Errors
+    /// Never: an RPC that cannot answer is reported as "not yet known", the same as a
+    /// signature that has not landed. Nothing here decides whether money moves, so a
+    /// failure to look is not a failure to trade.
+    pub async fn confirm(&self, signature: &str) -> Option<bool> {
+        const TRIES: u32 = 3;
+        const GAP: std::time::Duration = std::time::Duration::from_millis(2000);
+        for attempt in 0..TRIES {
+            if attempt > 0 {
+                tokio::time::sleep(GAP).await;
+            }
+            match self.exec.rpc.signature_status(signature).await {
+                Ok(Some(status)) => return Some(status.landed_cleanly()),
+                Ok(None) => {}
+                Err(e) => tracing::debug!("could not read the status of {signature} yet: {e:#}"),
+            }
+        }
+        None
+    }
+
     /// Report an outcome to the risk gate. Called by the caller, because only it knows
     /// whether a signature actually landed.
     pub fn record(&mut self, outcome: cb_executor::risk::Outcome) {

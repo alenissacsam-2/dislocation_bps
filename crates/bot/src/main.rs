@@ -1213,12 +1213,41 @@ async fn spawn_live(
                                                             net_usd: 0.0,
                                                         },
                                                     );
-                                                    tracing::info!("submitted {sig}");
+                                                    tracing::error!("submitted {sig}");
                                                     landed = true;
-                                                    outcome_reason = Some(
-                                                        "submitted; not yet confirmed".into(),
-                                                    );
-                                                    signature = Some(sig);
+                                                    signature = Some(sig.clone());
+                                                    // Then ask what became of it, rather than
+                                                    // leaving the log's last word on the most
+                                                    // important event this run can produce as
+                                                    // "asked". At ERROR so it stands out in a
+                                                    // file that is otherwise all refusals: this
+                                                    // is the line the whole exercise is for.
+                                                    outcome_reason = Some(match t.confirm(&sig).await {
+                                                        Some(true) => {
+                                                            tracing::error!(
+                                                                "LANDED {sig} — the transaction \
+                                                                 confirmed on chain"
+                                                            );
+                                                            "submitted and landed".into()
+                                                        }
+                                                        Some(false) => {
+                                                            tracing::warn!(
+                                                                "{sig} landed and reverted — the \
+                                                                 floor was not met by the time it \
+                                                                 was included; this costs the base \
+                                                                 fee and nothing else"
+                                                            );
+                                                            "submitted, landed, reverted".into()
+                                                        }
+                                                        None => {
+                                                            tracing::warn!(
+                                                                "{sig} has not confirmed yet — not \
+                                                                 the same as failed; check it in an \
+                                                                 explorer"
+                                                            );
+                                                            "submitted; not yet confirmed".into()
+                                                        }
+                                                    });
                                                 }
                                                 Ok(cb_executor::Attempt::SimulationRejected {
                                                     reason,
