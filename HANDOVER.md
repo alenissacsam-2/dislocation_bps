@@ -703,6 +703,31 @@ to hand, it was the wrong one, and nothing internal would have said so. A live s
 replaying the new logic against mainnet found zero buildable moments in half an hour,
 which is what prompted the re-check.
 
+**And then the corrected logic was measured against mainnet rather than argued about.**
+The same sampler, at the deployed size of $11.60 and the corrected 1.25× headroom, took
+3,997 samples over three hours and found **two moments it would have built and
+submitted**:
+
+| time (UTC) | route | size | floor chosen | guaranteed | expected out | net of fee |
+|---|---|---|---|---|---|---|
+| 18:56:14 | RAY 1bp → RAY 2bp SOL/USDC | $3.96 | 2.0 bps | 334 lam | 8,043 lam | **$0.00031** |
+| 19:51:14 | ORCA 2bp → RAY 1bp SOL/USDT | $11.60 | 1.5 bps | 1,239 lam | 18,185 lam | **$0.00135** |
+
+Both net positive after the 5,000-lamport fee. The first is only reachable because of
+the sizing-down fix — $3.96 is what the tighter leg could carry, and the old code would
+have refused the whole trade. The second chose a 1.5 bps floor against a fee needing
+6,250 lamports of margin and produced 16,946, nearly three times over.
+
+How close everything else came, as a fraction of the margin the fee requires: **3,980 of
+3,997 samples sat under a tenth of it.** The market here is flat almost all of the time
+and then briefly is not, which is the shape every other measurement in this file has
+also found.
+
+Two caveats on that number. The sampler watches 6 pools on 2 pairs, two hops, once every
+2.5 seconds; the bot watches 88 pools and sweeps five times a second, so it sees strictly
+more. And a moment the logic would *build* still has to survive simulation and inclusion
+— this measures the gate that had never once opened, not the whole path.
+
 **Size is the cheapest lever on reachability, and `config.toml` is not in the
 repository, so the reasoning lives here.** The margin the fee comes out of is
 `size × haircut`, so a bigger book buys the same margin from a smaller haircut, and a
