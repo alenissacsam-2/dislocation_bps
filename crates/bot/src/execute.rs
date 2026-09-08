@@ -42,6 +42,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
+use cb_core::path::Leg;
 use cb_core::types::{Dex, Pubkey32};
 use cb_executor::encode::{pk, programs, to_pubkey};
 use cb_executor::pda::associated_token_address;
@@ -219,6 +220,25 @@ struct TickHint {
     mint_a: Pubkey32,
 }
 
+/// The widest per-hop output floor discount this will ever choose, in tenths of a
+/// basis point.
+///
+/// Six basis points. Not a tolerance for losing money — the route still refuses to
+/// build unless its last floor beats its first input, whatever the haircut — but a
+/// bound on how much of each hop's output is left behind in the intermediate token
+/// account, since each hop spends what the one before it *guaranteed* rather than what
+/// it delivered. At 6 bps a $9 trade strands about half a cent, in the intermediate
+/// mint, recoverable. The edge here rarely supports more than 1.5 bps anyway.
+const MAX_HAIRCUT_TENTH_BPS: u32 = 60;
+
+/// The Solana base fee for a one-signature transaction, in lamports.
+///
+/// Only matters when the profit is measured in lamports — a wSOL cycle wraps and
+/// closes inside the transaction, so the fee comes out of the very balance the profit
+/// is read from. A cycle based on a token pays its fee from lamports instead, which
+/// the token balance never sees.
+pub const BASE_FEE_LAMPORTS: u128 = 5_000;
+
 /// Where one hop's predicted tick-array candidates sit inside the batched fetch: the
 /// offset of the first one, and the addresses asked for, in sweep order. `None` when
 /// this pool has never been decoded here and there was nothing to predict from.
@@ -273,14 +293,13 @@ impl Trader {
     /// config account a swap does not touch, so it cannot have gone stale. Everything
     /// else — liquidity, the sqrt price, the reserves — is read fresh, which is the
     /// entire point.
-    fn fresh_quote(
+    fn fresh_leg(
         dex: Dex,
         address: Pubkey32,
         data: &[u8],
         input_mint: &Pubkey32,
         fee_ppm: u32,
-        amount_in: u128,
-    ) -> Option<u128> {
+    ) -> Option<Leg> {
         let state = match dex {
             Dex::OrcaWhirlpool => cb_dex::orca_whirlpool::to_pool_state(address, data, 0).ok()?,
             Dex::RaydiumClmm => {
@@ -288,15 +307,108 @@ impl Trader {
             }
             _ => return None,
         };
-        state.leg_for_input(input_mint)?.quote(amount_in)
+        state.leg_for_input(input_mint)
+    }
+
+    /// Run a candidate haircut through the whole route, returning the last hop's quote
+    /// and the floor derived from it.
+    ///
+    /// The two differ by exactly one hop's haircut, which is the number that decides
+    /// whether the trade can pay its own fee — see [`Trader::widest_affordable_haircut`].
+    fn floor_chain(legs: &[Leg], spend: u128, tenth_bps: u32) -> Option<(u128, u128)> {
+        let mut cur = spend;
+        let mut last = (0u128, 0u128);
+        for leg in legs {
+            let quoted = leg.quote(cur)?;
+            let floor = haircut(quoted, tenth_bps);
+            if floor == 0 {
+                return None;
+            }
+            last = (quoted, floor);
+            cur = floor;
+        }
+        Some(last)
+    }
+
+    /// The most generous per-hop haircut this route can still afford.
+    ///
+    /// # Why a fixed number could not work
+    ///
+    /// The haircut is pulled in two directions at once and a constant satisfies
+    /// neither.
+    ///
+    /// Downward, because the route only builds while its last floor beats its first
+    /// input: for `n` hops at edge `e` that needs `n·s < e`, and this market's edge is
+    /// one to two basis points.
+    ///
+    /// Upward, because of how the profit is checked. Each hop is instructed to spend
+    /// exactly what the one before it *guaranteed*, not what it delivered, so the route
+    /// ends holding the last hop's quote while having guaranteed only that quote less
+    /// one haircut. The simulation must show a balance clearing `pre + guaranteed`, and
+    /// on a wSOL cycle the transaction fee comes out of that same balance. So the whole
+    /// margin between what arrives and what was promised — `spend × s`, **one** hop's
+    /// worth, not `n` — has to cover the fee.
+    ///
+    /// At $9.20 the fee is 5,000 lamports against an input of about 89,000,000, so `s`
+    /// must be at least 0.56 bps. The shipped value was 0.3. Every trade that survived
+    /// long enough to be checked failed there, and nothing in the logs said so, because
+    /// a balance that misses its floor is not an error the chain reports — it is a
+    /// number this code compares and rejects.
+    ///
+    /// So the haircut is chosen per trade: as wide as the edge will bear, which is
+    /// simultaneously the widest margin for the fee, the lowest floors for the AMMs to
+    /// satisfy, and the most tolerance for the price moving before it lands. `None`
+    /// when no width works, which is the honest answer for an edge that cannot cover
+    /// its own costs.
+    /// The widest haircut whose final floor still beats the input, ignoring fees.
+    ///
+    /// `None` when the edge cannot support any width at all — which is not this
+    /// function's business to explain. Left to [`cb_executor::route::build`], whose
+    /// refusal names the two amounts and is the one an operator can read.
+    fn widest_buildable_haircut(legs: &[Leg], spend: u128, floor_tenth_bps: u32) -> Option<u32> {
+        // Wider is better on every axis, and the floor falls monotonically as the
+        // haircut grows, so the first hit walking down is the answer. The ceiling never
+        // sits below a deliberately configured floor.
+        let ceiling = MAX_HAIRCUT_TENTH_BPS.max(floor_tenth_bps);
+        (floor_tenth_bps.max(1)..=ceiling)
+            .rev()
+            .find(|t| Self::floor_chain(legs, spend, *t).is_some_and(|(_, f)| f > spend))
+    }
+
+    /// Every leg of this cycle as the chain has it right now.
+    fn fresh_legs(plan: &CyclePlan, pool_data: &[Vec<u8>]) -> Result<Vec<Leg>> {
+        (0..plan.pools.len())
+            .map(|i| {
+                Self::fresh_leg(
+                    plan.pools[i].1,
+                    plan.pools[i].0,
+                    &pool_data[i],
+                    &plan.mints[i],
+                    plan.fee_ppm[i],
+                )
+                .with_context(|| {
+                    format!("hop {i} could not be re-priced against the state just fetched")
+                })
+            })
+            .collect()
     }
 
     /// Build the hops for a cycle, with each hop funded by the previous one's floor.
     ///
+    /// Returns the hops and the input actually used, which may be **smaller** than the
+    /// plan asked for — see the sizing note below. The caller must scale its USD
+    /// figures by the ratio before handing them to the risk gate.
+    ///
     /// # Errors
     /// If the plan is malformed, if a hop cannot be re-priced against the state just
     /// fetched, or if a hop's floor collapses to zero under slippage.
-    pub fn hops_for(&self, plan: &CyclePlan, pool_data: &[Vec<u8>], arrays: &[[Pubkey; 3]]) -> Result<Vec<Hop>> {
+    pub fn hops_for(
+        &self,
+        plan: &CyclePlan,
+        pool_data: &[Vec<u8>],
+        arrays: &[[Pubkey; 3]],
+        fee_headroom: u128,
+    ) -> Result<(Vec<Hop>, u128)> {
         let n = plan.pools.len();
         if n < 2 || plan.mints.len() != n + 1 || plan.leg_out.len() != n {
             bail!("malformed cycle plan: {n} pools, {} mints, {} quotes", plan.mints.len(), plan.leg_out.len());
@@ -305,8 +417,69 @@ impl Trader {
             bail!("have {} accounts and {} array sets for {n} pools", pool_data.len(), arrays.len());
         }
 
+        // Trade what the pools can carry now, not what they could carry at detection.
+        //
+        // A concentrated leg only quotes inside its current tick interval, and the room
+        // left in that interval is whatever sits between the price and the next
+        // boundary — which moves continuously and can be a few cents. The plan's
+        // `amount_in` was sized against the interval as it stood when the websocket
+        // last spoke, so by the time the accounts are re-read the leg often cannot
+        // honour it.
+        //
+        // The old answer was to refuse the whole trade, and that was throwing away
+        // **thirty-five of ninety-one attempts** over six hours of live running — more
+        // than a third of everything that reached the chain — with "hop N could not be
+        // re-priced". Nothing was wrong with those cycles. They were profitable and
+        // simply larger than the pool's remaining room.
+        //
+        // Sizing down is safe in a way that raising the size would not be: every floor
+        // below is still derived from the fresh quote at the size actually used, the
+        // route still refuses to build unless its last floor beats its first input, and
+        // the simulation still has the final say. A smaller trade earns less; it cannot
+        // earn something that is not there.
+        let legs = Self::fresh_legs(plan, pool_data)?;
+        let spend_total = cb_core::path::largest_feasible(&legs, plan.amount_in);
+        if spend_total == 0 {
+            bail!(
+                "no hop of this cycle can carry any size at all against the state just \
+                 fetched — the tightest leg has no room left in its tick"
+            );
+        }
+
+        // Two different failures, and only one of them belongs here.
+        //
+        // If no width builds at all the edge is simply gone, and `route::build` says so
+        // far better than this could — it names what the route spends against what it
+        // guarantees. Fall through to it on the configured floor.
+        //
+        // If a width builds but none of them leaves enough margin for the fee, that is
+        // this function's own arithmetic and nothing downstream will explain it: the
+        // trade would be assembled, simulated, and then rejected by a balance
+        // comparison that reports no reason at all. Say it here instead.
+        let tenth_bps = match Self::widest_buildable_haircut(
+            &legs,
+            spend_total,
+            self.opts.slippage_tenth_bps,
+        ) {
+            None => self.opts.slippage_tenth_bps,
+            Some(widest) => {
+                let (quoted, floor) = Self::floor_chain(&legs, spend_total, widest)
+                    .context("the chosen floor stopped chaining")?;
+                let margin = quoted.saturating_sub(floor);
+                if margin < fee_headroom {
+                    bail!(
+                        "the widest floor this edge allows leaves {margin} base units between \
+                         what the last hop delivers and what it guarantees, and the \
+                         transaction fee needs {fee_headroom} of that — the gain does not \
+                         cover the cost of collecting it"
+                    );
+                }
+                widest
+            }
+        };
+
         let mut hops = Vec::with_capacity(n);
-        let mut spend = plan.amount_in;
+        let mut spend = spend_total;
         for i in 0..n {
             // Price this hop against the state fetched moments ago, not against the
             // quote that motivated the detection.
@@ -325,24 +498,16 @@ impl Trader {
             // Re-quoting does not manufacture an edge that has gone. It does something
             // better: it finds out *before* building a transaction, so a vanished edge
             // costs a decode instead of a revert, a breaker strike, and a halt.
-            let fresh = Self::fresh_quote(
-                plan.pools[i].1,
-                plan.pools[i].0,
-                &pool_data[i],
-                &plan.mints[i],
-                plan.fee_ppm[i],
-                spend,
-            )
-            .with_context(|| {
-                format!("hop {i} could not be re-priced against the state just fetched")
+            let fresh = legs[i].quote(spend).with_context(|| {
+                format!(
+                    "hop {i} could not be re-priced at {spend} against the state just \
+                     fetched, though the whole route was sized to fit"
+                )
             })?;
 
-            let floor = haircut(fresh, self.opts.slippage_tenth_bps);
+            let floor = haircut(fresh, tenth_bps);
             if floor == 0 {
-                bail!(
-                    "hop {i} floors at zero after {} tenths of a bp of slippage",
-                    self.opts.slippage_tenth_bps
-                );
+                bail!("hop {i} floors at zero after {tenth_bps} tenths of a bp of slippage");
             }
             let amount_in = u64::try_from(spend).context("hop input exceeds u64")?;
             let min_amount_out = u64::try_from(floor).context("hop floor exceeds u64")?;
@@ -365,7 +530,7 @@ impl Trader {
             // The next hop spends exactly what this one guarantees. See the module docs.
             spend = floor;
         }
-        Ok(hops)
+        Ok((hops, spend_total))
     }
 
     /// Fetch state, build, simulate, and — unless this is a dry run — submit.
@@ -572,10 +737,32 @@ impl Trader {
         }
         let arrays: Vec<[Pubkey; 3]> = arrays.into_iter().flatten().collect();
 
-        let hops = match self.hops_for(plan, &pool_data, &arrays) {
+        // What the last hop's margin must cover before the profit check can pass. On a
+        // wSOL cycle the fee leaves the same balance the profit is read from, so the
+        // margin has to absorb it; on a token cycle it does not. Doubled, so a trade is
+        // not built to clear its own cost by a single lamport.
+        let fee_headroom = if wrapping { BASE_FEE_LAMPORTS * 2 } else { 0 };
+        let (hops, spent) = match self.hops_for(plan, &pool_data, &arrays, fee_headroom) {
             Ok(h) => h,
             Err(e) => return Ok(Attempt::Refused(e.to_string())),
         };
+
+
+        // The route may have been sized down to what the pools can still carry, so the
+        // figures the risk gate judges have to follow it down.
+        //
+        // Scaled linearly, which understates the profit rather than overstating it:
+        // cycle profit is concave in size and zero at zero, so a fraction `k` of the
+        // input returns *at least* `k` times the profit. Being wrong in that direction
+        // costs a refused trade; being wrong in the other direction is how a gate stops
+        // meaning anything.
+        let shrink = if plan.amount_in > 0 {
+            spent as f64 / plan.amount_in as f64
+        } else {
+            return Ok(Attempt::Refused("this cycle plans to spend nothing".into()));
+        };
+        let size_usd = size_usd * shrink;
+        let expected_net_usd = expected_net_usd * shrink;
 
         // The balance the profit is measured from, read from wherever this route will
         // actually report it. Reading a token account for a route that ends by closing
@@ -606,8 +793,11 @@ impl Trader {
             // cheaper than sending one that fails mid-transaction. "Refuse rather than
             // extrapolate" is this codebase's first design principle for exactly this
             // reason — overstating what is affordable is the direction that loses.
+            // Against what the wrap will *actually* move, which is the first hop's
+            // input after any sizing down — not the plan's original figure. Checking
+            // the larger number refused trades the wallet could comfortably afford.
             let distinct_mints = plan.mints.iter().collect::<std::collections::HashSet<_>>().len();
-            let amount_in_u64 = u64::try_from(plan.amount_in).unwrap_or(u64::MAX);
+            let amount_in_u64 = u64::try_from(spent).unwrap_or(u64::MAX);
             if let Some(reserved) = wrap_shortfall(amount_in_u64, distinct_mints, bal) {
                 return Ok(Attempt::Refused(format!(
                     "wrapping {amount_in_u64} lamports would leave less than the                      {reserved} lamports this transaction needs for account rent and                      fees, against a balance of {bal} — sizing must leave that headroom,                      not spend into it"
@@ -615,10 +805,32 @@ impl Trader {
             }
             bal
         } else {
-            profit_account
+            let held = profit_account
                 .and_then(|a| a.data.get(64..72).and_then(|b| b.try_into().ok()))
                 .map(u64::from_le_bytes)
-                .unwrap_or(0)
+                .unwrap_or(0);
+
+            // A cycle the wallet cannot actually fund is refused here rather than sent
+            // to fail on chain.
+            //
+            // Sizing knows `capital_usd`; it does not know which *mint* that capital is
+            // in. This wallet holds SOL and 0.0079 USDC, so every cycle entered at USDC
+            // or USDT — 195 of the 232 that cleared every other gate over nineteen
+            // hours — was asking to spend nine dollars of a token it does not have.
+            // Each would have failed in simulation with an insufficient-funds error
+            // from the token program, been counted as a defect rather than a shortfall,
+            // and taken the run a strike closer to a halt.
+            //
+            // The same loop is almost always reachable from SOL too, entered from the
+            // other side of the same pools. Refusing the unfundable entry frees the
+            // sweep's one attempt for the one that can be paid for.
+            if u128::from(held) < spent {
+                return Ok(Attempt::Refused(format!(
+                    "this cycle starts by spending {spent} of a mint the wallet holds {held} \
+                     of — the same loop entered from SOL can be funded, this one cannot"
+                )));
+            }
+            held
         };
 
         let opts = RouteOptions {
@@ -648,6 +860,116 @@ impl Trader {
             tx_base64: assembled.tx_base64,
         };
         plan_to_run.execute(&mut self.exec.gate, rpc, self.opts.dry_run).await
+    }
+
+    /// The most token accounts this will ever open in one go.
+    ///
+    /// Two is what a SOL/stable book needs — USDC and USDT — and a cap this tight means
+    /// a mistake in what gets passed in cannot spend more than about forty cents of
+    /// refundable deposit.
+    const MAX_ACCOUNTS_TO_OPEN: usize = 2;
+
+    /// Open a token account for each of `mints` the wallet does not already own, once,
+    /// before any trade has to pay for one mid-flight.
+    ///
+    /// # Why this is not housekeeping
+    ///
+    /// A cycle's profit is read from the owner's *lamport* balance, and the floor it
+    /// must clear is `pre_balance + the gain the route guarantees`. Opening an
+    /// associated token account costs 2,039,280 lamports of rent out of that same
+    /// balance. So a trade that has to open one is asking the simulation to show a gain
+    /// of about twenty-one cents, on a cycle worth a tenth of a cent.
+    ///
+    /// Measured on this wallet: the USDC account existed and the **USDT account did
+    /// not**, while roughly seventy per cent of every opportunity that cleared all the
+    /// other gates ran SOL↔USDT. Those trades could never have passed the balance check
+    /// — short by a factor of 383 — however good the price was. No log line said so,
+    /// because the transaction was abandoned before anything was submitted.
+    ///
+    /// Paying it here instead changes what the money is. Inside a trade it is a cost the
+    /// trade cannot cover; paid once up front it is a deposit that sits in the account
+    /// and comes back in full whenever the account is closed. Every trade afterwards
+    /// emits the same idempotent instruction and pays nothing.
+    ///
+    /// Nothing is sent that has not simulated cleanly first, as everywhere else here.
+    ///
+    /// # Errors
+    /// If the chain cannot be reached. A refusal to open — because nothing is missing,
+    /// or because more are missing than the cap allows — is not an error.
+    pub async fn ensure_token_accounts(&self, mints: &[Pubkey32]) -> Result<Option<String>> {
+        let token_program = pk(programs::SPL_TOKEN);
+        let wsol = pk(programs::WSOL_MINT);
+        // wSOL is deliberately absent: `WrapAndClose` opens and closes it inside every
+        // transaction, so its rent is borrowed and returned in the same breath.
+        let wanted: Vec<Pubkey> = mints
+            .iter()
+            .map(to_pubkey)
+            .filter(|m| *m != wsol)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if wanted.is_empty() {
+            return Ok(None);
+        }
+
+        let atas: Vec<Pubkey> =
+            wanted.iter().map(|m| associated_token_address(&self.owner, m, &token_program)).collect();
+        let existing = self.exec.rpc.accounts_full(&atas).await?;
+
+        let missing: Vec<(Pubkey, Pubkey)> = wanted
+            .iter()
+            .zip(atas.iter())
+            .zip(existing.iter())
+            .filter(|(_, acc)| acc.is_none())
+            .map(|((m, a), _)| (*m, *a))
+            .collect();
+        if missing.is_empty() {
+            tracing::info!("every token account this book needs already exists");
+            return Ok(None);
+        }
+        if missing.len() > Self::MAX_ACCOUNTS_TO_OPEN {
+            anyhow::bail!(
+                "{} token accounts are missing, over the {} this will open at once — \
+                 refusing rather than spending {} lamports of rent unasked",
+                missing.len(),
+                Self::MAX_ACCOUNTS_TO_OPEN,
+                missing.len() as u64 * route::TOKEN_ACCOUNT_RENT
+            );
+        }
+
+        let cost = missing.len() as u64 * route::TOKEN_ACCOUNT_RENT;
+        tracing::warn!(
+            "opening {} token account(s) the wallet does not have yet, at {cost} lamports of \
+             rent. This is a deposit, not a fee: it stays in the account and returns in full \
+             if the account is ever closed. Without it every cycle through those mints fails \
+             its profit check by the price of the rent.",
+            missing.len()
+        );
+
+        let mut ixs = vec![tx::set_compute_limit(60_000)];
+        for (mint, ata) in &missing {
+            ixs.push(tx::create_ata_idempotent(&self.owner, ata, &self.owner, mint, &token_program));
+        }
+
+        let (blockhash, _) = self.exec.rpc.latest_blockhash().await?;
+        let assembled = tx::assemble(&self.exec.wallet, &ixs, blockhash)?;
+
+        let sim = self.exec.rpc.simulate(&assembled.tx_base64, &[]).await?;
+        if !sim.succeeded() {
+            let ctx = sim.error_context().unwrap_or_default();
+            anyhow::bail!(
+                "opening the token accounts did not simulate cleanly, so nothing was sent: {} {ctx}",
+                sim.err.unwrap_or_else(|| "unknown".into())
+            );
+        }
+        if self.opts.dry_run {
+            tracing::info!("dry run — the token accounts simulated cleanly and were not opened");
+            return Ok(None);
+        }
+
+        let signature = self.exec.rpc.send(&assembled.tx_base64, true).await?;
+        tracing::warn!("opened {} token account(s): {signature}", missing.len());
+        Ok(Some(signature))
     }
 
     /// Report an outcome to the risk gate. Called by the caller, because only it knows
@@ -818,7 +1140,7 @@ mod tests {
         let data = pools_for(&p);
         let arrays = vec![[Pubkey::new_unique(); 3]; 3];
 
-        let hops = t.hops_for(&p, &data, &arrays).expect("a well formed plan");
+        let (hops, _) = t.hops_for(&p, &data, &arrays, 0).expect("a well formed plan");
         assert_eq!(hops.len(), 3);
         assert_eq!(hops[0].amount_in, 1_000_000);
         for w in hops.windows(2) {
@@ -846,14 +1168,14 @@ mod tests {
 
         let mut short = plan(3);
         short.mints.pop();
-        assert!(t.hops_for(&short, &data, &arrays).is_err());
+        assert!(t.hops_for(&short, &data, &arrays, 0).is_err());
 
         let mut mismatched = plan(3);
         mismatched.leg_out.pop();
-        assert!(t.hops_for(&mismatched, &data, &arrays).is_err());
+        assert!(t.hops_for(&mismatched, &data, &arrays, 0).is_err());
 
         // Fewer accounts than pools must not silently build a shorter cycle.
-        assert!(t.hops_for(&plan(3), &data[..2], &arrays).is_err());
+        assert!(t.hops_for(&plan(3), &data[..2], &arrays, 0).is_err());
     }
 
     /// Slippage wide enough to zero a floor must refuse, not encode a swap that would
@@ -868,7 +1190,7 @@ mod tests {
         };
         let data = pools_for(&plan(2));
         let arrays = vec![[Pubkey::new_unique(); 3]; 2];
-        let e = t.hops_for(&plan(2), &data, &arrays).unwrap_err().to_string();
+        let e = t.hops_for(&plan(2), &data, &arrays, 0).unwrap_err().to_string();
         assert!(e.contains("zero"), "{e}");
     }
 
@@ -897,7 +1219,7 @@ mod tests {
         whirlpool_with([0xAA; 32], [0xBB; 32])
     }
 
-    fn whirlpool_with(mint_a: Pubkey32, mint_b: Pubkey32) -> Vec<u8> {
+    pub(super) fn whirlpool_with(mint_a: Pubkey32, mint_b: Pubkey32) -> Vec<u8> {
         let mut d = vec![0u8; cb_dex::orca_whirlpool::WHIRLPOOL_LEN];
         let spacing: u16 = 64;
         d[41..43].copy_from_slice(&spacing.to_le_bytes());
@@ -1147,7 +1469,7 @@ mod mainnet {
             owner,
             ticks_seen: HashMap::new(),
         };
-        let hops = t.hops_for(&plan, &pool_data, &arrays).expect("hops");
+        let (hops, _) = t.hops_for(&plan, &pool_data, &arrays, 0).expect("hops");
 
         let opts = RouteOptions {
             compute_units: 600_000,
@@ -1252,7 +1574,7 @@ mod fresh_quote_tests {
         let data = tests::pools_for(&p);
         let arrays = vec![[Pubkey::new_unique(); 3]; 2];
 
-        let honest = t.hops_for(&p, &data, &arrays).expect("a well formed plan");
+        let (honest, _) = t.hops_for(&p, &data, &arrays, 0).expect("a well formed plan");
 
         // Now claim, in the plan only, that every leg returns a hundred times more.
         // The pools handed to `hops_for` are unchanged, so nothing about what the chain
@@ -1260,7 +1582,7 @@ mod fresh_quote_tests {
         for q in &mut p.leg_out {
             *q *= 100;
         }
-        let inflated = t.hops_for(&p, &data, &arrays).expect("a well formed plan");
+        let (inflated, _) = t.hops_for(&p, &data, &arrays, 0).expect("a well formed plan");
 
         assert_eq!(
             honest.iter().map(|h| h.min_amount_out).collect::<Vec<_>>(),
@@ -1281,10 +1603,11 @@ mod fresh_quote_tests {
             ticks_seen: HashMap::new(),
         };
         let p = tests::plan(3);
-        let hops = t
-            .hops_for(&p, &tests::pools_for(&p), &vec![[Pubkey::new_unique(); 3]; 3])
+        let (hops, spent) = t
+            .hops_for(&p, &tests::pools_for(&p), &vec![[Pubkey::new_unique(); 3]; 3], 0)
             .expect("a well formed plan");
 
+        assert_eq!(spent, p.amount_in, "these fixtures have room for the whole size");
         assert_eq!(u128::from(hops[0].amount_in), p.amount_in);
         for w in hops.windows(2) {
             assert_eq!(
@@ -1299,14 +1622,126 @@ mod fresh_quote_tests {
     /// would quietly reappear.
     #[test]
     fn a_venue_without_an_encoder_cannot_be_re_priced() {
-        assert!(Trader::fresh_quote(
-            Dex::RaydiumAmmV4,
-            [7u8; 32],
-            &[0u8; 300],
-            &[1u8; 32],
-            2_500,
-            1_000_000,
-        )
-        .is_none());
+        assert!(
+            Trader::fresh_leg(Dex::RaydiumAmmV4, [7u8; 32], &[0u8; 300], &[1u8; 32], 2_500)
+                .is_none()
+        );
+    }
+
+    /// A plan larger than the pool's remaining room is traded small, not refused.
+    ///
+    /// A concentrated leg quotes only inside its current tick, and the room left there
+    /// moves continuously. The plan is sized against the interval as it stood when the
+    /// websocket last spoke, so by the time the accounts are re-read the leg often
+    /// cannot honour it. Refusing outright threw away 35 of 91 attempts over six hours
+    /// of live running — more than a third of everything that reached the chain — on
+    /// cycles that were profitable and merely too big.
+    #[test]
+    fn a_plan_bigger_than_the_pool_is_sized_down_rather_than_refused() {
+        let t = Trader {
+            exec: unreachable_executor(),
+            opts: TradeOptions { slippage_tenth_bps: 3, ..Default::default() },
+            owner: Pubkey::new_unique(),
+            ticks_seen: HashMap::new(),
+        };
+        let mut p = tests::plan(2);
+        let data = tests::pools_for(&p);
+        let arrays = vec![[Pubkey::new_unique(); 3]; 2];
+
+        // Ask for far more than any tick interval can hold. Nothing about the pools
+        // changed, so the honest answer is "trade what is there", not "trade nothing".
+        p.amount_in = 100_000_000_000_000_000;
+        let (hops, spent) =
+            t.hops_for(&p, &data, &arrays, 0).expect("an oversized plan is still tradeable");
+        assert!(spent < p.amount_in, "it must not pretend the room is there");
+
+        // The ceiling is a property of the pools, not of how much was asked for.
+        let mut greedier = p.clone();
+        greedier.amount_in = p.amount_in * 10;
+        let (_, again) = t.hops_for(&greedier, &data, &arrays, 0).expect("still tradeable");
+        assert_eq!(spent, again, "the ceiling is the pools', not the request's");
+        assert_eq!(u128::from(hops[0].amount_in), spent, "the first hop spends what was chosen");
+
+        // The invariant that makes the whole thing safe is untouched by sizing down.
+        for w in hops.windows(2) {
+            assert_eq!(
+                w[1].amount_in, w[0].min_amount_out,
+                "a hop must still spend exactly what the one before it guaranteed"
+            );
+        }
+    }
+
+    /// The floor must leave the trade enough margin to pay its own fee.
+    ///
+    /// Each hop spends what the one before it *guaranteed*, so the route ends holding
+    /// the last hop's quote while having promised that quote less one haircut. On a
+    /// wSOL cycle the fee comes out of the same balance the profit is read from, so
+    /// that single haircut is all there is to absorb it. At $9.20 that means the
+    /// haircut cannot be under about 0.56 bps — and the shipped value was 0.3, which is
+    /// why nothing ever cleared the check.
+    #[test]
+    fn the_floor_widens_until_the_trade_can_pay_its_own_fee() {
+        let legs = {
+            let t = Trader {
+                exec: unreachable_executor(),
+                opts: TradeOptions::default(),
+                owner: Pubkey::new_unique(),
+                ticks_seen: HashMap::new(),
+            };
+            let _ = &t;
+            let p = tests::plan(2);
+            Trader::fresh_legs(&p, &tests::pools_for(&p)).expect("fixtures price")
+        };
+        let spend = tests::plan(2).amount_in;
+
+        let widest = Trader::widest_buildable_haircut(&legs, spend, 1).expect("some width works");
+        let (quoted, floor) = Trader::floor_chain(&legs, spend, widest).expect("it chains");
+
+        assert!(floor > spend, "however wide, the route must still guarantee a profit");
+        assert!(
+            quoted > floor,
+            "and it must arrive holding more than it promised — that difference is the \
+             only thing the fee can come out of"
+        );
+
+        // Widening is what buys the margin. A narrower floor leaves strictly less of it,
+        // which is the whole reason a fixed 0.3 bps could never pay a 5,000-lamport fee.
+        let narrow = widest / 2;
+        if narrow >= 1 {
+            let (nq, nf) = Trader::floor_chain(&legs, spend, narrow).expect("it chains");
+            assert!(
+                nq.saturating_sub(nf) < quoted.saturating_sub(floor),
+                "halving the floor must halve the margin the fee comes out of"
+            );
+        }
+
+        // And the search never returns something that would lose money.
+        for t in [1u32, 2, 5, widest] {
+            if let Some((_, f)) = Trader::floor_chain(&legs, spend, t) {
+                if t <= widest {
+                    assert!(f > spend, "width {t} is inside the buildable range");
+                }
+            }
+        }
+    }
+
+    /// Sizing down has a floor of its own: a cycle with no room anywhere is refused,
+    /// and says so in terms an operator can act on.
+    #[test]
+    fn a_cycle_with_no_room_at_all_is_still_refused() {
+        let t = Trader {
+            exec: unreachable_executor(),
+            opts: TradeOptions::default(),
+            owner: Pubkey::new_unique(),
+            ticks_seen: HashMap::new(),
+        };
+        let p = tests::plan(2);
+        // Pools that decode but trade the wrong mints cannot be re-priced at all.
+        let wrong = vec![tests::whirlpool_with([9u8; 32], [8u8; 32]); 2];
+        let e = t.hops_for(&p, &wrong, &[[Pubkey::new_unique(); 3]; 2], 0).unwrap_err();
+        assert!(
+            e.to_string().contains("could not be re-priced"),
+            "an unpriceable hop must say so: {e}"
+        );
     }
 }

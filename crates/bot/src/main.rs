@@ -493,6 +493,25 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
         f64::from(cfg.slippage_tenth_bps) / 10.0,
         cfg.priority_micro_lamports
     );
+
+    // Pay the rent for the accounts a cycle needs to hold, once, before any trade has
+    // to. See `Trader::ensure_token_accounts` for why a missing one is not an
+    // inconvenience but a wall: a trade that opens an account is asked to show a gain of
+    // twenty-one cents on a cycle worth a tenth of one.
+    //
+    // Only the base mints, which is where every executable cycle starts and ends and is
+    // the shortest list that unblocks all of them.
+    let base_mints = registry::Registry::embedded()?.base_mints;
+    if let Err(e) = trader.ensure_token_accounts(&base_mints).await {
+        // Not fatal. A book that can still trade its existing accounts is worth more
+        // than a process that refuses to start, and the log says exactly what is
+        // missing so it can be fixed deliberately.
+        tracing::error!(
+            "could not open the token accounts this book needs: {e:#}. Cycles through any \
+             mint the wallet has no account for will keep failing their profit check by \
+             the price of the rent."
+        );
+    }
     Ok(trader)
 }
 

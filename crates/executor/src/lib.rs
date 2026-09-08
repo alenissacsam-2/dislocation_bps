@@ -88,8 +88,9 @@ impl Plan {
         // The chain's opinion, before anything irreversible.
         let sim = rpc.simulate(&self.tx_base64, &[self.profit.address()]).await?;
         if !sim.succeeded() {
-            // Read the context before `err` is moved out of `sim`.
+            // Both read before `err` is moved out of `sim`.
             let context = sim.error_context();
+            let missed_floor = sim.missed_its_floor();
             let err = sim.err.unwrap_or_else(|| "unknown".into());
             // Carry the program's own account of what went wrong, not just the error
             // code. `{"InstructionError":[6,{"Custom":6018}]}` says a floor was missed;
@@ -102,9 +103,24 @@ impl Plan {
                 Some(ctx) => format!("{err} — {ctx}"),
                 None => err,
             };
-            // A simulation failure is a defect in what was built, not a lost race, so it
-            // counts toward the breaker. Three of these in a row means stop.
-            gate.record(Outcome::Failed);
+            // A malformed transaction is a defect and trips the breaker. A floor the
+            // pool could not meet is not — it is the guard working, and it costs
+            // nothing because nothing was submitted.
+            //
+            // This line used to record every rejection as a defect, on the reasoning
+            // that simulation only fails when what was built is wrong. That was true
+            // while the floors came from detection-time quotes: a rejection then meant
+            // the transaction had been demanding a profit derived from a price that no
+            // longer existed. Since `hops_for` began re-pricing against state fetched
+            // moments earlier, a missed floor means something else entirely — the price
+            // moved in the round trip between the re-price and the simulation.
+            //
+            // Losing that race is the normal outcome, roughly three times in four. So
+            // six in a row arrived quickly, halted trading for the full cooldown, and
+            // did it again on resume. Over six hours of live running the bot reached
+            // simulation nineteen times, missed the floor on fifteen of them, and spent
+            // the gaps refusing everything with "trading is halted".
+            gate.record(if missed_floor { Outcome::Missed } else { Outcome::Failed });
             return Ok(Attempt::SimulationRejected { reason, observed_net_usd: None });
         }
 

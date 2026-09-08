@@ -51,6 +51,43 @@ impl Simulation {
         self.err.is_none()
     }
 
+    /// Whether this failed because a swap could not deliver the output floor the
+    /// instruction demanded — rather than because the transaction was malformed.
+    ///
+    /// # Why the difference decides whether trading stops
+    ///
+    /// The risk gate's breaker exists to catch a *defect*: an encoder naming the wrong
+    /// accounts, a bad discriminator, a route that cannot fund itself. Six of those in
+    /// a row means something is broken and the run must stop before it costs money.
+    ///
+    /// A missed floor is the opposite of a defect. It means every account was right,
+    /// the programs ran, and the pool simply could not pay what was asked — because the
+    /// price moved in the fraction of a second between re-pricing the route and asking
+    /// the chain about it. That is a lost race. It costs nothing: the transaction is
+    /// abandoned at simulation and never submitted.
+    ///
+    /// Counting it as a defect is what stopped this run trading. Losing the race is the
+    /// *normal* outcome here — measured at roughly three attempts in four — so six in a
+    /// row arrives quickly and by design, and each one halted trading for the full
+    /// cooldown. The bot spent that time refusing the opportunities it was built for.
+    ///
+    /// Matched on the program's own error name rather than the numeric code, because
+    /// Anchor numbers restart at 6000 in every program and a bare `Custom(6018)` means
+    /// nothing without knowing who raised it. Both names below were read out of this
+    /// bot's own logs, beside the program that logged them:
+    ///
+    /// - `whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc` — `AmountOutBelowMinimum`
+    /// - `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK` — `TooLittleOutputReceived`
+    ///
+    /// Anything this does not recognise stays a defect. That is the safe direction: a
+    /// new failure mode halts the run until somebody has looked at it.
+    #[must_use]
+    pub fn missed_its_floor(&self) -> bool {
+        const FLOOR_ERRORS: [&str; 2] = ["AmountOutBelowMinimum", "TooLittleOutputReceived"];
+        self.err.is_some()
+            && self.logs.iter().any(|l| FLOOR_ERRORS.iter().any(|name| l.contains(name)))
+    }
+
     /// What the failing program itself said, condensed to the lines that carry meaning.
     ///
     /// A bare `Custom(6018)` says a floor was missed and nothing else. The AMMs log
@@ -823,6 +860,54 @@ mod error_context_tests {
         assert!(sim(&["Program whirL invoke [1]", "Program log: Instruction: Swap"])
             .error_context()
             .is_none());
+    }
+
+    /// The distinction that decides whether the run keeps trading.
+    ///
+    /// Both venues' floor errors are recognised, by the name the program logs rather
+    /// than the number — 6018 and 6036 mean different things in different programs and
+    /// the same thing in neither.
+    #[test]
+    fn a_missed_floor_is_told_apart_from_a_broken_transaction() {
+        let raydium = sim(&[
+            "Program CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK invoke [1]",
+            "Program log: AnchorError thrown in programs/amm/src/instructions/swap.rs:1054. \
+             Error Code: TooLittleOutputReceived. Error Number: 6018.",
+        ]);
+        assert!(raydium.missed_its_floor(), "the pool could not pay the floor — a lost race");
+
+        let orca = sim(&[
+            "Program whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc invoke [1]",
+            "Program log: AnchorError occurred. Error Code: AmountOutBelowMinimum. \
+             Error Number: 6036.",
+        ]);
+        assert!(orca.missed_its_floor(), "same fact, other venue");
+    }
+
+    /// Everything else stays a defect, which is the safe direction: an unrecognised
+    /// failure halts the run until somebody has looked at it.
+    #[test]
+    fn an_unrecognised_failure_still_counts_as_a_defect() {
+        for logs in [
+            vec!["Program log: Error: insufficient funds"],
+            vec!["Program 11111111111111111111111111111111 failed: custom program error: 0x1"],
+            vec!["Program log: AnchorError. Error Code: ConstraintSeeds. Error Number: 2006."],
+            vec![],
+        ] {
+            assert!(
+                !sim(&logs).missed_its_floor(),
+                "only a missed floor is competition; {logs:?} is not"
+            );
+        }
+    }
+
+    /// And a simulation that worked is never a miss, whatever its logs happen to say.
+    #[test]
+    fn a_successful_simulation_missed_nothing() {
+        let mut s = sim(&["Program log: Error Code: TooLittleOutputReceived"]);
+        s.err = None;
+        assert!(s.succeeded());
+        assert!(!s.missed_its_floor());
     }
 
     /// A rejection must not be able to flood the operator's log with a whole trace.
