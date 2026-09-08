@@ -673,6 +673,13 @@ an error the chain reports, it is a comparison this code makes and rejects.
 A constant cannot serve: the floor is pushed down by `n·s < e` and up by the fee. It is
 chosen per trade now, the widest the edge will bear.
 
+**That simulation charges the fee at all was measured, not assumed** — §4.3's rule
+applied to this codebase's own arithmetic. A one-signature transaction was simulated
+against mainnet with `sigVerify: false` and the fee payer requested in the accounts
+array: it came back at 132,741,877 lamports against a real balance of 132,746,877,
+exactly 5,000 lighter. Worth checking in both directions: had simulation been fee-free,
+demanding the headroom would have refused good trades for no reason at all.
+
 Two more found in the same audit:
 
 - Routes were refused outright when a leg's tick held less than the plan asked for —

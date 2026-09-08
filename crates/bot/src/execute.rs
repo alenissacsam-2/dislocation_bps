@@ -237,6 +237,15 @@ const MAX_HAIRCUT_TENTH_BPS: u32 = 60;
 /// closes inside the transaction, so the fee comes out of the very balance the profit
 /// is read from. A cycle based on a token pays its fee from lamports instead, which
 /// the token balance never sees.
+///
+/// **That the simulation charges it at all was measured, not assumed.** A one-signature
+/// transaction was simulated against mainnet with `sigVerify: false` and the fee payer
+/// requested in the accounts array: the balance came back 132,741,877 against a real
+/// 132,746,877, exactly 5,000 lamports lighter. So `min_post_balance` is compared
+/// against a figure the fee has already been taken out of, and a route whose margin
+/// does not cover it cannot pass however good the price is. Checking this mattered —
+/// had simulation been fee-free, demanding the headroom would have refused good trades
+/// for nothing.
 pub const BASE_FEE_LAMPORTS: u128 = 5_000;
 
 /// Where one hop's predicted tick-array candidates sit inside the batched fetch: the
