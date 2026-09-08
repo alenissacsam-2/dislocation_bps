@@ -51,6 +51,15 @@ pub struct Chosen {
     pub current_exists: bool,
 }
 
+/// How many ticks one array covers on this venue.
+#[must_use]
+fn per_array(dex: Dex) -> i32 {
+    match dex {
+        Dex::OrcaWhirlpool => ORCA_TICKS_PER_ARRAY,
+        _ => RAYDIUM_TICKS_PER_ARRAY,
+    }
+}
+
 /// Derive the candidate addresses for a pool, nearest first in the traversal direction.
 #[must_use]
 pub fn candidates(
@@ -61,11 +70,19 @@ pub fn candidates(
     tick_spacing: u16,
     price_falling: bool,
 ) -> Vec<(i32, Pubkey)> {
-    let per_array = match dex {
-        Dex::OrcaWhirlpool => ORCA_TICKS_PER_ARRAY,
-        _ => RAYDIUM_TICKS_PER_ARRAY,
-    };
-    tick_array_sweep(tick_current, tick_spacing, per_array, price_falling, SWEEP_WIDTH)
+    sweep(dex, pool, program, tick_current, tick_spacing, price_falling, SWEEP_WIDTH)
+}
+
+fn sweep(
+    dex: Dex,
+    pool: &Pubkey,
+    program: &Pubkey,
+    tick_current: i32,
+    tick_spacing: u16,
+    price_falling: bool,
+    how_many: usize,
+) -> Vec<(i32, Pubkey)> {
+    tick_array_sweep(tick_current, tick_spacing, per_array(dex), price_falling, how_many)
         .into_iter()
         .map(|start| {
             let key = match dex {
@@ -75,6 +92,69 @@ pub fn candidates(
             (start, key)
         })
         .collect()
+}
+
+/// Arrays to look behind the last known tick, so a price that moved *against* the
+/// traversal direction is still inside the prefetched window.
+const PREFETCH_BEHIND: i32 = 1;
+/// How many arrays a prefetch asks for. Wider than [`SWEEP_WIDTH`] by the margin it
+/// looks behind, plus one, so the real window is a subset from either side.
+const PREFETCH_WIDTH: usize = SWEEP_WIDTH + 2;
+
+/// A superset of the candidates a *slightly stale* tick implies, for asking about the
+/// tick arrays in the same round trip that fetches the pools.
+///
+/// # Why this exists
+///
+/// [`resolve`] cannot run until the pool account has been read, because it needs the
+/// pool's current tick — so an attempt pays for the pool fetch, then pays again for the
+/// arrays, then again for the balance, then again for the simulation. Measured from the
+/// machine this runs on, a round trip to the configured Helius endpoint is 98 ms (the
+/// public fallback is 296 ms), so four of them is about 390 ms — one Solana slot
+/// between reading a price and asking the chain to honour it, against an edge of one to
+/// two basis points. The price moves a meaningful fraction of that edge in that window,
+/// and the refusals said so: floors missed by roughly a basis point.
+///
+/// The dependency is real but the *precision* it needs is not. An array spans
+/// `tick_spacing × ticks_per_array` ticks — hundreds of basis points on the pools this
+/// trades — so a tick that moved between the sweep and the attempt lands in the same
+/// window with room to spare. Prefetching from the last known tick, one array wider on
+/// each side, and then checking the fresh tick's real window against what came back,
+/// turns two round trips into one without assuming anything: when the check fails the
+/// caller asks, exactly as it does today.
+#[must_use]
+pub fn prefetch_candidates(
+    dex: Dex,
+    pool: &Pubkey,
+    program: &Pubkey,
+    last_known_tick: i32,
+    tick_spacing: u16,
+    price_falling: bool,
+) -> Vec<(i32, Pubkey)> {
+    let span = i32::from(tick_spacing).saturating_mul(per_array(dex));
+    // One array *against* the direction of travel: the sweep only ever walks forward,
+    // so the margin for a tick that slipped backwards has to come from the anchor.
+    let behind = span.saturating_mul(PREFETCH_BEHIND);
+    let anchor = if price_falling {
+        last_known_tick.saturating_add(behind)
+    } else {
+        last_known_tick.saturating_sub(behind)
+    };
+    sweep(dex, pool, program, anchor, tick_spacing, price_falling, PREFETCH_WIDTH)
+}
+
+/// Turn a candidate list and the subset known to be live into the three arrays the
+/// instruction will name.
+///
+/// Public so a caller that fetched the candidate accounts itself — see
+/// [`prefetch_candidates`] — can answer the same question without a second round trip.
+/// `None` when there were no candidates at all, which is [`resolve`]'s error case.
+#[must_use]
+pub fn choose(candidates: &[(i32, Pubkey)], live: &[(i32, Pubkey)]) -> Option<Chosen> {
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(pick(candidates, live))
 }
 
 /// Ask the chain which candidates exist and take the first three, nearest first.
@@ -142,6 +222,69 @@ mod tests {
 
     fn cands(starts: &[i32]) -> Vec<(i32, Pubkey)> {
         starts.iter().map(|s| (*s, Pubkey::new_unique())).collect()
+    }
+
+    /// The property the whole prefetch rests on: whatever the tick does between the
+    /// sweep that recorded it and the attempt that uses it, the window the *fresh*
+    /// tick asks for is inside the window the *stale* one prefetched.
+    ///
+    /// If this is ever false the caller does not guess — it falls back to asking — so
+    /// the cost of the property failing is a round trip, not a wrong array. But the
+    /// point of the exercise is that it should almost never fail, so the range swept
+    /// here is deliberately violent: a full array in each direction, on both venues,
+    /// at every spacing the registry uses.
+    #[test]
+    fn a_tick_that_moved_is_still_inside_the_window_that_was_prefetched() {
+        let pool = Pubkey::new_unique();
+        let program = Pubkey::new_unique();
+        for dex in [Dex::OrcaWhirlpool, Dex::RaydiumClmm] {
+            for spacing in [1u16, 2, 4, 8, 16, 60, 64, 120] {
+                let span = i32::from(spacing) * per_array(dex);
+                for falling in [true, false] {
+                    let stale = 0i32;
+                    let wide =
+                        prefetch_candidates(dex, &pool, &program, stale, spacing, falling);
+                    let have: std::collections::HashSet<Pubkey> =
+                        wide.iter().map(|(_, k)| *k).collect();
+                    // A whole array of movement in either direction, sampled at the
+                    // boundaries and inside.
+                    for moved in [-span, -span / 2, -1, 0, 1, span / 2, span] {
+                        let real =
+                            candidates(dex, &pool, &program, stale + moved, spacing, falling);
+                        assert!(
+                            real.iter().all(|(_, k)| have.contains(k)),
+                            "{dex:?} spacing {spacing} falling {falling}: a tick that moved \
+                             {moved} asks for an array the prefetch did not cover"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// And the prefetch must not be so wide that it stops being one round trip's worth
+    /// of question. Twelve was already chosen to fit `getMultipleAccounts` alongside
+    /// the pools; this stays in the same order.
+    #[test]
+    fn the_prefetch_window_stays_small_enough_to_ask_in_one_call() {
+        let pool = Pubkey::new_unique();
+        let program = Pubkey::new_unique();
+        let wide = prefetch_candidates(Dex::RaydiumClmm, &pool, &program, 0, 60, false);
+        assert_eq!(wide.len(), PREFETCH_WIDTH);
+        // Three hops of prefetch plus their pools and the profit account still fits the
+        // 100-account ceiling on getMultipleAccounts with room to spare.
+        const { assert!(PREFETCH_WIDTH * 3 + 4 < 100) }
+    }
+
+    /// `choose` answers exactly what `resolve` would have, given the same knowledge —
+    /// otherwise the fast path and the fallback would disagree about which arrays a
+    /// swap names, which is the kind of difference that only shows up on chain.
+    #[test]
+    fn choosing_from_a_prefetch_matches_asking_directly() {
+        let c = cands(&[0, -60, -120, -180, -240]);
+        let live = vec![c[1], c[3]];
+        assert_eq!(choose(&c, &live).expect("candidates exist").arrays, pick(&c, &live).arrays);
+        assert!(choose(&[], &[]).is_none(), "no candidates is not a choice");
     }
 
     #[test]

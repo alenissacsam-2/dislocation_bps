@@ -41,6 +41,7 @@
 //! the correct answer and not an error.
 
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use cb_core::types::{Dex, Pubkey32};
 use cb_executor::encode::{pk, programs, to_pubkey};
 use cb_executor::pda::associated_token_address;
@@ -200,18 +201,61 @@ pub fn haircut(amount: u128, tenth_bps: u32) -> u128 {
     amount.saturating_mul(keep) / 100_000
 }
 
+/// What a pool's tick geometry looked like the last time this trader decoded it.
+///
+/// Kept so the next attempt can predict which tick arrays to ask about and fold that
+/// question into the round trip that fetches the pools — see
+/// [`cb_executor::ticks::prefetch_candidates`]. `mint_a` is here because the traversal
+/// direction decides which way the sweep walks, and that too is immutable pool
+/// configuration rather than something worth a round trip.
+///
+/// Nothing here is trusted. `tick` is only ever used to choose *which addresses to ask
+/// about*; the arrays the instruction finally names are picked from the tick read out
+/// of the account fetched this attempt.
+#[derive(Debug, Clone, Copy)]
+struct TickHint {
+    tick: i32,
+    spacing: u16,
+    mint_a: Pubkey32,
+}
+
+/// Where one hop's predicted tick-array candidates sit inside the batched fetch: the
+/// offset of the first one, and the addresses asked for, in sweep order. `None` when
+/// this pool has never been decoded here and there was nothing to predict from.
+type Prefetched = Option<(usize, Vec<(i32, Pubkey)>)>;
+
+/// The program that owns a venue's pools and tick arrays.
+fn program_for(dex: Dex) -> Pubkey {
+    match dex {
+        Dex::OrcaWhirlpool => pk(cb_dex::orca_whirlpool::PROGRAM_ID),
+        _ => pk(cb_dex::raydium_clmm::PROGRAM_ID),
+    }
+}
+
+/// The pool's own token A, read from the account rather than from the registry.
+fn mint_a_of(dex: Dex, data: &[u8]) -> Result<Pubkey32> {
+    match dex {
+        Dex::OrcaWhirlpool => Ok(cb_dex::orca_whirlpool::decode(data)?.mint_a),
+        Dex::RaydiumClmm => Ok(cb_dex::raydium_clmm::decode(data)?.mint_0),
+        other => bail!("{} is not encodable", other.name()),
+    }
+}
+
 /// Live execution, holding the wallet and the risk gate across attempts.
 pub struct Trader {
     exec: Executor,
     opts: TradeOptions,
     owner: Pubkey,
+    /// Tick geometry per pool, so the tick-array question costs no round trip of its
+    /// own after the first attempt against that pool. See [`TickHint`].
+    ticks_seen: HashMap<Pubkey32, TickHint>,
 }
 
 impl Trader {
     #[must_use]
     pub fn new(exec: Executor, opts: TradeOptions) -> Self {
         let owner = exec.pubkey();
-        Self { exec, opts, owner }
+        Self { exec, opts, owner, ticks_seen: HashMap::new() }
     }
 
     #[must_use]
@@ -382,16 +426,67 @@ impl Trader {
         // floors then missed by about a basis point, which is precisely the size of
         // what moves in that window. The blockhash never needed to be in there at all:
         // it depends on nothing here, and simulation replaces it anyway.
-        let keys: Vec<Pubkey> = plan.pools.iter().map(|(k, _)| to_pubkey(k)).collect();
+        // Everything the chain has to answer before this trade can be built, asked at
+        // once wherever the questions do not actually depend on each other.
+        //
+        // This used to be four serial round trips: pools, then tick arrays, then the
+        // wallet balance, then the simulation. A round trip to the configured Helius
+        // endpoint measures 98 ms from this machine — 296 ms to the public fallback —
+        // so that is about 390 ms, one whole Solana slot, between reading a price and
+        // asking the chain to honour it. The edge being chased is one to two basis
+        // points and the price moves a real fraction of that inside a slot, which is
+        // what the refusals kept saying: floors missed by roughly a basis point.
+        //
+        // Only one of those dependencies is real. The balance depends on nothing, so it
+        // is read here. The tick arrays depend on the pool's current tick, but only to
+        // the precision of an array — hundreds of basis points wide — so they are
+        // *predicted* from the last tick each pool was seen at and checked against the
+        // fresh one below. Two round trips remain: this, and the simulation.
+        let base_mint = to_pubkey(&plan.mints[0]);
+        let wsol = pk(programs::WSOL_MINT);
+        let wrapping = self.opts.wsol == WsolPolicy::WrapAndClose && base_mint == wsol;
+        // The account this route's profit will be read from, whichever kind it is. The
+        // owner's lamports and a token account's data come back from the same call, and
+        // at the same commitment `balance()` used, so nothing about the wrap-shortfall
+        // check below has changed except when it is asked.
+        let profit_key =
+            if wrapping { self.owner } else { associated_token_address(&self.owner, &base_mint, &token_program) };
+
+        let n = plan.pools.len();
+        let mut keys: Vec<Pubkey> = plan.pools.iter().map(|(k, _)| to_pubkey(k)).collect();
+        keys.push(profit_key);
+
+        // Where each hop's predicted tick-array candidates sit in `keys`. `None` for a
+        // pool this trader has not decoded before, which falls back to asking.
+        let mut predicted: Vec<Prefetched> = Vec::with_capacity(n);
+        for (i, (pool_raw, dex)) in plan.pools.iter().enumerate() {
+            let Some(hint) = self.ticks_seen.get(pool_raw) else {
+                predicted.push(None);
+                continue;
+            };
+            let cands = ticks::prefetch_candidates(
+                *dex,
+                &to_pubkey(pool_raw),
+                &program_for(*dex),
+                hint.tick,
+                hint.spacing,
+                plan.mints[i] == hint.mint_a,
+            );
+            let at = keys.len();
+            keys.extend(cands.iter().map(|(_, k)| *k));
+            predicted.push(Some((at, cands)));
+        }
+
         let (fetched, (blockhash, _)) =
             tokio::try_join!(rpc.accounts_full(&keys), rpc.latest_blockhash())?;
-        let mut pool_data = Vec::with_capacity(keys.len());
-        for (i, acc) in fetched.into_iter().enumerate() {
-            let Some(a) = acc else {
-                return Ok(Attempt::Refused(format!("pool {} vanished between sweep and build", keys[i])));
+        let mut pool_data = Vec::with_capacity(n);
+        for (key, acc) in keys.iter().zip(fetched.iter()).take(n) {
+            let Some(a) = acc.as_ref() else {
+                return Ok(Attempt::Refused(format!("pool {key} vanished between sweep and build")));
             };
-            pool_data.push(a.data);
+            pool_data.push(a.data.clone());
         }
+        let profit_account = fetched.get(n).and_then(Option::as_ref);
 
         // Which tick arrays actually exist, in the direction each hop will move the
         // price. Measured per attempt rather than cached: an array is created the
@@ -402,32 +497,80 @@ impl Trader {
         // each needs only its own pool's current tick — so doing them in sequence spent
         // one full round trip per hop widening the very gap that then made the floors
         // unreachable.
-        let mut pending = Vec::with_capacity(plan.pools.len());
+        let mut arrays: Vec<Option<[Pubkey; 3]>> = vec![None; n];
+        let mut pending = Vec::new();
+        let mut learned: Vec<(Pubkey32, TickHint)> = Vec::with_capacity(n);
         for (i, (pool_raw, dex)) in plan.pools.iter().enumerate() {
             let pool = to_pubkey(pool_raw);
-            let program = match dex {
-                Dex::OrcaWhirlpool => pk(cb_dex::orca_whirlpool::PROGRAM_ID),
-                _ => pk(cb_dex::raydium_clmm::PROGRAM_ID),
-            };
+            let program = program_for(*dex);
             let (tick, spacing) = tick_and_spacing(*dex, &pool_data[i])?;
             let falling = input_is_token_a(*dex, &pool_data[i], &plan.mints[i])?;
-            pending.push(async move {
-                let chosen =
-                    ticks::resolve(rpc, *dex, &pool, &program, tick, spacing, falling).await?;
-                anyhow::Ok((pool, chosen))
-            });
-        }
-        let resolved = futures::future::try_join_all(pending).await?;
+            // Whatever happens below, next time this pool comes round we can predict.
+            learned.push((
+                *pool_raw,
+                TickHint { tick, spacing, mint_a: mint_a_of(*dex, &pool_data[i])? },
+            ));
 
-        let mut arrays = Vec::with_capacity(plan.pools.len());
-        for (pool, chosen) in resolved {
-            if chosen.found == 0 {
-                return Ok(Attempt::Refused(format!(
-                    "pool {pool} has no initialised tick arrays to swap through"
-                )));
+            // The window the *fresh* tick actually asks for.
+            let real = ticks::candidates(*dex, &pool, &program, tick, spacing, falling);
+            let from_prefetch = predicted[i].as_ref().and_then(|(at, cands)| {
+                let known: HashMap<Pubkey, bool> = cands
+                    .iter()
+                    .enumerate()
+                    .map(|(j, (_, key))| {
+                        let live = fetched
+                            .get(at + j)
+                            .and_then(Option::as_ref)
+                            .is_some_and(|a| a.owner == program);
+                        (*key, live)
+                    })
+                    .collect();
+                // Every address the real window names has to be one we already asked
+                // about. Missing even one means we do not know whether it exists, and
+                // guessing is how a swap gets handed an array that is not there.
+                if !real.iter().all(|(_, key)| known.contains_key(key)) {
+                    return None;
+                }
+                let live: Vec<(i32, Pubkey)> =
+                    real.iter().copied().filter(|(_, key)| known[key]).collect();
+                ticks::choose(&real, &live)
+            });
+
+            match from_prefetch {
+                Some(chosen) if chosen.found > 0 => arrays[i] = Some(chosen.arrays),
+                Some(_) => {
+                    return Ok(Attempt::Refused(format!(
+                        "pool {pool} has no initialised tick arrays to swap through"
+                    )))
+                }
+                None => pending.push((i, pool, program, tick, spacing, falling)),
             }
-            arrays.push(chosen.arrays);
         }
+        for (pool_raw, hint) in learned {
+            self.ticks_seen.insert(pool_raw, hint);
+        }
+
+        // Only the hops the prediction could not answer, and only on the first attempt
+        // against a pool or after a tick has walked clean out of the prefetched window.
+        if !pending.is_empty() {
+            let asked = pending.iter().map(|&(i, pool, program, tick, spacing, falling)| {
+                let dex = plan.pools[i].1;
+                async move {
+                    let chosen =
+                        ticks::resolve(rpc, dex, &pool, &program, tick, spacing, falling).await?;
+                    anyhow::Ok((i, pool, chosen))
+                }
+            });
+            for (i, pool, chosen) in futures::future::try_join_all(asked).await? {
+                if chosen.found == 0 {
+                    return Ok(Attempt::Refused(format!(
+                        "pool {pool} has no initialised tick arrays to swap through"
+                    )));
+                }
+                arrays[i] = Some(chosen.arrays);
+            }
+        }
+        let arrays: Vec<[Pubkey; 3]> = arrays.into_iter().flatten().collect();
 
         let hops = match self.hops_for(plan, &pool_data, &arrays) {
             Ok(h) => h,
@@ -438,12 +581,11 @@ impl Trader {
         // actually report it. Reading a token account for a route that ends by closing
         // that account would measure the wrong thing entirely — and would do it
         // quietly, since both are just numbers.
-        let base_mint = to_pubkey(&plan.mints[0]);
-        let wsol = pk(programs::WSOL_MINT);
-        let wrapping = self.opts.wsol == WsolPolicy::WrapAndClose && base_mint == wsol;
-
+        //
+        // Fetched above, beside the pools, rather than in a round trip of its own: it
+        // depends on nothing this function has learned.
         let pre_balance = if wrapping {
-            let bal = rpc.balance(&self.owner).await?;
+            let bal = profit_account.map_or(0, |a| a.lamports);
 
             // Reserve rent for every distinct mint this cycle touches, plus fee
             // headroom, before trusting the plan's amount_in as affordable.
@@ -473,12 +615,7 @@ impl Trader {
             }
             bal
         } else {
-            let base_ata = associated_token_address(&self.owner, &base_mint, &token_program);
-            rpc.accounts_full(&[base_ata])
-                .await?
-                .into_iter()
-                .next()
-                .flatten()
+            profit_account
                 .and_then(|a| a.data.get(64..72).and_then(|b| b.try_into().ok()))
                 .map(u64::from_le_bytes)
                 .unwrap_or(0)
@@ -675,6 +812,7 @@ mod tests {
             exec: unreachable_executor(),
             opts: TradeOptions { slippage_tenth_bps: 300, ..Default::default() },
             owner: Pubkey::new_unique(),
+            ticks_seen: HashMap::new(),
         };
         let p = plan(3);
         let data = pools_for(&p);
@@ -701,6 +839,7 @@ mod tests {
             exec: unreachable_executor(),
             opts: TradeOptions::default(),
             owner: Pubkey::new_unique(),
+            ticks_seen: HashMap::new(),
         };
         let data = pools_for(&plan(3));
         let arrays = vec![[Pubkey::new_unique(); 3]; 3];
@@ -725,6 +864,7 @@ mod tests {
             exec: unreachable_executor(),
             opts: TradeOptions { slippage_tenth_bps: 100_000, ..Default::default() },
             owner: Pubkey::new_unique(),
+            ticks_seen: HashMap::new(),
         };
         let data = pools_for(&plan(2));
         let arrays = vec![[Pubkey::new_unique(); 3]; 2];
@@ -1005,6 +1145,7 @@ mod mainnet {
             exec: super::tests::unreachable_executor(),
             opts: TradeOptions { slippage_tenth_bps: 300, ..Default::default() },
             owner,
+            ticks_seen: HashMap::new(),
         };
         let hops = t.hops_for(&plan, &pool_data, &arrays).expect("hops");
 
@@ -1104,6 +1245,7 @@ mod fresh_quote_tests {
             exec: unreachable_executor(),
             opts: TradeOptions { slippage_tenth_bps: 0, ..Default::default() },
             owner: Pubkey::new_unique(),
+            ticks_seen: HashMap::new(),
         };
 
         let mut p = tests::plan(2);
@@ -1136,6 +1278,7 @@ mod fresh_quote_tests {
             exec: unreachable_executor(),
             opts: TradeOptions { slippage_tenth_bps: 100, ..Default::default() },
             owner: Pubkey::new_unique(),
+            ticks_seen: HashMap::new(),
         };
         let p = tests::plan(3);
         let hops = t
