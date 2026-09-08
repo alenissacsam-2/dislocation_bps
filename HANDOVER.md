@@ -560,7 +560,55 @@ median $0.00148 against a $0.00051 fee, spread across all 15 hours, entirely on
 23% survival rate the cheap band actually measured, that is a few cents a day on $9.20 —
 which is the first time this instrument has had a number that is small rather than fake.
 
-The pattern in all ten: **an internal check cannot catch an error in what the code
+### 4.11 — The capital ladder is flat because the quote stops at one tick — **found 2026-09-08, open**
+
+With the floor, tip, cooldown and fee ceiling fixed, 230 moments over 19.1 hours clear
+every gate — 12.0 an hour. Their capital ladder:
+
+| book | gross/day | net of the 5,000-lamport fee | median per trade |
+|---|---|---|---|
+| $9.20 (today) | $0.584 | $0.436 | $0.00128 |
+| $100 | $0.935 | $0.787 | $0.00137 |
+| $1,000 | $0.935 | $0.787 | $0.00137 |
+| $10,000 | $0.935 | $0.787 | $0.00137 |
+
+**Identical from $100 up.** Every rung above $100 is capped by the same thing, and the
+optimal sizes say what it is: median $8, p75 $18, **max $26** across all 230.
+
+It is not the market. [`clmm::capacity_for_input`] refuses to quote past the current
+tick interval, by design — past a boundary the pool's liquidity changes and the
+constant-product equivalence this crate prices with breaks, so the quote is refused
+rather than extrapolated. On the pools that matter that bound is brutal:
+
+| pool | spacing | price band the model will quote inside | max in |
+|---|---|---|---|
+| RAY-CL 1bp WSOL/USDC | 1 | **0.01 bps** | **$0.16** USDC / $4.19 SOL |
+| RAY-CL 2bp WSOL/USDC | 1 | 0.01 bps | $18.08 USDC / $21.67 SOL |
+| ORCA 4bp SOL/USDC | 4 | 0.04 bps | $22,101 USDC / $31,759 SOL |
+
+The cheapest pools — the only ones whose round trips ever survive re-pricing — are
+tick-spacing 1, so the model quotes them inside a hundredth of a basis point. The
+Raydium 1 bp pool holds $498k of TVL and this instrument will not price more than
+sixteen cents through it.
+
+So the honest ceiling today is **$0.44/day net at $9.20, rising to $0.79 with unlimited
+capital and stopping there** — and roughly a quarter of that after the fill rate. More
+money does not help. What would is pricing across tick boundaries, which means reading
+the tick arrays at *detection* rather than only at execution, and walking the swap the
+way the programs do.
+
+That is a real piece of work and it is the one lever left with an order of magnitude in
+it. It is also exactly the kind of change this file exists to warn about: it makes the
+quote *more optimistic*, and every previous defect in §4 came from a number that was
+optimistic in a way nothing internal could catch. If it is built, it must be pinned
+against an outside quote — a router, or a simulation at the same size — before a single
+trade is sized from it. See §4.3.
+
+One caution against expecting too much from it: a 1.5 bp dislocation that sits open for
+seconds is sitting there *because* it is too small to be worth taking. Relaxing the
+depth bound may find that the edge shrinks with size faster than the size grows.
+
+The pattern in all eleven: **an internal check cannot catch an error in what the code
 believes about the outside world** — including what it believes its own numbers mean.
 Every new decoder must be pinned against a value the decoder itself did not produce,
 every headline must name which search produced it, and every threshold must be stated in
