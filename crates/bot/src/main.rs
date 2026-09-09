@@ -72,15 +72,38 @@ const PAYS_A_TIP: bool = false;
 /// How far apart, in slots, a cycle's two legs may have been priced and still be worth
 /// trading.
 ///
-/// One slot of tolerance, not zero: the two legs can straddle a slot boundary for
-/// reasons that have nothing to do with the market, and requiring a single shared slot
-/// would throw away real simultaneous cycles to no purpose.
-///
 /// This bounds the *artifact*, not the risk. An edge computed from two prices observed
 /// seconds apart is partly the market moving between the observations, and that part was
 /// never simultaneously on offer to anyone. `--report` has argued this since the
 /// artifact was found; until now nothing stopped execution acting on it.
-const MAX_EXECUTABLE_SLOT_SPREAD: u64 = 1;
+///
+/// # Why this is twelve and not one
+///
+/// It was one, which is as strict as the measure can be, and at one it became the
+/// largest single filter on candidates worth having: over thirty-nine minutes of live
+/// running, **109 of the ~151 cycles that cleared the economics gate died here** while
+/// only two ever reached the chain.
+///
+/// What it was rejecting was mostly not an artifact. The biggest buckets were spreads
+/// of eight and nine slots between two Raydium CLMM pools, and `reconcile` — which
+/// re-reads every watched account over HTTP and compares — was reporting one to three
+/// pools drifted out of seventy-nine, often none at all. The prices were right. This
+/// module's own note on reconciliation says why: *no update means no change*, so an old
+/// slot on a pool nobody has swapped is a correct price rather than a stale one, and
+/// nothing in a slot number tells those two apart.
+///
+/// The honest test is not the slot at all. It is whether the edge survives being
+/// re-priced against both pools fetched in the same round trip, which `hops_for` does
+/// on every attempt, and which costs a round trip and no money when it fails. This is
+/// now a cheap pre-filter in front of that: it keeps the sweep's one attempt away from
+/// the far bands, where the artifact really does dominate — the run that found it
+/// measured 1.27 bps of mean edge at 0-1 slots against 3.42 at 21+ — and lets the
+/// re-price adjudicate everything nearer.
+///
+/// Twelve slots is about five seconds. Revisit it with the data it is about to produce:
+/// there is none above one slot yet, because the ceiling of one is what stopped it
+/// being collected.
+const MAX_EXECUTABLE_SLOT_SPREAD: u64 = 12;
 
 /// Whether a cycle's legs were priced too far apart in time to be worth trading.
 #[must_use]
@@ -2238,11 +2261,29 @@ mod slot_spread_gate_tests {
     /// This fails if the ceiling is ever loosened back over those bands.
     #[test]
     fn the_bands_that_measured_as_artifact_are_excluded() {
-        for spread in [2u64, 6, 13, 17, 21, 27, 100] {
+        for spread in [13u64, 17, 21, 27, 100, 465] {
             assert!(
                 too_skewed_to_trade(spread),
                 "{spread} slots of skew is inside the ceiling — that band measured as \
                  the clock, not as an edge"
+            );
+        }
+    }
+
+    /// The near bands are let through to be adjudicated by re-pricing, not by the clock.
+    ///
+    /// A ceiling of one slot rejected 109 of the ~151 candidates that cleared the
+    /// economics gate in a thirty-nine-minute run, while two reached the chain. Most of
+    /// what it rejected was two Raydium CLMM pools eight or nine slots apart, at a time
+    /// when `reconcile` was finding one to three pools of seventy-nine drifted and often
+    /// none — so the prices were right and the gap was a pool nobody had swapped.
+    #[test]
+    fn a_quiet_pool_is_no_longer_mistaken_for_a_stale_one() {
+        for spread in [0u64, 1, 4, 5, 8, 9, 12] {
+            assert!(
+                !too_skewed_to_trade(spread),
+                "{spread} slots is inside the window the fresh re-price should judge, \
+                 not the clock"
             );
         }
     }
