@@ -209,9 +209,20 @@ function onPool(e) {
 }
 
 /* The pair quoted by the most venues, because that is where a two-hop round trip
- * exists at all and therefore where divergence means something. */
+ * exists at all and therefore where divergence means something.
+ *
+ * Re-evaluated on every sample, not once. This used to run only while `divPair` was
+ * unset, so the first pair that happened to reach two pools won permanently — decided
+ * on the second price event of the session, when `S.pairs` holds two entries and the
+ * counts mean nothing. A live run sat on SOL/RAY and its two Raydium pools for the
+ * whole session while WSOL/USDC, quoted by ten, was never considered.
+ *
+ * The starting count is the incumbent's own, so a switch needs strictly more venues
+ * than the pair already shown. That is the hysteresis: ties do not flap, and the chart
+ * stops clearing itself once the book is populated. */
 function pickPair() {
-  let best = null, n = 0;
+  let best = S.divPair;
+  let n = S.divPair ? (S.pairs.get(S.divPair)?.size ?? 0) : 0;
   for (const [pair, set] of S.pairs) if (set.size > n) { n = set.size; best = pair; }
   if (best && best !== S.divPair && n >= 2) { S.divPair = best; S.div.clear(); }
 }
@@ -221,7 +232,8 @@ function pickPair() {
  * compare venues at different instants and manufacture divergence that is really just
  * staleness. */
 function sampleDivergence() {
-  if (!S.divPair) { pickPair(); return; }
+  pickPair();
+  if (!S.divPair) return;
   const addrs = [...(S.pairs.get(S.divPair) || [])].filter((a) => S.pools.has(a));
   if (addrs.length < 2) return;
   const prices = addrs.map((a) => S.pools.get(a).price).filter((p) => p > 0);
