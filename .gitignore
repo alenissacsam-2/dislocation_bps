@@ -58,3 +58,8 @@ cb-bot.log
 
 # Sidecar staged by scripts/installer.ps1 — build output, not source.
 crates/desk/binaries/
+
+# An Apple configuration profile carrying an inference-gateway API key. Personal,
+# unrelated to this project, and swept in once by a `git add -A`. Never push it.
+Claude.mobileconfig
+*.mobileconfig
