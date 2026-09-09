@@ -176,6 +176,13 @@ const PRICE_MOVED_COOLDOWN: Duration = Duration::from_millis(400);
 /// How long a cycle refused for a reason *the market cannot change* is left alone —
 /// a size that will not fit the wallet refuses identically until the wallet moves.
 const STRUCTURAL_COOLDOWN: Duration = Duration::from_secs(20);
+/// How long an *entry mint* the wallet cannot fund is left alone.
+///
+/// Keyed on the mint rather than the cycle, because that is what the fact is about.
+/// The wallet holds SOL and a few thousand base units of USDC; a cycle entered at USDC
+/// is unfundable no matter which loop it belongs to, and it stays unfundable until a
+/// balance moves rather than until a price does.
+const UNFUNDABLE_ENTRY_WINDOW: Duration = Duration::from_secs(20);
 /// How often the same refusal may reach the log, tracked separately from how often it
 /// may be retried. Retrying a cycle four times a second is correct; saying so four
 /// times a second is not.
@@ -290,17 +297,33 @@ fn refusal_cooldown_for(reason: &str) -> Option<Duration> {
     if reason.starts_with("trading is halted") {
         return None;
     }
+    // Not a fact about the loop, so it earns the loop no hold at all — see
+    // `refused_for_entry_mint`, which holds the *mint* instead.
+    if refused_for_entry_mint(reason) {
+        return None;
+    }
     // Structural: true until the wallet or the limits change, not until the price does.
-    //
-    // "of a mint the wallet holds" belongs here and would otherwise be retried every
-    // four hundred milliseconds forever. A balance in the wrong token does not become
-    // the right one because the price moved, and the same loop entered from SOL is
-    // sitting in the very same sweep waiting for the attempt this one keeps taking.
     let structural = reason.contains("would leave less than")
-        || reason.contains("of a mint the wallet holds")
         || reason.contains("exceeds")
         || reason.contains("has no encoder");
     Some(if structural { STRUCTURAL_COOLDOWN } else { PRICE_MOVED_COOLDOWN })
+}
+
+/// Whether a refusal was about *which end of the loop was entered* rather than about
+/// the loop.
+///
+/// This distinction is worth a function because `cycle_key` is deliberately invariant
+/// to the entry point: one round trip appears in a sweep twice, once per direction,
+/// under a single key. Holding that key because the USDC-entered rotation could not be
+/// funded also holds the SOL-entered rotation, which could — so the one refusal that
+/// names its own remedy ("the same loop entered from SOL can be funded") was silencing
+/// the remedy for twenty seconds.
+///
+/// Measured over one 1h53m live run: 10 of 56 attempts were refused here. Each also
+/// spent that sweep's single attempt and put its fundable twin on a structural hold.
+#[must_use]
+fn refused_for_entry_mint(reason: &str) -> bool {
+    reason.contains("of a mint the wallet holds")
 }
 
 /// A cycle held off until its own deadline should be skipped rather than re-attempted.
@@ -390,14 +413,15 @@ mod refusal_cooldown_tests {
             Some(STRUCTURAL_COOLDOWN)
         );
         // A balance in the wrong token does not become the right one because the price
-        // moved, and every retry takes the sweep's one attempt away from the same loop
-        // entered from a mint the wallet actually holds.
+        // moved — but the hold belongs on the *mint*, not on the loop, because the loop
+        // is also on offer entered from SOL and shares this one's key.
         assert_eq!(
             refusal_cooldown_for(
                 "this cycle starts by spending 9200000 of a mint the wallet holds 7904 of \
                  — the same loop entered from SOL can be funded, this one cannot"
             ),
-            Some(STRUCTURAL_COOLDOWN)
+            None,
+            "holding the cycle key here also holds the rotation that can be funded"
         );
         // But an edge that cannot cover the fee is a fact about the price, and the
         // price is the thing most likely to have changed by the next sweep.
@@ -410,6 +434,25 @@ mod refusal_cooldown_tests {
             Some(PRICE_MOVED_COOLDOWN)
         );
         assert!(PRICE_MOVED_COOLDOWN < STRUCTURAL_COOLDOWN);
+    }
+
+    /// The entry-mint refusal is recognised on the wording the executor actually
+    /// emits, and nothing else is mistaken for it — in particular the *other* balance
+    /// refusal, which is about SOL and is genuinely structural for the whole loop.
+    #[test]
+    fn only_the_entry_mint_refusal_is_treated_as_an_entry_mint_refusal() {
+        assert!(refused_for_entry_mint(
+            "this cycle starts by spending 9540740 of a mint the wallet holds 0 of — the \
+             same loop entered from SOL can be funded, this one cannot"
+        ));
+        assert!(!refused_for_entry_mint(
+            "wrapping 128808539 lamports would leave less than the 4178560 lamports this \
+             transaction needs for account rent and fees"
+        ));
+        assert!(!refused_for_entry_mint(
+            "this route spends 17770165 and guarantees only 17764611 back — signing it \
+             would authorise a loss"
+        ));
     }
 
     /// A halt is one fact about the gate, not about any cycle. Holding cycles for it
@@ -900,6 +943,14 @@ async fn spawn_live(
         > = std::collections::HashMap::new();
         let mut recent_logged: std::collections::HashMap<String, std::time::Instant> =
             std::collections::HashMap::new();
+        // Mints the wallet has just been shown it cannot start a trade in. Held here
+        // rather than in `recent_refusals` because the fact is about the mint: the
+        // cycle key it arrived under covers the rotation that *can* be funded too.
+        // See `refused_for_entry_mint` and `UNFUNDABLE_ENTRY_WINDOW`.
+        let mut unfundable_entries: std::collections::HashMap<
+            cb_core::types::Pubkey32,
+            std::time::Instant,
+        > = std::collections::HashMap::new();
         // The gate being halted, separately throttled from the per-cycle map above: it is
         // one fact about the whole run, not one fact per cycle, so it gets one shared
         // timestamp rather than a fresh cooldown entry for every distinct cycle that
@@ -1075,6 +1126,7 @@ async fn spawn_live(
                     // history, not state.
                     recent_refusals.retain(|_, (at, window)| at.elapsed() < *window * 5);
                     recent_logged.retain(|_, at| at.elapsed() < LOG_COOLDOWN * 5);
+                    unfundable_entries.retain(|_, at| at.elapsed() < UNFUNDABLE_ENTRY_WINDOW);
                     for opp in sweep.opportunities {
                         let id = next_id;
                         next_id += 1;
@@ -1181,10 +1233,24 @@ async fn spawn_live(
                                     let blocked_by = opp.plan.as_ref().and_then(
                                         execute::CyclePlan::blocking_venue,
                                     );
+                                    // A mint the wallet was just shown it cannot start a
+                                    // trade in. Cheap here, and the alternative is two
+                                    // RPC round trips to be told the same thing by the
+                                    // balance the executor fetches.
+                                    let unfundable_entry = opp
+                                        .plan
+                                        .as_ref()
+                                        .and_then(|pl| pl.mints.first())
+                                        .is_some_and(|m| {
+                                            unfundable_entries.get(m).is_some_and(|at| {
+                                                at.elapsed() < UNFUNDABLE_ENTRY_WINDOW
+                                            })
+                                        });
                                     let candidate = if attempted_this_sweep
                                         || on_cooldown
                                         || too_skewed
                                         || too_expensive
+                                        || unfundable_entry
                                     {
                                         None
                                     } else {
@@ -1214,6 +1280,11 @@ async fn spawn_live(
                                                      arbitrages, not one we can",
                                                     opp.fee_bps
                                                 )
+                                            } else if unfundable_entry {
+                                                "not attempted — the wallet cannot start a \
+                                                 trade in this cycle's entry mint; the same \
+                                                 loop entered from SOL is not held by this"
+                                                    .to_string()
                                             } else if let Some(dex) = blocked_by {
                                                 // Its own message. Pooled with the
                                                 // sweep budget these were unreadable,
@@ -1366,6 +1437,23 @@ async fn spawn_live(
                                                     }
                                                     outcome_reason =
                                                         Some(format!("refused: {why}"));
+                                                    // Nothing was signed and nothing was sent:
+                                                    // the executor read a balance and stopped.
+                                                    // Charging the sweep's single attempt for
+                                                    // that hands the slot to nobody, when the
+                                                    // rotation of this very loop that *can* be
+                                                    // funded is further down the same list.
+                                                    // The mint is held instead, so the round
+                                                    // trip is not repeated either.
+                                                    if refused_for_entry_mint(&why) {
+                                                        if let Some(m) = plan.mints.first() {
+                                                            unfundable_entries.insert(
+                                                                *m,
+                                                                std::time::Instant::now(),
+                                                            );
+                                                        }
+                                                        attempted_this_sweep = false;
+                                                    }
                                                     // A halt earns no per-cycle hold: it is one
                                                     // fact about the gate, and holding every
                                                     // cycle seen during it would leave them all
