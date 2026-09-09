@@ -371,14 +371,29 @@ impl Rpc {
             // the same node, so paying for another costs a round trip in a race that is
             // decided in milliseconds.
             "skipPreflight": skip_preflight,
-            "maxRetries": 0,
+            // Rebroadcast of the *same signed bytes* by the *same* node, which is a
+            // different thing from the endpoint failover refused below. A signature can
+            // execute at most once — the chain's status cache rejects a duplicate for as
+            // long as the blockhash is valid — so re-sending identical bytes cannot
+            // produce a second trade, only a second chance at the first one.
+            //
+            // Zero was costing the whole exercise. The first transaction this bot ever
+            // submitted came back with a signature and never appeared on chain: accepted
+            // for forwarding, handed to one leader, dropped, and with no retry that was
+            // the end of it. `sendTransaction` returning a signature means the node took
+            // the bytes, not that anybody included them.
+            "maxRetries": 3,
             "preflightCommitment": "confirmed",
         });
-        // Deliberately NOT `call`: no failover, and no retry, on this one call. Which
-        // endpoint carries it still rotates — `next_start` advances the same shared
-        // counter reads use, so sends spread across the configured providers over time
-        // exactly as reads do — but once chosen, that single endpoint gets exactly one
-        // attempt.
+        // Deliberately NOT `call`: no failover on this one call. Which endpoint carries
+        // it still rotates — `next_start` advances the same shared counter reads use, so
+        // sends spread across the configured providers over time exactly as reads do —
+        // but once chosen, that single endpoint gets the whole job.
+        //
+        // This is not in tension with `maxRetries` above. That is one node rebroadcasting
+        // one signature; this is about never handing the same trade to a *second* node,
+        // which is the case where a timeout on the first leaves us unable to say whether
+        // anything was received.
         //
         // A transaction that times out may still have been received. Sending it again
         // to a second endpoint is how the same trade gets submitted twice, and the

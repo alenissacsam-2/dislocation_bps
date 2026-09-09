@@ -248,6 +248,24 @@ const MAX_HAIRCUT_TENTH_BPS: u32 = 60;
 /// for nothing.
 pub const BASE_FEE_LAMPORTS: u128 = 5_000;
 
+/// What the priority bid will cost, in lamports.
+///
+/// Solana charges the bid against the compute limit the transaction *requests*, not the
+/// units it goes on to consume, so this is knowable before the trade is built — and a
+/// generous limit is not free, it is a proportionally larger bid.
+///
+/// It has to be in the headroom for the same reason the base fee is. A route is allowed
+/// to build only when what its last hop guarantees exceeds what its first hop spends by
+/// more than the transaction costs; leaving the bid out of that sum would authorise
+/// trades whose guaranteed gain is smaller than the fee collected for delivering it.
+#[must_use]
+pub fn priority_fee_lamports(micro_lamports_per_cu: u64, compute_units: u32) -> u128 {
+    let total = u128::from(micro_lamports_per_cu) * u128::from(compute_units);
+    // Rounded up: the chain does not discount the fraction, and rounding a cost down is
+    // the direction that overstates what a trade can afford.
+    total.div_ceil(1_000_000)
+}
+
 /// Where one hop's predicted tick-array candidates sit inside the batched fetch: the
 /// offset of the first one, and the addresses asked for, in sweep order. `None` when
 /// this pool has never been decoded here and there was nothing to predict from.
@@ -770,7 +788,17 @@ impl Trader {
         // the bare fee, with a cushion for the price moving between the re-price and
         // the simulation instead of none at all. Raising it further buys nothing that
         // exists to be bought.
-        let fee_headroom = if wrapping { BASE_FEE_LAMPORTS * 5 / 4 } else { 0 };
+        //
+        // The priority bid joins it for the same reason, and it is not optional in this
+        // market: `getRecentPrioritizationFees` over 150 slots on the very pools traded
+        // here charged something in 104 of them, median 2,418 micro-lamports per compute
+        // unit. This bot bid zero, and its first ever submission —
+        // `5tQg161Zf4dGFc3s...`, 15:07:16 UTC — came back with a signature and was never
+        // included. A transaction nobody has a reason to pick up is not cheap, it is
+        // free and worthless.
+        let priority =
+            priority_fee_lamports(self.opts.priority_micro_lamports, self.opts.compute_units);
+        let fee_headroom = if wrapping { (BASE_FEE_LAMPORTS + priority) * 5 / 4 } else { 0 };
         let (hops, spent) = match self.hops_for(plan, &pool_data, &arrays, fee_headroom) {
             Ok(h) => h,
             Err(e) => return Ok(Attempt::Refused(e.to_string())),
@@ -1158,6 +1186,35 @@ fn input_is_token_a(dex: Dex, data: &[u8], mint: &Pubkey32) -> Result<bool> {
 mod tests {
     use super::*;
     use cb_executor::rpc::Rpc;
+
+    /// The bid is charged on the limit requested, so the arithmetic has to be the
+    /// chain's and not an approximation of it — and it must round *up*, because a cost
+    /// rounded down is a route allowed to build on money it does not have.
+    #[test]
+    fn the_priority_bid_is_priced_on_the_limit_requested_and_never_rounded_down() {
+        // Bidding nothing costs nothing: the state this bot shipped in, and the reason
+        // its first submission was never included.
+        assert_eq!(priority_fee_lamports(0, 400_000), 0);
+        // The measured median on the pools traded here, at the configured limit.
+        assert_eq!(priority_fee_lamports(2_500, 400_000), 1_000);
+        // A generous compute limit is a proportionally larger bid, not a free one.
+        assert_eq!(priority_fee_lamports(2_500, 800_000), 2_000);
+        // Anything with a fraction goes up, never down.
+        assert_eq!(priority_fee_lamports(1, 1), 1, "a fraction of a lamport still costs one");
+        assert_eq!(priority_fee_lamports(1, 1_000_000), 1);
+        assert_eq!(priority_fee_lamports(1, 1_000_001), 2);
+    }
+
+    /// The headroom a route has to clear is the *whole* cost of collecting the gain.
+    /// Leaving the bid out of it is how a trade lands and still loses money.
+    #[test]
+    fn the_headroom_grows_by_exactly_what_the_bid_adds() {
+        let bare = (BASE_FEE_LAMPORTS + priority_fee_lamports(0, 400_000)) * 5 / 4;
+        let bid = (BASE_FEE_LAMPORTS + priority_fee_lamports(2_500, 400_000)) * 5 / 4;
+        assert_eq!(bare, 6_250, "the fee alone, a quarter over");
+        assert_eq!(bid, 7_500, "the fee plus a 1,000-lamport bid, a quarter over");
+        assert!(bid > bare, "bidding for inclusion cannot make a route cheaper to justify");
+    }
 
     /// Mint `i` of a cycle. Distinct per hop, and the last equals the first so the
     /// cycle closes the way `route::build` insists on.
