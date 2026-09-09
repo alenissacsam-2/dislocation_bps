@@ -985,28 +985,79 @@ impl Trader {
             ixs.push(tx::create_ata_idempotent(&self.owner, ata, &self.owner, mint, &token_program));
         }
 
-        let (blockhash, _) = self.exec.rpc.latest_blockhash().await?;
-        let assembled = tx::assemble(&self.exec.wallet, &ixs, blockhash)?;
+        // Sent until it actually lands, unlike a trade.
+        //
+        // `Rpc::send` sets `maxRetries: 0` and never rebroadcasts, deliberately: a
+        // stale arbitrage is worthless and re-sending one is worse than dropping it.
+        // This is the opposite case. There is no race, nothing here goes stale but the
+        // blockhash, and the transaction only has to arrive.
+        //
+        // Reusing the fire-and-forget path cost a whole run. The first send returned a
+        // signature, the account was reported open, and the transaction was never
+        // included — `getSignatureStatuses` with full history search had never heard of
+        // it, and the wallet's newest transaction was still nine days old. Every
+        // SOL↔USDT cycle stayed blocked behind a wall the log said had come down. A
+        // signature is a receipt for having asked.
+        //
+        // So: re-sign against a fresh blockhash each round, and believe nothing until
+        // the chain confirms it.
+        const ROUNDS: u32 = 4;
+        let mut last_signature = None;
+        for round in 1..=ROUNDS {
+            let (blockhash, _) = self.exec.rpc.latest_blockhash().await?;
+            let assembled = tx::assemble(&self.exec.wallet, &ixs, blockhash)?;
 
-        let sim = self.exec.rpc.simulate(&assembled.tx_base64, &[]).await?;
-        if !sim.succeeded() {
-            let ctx = sim.error_context().unwrap_or_default();
-            anyhow::bail!(
-                "opening the token accounts did not simulate cleanly, so nothing was sent: {} {ctx}",
-                sim.err.unwrap_or_else(|| "unknown".into())
-            );
-        }
-        if self.opts.dry_run {
-            tracing::info!("dry run — the token accounts simulated cleanly and were not opened");
-            return Ok(None);
-        }
+            let sim = self.exec.rpc.simulate(&assembled.tx_base64, &[]).await?;
+            if !sim.succeeded() {
+                let ctx = sim.error_context().unwrap_or_default();
+                anyhow::bail!(
+                    "opening the token accounts did not simulate cleanly, so nothing was \
+                     sent: {} {ctx}",
+                    sim.err.unwrap_or_else(|| "unknown".into())
+                );
+            }
+            if self.opts.dry_run {
+                tracing::info!(
+                    "dry run — the token accounts simulated cleanly and were not opened"
+                );
+                return Ok(None);
+            }
 
-        let signature = self.exec.rpc.send(&assembled.tx_base64, true).await?;
-        tracing::warn!("opened {} token account(s): {signature}", missing.len());
-        Ok(Some(signature))
+            let signature = self.exec.rpc.send(&assembled.tx_base64, true).await?;
+            last_signature = Some(signature.clone());
+            // Fifteen tries at two seconds is thirty seconds of patience, which is
+            // generous for inclusion and costs nothing: this runs once, at startup,
+            // before any sweep is waiting on it.
+            match self.confirm(&signature, 15).await {
+                Some(true) => {
+                    tracing::warn!(
+                        "opened {} token account(s), confirmed on chain: {signature}",
+                        missing.len()
+                    );
+                    return Ok(Some(signature));
+                }
+                Some(false) => anyhow::bail!(
+                    "the transaction opening the token accounts reverted on chain: {signature}"
+                ),
+                None if round < ROUNDS => tracing::warn!(
+                    "{signature} has not been included; re-sending against a fresh blockhash \
+                     ({round} of {ROUNDS})"
+                ),
+                None => {}
+            }
+        }
+        anyhow::bail!(
+            "sent the token-account transaction {ROUNDS} times and none was included; the last \
+             was {}. Cycles through those mints stay blocked until one lands.",
+            last_signature.unwrap_or_else(|| "—".into())
+        )
     }
 
     /// Wait briefly for a submitted signature to reach the chain, and say what happened.
+    ///
+    /// Polls `tries` times at two-second intervals. A trade wants a small number
+    /// because a sweep is waiting behind it; the once-per-run setup transaction wants a
+    /// patient one, because nothing is waiting and it has to actually arrive.
     ///
     /// `Some(true)` landed cleanly, `Some(false)` landed and reverted, `None` still
     /// unknown when the wait ran out — which is not the same as failed and must not be
@@ -1025,10 +1076,9 @@ impl Trader {
     /// Never: an RPC that cannot answer is reported as "not yet known", the same as a
     /// signature that has not landed. Nothing here decides whether money moves, so a
     /// failure to look is not a failure to trade.
-    pub async fn confirm(&self, signature: &str) -> Option<bool> {
-        const TRIES: u32 = 3;
+    pub async fn confirm(&self, signature: &str, tries: u32) -> Option<bool> {
         const GAP: std::time::Duration = std::time::Duration::from_millis(2000);
-        for attempt in 0..TRIES {
+        for attempt in 0..tries {
             if attempt > 0 {
                 tokio::time::sleep(GAP).await;
             }

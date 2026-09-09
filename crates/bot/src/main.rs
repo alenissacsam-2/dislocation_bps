@@ -1236,7 +1236,7 @@ async fn spawn_live(
                                                     // "asked". At ERROR so it stands out in a
                                                     // file that is otherwise all refusals: this
                                                     // is the line the whole exercise is for.
-                                                    outcome_reason = Some(match t.confirm(&sig).await {
+                                                    outcome_reason = Some(match t.confirm(&sig, 3).await {
                                                         Some(true) => {
                                                             tracing::error!(
                                                                 "LANDED {sig} — the transaction \
