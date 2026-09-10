@@ -157,20 +157,42 @@ impl BotRunner for NativeRunner {
         Ok(())
     }
 
+    /// # Why there is exactly one place that reports `Failed`
+    ///
+    /// `start` refuses outright while a child handle is held — "the instrument is
+    /// already running" — so any conclusion that the child is gone *must* release the
+    /// handle in the same breath. This used to be written as a four-arm match in which
+    /// only one of the two "it is gone" arms cleared it, and the arm that did not is a
+    /// wedge for the life of the application: every later restart bails instantly, this
+    /// function keeps answering `Failed`, the watcher spends its three attempts inside
+    /// twelve seconds and gives up for good. A release build has no console, so none of
+    /// that is written anywhere. Both unexplained stoppages on 2026-09-10 look like this.
+    ///
+    /// So the two ways of concluding the child is gone now converge on one statement,
+    /// and reporting `Failed` while still holding the handle is not expressible here.
+    ///
+    /// A handle that cannot be waited on says nothing about the process, so it is worth
+    /// nothing as an interlock. The real guard against a second writer is the bound
+    /// port, and it still runs: releasing the handle leaves `Foreign` reachable, so a
+    /// bot that genuinely is alive is never raced.
     fn probe(&self) -> RunState {
         let mut guard = self.child.lock().unwrap();
-        match guard.as_mut() {
-            Some(c) => match c.try_wait() {
-                Ok(Some(_)) => {
-                    *guard = None;
-                    RunState::Failed
-                }
-                Ok(None) if port_is_bound(BOT_PORT) => RunState::Running,
-                Ok(None) => RunState::Starting,
-                Err(_) => RunState::Failed,
-            },
-            None if port_is_bound(BOT_PORT) => RunState::Foreign,
-            None => RunState::Stopped,
+        let Some(child) = guard.as_mut() else {
+            return if port_is_bound(BOT_PORT) { RunState::Foreign } else { RunState::Stopped };
+        };
+        let gone = match child.try_wait() {
+            Ok(Some(_)) => true,
+            Err(_) => true,
+            Ok(None) => false,
+        };
+        if gone {
+            *guard = None;
+            return RunState::Failed;
+        }
+        if port_is_bound(BOT_PORT) {
+            RunState::Running
+        } else {
+            RunState::Starting
         }
     }
 }
@@ -208,6 +230,60 @@ mod tests {
             }
             assert!(attempt < 7, "eight freshly released ports all read as bound");
         }
+    }
+
+    /// The wedge that stranded the instrument twice on 2026-09-10.
+    ///
+    /// `start` refuses outright while a child handle is held, so any `probe` that
+    /// concludes the child is gone has to release it. If one does not, the runner is
+    /// dead for the life of the application: every restart bails with "already
+    /// running", the watcher spends its three attempts in twelve seconds, and a release
+    /// build has no console to say so.
+    ///
+    /// This reaches `probe` through a child that exited cleanly, because the other way
+    /// in — a `try_wait` that errors — cannot be produced from a test without mocking
+    /// the process handle. So the guarantee this test gives is narrower than the bug it
+    /// was written for, and the real protection is structural: [`NativeRunner::probe`]
+    /// has one release point that both conclusions pass through. This pins the contract
+    /// so a future refactor cannot quietly reintroduce a second one.
+    #[test]
+    fn a_probe_that_reports_failed_releases_the_handle_it_gave_up_on() {
+        let r = NativeRunner::new(
+            PathBuf::from("definitely-not-here.exe"),
+            PathBuf::from("."),
+            std::env::temp_dir().join("cbdesk-wedge-test.log"),
+        );
+        // A real child that exits immediately, so `try_wait` has something to reap.
+        let child = if cfg!(target_os = "windows") {
+            Command::new("cmd").args(["/C", "exit"]).spawn()
+        } else {
+            Command::new("sh").args(["-c", "exit"]).spawn()
+        }
+        .expect("spawning a trivial process must work");
+        *r.child.lock().unwrap() = Some(child);
+
+        // It may still be starting for a moment; what matters is where it lands.
+        let mut state = r.probe();
+        for _ in 0..50 {
+            if state != RunState::Starting {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            state = r.probe();
+        }
+        assert_eq!(state, RunState::Failed, "an exited child is a failed run");
+        assert!(
+            r.child.lock().unwrap().is_none(),
+            "the handle must be released, or every later start refuses"
+        );
+
+        // And the next start must fail for a real reason — a missing binary, or a port
+        // someone else holds — never because a stale handle is still sitting there.
+        let e = r.start(None).expect_err("this runner has no binary").to_string();
+        assert!(
+            !e.contains("already running"),
+            "start refused because of a handle probe should have dropped: {e}"
+        );
     }
 
     #[test]
