@@ -7,13 +7,18 @@
 //! and both keep every account a swap needs either in the pool account or derivable
 //! from it.
 //!
-//! Raydium AMM v4 is five pools and needs the pool's OpenBook market, bids, asks,
-//! event queue, both market vaults and the market's vault signer — nine accounts that
-//! live in the AMM account at offsets this codebase has never read, plus an order-book
-//! program whose behaviour is not the constant-product formula the quote assumed.
-//! CP-Swap is two pools and Meteora DAMM v2 is one. Encoding the three of them is
-//! about as much work as the two above and reaches 9% of the universe, so they refuse
-//! by returning an error naming themselves rather than pretending.
+//! Raydium AMM v4 is five more, and both reasons for leaving it out turned out to be
+//! false. The nine OpenBook accounts are no longer read by `swapBaseIn` — landed
+//! transactions on four of the five pools pass the pool's own address for every one of
+//! them — so no offsets need finding. And the fill is the constant-product price the
+//! quote already assumed, matching `x * y = k` to under a thousandth of a basis point
+//! across five sampled swaps. See [`raydium_v4`] for both measurements. It is a
+//! constant-product venue with no ticks and no price limit, which is why it shares
+//! none of the machinery in [`crate::pda`].
+//!
+//! CP-Swap is two pools and Meteora DAMM v2 is one. Encoding both reaches 3% of the
+//! universe, so they refuse by returning an error naming themselves rather than
+//! pretending.
 //!
 //! # The price limit is derived, not constant
 //!
@@ -31,6 +36,7 @@
 
 pub mod orca;
 pub mod raydium;
+pub mod raydium_v4;
 
 use crate::encode::pk;
 use anyhow::{bail, Result};
@@ -72,11 +78,7 @@ pub struct SwapContext {
 /// See the module docs. Halving or doubling a square root is a 4× move in price.
 #[must_use]
 pub fn price_limit(sqrt_price_x64: u128, price_falling: bool, min: u128, max: u128) -> u128 {
-    let raw = if price_falling {
-        sqrt_price_x64 / 2
-    } else {
-        sqrt_price_x64.saturating_mul(2)
-    };
+    let raw = if price_falling { sqrt_price_x64 / 2 } else { sqrt_price_x64.saturating_mul(2) };
     // Strictly inside, because both programs use strict inequalities.
     raw.clamp(min.saturating_add(1), max.saturating_sub(1))
 }
@@ -98,9 +100,8 @@ pub fn build_swap(
 ) -> Result<Instruction> {
     match dex {
         Dex::OrcaWhirlpool => orca::swap(ctx, pool_data),
-        Dex::RaydiumClmm => {
-            raydium::swap(ctx, pool_data, extra.token_program, extra.bitmap_policy)
-        }
+        Dex::RaydiumClmm => raydium::swap(ctx, pool_data, extra.token_program, extra.bitmap_policy),
+        Dex::RaydiumAmmV4 => raydium_v4::swap(ctx, pool_data),
         other => bail!(
             "{} swaps are not encoded — see crates/executor/src/venue/mod.rs for why",
             other.name()
@@ -172,7 +173,7 @@ mod tests {
             tick_arrays: [Pubkey::new_unique(); crate::pda::TICK_ARRAYS_PER_SWAP],
         };
         let extra = VenueExtra::default();
-        for dex in [Dex::RaydiumAmmV4, Dex::RaydiumCpmm, Dex::MeteoraDammV2, Dex::PumpSwap] {
+        for dex in [Dex::RaydiumCpmm, Dex::MeteoraDammV2, Dex::PumpSwap] {
             let e = build_swap(dex, &ctx, &[0u8; 2000], &extra).unwrap_err().to_string();
             assert!(e.contains(dex.name()), "refusal for {dex:?} does not name it: {e}");
         }

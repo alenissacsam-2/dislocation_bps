@@ -145,12 +145,7 @@ pub struct Route {
 /// # Errors
 /// If the hops do not form a cycle, if either floor invariant in the module docs is
 /// violated, or if a venue cannot be encoded.
-pub fn build(
-    owner: &Pubkey,
-    hops: &[Hop],
-    pre_balance: u64,
-    opts: &RouteOptions,
-) -> Result<Route> {
+pub fn build(owner: &Pubkey, hops: &[Hop], pre_balance: u64, opts: &RouteOptions) -> Result<Route> {
     ensure!(hops.len() >= 2, "a cycle needs at least two hops, got {}", hops.len());
 
     let base_mint = hops[0].input_mint;
@@ -302,11 +297,7 @@ mod tests {
                 // Each hop guarantees a touch more than the next one spends, and the
                 // last more than the first spent.
                 min_amount_out: 1_000_001 + i as u64,
-                tick_arrays: [
-                    Pubkey::new_unique(),
-                    Pubkey::new_unique(),
-                    Pubkey::new_unique(),
-                ],
+                tick_arrays: [Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique()],
             })
             .collect()
     }
@@ -451,9 +442,9 @@ mod tests {
     fn a_cycle_through_an_unencodable_venue_refuses() {
         let owner = Pubkey::new_unique();
         let mut hops = cycle(3);
-        hops[1].dex = Dex::RaydiumAmmV4;
+        hops[1].dex = Dex::MeteoraDammV2;
         let e = build(&owner, &hops, 0, &opts()).unwrap_err().to_string();
-        assert!(e.contains("Raydium AMM v4"), "refusal must name the venue: {e}");
+        assert!(e.contains("Meteora DAMM v2"), "refusal must name the venue: {e}");
     }
 }
 

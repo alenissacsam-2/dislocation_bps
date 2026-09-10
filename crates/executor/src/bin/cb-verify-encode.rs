@@ -65,12 +65,12 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var("CRYPTOBOT_RPC_HTTP_URL").ok())
         .unwrap_or_else(|| "https://api.mainnet-beta.solana.com".to_string());
     let pools_path = flag("--pools").unwrap_or_else(|| "crates/bot/pools.json".to_string());
-    let limit: usize =
-        flag("--limit").and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let limit: usize = flag("--limit").and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
 
     let raw = std::fs::read_to_string(&pools_path)
         .with_context(|| format!("could not read the pool registry at {pools_path}"))?;
-    let registry: Registry = serde_json::from_str(&raw).context("pools.json is not the registry")?;
+    let registry: Registry =
+        serde_json::from_str(&raw).context("pools.json is not the registry")?;
 
     let rpc = Rpc::new(&rpc_url)?;
 
@@ -126,6 +126,7 @@ fn supported(dex: &str) -> Option<Dex> {
     match dex {
         "orca_whirlpool" => Some(Dex::OrcaWhirlpool),
         "raydium_clmm" => Some(Dex::RaydiumClmm),
+        "raydium_v4" => Some(Dex::RaydiumAmmV4),
         _ => None,
     }
 }
@@ -145,34 +146,54 @@ async fn check_pool(
             verdict: Verdict::Fail,
             detail: "the pool account does not exist".into(),
         });
-        return Ok(PoolReport { address: raw.address.clone(), label: raw.label.clone(), dex, checks });
+        return Ok(PoolReport {
+            address: raw.address.clone(),
+            label: raw.label.clone(),
+            dex,
+            checks,
+        });
     };
 
-    let (mint_a, mint_b, vault_a, vault_b, tick, spacing, liquidity, program) =
-        match dex {
-            Dex::OrcaWhirlpool => {
-                let w = cb_dex::orca_whirlpool::decode(&pool_data)?;
-                (
-                    w.mint_a, w.mint_b, w.vault_a, w.vault_b, w.tick_current, w.tick_spacing,
-                    w.liquidity, pk(cb_dex::orca_whirlpool::PROGRAM_ID),
-                )
-            }
-            _ => {
-                let p = cb_dex::raydium_clmm::decode(&pool_data)?;
-                (
-                    p.mint_0, p.mint_1, p.vault_0, p.vault_1, p.tick_current, p.tick_spacing,
-                    p.liquidity, pk(cb_dex::raydium_clmm::PROGRAM_ID),
-                )
-            }
-        };
+    // Constant-product venues share none of what follows — no tick, no spacing, no
+    // oracle, no arrays to find — so they take their own much shorter route.
+    if dex == Dex::RaydiumAmmV4 {
+        return check_v4(rpc, simulate_as, raw, pool, &pool_data, checks).await;
+    }
+
+    let (mint_a, mint_b, vault_a, vault_b, tick, spacing, liquidity, program) = match dex {
+        Dex::OrcaWhirlpool => {
+            let w = cb_dex::orca_whirlpool::decode(&pool_data)?;
+            (
+                w.mint_a,
+                w.mint_b,
+                w.vault_a,
+                w.vault_b,
+                w.tick_current,
+                w.tick_spacing,
+                w.liquidity,
+                pk(cb_dex::orca_whirlpool::PROGRAM_ID),
+            )
+        }
+        _ => {
+            let p = cb_dex::raydium_clmm::decode(&pool_data)?;
+            (
+                p.mint_0,
+                p.mint_1,
+                p.vault_0,
+                p.vault_1,
+                p.tick_current,
+                p.tick_spacing,
+                p.liquidity,
+                pk(cb_dex::raydium_clmm::PROGRAM_ID),
+            )
+        }
+    };
 
     // The direction the probe swap will take: spending token A pushes the price down.
     let falling = true;
 
     let oracle = orca_oracle(&pool, &program);
-    let fetched = rpc
-        .accounts_full(&[to_pubkey(&vault_a), to_pubkey(&vault_b), oracle])
-        .await?;
+    let fetched = rpc.accounts_full(&[to_pubkey(&vault_a), to_pubkey(&vault_b), oracle]).await?;
 
     // ---- 1. The vaults must be token accounts holding the pool's own mints. ----
     for (i, want_mint) in [mint_a, mint_b].iter().enumerate() {
@@ -184,11 +205,9 @@ async fn check_pool(
                 detail: format!("{side} does not exist - the vault offset is wrong"),
             },
             Some(acc) => match token_account_mint(&acc.data) {
-                Err(e) => Check {
-                    name: "vault",
-                    verdict: Verdict::Fail,
-                    detail: format!("{side}: {e}"),
-                },
+                Err(e) => {
+                    Check { name: "vault", verdict: Verdict::Fail, detail: format!("{side}: {e}") }
+                }
                 Ok(m) if m == *want_mint => Check {
                     name: "vault",
                     verdict: Verdict::Pass,
@@ -399,10 +418,8 @@ async fn check_pool(
     };
 
     for policy in policies {
-        let extra = VenueExtra {
-            token_program,
-            bitmap_policy: policy.unwrap_or(BitmapPolicy::Include),
-        };
+        let extra =
+            VenueExtra { token_program, bitmap_policy: policy.unwrap_or(BitmapPolicy::Include) };
         let name = match policy {
             Some(BitmapPolicy::Include) => "swap(bitmap)",
             Some(BitmapPolicy::Omit) => "swap(no bitmap)",
@@ -465,6 +482,158 @@ async fn check_pool(
     }
 
     Ok(PoolReport { address: raw.address.clone(), label: raw.label.clone(), dex, checks })
+}
+
+/// Raydium AMM v4.
+///
+/// # What is actually being tested here
+///
+/// The encoder passes the pool's own address for the nine OpenBook accounts, on the
+/// evidence that landed transactions do the same. Evidence from four pools is not a
+/// proof about the fifth, and reading a program's source is not the same as watching
+/// it accept an account list. A simulation against live state is the only thing that
+/// settles it, which is what this does — per pool, so the answer is per pool.
+///
+/// A pass here means the program ran the swap to completion with filler in those
+/// slots. A failure naming a market account means that pool still wants the real ones
+/// and must stay unencoded; a failure naming the *simulating address's* token accounts
+/// means only that the address does not hold the mint, which [`classify`] separates.
+async fn check_v4(
+    rpc: &Rpc,
+    simulate_as: Option<Pubkey>,
+    raw: &RawPool,
+    pool: Pubkey,
+    pool_data: &[u8],
+    mut checks: Vec<Check>,
+) -> Result<PoolReport> {
+    let dex = Dex::RaydiumAmmV4;
+    let report = |checks| {
+        Ok(PoolReport { address: raw.address.clone(), label: raw.label.clone(), dex, checks })
+    };
+
+    let amm = match cb_dex::raydium_v4::decode_amm_info(pool_data) {
+        Ok(a) => a,
+        Err(e) => {
+            checks.push(Check { name: "pool", verdict: Verdict::Fail, detail: e.to_string() });
+            return report(checks);
+        }
+    };
+    checks.push(Check {
+        name: "pool",
+        verdict: Verdict::Pass,
+        detail: format!("AmmInfo decodes, swap fee {} ppm", amm.fee_ppm()),
+    });
+
+    // The vaults the encoder names come from the pool account, so if the offsets were
+    // wrong they would be wrong here in a way no simulation error would explain. Check
+    // they really are token accounts of the pool's own two mints before going further.
+    let vaults =
+        rpc.accounts_full(&[to_pubkey(&amm.base_vault), to_pubkey(&amm.quote_vault)]).await?;
+    for (name, slot, want) in
+        [("coin vault", vaults.first(), amm.base_mint), ("pc vault", vaults.get(1), amm.quote_mint)]
+    {
+        let check = match slot.and_then(Option::as_ref) {
+            None => Check {
+                name,
+                verdict: Verdict::Fail,
+                detail: "the vault named by AmmInfo does not exist".into(),
+            },
+            Some(acc) => match token_account_mint(&acc.data) {
+                Err(e) => Check { name, verdict: Verdict::Fail, detail: e.to_string() },
+                Ok(mint) if mint == want => Check {
+                    name,
+                    verdict: Verdict::Pass,
+                    detail: "holds the mint AmmInfo says it does".into(),
+                },
+                Ok(_) => Check {
+                    name,
+                    verdict: Verdict::Fail,
+                    detail: "vault holds a different mint than AmmInfo claims — bad offsets".into(),
+                },
+            },
+        };
+        let failed = check.verdict == Verdict::Fail;
+        checks.push(check);
+        if failed {
+            return report(checks);
+        }
+    }
+
+    let Some(owner) = simulate_as else {
+        checks.push(Check {
+            name: "swap",
+            verdict: Verdict::Inconclusive,
+            detail: "skipped: pass --as <funded address> to check the instruction".into(),
+        });
+        return report(checks);
+    };
+
+    let token_program = pk(programs::SPL_TOKEN);
+    let ctx = SwapContext {
+        owner,
+        pool,
+        user_source: associated_token_address(&owner, &to_pubkey(&amm.base_mint), &token_program),
+        user_dest: associated_token_address(&owner, &to_pubkey(&amm.quote_mint), &token_program),
+        amount_in: PROBE_AMOUNT,
+        min_amount_out: 1,
+        input_is_a: true,
+        // Unused by this venue. Deliberately the pool, so that if it ever were read the
+        // failure names an account this file mentions rather than a random key.
+        tick_arrays: [pool; cb_executor::pda::TICK_ARRAYS_PER_SWAP],
+    };
+
+    let ix = match venue::build_swap(dex, &ctx, pool_data, &VenueExtra::default()) {
+        Ok(i) => i,
+        Err(e) => {
+            checks.push(Check { name: "swap", verdict: Verdict::Fail, detail: e.to_string() });
+            return report(checks);
+        }
+    };
+
+    let mut probe = vec![tx::set_compute_limit(600_000)];
+    for mint in [&amm.base_mint, &amm.quote_mint] {
+        let m = to_pubkey(mint);
+        let ata = associated_token_address(&owner, &m, &token_program);
+        probe.push(tx::create_ata_idempotent(&owner, &ata, &owner, &m, &token_program));
+    }
+    probe.push(ix);
+
+    let (blockhash, _) = rpc.latest_blockhash().await?;
+    let compiled = match tx::compile_unsigned(&owner, &probe, blockhash) {
+        Ok(a) => a,
+        Err(e) => {
+            checks.push(Check { name: "swap", verdict: Verdict::Fail, detail: e.to_string() });
+            return report(checks);
+        }
+    };
+    let sim = rpc.simulate(&compiled.tx_base64, &[]).await?;
+    checks.push(match &sim.err {
+        None => Check {
+            name: "swap",
+            verdict: Verdict::Pass,
+            detail: format!(
+                "simulated cleanly with the pool standing in for all nine market \
+                 accounts ({} compute units)",
+                sim.units_consumed.unwrap_or(0)
+            ),
+        },
+        Some(e) => {
+            let (verdict, detail) = classify(e, &sim.logs);
+            // Printed whatever the verdict, unlike the concentrated-liquidity path
+            // above. A pass here rests on the claim that nine accounts go unread, and
+            // the only thing that can show how far the program actually got before it
+            // stopped is the log it wrote on the way.
+            if std::env::args().any(|a| a == "--raw") {
+                println!("        raw error: {e}");
+                for l in sim.logs.iter().rev().take(8).rev() {
+                    println!("        log: {l}");
+                }
+            }
+            Check { name: "swap", verdict, detail }
+        }
+    });
+
+    report(checks)
 }
 
 fn print_last(reports: &[PoolReport], verbose: bool) {

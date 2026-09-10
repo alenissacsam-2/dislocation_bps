@@ -41,7 +41,6 @@
 //! the correct answer and not an error.
 
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
 use cb_core::path::Leg;
 use cb_core::types::{Dex, Pubkey32};
 use cb_executor::encode::{pk, programs, to_pubkey};
@@ -51,6 +50,7 @@ use cb_executor::venue::raydium::BitmapPolicy;
 use cb_executor::venue::VenueExtra;
 use cb_executor::{ticks, tx, Attempt, Executor, Plan};
 use solana_sdk::pubkey::Pubkey;
+use std::collections::HashMap;
 
 /// Everything execution needs to rebuild a detected cycle as instructions.
 ///
@@ -80,22 +80,57 @@ pub struct CyclePlan {
     pub fee_ppm: Vec<u32>,
 }
 
+/// Whether [`cb_executor::venue::build_swap`] can encode a swap on this venue.
+///
+/// One definition rather than a `matches!` repeated at each of the places that need to
+/// know. The two used to be written out separately and adding a venue meant finding
+/// every one of them; missing a single site does not fail to compile, it produces a
+/// plan the router accepts and the encoder then refuses at the last moment.
+#[must_use]
+pub const fn has_encoder(dex: Dex) -> bool {
+    matches!(dex, Dex::OrcaWhirlpool | Dex::RaydiumClmm | Dex::RaydiumAmmV4)
+}
+
+/// Whether a venue prices in ticks, and so needs tick arrays resolved before a swap
+/// on it can be built.
+///
+/// Raydium AMM v4 is constant-product: its whole state is the pool account and two
+/// vault balances, there is no tick to be in and nothing to resolve.
+#[must_use]
+pub const fn is_concentrated(dex: Dex) -> bool {
+    matches!(dex, Dex::OrcaWhirlpool | Dex::RaydiumClmm)
+}
+
+/// Whether a cycle on this venue can be re-priced from the accounts an attempt
+/// already fetches.
+///
+/// Separate from [`has_encoder`] because they are separate facts, and Raydium AMM v4
+/// is currently one and not the other. Every floor in a route comes from re-pricing
+/// the hop against state fetched moments before signing — the fix that made this bot
+/// able to land anything at all — and for the concentrated venues the pool account
+/// carries everything that needs, so one batched read serves both purposes.
+///
+/// A v4 pool's reserves are not in its pool account. They are the balances of two
+/// separate vault accounts, minus the protocol fees accrued in them, and the attempt
+/// path fetches one account per pool. Until it fetches three for this venue, a v4
+/// cycle can be *built* — the encoder is verified against all five pools — and cannot
+/// be *priced*, so it is refused before anything is fetched rather than after.
+#[must_use]
+pub const fn can_reprice(dex: Dex) -> bool {
+    matches!(dex, Dex::OrcaWhirlpool | Dex::RaydiumClmm)
+}
+
 impl CyclePlan {
     /// Whether every venue in this cycle has an encoder.
     #[must_use]
     pub fn encodable(&self) -> bool {
-        self.pools
-            .iter()
-            .all(|(_, d)| matches!(d, Dex::OrcaWhirlpool | Dex::RaydiumClmm))
+        self.pools.iter().all(|(_, d)| has_encoder(*d))
     }
 
     /// The venue that stops this cycle being encodable, if any.
     #[must_use]
     pub fn blocking_venue(&self) -> Option<Dex> {
-        self.pools
-            .iter()
-            .find(|(_, d)| !matches!(d, Dex::OrcaWhirlpool | Dex::RaydiumClmm))
-            .map(|(_, d)| *d)
+        self.pools.iter().find(|(_, d)| !has_encoder(*d)).map(|(_, d)| *d)
     }
 }
 
@@ -272,9 +307,17 @@ pub fn priority_fee_lamports(micro_lamports_per_cu: u64, compute_units: u32) -> 
 type Prefetched = Option<(usize, Vec<(i32, Pubkey)>)>;
 
 /// The program that owns a venue's pools and tick arrays.
+/// The program that owns a venue's pool accounts.
+///
+/// Written out per venue rather than defaulting, because the catch-all this replaced
+/// answered "Raydium CLMM" for every venue that was not Orca — correct only while
+/// those were the sole two callers. The address is used to decide whether a tick array
+/// exists by checking its owner, so a wrong answer reads "no arrays here" and refuses
+/// the trade rather than failing in a way that names the cause.
 fn program_for(dex: Dex) -> Pubkey {
     match dex {
         Dex::OrcaWhirlpool => pk(cb_dex::orca_whirlpool::PROGRAM_ID),
+        Dex::RaydiumAmmV4 => pk(cb_dex::raydium_v4::PROGRAM_ID),
         _ => pk(cb_dex::raydium_clmm::PROGRAM_ID),
     }
 }
@@ -284,6 +327,7 @@ fn mint_a_of(dex: Dex, data: &[u8]) -> Result<Pubkey32> {
     match dex {
         Dex::OrcaWhirlpool => Ok(cb_dex::orca_whirlpool::decode(data)?.mint_a),
         Dex::RaydiumClmm => Ok(cb_dex::raydium_clmm::decode(data)?.mint_0),
+        Dex::RaydiumAmmV4 => Ok(cb_dex::raydium_v4::decode_amm_info(data)?.base_mint),
         other => bail!("{} is not encodable", other.name()),
     }
 }
@@ -438,10 +482,18 @@ impl Trader {
     ) -> Result<(Vec<Hop>, u128)> {
         let n = plan.pools.len();
         if n < 2 || plan.mints.len() != n + 1 || plan.leg_out.len() != n {
-            bail!("malformed cycle plan: {n} pools, {} mints, {} quotes", plan.mints.len(), plan.leg_out.len());
+            bail!(
+                "malformed cycle plan: {n} pools, {} mints, {} quotes",
+                plan.mints.len(),
+                plan.leg_out.len()
+            );
         }
         if pool_data.len() != n || arrays.len() != n {
-            bail!("have {} accounts and {} array sets for {n} pools", pool_data.len(), arrays.len());
+            bail!(
+                "have {} accounts and {} array sets for {n} pools",
+                pool_data.len(),
+                arrays.len()
+            );
         }
 
         // Trade what the pools can carry now, not what they could carry at detection.
@@ -592,6 +644,17 @@ impl Trader {
         if let Some(dex) = plan.blocking_venue() {
             return Ok(Attempt::Refused(format!("{} has no encoder", dex.name())));
         }
+        // Before the fetch, for the same reason the halt check is: the alternative is
+        // paying for a full account read and then failing inside `fresh_legs` with
+        // "could not be re-priced against the state just fetched", which blames the
+        // market for a feature that is not written yet.
+        if let Some((_, dex)) = plan.pools.iter().find(|(_, d)| !can_reprice(*d)) {
+            return Ok(Attempt::Refused(format!(
+                "{} can be encoded but not yet re-priced — its reserves are two vault \
+                 accounts this attempt does not fetch",
+                dex.name()
+            )));
+        }
         if plan.pools.len() > MAX_EXECUTABLE_HOPS {
             return Ok(Attempt::Refused(format!(
                 "{} hops will not fit in one transaction without an address lookup table                  (the ceiling is {MAX_EXECUTABLE_HOPS})",
@@ -641,8 +704,11 @@ impl Trader {
         // owner's lamports and a token account's data come back from the same call, and
         // at the same commitment `balance()` used, so nothing about the wrap-shortfall
         // check below has changed except when it is asked.
-        let profit_key =
-            if wrapping { self.owner } else { associated_token_address(&self.owner, &base_mint, &token_program) };
+        let profit_key = if wrapping {
+            self.owner
+        } else {
+            associated_token_address(&self.owner, &base_mint, &token_program)
+        };
 
         let n = plan.pools.len();
         let mut keys: Vec<Pubkey> = plan.pools.iter().map(|(k, _)| to_pubkey(k)).collect();
@@ -674,7 +740,9 @@ impl Trader {
         let mut pool_data = Vec::with_capacity(n);
         for (key, acc) in keys.iter().zip(fetched.iter()).take(n) {
             let Some(a) = acc.as_ref() else {
-                return Ok(Attempt::Refused(format!("pool {key} vanished between sweep and build")));
+                return Ok(Attempt::Refused(format!(
+                    "pool {key} vanished between sweep and build"
+                )));
             };
             pool_data.push(a.data.clone());
         }
@@ -695,6 +763,19 @@ impl Trader {
         for (i, (pool_raw, dex)) in plan.pools.iter().enumerate() {
             let pool = to_pubkey(pool_raw);
             let program = program_for(*dex);
+
+            // A constant-product hop has no tick to be in and no arrays to find, so it
+            // skips this whole apparatus — including the hint cache, which exists to
+            // predict a tick and would only ever hold a meaningless one for such a
+            // pool. The slot is filled rather than left empty because the `flatten`
+            // below drops `None`s silently, and a dropped entry would shift every later
+            // hop's arrays onto the wrong pool. The value is inert: this venue's
+            // encoder never reads it.
+            if !is_concentrated(*dex) {
+                arrays[i] = Some([pool; 3]);
+                continue;
+            }
+
             let (tick, spacing) = tick_and_spacing(*dex, &pool_data[i])?;
             let falling = input_is_token_a(*dex, &pool_data[i], &plan.mints[i])?;
             // Whatever happens below, next time this pool comes round we can predict.
@@ -803,7 +884,6 @@ impl Trader {
             Ok(h) => h,
             Err(e) => return Ok(Attempt::Refused(e.to_string())),
         };
-
 
         // The route may have been sized down to what the pools can still carry, so the
         // figures the risk gate judges have to follow it down.
@@ -978,8 +1058,10 @@ impl Trader {
             return Ok(None);
         }
 
-        let atas: Vec<Pubkey> =
-            wanted.iter().map(|m| associated_token_address(&self.owner, m, &token_program)).collect();
+        let atas: Vec<Pubkey> = wanted
+            .iter()
+            .map(|m| associated_token_address(&self.owner, m, &token_program))
+            .collect();
         let existing = self.exec.rpc.accounts_full(&atas).await?;
 
         let missing: Vec<(Pubkey, Pubkey)> = wanted
@@ -1017,7 +1099,13 @@ impl Trader {
         // that had nothing wrong with it, which is a silly way to stay blocked.
         let mut ixs = vec![tx::set_compute_limit(120_000)];
         for (mint, ata) in &missing {
-            ixs.push(tx::create_ata_idempotent(&self.owner, ata, &self.owner, mint, &token_program));
+            ixs.push(tx::create_ata_idempotent(
+                &self.owner,
+                ata,
+                &self.owner,
+                mint,
+                &token_program,
+            ));
         }
 
         // Sent until it actually lands, unlike a trade.
@@ -1177,6 +1265,12 @@ fn input_is_token_a(dex: Dex, data: &[u8], mint: &Pubkey32) -> Result<bool> {
         Dex::RaydiumClmm => {
             let p = cb_dex::raydium_clmm::decode(data)?;
             (p.mint_0, p.mint_1)
+        }
+        // v4 calls them base and quote rather than 0 and 1, and the swap's account
+        // list fixes coin before pc, so base is this venue's token A.
+        Dex::RaydiumAmmV4 => {
+            let p = cb_dex::raydium_v4::decode_amm_info(data)?;
+            (p.base_mint, p.quote_mint)
         }
         other => bail!("{} is not encodable", other.name()),
     };
@@ -1380,13 +1474,63 @@ mod tests {
     #[test]
     fn unencodable_venues_are_named_before_anything_is_fetched() {
         let mut p = plan(3);
-        p.pools[1].1 = Dex::RaydiumAmmV4;
+        p.pools[1].1 = Dex::MeteoraDammV2;
         assert!(!p.encodable());
-        assert_eq!(p.blocking_venue(), Some(Dex::RaydiumAmmV4));
+        assert_eq!(p.blocking_venue(), Some(Dex::MeteoraDammV2));
 
         let clean = plan(3);
         assert!(clean.encodable());
         assert_eq!(clean.blocking_venue(), None);
+    }
+
+    /// This asserted the opposite until v4 got an encoder, which is the point of
+    /// pinning it: the router's idea of what can be built and the encoder's have to
+    /// move together, and nothing else makes them.
+    #[test]
+    fn every_venue_the_router_will_plan_is_one_the_encoder_accepts() {
+        for dex in [Dex::OrcaWhirlpool, Dex::RaydiumClmm, Dex::RaydiumAmmV4] {
+            assert!(has_encoder(dex), "{} is planned but cannot be built", dex.name());
+        }
+        for dex in [Dex::RaydiumCpmm, Dex::MeteoraDammV2, Dex::PumpSwap] {
+            assert!(!has_encoder(dex), "{} has an encoder now; say so here", dex.name());
+        }
+        // Only the two tick venues go near the tick-array resolver.
+        assert!(is_concentrated(Dex::OrcaWhirlpool) && is_concentrated(Dex::RaydiumClmm));
+        assert!(!is_concentrated(Dex::RaydiumAmmV4), "v4 is constant-product, it has no ticks");
+    }
+
+    /// The two facts are separate and v4 is currently one and not the other. When
+    /// re-pricing learns to fetch its vaults, this test is the thing that says so.
+    #[test]
+    fn a_venue_that_can_be_built_but_not_priced_is_refused_before_anything_is_fetched() {
+        assert!(has_encoder(Dex::RaydiumAmmV4));
+        assert!(!can_reprice(Dex::RaydiumAmmV4));
+        // Nothing may be repriceable without also being encodable; that pairing would
+        // build a route the encoder then refuses at the last moment.
+        for dex in [
+            Dex::OrcaWhirlpool,
+            Dex::RaydiumClmm,
+            Dex::RaydiumAmmV4,
+            Dex::RaydiumCpmm,
+            Dex::MeteoraDammV2,
+            Dex::PumpSwap,
+        ] {
+            assert!(
+                !can_reprice(dex) || has_encoder(dex),
+                "{} would be planned and priced with no way to build it",
+                dex.name()
+            );
+        }
+    }
+
+    /// The catch-all this replaced answered "Raydium CLMM" for every venue that was
+    /// not Orca, which was right only while those two were the only callers.
+    #[test]
+    fn each_venue_is_pointed_at_its_own_program() {
+        assert_eq!(program_for(Dex::OrcaWhirlpool), pk(cb_dex::orca_whirlpool::PROGRAM_ID));
+        assert_eq!(program_for(Dex::RaydiumClmm), pk(cb_dex::raydium_clmm::PROGRAM_ID));
+        assert_eq!(program_for(Dex::RaydiumAmmV4), pk(cb_dex::raydium_v4::PROGRAM_ID));
+        assert_ne!(program_for(Dex::RaydiumAmmV4), program_for(Dex::RaydiumClmm));
     }
 
     /// A mint the pool does not trade must be an error, not a coin flip on direction.
@@ -1418,8 +1562,7 @@ mod tests {
         // against real state it became a pool that cannot trade. Tick 32 with spacing 64
         // sits mid-range, where both directions quote.
         let tick: i32 = 32;
-        let sqrt_price =
-            cb_core::clmm::sqrt_price_at_tick(tick).expect("tick 32 has a sqrt price");
+        let sqrt_price = cb_core::clmm::sqrt_price_at_tick(tick).expect("tick 32 has a sqrt price");
         d[65..81].copy_from_slice(&sqrt_price.to_le_bytes());
         d[81..85].copy_from_slice(&tick.to_le_bytes());
         d[101..133].copy_from_slice(&mint_a);
@@ -1456,8 +1599,8 @@ mod tests {
 #[cfg(test)]
 mod mainnet {
     use super::*;
-    use cb_executor::rpc::Rpc;
     use cb_core::types::Dex;
+    use cb_executor::rpc::Rpc;
 
     const WSOL: &str = "So11111111111111111111111111111111111111112";
     const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -1552,9 +1695,7 @@ mod mainnet {
     #[ignore = "hits mainnet"]
     async fn both_pools_decode_and_have_tick_arrays_to_swap_through() {
         let rpc = Rpc::new("https://api.mainnet-beta.solana.com").expect("client");
-        for (b58, dex) in
-            [(ORCA_SOL_USDC, Dex::OrcaWhirlpool), (RAY_SOL_USDC, Dex::RaydiumClmm)]
-        {
+        for (b58, dex) in [(ORCA_SOL_USDC, Dex::OrcaWhirlpool), (RAY_SOL_USDC, Dex::RaydiumClmm)] {
             let key = to_pubkey(&raw(b58));
             let data = rpc
                 .accounts_full(&[key])
@@ -1570,9 +1711,8 @@ mod mainnet {
                 Dex::OrcaWhirlpool => pk(cb_dex::orca_whirlpool::PROGRAM_ID),
                 _ => pk(cb_dex::raydium_clmm::PROGRAM_ID),
             };
-            let chosen = ticks::resolve(&rpc, dex, &key, &program, tick, spacing, true)
-                .await
-                .expect("rpc");
+            let chosen =
+                ticks::resolve(&rpc, dex, &key, &program, tick, spacing, true).await.expect("rpc");
             println!(
                 "{dex:?} {b58}: tick {tick} spacing {spacing}, {} live arrays, current {}",
                 chosen.found, chosen.current_exists
@@ -1727,7 +1867,10 @@ mod mainnet {
         assert!(wrap_shortfall(0, 1, bal_for_two).is_none(), "1 mint fits inside 2 mints' reserve");
         assert!(wrap_shortfall(0, 2, bal_for_two).is_none(), "exactly enough is enough");
         assert!(wrap_shortfall(0, 2, bal_for_two - 1).is_some(), "one lamport short must refuse");
-        assert!(wrap_shortfall(0, 3, bal_for_two).is_some(), "3 mints must not fit 2 mints' reserve");
+        assert!(
+            wrap_shortfall(0, 3, bal_for_two).is_some(),
+            "3 mints must not fit 2 mints' reserve"
+        );
     }
 }
 
@@ -1805,10 +1948,8 @@ mod fresh_quote_tests {
     /// would quietly reappear.
     #[test]
     fn a_venue_without_an_encoder_cannot_be_re_priced() {
-        assert!(
-            Trader::fresh_leg(Dex::RaydiumAmmV4, [7u8; 32], &[0u8; 300], &[1u8; 32], 2_500)
-                .is_none()
-        );
+        assert!(Trader::fresh_leg(Dex::RaydiumAmmV4, [7u8; 32], &[0u8; 300], &[1u8; 32], 2_500)
+            .is_none());
     }
 
     /// A plan larger than the pool's remaining room is traded small, not refused.
