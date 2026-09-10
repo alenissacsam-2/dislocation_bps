@@ -161,6 +161,72 @@ fn too_expensive_to_trade(fee_bps: f64) -> bool {
     fee_bps > EXECUTABLE_FEE_CEILING_BPS
 }
 
+/// How many cycles one sweep may *attempt*, as distinct from how many it may submit.
+///
+/// # Why these were ever the same number, and why they must not be
+///
+/// The rule used to be one attempt per sweep, for a reason that is still correct:
+/// submitting several transactions against overlapping pools inside one slot has each
+/// one invalidate the next. But that hazard belongs to *submitting*. An attempt that
+/// gets refused re-prices against fresh accounts, decides the edge is gone and stops —
+/// it signs nothing, sends nothing, and cannot invalidate anything. Conflating the two
+/// spent the sweep's whole budget on the first candidate even when that candidate was
+/// refused a few milliseconds later for a reason that said nothing about the rest.
+///
+/// The cost was measured over the live-armed run: **768 candidates** that were inside
+/// every gate — fee at or under 4 bps, legs within 12 slots, net edge in the 1-10 bps
+/// band where every one of the twelve submissions to date has come from — were turned
+/// away with "another cycle took this sweep's one attempt". At the 0.6% conversion
+/// measured in that band that is roughly 4.6 submissions never made, against 12 made,
+/// and each submission carries a positive expectation of about $0.00027.
+///
+/// Three rather than more because attempts are sequential and each costs three or four
+/// RPC round trips, near 400ms: the third candidate is being re-priced about 0.8s after
+/// detection, and the price moves around 0.27 bps in two seconds, so the staleness this
+/// adds stays well inside the floor's tolerance. A larger number would not.
+const MAX_ATTEMPTS_PER_SWEEP: usize = 3;
+
+/// Above this net edge, a detection is far more likely to be an artefact than an offer.
+///
+/// Not a ceiling — nothing is refused for exceeding it. It only decides *order*, so a
+/// sweep spends its attempts on the band that has actually produced submissions before
+/// it spends them on the band that never has.
+///
+/// Route-building attempts to date, by net edge, against whether they reached a
+/// submission:
+///
+/// | net edge | attempts | submitted |
+/// |----------|----------|-----------|
+/// | 0-1 bps  | 22       | 0         |
+/// | 1-2 bps  | 528      | 2 (0.4%)  |
+/// | 2-5 bps  | 1104     | 5 (0.5%)  |
+/// | 5-10 bps | 619      | 5 (0.8%)  |
+/// | 10-25 bps| 288      | 0         |
+/// | 25+ bps  | 36       | 0         |
+///
+/// Every submission ever made sits between 1.11 and 9.56 bps. The 324 attempts above
+/// ten produced none, and re-priced to a median of −4.83 bps against −2.32 for the
+/// 1-2 bps band — a concentrated pool quoting a price no size can be traded at.
+///
+/// It is deliberately *not* a refusal. Zero of 324 looks decisive and is not: at the
+/// 0.53% rate the productive bands run at, 324 attempts would be expected to yield 1.7
+/// submissions, and seeing none has an 18% probability. That is nowhere near enough to
+/// throw the band away. It is more than enough to stop letting it go first.
+const ARTEFACT_EDGE_BPS: f64 = 10.0;
+
+/// Order a sweep's candidates so the band that has actually produced submissions is
+/// offered the attempt budget first.
+///
+/// Generic over the accessor rather than taking `LiveOpportunity` directly, so the
+/// property that matters — a stable partition, not a reordering — can be tested without
+/// building a whole opportunity. See [`ARTEFACT_EDGE_BPS`] for why the split is here.
+fn order_by_plausibility<T>(items: &mut [T], edge_bps: impl Fn(&T) -> f64) {
+    // `false` sorts before `true`, so "not an artefact" leads. `sort_by_key` is stable,
+    // which is the whole point: inside each half the incoming best-first order survives
+    // untouched, and nothing is dropped.
+    items.sort_by_key(|i| edge_bps(i) > ARTEFACT_EDGE_BPS);
+}
+
 /// How long a cycle refused because *the price moved* is left alone. Two sweeps: long
 /// enough that another cycle gets the next attempt, short enough to come back while
 /// the gap may still be open. See `refusal_cooldown_for`.
@@ -336,6 +402,38 @@ fn on_refusal_cooldown(
     cycle_key: &str,
 ) -> bool {
     recent.get(cycle_key).is_some_and(|(at, window)| at.elapsed() < *window)
+}
+
+#[cfg(test)]
+mod sweep_budget_tests {
+    use super::*;
+
+    /// The productive band must lead, and the incoming order must survive inside each
+    /// half. A boolean sort key is easy to get backwards, and getting it backwards would
+    /// spend every sweep on exactly the candidates that have never converted.
+    #[test]
+    fn plausible_candidates_lead_and_the_rest_keep_their_order() {
+        // Incoming order is best-gross-first, which is where the artefacts cluster.
+        let mut v = vec![40.0, 25.1, 12.0, 9.56, 5.0, 2.4, 1.11, -3.0];
+        order_by_plausibility(&mut v, |e| *e);
+        assert_eq!(v, vec![9.56, 5.0, 2.4, 1.11, -3.0, 40.0, 25.1, 12.0]);
+        // Every submission ever made sits in the leading group.
+        assert!(v[..5].iter().all(|e| *e <= ARTEFACT_EDGE_BPS));
+    }
+
+    /// Nothing is discarded — the split decides order only. Zero of 324 attempts above
+    /// the line converting is an 18%-probability outcome at the productive rate, which
+    /// is not enough to throw the band away.
+    #[test]
+    fn ordering_drops_nothing() {
+        let mut v = vec![50.0, 11.0, 3.0];
+        order_by_plausibility(&mut v, |e| *e);
+        assert_eq!(v.len(), 3);
+        let mut sorted = v.clone();
+        sorted.sort_by(f64::total_cmp);
+        assert_eq!(sorted, vec![3.0, 11.0, 50.0]);
+    }
+
 }
 
 #[cfg(test)]
@@ -1134,8 +1232,27 @@ async fn spawn_live(
                     }
 
                     let sol_price = market.sol_price_usd().unwrap_or(0.0);
-                    // Reset every sweep: one attempt per pass, not one per run.
-                    let mut attempted_this_sweep = false;
+                    // Both reset every sweep: this is a budget per pass, not per run.
+                    //
+                    // Two counters rather than one flag, because attempting and
+                    // submitting are different acts with different hazards. See
+                    // [`MAX_ATTEMPTS_PER_SWEEP`].
+                    let mut attempts_this_sweep: usize = 0;
+                    let mut submitted_this_sweep = false;
+                    // Order the sweep's candidates before spending its attempts on them.
+                    //
+                    // The list arrives sorted by gross profit, and gross grows with the
+                    // very artefact that makes a detection worthless: a pool quoting a
+                    // price no size can be traded at shows an enormous edge and re-prices
+                    // to a loss every time. That is the same trap the slot-spread ceiling
+                    // was added for, on a different axis — see [`ARTEFACT_EDGE_BPS`] for
+                    // the attempt-by-attempt table.
+                    //
+                    // A stable partition, not a filter: everything still gets its turn if
+                    // the budget lasts, and within each half the original best-first order
+                    // is untouched.
+                    let mut opportunities = sweep.opportunities;
+                    order_by_plausibility(&mut opportunities, |o| o.edge_bps);
                     // Bounded, the same way the event bus is: a cycle refused once and
                     // never seen again must not sit in this map for the life of the
                     // process. Five times the cooldown is generous headroom for a cycle
@@ -1144,7 +1261,7 @@ async fn spawn_live(
                     recent_refusals.retain(|_, (at, window)| at.elapsed() < *window * 5);
                     recent_logged.retain(|_, at| at.elapsed() < LOG_COOLDOWN * 5);
                     unfundable_entries.retain(|_, at| at.elapsed() < UNFUNDABLE_ENTRY_WINDOW);
-                    for opp in sweep.opportunities {
+                    for opp in opportunities {
                         let id = next_id;
                         next_id += 1;
 
@@ -1263,7 +1380,8 @@ async fn spawn_live(
                                                 at.elapsed() < UNFUNDABLE_ENTRY_WINDOW
                                             })
                                         });
-                                    let candidate = if attempted_this_sweep
+                                    let candidate = if submitted_this_sweep
+                                        || attempts_this_sweep >= MAX_ATTEMPTS_PER_SWEEP
                                         || on_cooldown
                                         || too_skewed
                                         || too_expensive
@@ -1313,13 +1431,15 @@ async fn spawn_live(
                                                     dex.name()
                                                 )
                                             } else {
-                                                "not attempted — another cycle took this \
-                                                 sweep's one attempt"
-                                                    .to_string()
+                                                format!(
+                                                    "not attempted — this sweep's {} attempts \
+                                                     went to other cycles",
+                                                    MAX_ATTEMPTS_PER_SWEEP
+                                                )
                                             });
                                         }
                                         Some(plan) => {
-                                            attempted_this_sweep = true;
+                                            attempts_this_sweep += 1;
                                             let started = std::time::Instant::now();
                                             let r = t.attempt(plan, opp.size_usd, net).await;
                                             latency_ms = started.elapsed().as_millis() as u64;
@@ -1338,6 +1458,13 @@ async fn spawn_live(
                                                             net_usd: 0.0,
                                                         },
                                                     );
+                                                    // The sweep is finished here whatever
+                                                    // its attempt budget had left. This is
+                                                    // the hazard the old one-attempt rule
+                                                    // existed for: a second transaction
+                                                    // against an overlapping pool in the
+                                                    // same slot invalidates the first.
+                                                    submitted_this_sweep = true;
                                                     tracing::error!("submitted {sig}");
                                                     landed = true;
                                                     signature = Some(sig.clone());
@@ -1469,7 +1596,8 @@ async fn spawn_live(
                                                                 std::time::Instant::now(),
                                                             );
                                                         }
-                                                        attempted_this_sweep = false;
+                                                        attempts_this_sweep =
+                                                            attempts_this_sweep.saturating_sub(1);
                                                     }
                                                     // A halt earns no per-cycle hold: it is one
                                                     // fact about the gate, and holding every
