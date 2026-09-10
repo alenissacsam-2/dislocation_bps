@@ -152,14 +152,37 @@ fn build_tray(tauri_app: &tauri::App) -> tauri::Result<()> {
 /// immediately — a config it refuses, a missing binary, a held port — reads as `Failed`
 /// again four seconds later and is restarted forever, writing a log line each time and
 /// never recovering. A cause that survives several restarts is not one restarting fixes.
-/// After [`RESTART_ATTEMPTS`] consecutive failures the watcher stops trying and leaves
-/// the state visible in the tray; anything that reaches `Running` clears the count.
+/// After [`RESTART_ATTEMPTS`] consecutive failures the watcher stops retrying *quickly*;
+/// anything that reaches `Running` clears the count.
 const RESTART_ATTEMPTS: u32 = 3;
+
+/// How long to wait between restarts once the quick ones have been used up.
+///
+/// # Why giving up permanently was wrong
+///
+/// This used to stop for good after [`RESTART_ATTEMPTS`], on the reasoning that a cause
+/// surviving three restarts is not one restarting fixes. That reasoning holds for a
+/// permanent cause and fails badly for a transient one, because all three attempts land
+/// inside twelve seconds — so anything that blocks spawning for even a quarter of a
+/// minute consumes the entire budget and strands the instrument until somebody notices.
+///
+/// A freshly linked binary does exactly that: Windows Defender holds a lock on a newly
+/// written executable while it scans, and a spawn during that window fails with an
+/// access error. On 2026-09-10 a rebuild finished six seconds before the running bot was
+/// stopped, all three attempts failed inside the scan, and the bot stayed down with no
+/// console to report it and nobody at the keyboard.
+///
+/// So the fast attempts stay, and after them the watcher keeps trying on a slow cadence
+/// instead of stopping. A permanent cause now costs one line a minute in a log nobody
+/// reads rather than a dead instrument; a transient one recovers by itself, which is the
+/// entire reason the watcher exists.
+const RESTART_BACKOFF: Duration = Duration::from_secs(60);
 
 fn spawn_watcher(handle: tauri::AppHandle) {
     std::thread::spawn(move || {
         let mut last = None;
         let mut consecutive_restarts: u32 = 0;
+        let mut last_restart: Option<std::time::Instant> = None;
         loop {
             std::thread::sleep(Duration::from_secs(WATCH_SECS));
             let state = handle.state::<app::App>();
@@ -187,19 +210,30 @@ fn spawn_watcher(handle: tauri::AppHandle) {
             }
 
             if now == RunState::Failed && state.auto_restart.load(Ordering::Relaxed) {
-                if consecutive_restarts >= RESTART_ATTEMPTS {
-                    // Said once, at the point it gives up, rather than every four
-                    // seconds for as long as the application is open.
+                // Fast attempts first, then a slow cadence — never a full stop. See
+                // [`RESTART_BACKOFF`] for what stopping cost.
+                let due = if consecutive_restarts < RESTART_ATTEMPTS {
+                    true
+                } else {
+                    last_restart.is_none_or(|at: std::time::Instant| at.elapsed() >= RESTART_BACKOFF)
+                };
+                if due {
                     if consecutive_restarts == RESTART_ATTEMPTS {
+                        // Said once, at the point the cadence changes, rather than every
+                        // four seconds for as long as the application is open.
                         eprintln!(
                             "the bot has failed {RESTART_ATTEMPTS} restarts in a row; \
-                             not trying again until it is started deliberately"
+                             slowing to one attempt every {}s and continuing to try",
+                            RESTART_BACKOFF.as_secs()
                         );
-                        consecutive_restarts += 1;
                     }
-                } else {
                     consecutive_restarts += 1;
-                    let _ = state.runner.start(app::live_passphrase(&state));
+                    last_restart = Some(std::time::Instant::now());
+                    if let Err(e) = state.runner.start(app::live_passphrase(&state)) {
+                        // Worth saying out loud: a spawn that fails is the case this
+                        // whole backoff exists for, and it is invisible otherwise.
+                        eprintln!("restart attempt {consecutive_restarts} failed: {e}");
+                    }
                 }
             }
         }
