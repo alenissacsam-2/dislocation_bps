@@ -120,6 +120,66 @@ pub fn read_config(app: tauri::State<'_, App>) -> Result<config::Params, String>
     config::read_params(&app.paths.config()).map_err(|e| e.to_string())
 }
 
+/// Put the current ledger aside and begin a clean one, optionally restarting into it.
+///
+/// [`save_config`] already does this, because a parameter change ends the run that its
+/// old parameters described. But the reverse is just as often true: an operator wants a
+/// fresh measurement *without* changing anything, and until now the only way to get one
+/// was to edit a value and change it back — which archives the run for a reason that
+/// isn't the real one and leaves a misleading trail.
+///
+/// Stopping first is not optional. The bot holds the SQLite file and its write-ahead
+/// log open, and moving a database out from under a live writer is how you get a
+/// half-written WAL beside a database that no longer matches it. Restarting afterwards
+/// is offered rather than assumed: the operator may be archiving precisely because they
+/// intend to change something before the next run.
+///
+/// Reports what happened to each step separately, for the same reason `save_config`
+/// does — "archived but could not restart" is a different situation from "nothing
+/// happened", and one boolean cannot tell them apart.
+///
+/// # Errors
+/// If the bot cannot be stopped, or the ledger cannot be moved.
+#[tauri::command]
+pub async fn archive_run(
+    app: tauri::State<'_, App>,
+    restart: bool,
+) -> Result<serde_json::Value, String> {
+    let runner = Arc::clone(&app.runner);
+    let paths = app.paths.clone();
+    // Captured out here: `app` is a borrow and cannot cross into a 'static task.
+    let secret = live_passphrase(&app);
+    // Off the main thread: the ledger and its WAL run to hundreds of megabytes, and
+    // moving them on the event loop freezes the window for the duration.
+    tauri::async_runtime::spawn_blocking(move || {
+        let was_running = matches!(runner.probe(), RunState::Running | RunState::Starting);
+        if was_running {
+            runner.stop().map_err(|e| e.to_string())?;
+        }
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let archived = archive::archive_ledger(&paths.ledger(), &paths.archive_dir(), &stamp)
+            .map_err(|e| e.to_string())?;
+        let mut restarted = false;
+        let mut restart_error = None;
+        if restart && was_running {
+            match runner.start(secret) {
+                Ok(()) => restarted = true,
+                Err(e) => restart_error = Some(e.to_string()),
+            }
+        }
+        Ok(serde_json::json!({
+            // `null` when there was nothing to move, which is the normal state right
+            // after an archive rather than a failure.
+            "archived": archived.map(|p| p.display().to_string()),
+            "wasRunning": was_running,
+            "restarted": restarted,
+            "restartError": restart_error,
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Write the parameters, archive the run they no longer describe, and optionally
 /// restart into a clean one.
 ///

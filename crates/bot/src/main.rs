@@ -598,7 +598,21 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
     // needs and every cycle through that mint quietly failing its profit check for the
     // rest of the session — which is precisely the failure this call exists to end.
     // Idempotent, so a retry after a send that actually succeeded finds nothing to do.
-    let base_mints = registry::Registry::embedded()?.base_mints;
+    let mut base_mints = registry::Registry::embedded()?.base_mints;
+    // The base mints are only where cycles *start*. A loop through an intermediate mint
+    // the wallet has no account for cannot pass its profit check at all, because the
+    // rent it would have to pay inside the trade is two hundred times the gain — so the
+    // mints named in `extra_token_mints` are appended here rather than being a separate
+    // call, and `MAX_ACCOUNTS_TO_OPEN` caps the whole list together.
+    for m in &cfg.extra_token_mints {
+        match registry::pk(m) {
+            Ok(k) if !base_mints.contains(&k) => base_mints.push(k),
+            Ok(_) => {}
+            // Named but unreadable is worth saying out loud: the operator asked for this
+            // mint to be reachable and it silently will not be.
+            Err(e) => tracing::error!("extra_token_mints: {m} is not a public key ({e}); skipped"),
+        }
+    }
     for attempt in 1..=3u32 {
         match trader.ensure_token_accounts(&base_mints).await {
             Ok(_) => break,
@@ -663,6 +677,9 @@ async fn main() -> anyhow::Result<()> {
             rpc_ws_url: "wss://api.mainnet-beta.solana.com".into(),
             min_profit_lamports: 0,
             max_position_lamports: 20_000_000,
+            // Empty, like every other default here: this fallback is the paper-mode
+            // path, and paying rent is not something a run with no config should decide.
+            extra_token_mints: Vec::new(),
             capital_usd: 100.0,
             fee_buffer_usd: 0.20,
             min_trade_usd: 10.0,

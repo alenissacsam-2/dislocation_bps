@@ -120,6 +120,22 @@ pub struct Config {
     #[serde(default)]
     pub priority_micro_lamports: u64,
 
+    /// Extra mints to hold a token account for, beyond the registry's base mints.
+    ///
+    /// A cycle passing through a mint the wallet has no account for must open one
+    /// *inside* the trade, and that costs 2,039,280 lamports of rent — so the trade has
+    /// to show a twenty-one cent gain on a cycle worth a tenth of a cent, and always
+    /// fails its profit check. Pre-opening the account is what makes that mint
+    /// reachable at all.
+    ///
+    /// The base mints are the entry points every cycle starts and ends at; these are the
+    /// *intermediate* mints worth paying rent to reach, and which those are is a
+    /// measurement rather than a guess. Kept in config rather than the registry because
+    /// it is a statement about this wallet's budget, not about the pool graph, and the
+    /// rent is refundable the moment an account is closed.
+    #[serde(default)]
+    pub extra_token_mints: Vec<String>,
+
     /// Simulate every trade and submit none.
     ///
     /// **Defaults to true, and that is not a placeholder.** `mode = "live"` arms the
@@ -289,6 +305,7 @@ mod tests {
             max_hops: 3,
             slippage_tenth_bps: 300,
             priority_micro_lamports: 0,
+            extra_token_mints: Vec::new(),
             dry_run: true,
             max_position_usd: 25.0,
             max_daily_loss_usd: 5.0,

@@ -923,10 +923,17 @@ impl Trader {
 
     /// The most token accounts this will ever open in one go.
     ///
-    /// Two is what a SOL/stable book needs — USDC and USDT — and a cap this tight means
-    /// a mistake in what gets passed in cannot spend more than about forty cents of
-    /// refundable deposit.
-    const MAX_ACCOUNTS_TO_OPEN: usize = 2;
+    /// Two was what a SOL/stable book needs — USDC and USDT — and the cap existed so a
+    /// mistake in what gets passed in could not spend more than about forty cents of
+    /// refundable deposit. Raised to five on 2026-09-10 to let the book reach the
+    /// intermediate mints named in `extra_token_mints`, which is the only way a cycle
+    /// through one of them can ever pass its profit check.
+    ///
+    /// Five accounts is 10,196,400 lamports, about $1.05, and it is a deposit rather
+    /// than a spend: closing an account returns it in full. What it genuinely costs is
+    /// the trading capital it stands in while it is parked, which is the reason for a
+    /// cap at all.
+    const MAX_ACCOUNTS_TO_OPEN: usize = 5;
 
     /// Open a token account for each of `mints` the wallet does not already own, once,
     /// before any trade has to pay for one mid-flight.

@@ -592,6 +592,10 @@ async function refreshStatus() {
   $("btnStart").disabled = s.state !== "stopped" || !s.botExePresent;
   // A foreign process was not started here and must never be killed from here.
   $("btnStop").disabled = !(s.state === "running" || s.state === "starting");
+  // Needs a ledger to file and a process this window owns. A foreign bot is excluded
+  // for the same reason Stop excludes it: archiving stops it first, and stopping a
+  // process we did not start is not ours to do.
+  $("btnArchive").disabled = !s.ledgerPresent || s.state === "foreign";
   $("railPath").textContent = s.root || "";
   $("sLedger").textContent = s.ledgerPresent ? "cryptobot.db" : "none";
 }
@@ -1097,6 +1101,29 @@ $("btnStart").onclick = async () => {
 $("btnStop").onclick = async () => {
   $("btnStop").disabled = true;
   try { await invoke("bot_stop"); } catch (e) { await showFailure(String(e)); }
+  refreshStatus();
+};
+$("btnArchive").onclick = async () => {
+  // Asked before doing, because it ends the run in progress. The wording says where
+  // the data goes: nothing here deletes anything, and an operator who hesitates should
+  // hesitate over "the run stops", not over "do I lose the numbers".
+  const running = S.status && (S.status.state === "running" || S.status.state === "starting");
+  const ask = running
+    ? "Stop the bot, file this run in the archive, and start a fresh one?\n\n"
+      + "The current ledger stays readable under History."
+    : "File this run in the archive and begin an empty ledger?\n\n"
+      + "The current ledger stays readable under History.";
+  if (!confirm(ask)) return;
+  $("btnArchive").disabled = true;
+  try {
+    const r = await invoke("archive_run", { restart: running });
+    if (r && r.restartError) {
+      // Archived but not restarted is a real outcome and must not read as success.
+      await showFailure("Archived, but the bot did not restart: " + r.restartError);
+    }
+  } catch (e) {
+    await showFailure(String(e));
+  }
   refreshStatus();
 };
 for (const b of document.querySelectorAll("nav button")) {

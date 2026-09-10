@@ -31,6 +31,12 @@
       <button id="btnStart" class="primary" disabled>Start</button>
       <button id="btnStop" disabled>Stop</button>
     </div>
+    <!-- Separate row, and deliberately not styled as a primary action: it ends the
+         measurement in progress. Nothing is deleted — the ledger moves to the archive
+         and stays readable from the History view. -->
+    <div class="controls">
+      <button id="btnArchive" class="ghost" disabled>Archive &amp; start fresh</button>
+    </div>
   </div>
 
   <!-- Mode and money, beside the Start button rather than three screens away.

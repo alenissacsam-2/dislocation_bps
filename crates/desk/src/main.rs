@@ -36,6 +36,7 @@ fn main() {
             app::bot_stop,
             app::read_config,
             app::save_config,
+            app::archive_run,
             app::read_history,
             app::read_history_at,
             app::read_archives,

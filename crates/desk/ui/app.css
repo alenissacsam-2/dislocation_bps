@@ -120,7 +120,12 @@ body{
 #stateLabel{font-size:12px;font-weight:500}
 .state-note{font-size:11px;color:var(--muted);line-height:1.45}
 .controls{display:flex;gap:6px}
+.controls+.controls{margin-top:6px}
 .controls button{flex:1}
+/* Reads as secondary to Start/Stop, because it is: it ends the run in progress rather
+   than changing whether one is running. Sized to the row so it does not shrink to the
+   compact ghost used inside the rail panels. */
+.controls button.ghost{font-size:11.5px;padding:5px 8px;border:1px solid var(--line)}
 
 nav{display:flex;flex-direction:column;gap:1px}
 nav button{
