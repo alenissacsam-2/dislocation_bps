@@ -186,46 +186,6 @@ fn too_expensive_to_trade(fee_bps: f64) -> bool {
 /// adds stays well inside the floor's tolerance. A larger number would not.
 const MAX_ATTEMPTS_PER_SWEEP: usize = 3;
 
-/// Above this net edge, a detection is far more likely to be an artefact than an offer.
-///
-/// Not a ceiling — nothing is refused for exceeding it. It only decides *order*, so a
-/// sweep spends its attempts on the band that has actually produced submissions before
-/// it spends them on the band that never has.
-///
-/// Route-building attempts to date, by net edge, against whether they reached a
-/// submission:
-///
-/// | net edge | attempts | submitted |
-/// |----------|----------|-----------|
-/// | 0-1 bps  | 22       | 0         |
-/// | 1-2 bps  | 528      | 2 (0.4%)  |
-/// | 2-5 bps  | 1104     | 5 (0.5%)  |
-/// | 5-10 bps | 619      | 5 (0.8%)  |
-/// | 10-25 bps| 288      | 0         |
-/// | 25+ bps  | 36       | 0         |
-///
-/// Every submission ever made sits between 1.11 and 9.56 bps. The 324 attempts above
-/// ten produced none, and re-priced to a median of −4.83 bps against −2.32 for the
-/// 1-2 bps band — a concentrated pool quoting a price no size can be traded at.
-///
-/// It is deliberately *not* a refusal. Zero of 324 looks decisive and is not: at the
-/// 0.53% rate the productive bands run at, 324 attempts would be expected to yield 1.7
-/// submissions, and seeing none has an 18% probability. That is nowhere near enough to
-/// throw the band away. It is more than enough to stop letting it go first.
-const ARTEFACT_EDGE_BPS: f64 = 10.0;
-
-/// Order a sweep's candidates so the band that has actually produced submissions is
-/// offered the attempt budget first.
-///
-/// Generic over the accessor rather than taking `LiveOpportunity` directly, so the
-/// property that matters — a stable partition, not a reordering — can be tested without
-/// building a whole opportunity. See [`ARTEFACT_EDGE_BPS`] for why the split is here.
-fn order_by_plausibility<T>(items: &mut [T], edge_bps: impl Fn(&T) -> f64) {
-    // `false` sorts before `true`, so "not an artefact" leads. `sort_by_key` is stable,
-    // which is the whole point: inside each half the incoming best-first order survives
-    // untouched, and nothing is dropped.
-    items.sort_by_key(|i| edge_bps(i) > ARTEFACT_EDGE_BPS);
-}
 
 /// How long a cycle refused because *the price moved* is left alone. Two sweeps: long
 /// enough that another cycle gets the next attempt, short enough to come back while
@@ -402,38 +362,6 @@ fn on_refusal_cooldown(
     cycle_key: &str,
 ) -> bool {
     recent.get(cycle_key).is_some_and(|(at, window)| at.elapsed() < *window)
-}
-
-#[cfg(test)]
-mod sweep_budget_tests {
-    use super::*;
-
-    /// The productive band must lead, and the incoming order must survive inside each
-    /// half. A boolean sort key is easy to get backwards, and getting it backwards would
-    /// spend every sweep on exactly the candidates that have never converted.
-    #[test]
-    fn plausible_candidates_lead_and_the_rest_keep_their_order() {
-        // Incoming order is best-gross-first, which is where the artefacts cluster.
-        let mut v = vec![40.0, 25.1, 12.0, 9.56, 5.0, 2.4, 1.11, -3.0];
-        order_by_plausibility(&mut v, |e| *e);
-        assert_eq!(v, vec![9.56, 5.0, 2.4, 1.11, -3.0, 40.0, 25.1, 12.0]);
-        // Every submission ever made sits in the leading group.
-        assert!(v[..5].iter().all(|e| *e <= ARTEFACT_EDGE_BPS));
-    }
-
-    /// Nothing is discarded — the split decides order only. Zero of 324 attempts above
-    /// the line converting is an 18%-probability outcome at the productive rate, which
-    /// is not enough to throw the band away.
-    #[test]
-    fn ordering_drops_nothing() {
-        let mut v = vec![50.0, 11.0, 3.0];
-        order_by_plausibility(&mut v, |e| *e);
-        assert_eq!(v.len(), 3);
-        let mut sorted = v.clone();
-        sorted.sort_by(f64::total_cmp);
-        assert_eq!(sorted, vec![3.0, 11.0, 50.0]);
-    }
-
 }
 
 #[cfg(test)]
@@ -1239,20 +1167,37 @@ async fn spawn_live(
                     // [`MAX_ATTEMPTS_PER_SWEEP`].
                     let mut attempts_this_sweep: usize = 0;
                     let mut submitted_this_sweep = false;
-                    // Order the sweep's candidates before spending its attempts on them.
+                    // Left in the order the scanner produced: best gross profit first.
                     //
-                    // The list arrives sorted by gross profit, and gross grows with the
-                    // very artefact that makes a detection worthless: a pool quoting a
-                    // price no size can be traded at shows an enormous edge and re-prices
-                    // to a loss every time. That is the same trap the slot-spread ceiling
-                    // was added for, on a different axis — see [`ARTEFACT_EDGE_BPS`] for
-                    // the attempt-by-attempt table.
+                    // Re-examined against every attempt the ledger can label, because the
+                    // obvious improvement here is wrong and the next reader should not
+                    // have to rediscover that. 2,362 attempts split cleanly: 254 built a
+                    // route whose floor beat its input and reached simulation, 2,108 died
+                    // at the re-price. Scoring each candidate ordering by how well it puts
+                    // the survivors first — AUC, 0.5 being a coin flip:
                     //
-                    // A stable partition, not a filter: everything still gets its turn if
-                    // the budget lasts, and within each half the original best-first order
-                    // is untouched.
-                    let mut opportunities = sweep.opportunities;
-                    order_by_plausibility(&mut opportunities, |o| o.edge_bps);
+                    // | ordering                                   | AUC   |
+                    // |--------------------------------------------|-------|
+                    // | gross profit — what the scanner already does| 0.729 |
+                    // | gross, net edge over 10 bps pushed to back  | 0.700 |
+                    // | same, thresholds at 5 / 8 / 15 / 25 bps     | 0.673-0.705 |
+                    // | detected net edge alone                     | 0.461 |
+                    // | cheapest fee first                          | 0.517 |
+                    //
+                    // A seven-feature logistic regression on the same labels, fitted on
+                    // the first 70% and scored on the last 30%, reaches 0.788 held out and
+                    // still loses to plain gross.
+                    //
+                    // The tempting story was that a very large detected edge is an
+                    // artefact — a concentrated pool quoting a price no size can trade at.
+                    // It is not: attempts above 10 bps of net edge reach simulation 9.2%
+                    // of the time against 11.0% below it. The apparent cliff came from
+                    // counting *submissions*, of which there have only ever been twelve;
+                    // at that base rate the high-edge group would be expected to yield
+                    // about 1.3, so observing none says nothing.
+                    //
+                    // Rank by gross. Do not rank by edge — that is worse than a coin flip.
+                    let opportunities = sweep.opportunities;
                     // Bounded, the same way the event bus is: a cycle refused once and
                     // never seen again must not sit in this map for the life of the
                     // process. Five times the cooldown is generous headroom for a cycle
