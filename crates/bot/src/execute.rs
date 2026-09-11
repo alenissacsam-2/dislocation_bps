@@ -1220,6 +1220,27 @@ impl Trader {
         self.exec.gate.record(outcome);
     }
 
+    /// Fold a confirmed profit or loss into the trade already recorded for `signature`.
+    ///
+    /// Separate from [`Trader::record`] because the trade is counted when it is sent and
+    /// priced when the chain answers, and those are different moments. See
+    /// [`cb_executor::risk::RiskGate::settle`].
+    pub fn settle(&mut self, net_usd: f64) {
+        self.exec.gate.settle(net_usd);
+    }
+
+    /// What one submission costs in lamports, whatever becomes of it.
+    ///
+    /// The base fee plus the priority bid, which Solana charges on the compute limit
+    /// *requested* rather than the amount consumed. A transaction that lands and reverts
+    /// pays this in full and returns nothing, which is precisely the loss the daily
+    /// budget needs to be able to see.
+    #[must_use]
+    pub fn submission_cost_lamports(&self) -> u128 {
+        BASE_FEE_LAMPORTS
+            + priority_fee_lamports(self.opts.priority_micro_lamports, self.opts.compute_units)
+    }
+
     #[must_use]
     pub fn halted(&self) -> Option<String> {
         self.exec.gate.halted()

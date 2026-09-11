@@ -356,6 +356,39 @@ impl RiskGate {
             self.halt(format!("{} trades failed in a row", self.consecutive_failures));
         }
     }
+
+    /// Fold a *confirmed* profit or loss into a trade that has already been recorded.
+    ///
+    /// # Why this exists separately from [`RiskGate::record`]
+    ///
+    /// A submission has to be counted the moment it is sent, because `max_daily_trades`
+    /// is the cap on how much this bot may spend and a transaction in flight is already
+    /// spending. But its P&L is not known then — the chain has not answered — so it is
+    /// booked at zero, and until now it stayed at zero forever. That left
+    /// `max_daily_loss_usd` measuring a number nothing ever wrote to: the one limit
+    /// denominated in money could not see money.
+    ///
+    /// That was survivable only because a submission cost a flat ~6,000 lamports and the
+    /// separate `max_daily_trades` cap bounded the day at around $0.30. It stops being
+    /// survivable the moment the priority bid varies with the opportunity, because then
+    /// the cost of a reverted trade varies with it too.
+    ///
+    /// So: this adds to the realised figure and re-checks the loss limit, and
+    /// deliberately touches neither `trades_today` nor `consecutive_failures` — the
+    /// trade was already counted, and counting it twice would halve the daily cap.
+    pub fn settle(&mut self, net_usd: f64) {
+        if !net_usd.is_finite() {
+            return;
+        }
+        self.realised_usd += net_usd;
+        if self.realised_usd <= -self.limits.max_daily_loss_usd {
+            self.halt(format!(
+                "daily loss limit of ${:.2} reached",
+                self.limits.max_daily_loss_usd
+            ));
+        }
+    }
+
 }
 
 #[cfg(test)]
@@ -374,6 +407,49 @@ mod tests {
             // meaning exactly what they say. Auto-resume gets its own gate below.
             halt_cooldown_secs: 0,
         })
+    }
+
+    /// The trade is counted when it is sent and priced when the chain answers. Pricing
+    /// it must not count it a second time, or the daily cap silently halves.
+    #[test]
+    fn settling_a_trade_prices_it_without_counting_it_again() {
+        let mut g = gate();
+        g.record(Outcome::Landed { net_usd: 0.0 });
+        assert_eq!(g.trades_today(), 1);
+        assert!((g.realised_usd() - 0.0).abs() < f64::EPSILON);
+
+        g.settle(-0.25);
+        assert_eq!(g.trades_today(), 1, "settling is not a new trade");
+        assert!((g.realised_usd() + 0.25).abs() < 1e-9);
+        assert!(g.halted().is_none(), "a quarter is nowhere near the $10 limit");
+    }
+
+    /// The whole point: a loss that only becomes known after confirmation still has to
+    /// reach the daily limit. Before `settle` existed this figure stayed at zero and the
+    /// one limit denominated in money could never trigger.
+    #[test]
+    fn losses_confirmed_after_the_fact_still_halt_on_the_daily_limit() {
+        let mut g = gate();
+        for _ in 0..4 {
+            g.record(Outcome::Landed { net_usd: 0.0 });
+            g.settle(-3.0);
+        }
+        assert!(
+            g.halted().is_some(),
+            "four confirmed $3 losses exceed the $10 daily limit and must halt"
+        );
+        assert!(g.halted().unwrap().contains("daily loss limit"));
+    }
+
+    /// A confirmation that never arrives must not be guessed at in either direction.
+    #[test]
+    fn settling_a_non_finite_figure_changes_nothing() {
+        let mut g = gate();
+        g.record(Outcome::Landed { net_usd: 0.0 });
+        g.settle(f64::NAN);
+        g.settle(f64::NEG_INFINITY);
+        assert!(g.realised_usd().is_finite(), "a bad figure must not poison the running total");
+        assert!(g.halted().is_none());
     }
 
     fn ok_trade() -> Proposal {

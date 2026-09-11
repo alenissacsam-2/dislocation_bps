@@ -262,10 +262,13 @@ mod tests {
         .expect("spawning a trivial process must work");
         *r.child.lock().unwrap() = Some(child);
 
-        // It may still be starting for a moment; what matters is where it lands.
+        // Poll until the child is reaped. Anything other than `Failed` is transient
+        // here: before the exit is observed this reads as `Starting`, or as `Running`
+        // if a real instrument happens to be holding the port while the test runs — so
+        // the loop waits for the verdict rather than sampling once and trusting it.
         let mut state = r.probe();
-        for _ in 0..50 {
-            if state != RunState::Starting {
+        for _ in 0..100 {
+            if state == RunState::Failed {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));

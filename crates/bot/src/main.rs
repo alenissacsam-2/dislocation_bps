@@ -1428,11 +1428,25 @@ async fn spawn_live(
                                                             "submitted and landed".into()
                                                         }
                                                         Some(false) => {
+                                                            // Price it, and tell the risk gate.
+                                                            // A revert pays the whole fee and
+                                                            // returns nothing, and until now
+                                                            // that loss was booked at zero —
+                                                            // leaving `max_daily_loss_usd`
+                                                            // measuring a figure nothing wrote.
+                                                            let cost_usd = t
+                                                                .submission_cost_lamports()
+                                                                as f64
+                                                                / 1e9
+                                                                * sol_price;
+                                                            t.settle(-cost_usd);
+                                                            realised = -cost_usd;
                                                             tracing::warn!(
                                                                 "{sig} landed and reverted — the \
                                                                  floor was not met by the time it \
-                                                                 was included; this costs the base \
-                                                                 fee and nothing else"
+                                                                 was included; this cost \
+                                                                 ${cost_usd:.6} and returned \
+                                                                 nothing"
                                                             );
                                                             "submitted, landed, reverted".into()
                                                         }
