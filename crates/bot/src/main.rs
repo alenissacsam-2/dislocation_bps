@@ -651,7 +651,21 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
     let opts = execute::TradeOptions {
         slippage_tenth_bps: cfg.slippage_tenth_bps,
         priority_micro_lamports: cfg.priority_micro_lamports,
-        compute_units: 400_000,
+        // Priority is charged on the limit *requested*, not the units consumed, so this
+        // number is a price as much as a safety margin. 400,000 was the conservative
+        // guess made before anything had landed.
+        //
+        // Measured since, on chain rather than on ours: across 16,036 successful
+        // transactions in 15 consecutive blocks, the closed-loop arbitrages that
+        // actually profited consumed a median of 179,138 compute units, with a
+        // ninetieth percentile of 255,880 and a maximum of 282,466. Our own reverted
+        // attempt burned 77,938 getting one hop in, including the account creations.
+        //
+        // 300,000 sits above every winner in that sample and buys a third more priority
+        // for the same lamports. Raising it again is cheap to justify and cheap to do;
+        // a transaction that runs out of units pays its fee and reverts, so the failure
+        // is bounded but it is not free.
+        compute_units: 300_000,
         dry_run: cfg.dry_run,
         create_token_accounts: true,
         wsol: cb_executor::route::WsolPolicy::WrapAndClose,
