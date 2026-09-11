@@ -355,13 +355,118 @@ pub struct Trader {
     /// Tick geometry per pool, so the tick-array question costs no round trip of its
     /// own after the first attempt against that pool. See [`TickHint`].
     ticks_seen: HashMap<Pubkey32, TickHint>,
+    /// The two vault accounts a constant-product pool prices from, per pool.
+    ///
+    /// They are written into the pool account and a swap never moves them, so one
+    /// lookup is good for the life of the pool. Caching them is what makes Raydium AMM
+    /// v4 re-priceable at all: the balances have to arrive in the *same* round trip as
+    /// the pool account, and their addresses are only knowable by first decoding that
+    /// account. Learning them costs the pool one refused attempt, once, ever.
+    vaults_seen: HashMap<Pubkey32, [Pubkey; 2]>,
+    /// Mints the classic token program does not own.
+    ///
+    /// Registry configuration, not chain state, so it is loaded once and never
+    /// refreshed: a mint cannot change which program owns it. Anything absent is
+    /// treated as classic, which is the safe direction — a classic assumption on a
+    /// Token-2022 mint derives an address the program will reject, while the reverse
+    /// would build a v2 instruction a classic pool has no handler for.
+    token_2022_mints: std::collections::HashSet<Pubkey32>,
+    /// Mints the wallet already holds a token account for.
+    ///
+    /// # Why a cycle through anything else cannot profit, at any edge
+    ///
+    /// A route creates the accounts it touches, idempotently, and an account that does
+    /// not exist yet costs [`route::TOKEN_ACCOUNT_RENT`] — 2,039,280 lamports — to
+    /// create. On a wSOL cycle the profit is read from the owner's *lamport* balance,
+    /// and the rent comes out of that same balance, so the simulation's post-balance
+    /// check fails by the price of the rent no matter how good the trade was.
+    ///
+    /// That is the correct behaviour and it was invisible: the refusal arrived as a
+    /// balance comparison with no reason attached, after two round trips. Knowing the
+    /// set up front turns it into one line, spent nothing, and says what opening it
+    /// would cost — which at this book is 1.68% of the wallet per mint and therefore a
+    /// decision somebody should make on purpose.
+    ///
+    /// Empty means never measured, which is deliberately not the same as "the wallet
+    /// holds nothing": an unmeasured set refuses nothing and the old behaviour stands.
+    accounts_held: std::collections::HashSet<Pubkey32>,
 }
 
 impl Trader {
     #[must_use]
     pub fn new(exec: Executor, opts: TradeOptions) -> Self {
         let owner = exec.pubkey();
-        Self { exec, opts, owner, ticks_seen: HashMap::new() }
+        Self {
+            exec,
+            opts,
+            owner,
+            ticks_seen: HashMap::new(),
+            vaults_seen: HashMap::new(),
+            token_2022_mints: std::collections::HashSet::new(),
+            accounts_held: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Tell this trader which mints belong to Token-2022, from the registry.
+    ///
+    /// Separate from `new` so the executor does not have to know what a registry is,
+    /// and so a caller that never learns keeps the old behaviour exactly: every mint
+    /// classic, every swap the v1 instruction.
+    pub fn set_token_2022_mints(&mut self, mints: impl IntoIterator<Item = Pubkey32>) {
+        self.token_2022_mints = mints.into_iter().collect();
+    }
+
+    /// Read, in one round trip, which of these mints the wallet already has an account
+    /// for, and remember it. See [`Trader::accounts_held`].
+    ///
+    /// Configuration-like rather than state-like: an account that exists is not going
+    /// to stop existing, and one the wallet opens later is picked up on the next start.
+    /// Returns the mints it has no account for, so the caller can say what they cost.
+    ///
+    /// # Errors
+    /// If the chain cannot be reached.
+    pub async fn learn_token_accounts(&mut self, mints: &[Pubkey32]) -> Result<Vec<Pubkey32>> {
+        let wsol = pk(programs::WSOL_MINT);
+        let wanted: Vec<Pubkey32> =
+            mints.iter().copied().filter(|m| to_pubkey(m) != wsol).collect();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let atas: Vec<Pubkey> = wanted
+            .iter()
+            .map(|m| associated_token_address(&self.owner, &to_pubkey(m), &self.token_program_of(m)))
+            .collect();
+        let found = self.exec.rpc.accounts_full(&atas).await?;
+
+        let mut missing = Vec::new();
+        // wSOL is always held in the sense that matters: `WrapAndClose` opens and closes
+        // it inside the transaction, so it never needs to exist beforehand.
+        self.accounts_held.insert(*pk(programs::WSOL_MINT).as_array());
+        for (mint, acc) in wanted.iter().zip(found.iter()) {
+            if acc.is_some() {
+                self.accounts_held.insert(*mint);
+            } else {
+                missing.push(*mint);
+            }
+        }
+        Ok(missing)
+    }
+
+    /// The first mint of this cycle the wallet cannot hold without paying rent.
+    fn mint_without_an_account(&self, plan: &CyclePlan) -> Option<Pubkey32> {
+        if self.accounts_held.is_empty() {
+            return None;
+        }
+        plan.mints.iter().find(|m| !self.accounts_held.contains(*m)).copied()
+    }
+
+    /// The program that owns a mint, as an address the encoder can use directly.
+    fn token_program_of(&self, mint: &Pubkey32) -> Pubkey {
+        if self.token_2022_mints.contains(mint) {
+            pk(programs::SPL_TOKEN_2022)
+        } else {
+            pk(programs::SPL_TOKEN)
+        }
     }
 
     #[must_use]
@@ -379,17 +484,30 @@ impl Trader {
     /// config account a swap does not touch, so it cannot have gone stale. Everything
     /// else — liquidity, the sqrt price, the reserves — is read fresh, which is the
     /// entire point.
+    /// `vaults` carries the two vault balances a constant-product venue prices from,
+    /// and is `None` for a concentrated one, whose whole state is the pool account.
     fn fresh_leg(
         dex: Dex,
         address: Pubkey32,
         data: &[u8],
         input_mint: &Pubkey32,
         fee_ppm: u32,
+        vaults: Option<(u64, u64)>,
     ) -> Option<Leg> {
         let state = match dex {
             Dex::OrcaWhirlpool => cb_dex::orca_whirlpool::to_pool_state(address, data, 0).ok()?,
             Dex::RaydiumClmm => {
                 cb_dex::raydium_clmm::to_pool_state(address, data, fee_ppm, 0).ok()?
+            }
+            // The pool account holds the fee, the mints and the uncollected protocol
+            // fees; the price lives entirely in two SPL token accounts it points at.
+            // Both have to be read in the same round trip as the pool or this is not a
+            // re-price, it is two prices from two moments — the failure this whole file
+            // exists to stop making.
+            Dex::RaydiumAmmV4 => {
+                let (base, quote) = vaults?;
+                let info = cb_dex::raydium_v4::decode_amm_info(data).ok()?;
+                cb_dex::raydium_v4::to_pool_state(address, &info, base, quote, 0).ok()?
             }
             _ => return None,
         };
@@ -462,7 +580,11 @@ impl Trader {
     }
 
     /// Every leg of this cycle as the chain has it right now.
-    fn fresh_legs(plan: &CyclePlan, pool_data: &[Vec<u8>]) -> Result<Vec<Leg>> {
+    fn fresh_legs(
+        plan: &CyclePlan,
+        pool_data: &[Vec<u8>],
+        vaults: &[Option<(u64, u64)>],
+    ) -> Result<Vec<Leg>> {
         (0..plan.pools.len())
             .map(|i| {
                 Self::fresh_leg(
@@ -471,12 +593,22 @@ impl Trader {
                     &pool_data[i],
                     &plan.mints[i],
                     plan.fee_ppm[i],
+                    vaults.get(i).copied().flatten(),
                 )
                 .with_context(|| {
                     format!("hop {i} could not be re-priced against the state just fetched")
                 })
             })
             .collect()
+    }
+
+    /// The token balance inside a vault account.
+    ///
+    /// Deferred to the venue crate, which owns the layout and already has the offset
+    /// written down once. A second copy of `64` in this file is a second place to get
+    /// it wrong.
+    fn spl_amount(data: &[u8]) -> Option<u64> {
+        cb_dex::raydium_v4::decode_token_amount(data).ok()
     }
 
     /// Build the hops for a cycle, with each hop funded by the previous one's floor.
@@ -493,6 +625,7 @@ impl Trader {
         plan: &CyclePlan,
         pool_data: &[Vec<u8>],
         arrays: &[[Pubkey; 3]],
+        vaults: &[Option<(u64, u64)>],
         fee_headroom: u128,
     ) -> Result<(Vec<Hop>, u128)> {
         let n = plan.pools.len();
@@ -531,7 +664,7 @@ impl Trader {
         // route still refuses to build unless its last floor beats its first input, and
         // the simulation still has the final say. A smaller trade earns less; it cannot
         // earn something that is not there.
-        let legs = Self::fresh_legs(plan, pool_data)?;
+        let legs = Self::fresh_legs(plan, pool_data, vaults)?;
         let spend_total = cb_core::path::largest_feasible(&legs, plan.amount_in);
         if spend_total == 0 {
             bail!(
@@ -617,6 +750,8 @@ impl Trader {
                 // of the two by the venue's own ordering — read from the account rather
                 // than assumed, because getting it backwards reverses the swap.
                 input_is_a: input_is_token_a(plan.pools[i].1, &pool_data[i], &plan.mints[i])?,
+                input_token_program: self.token_program_of(&plan.mints[i]),
+                output_token_program: self.token_program_of(&plan.mints[i + 1]),
                 amount_in,
                 min_amount_out,
                 tick_arrays: arrays[i],
@@ -694,6 +829,20 @@ impl Trader {
             if let Some(why) = self.exec.gate.halted() {
                 return Ok(Attempt::Refused(format!("trading is halted: {why}")));
             }
+        }
+
+        // A cycle whose intermediate mint the wallet has no account for cannot clear
+        // its own profit check, because creating that account costs rent out of the
+        // very balance the profit is measured in. Said here, once, for nothing, rather
+        // than discovered two round trips later as an unexplained balance shortfall.
+        if let Some(mint) = self.mint_without_an_account(plan) {
+            return Ok(Attempt::Refused(format!(
+                "the wallet holds no token account for {}, and opening one costs {} lamports \
+                 of rent out of the same balance this trade's profit is measured in — add \
+                 the mint to extra_token_mints to pay that deposit on purpose",
+                to_pubkey(&mint),
+                route::TOKEN_ACCOUNT_RENT
+            )));
         }
 
         if let Some(dex) = plan.blocking_venue() {
@@ -790,6 +939,23 @@ impl Trader {
             predicted.push(Some((at, cands)));
         }
 
+        // Vault balances for the constant-product hops, in this same round trip.
+        //
+        // A pool whose vaults are not cached yet contributes nothing here and is
+        // learned from its own account below, which costs it one attempt the first
+        // time it is ever seen and nothing afterwards.
+        let mut vault_at: Vec<Option<usize>> = vec![None; n];
+        for (i, (pool_raw, dex)) in plan.pools.iter().enumerate() {
+            if is_concentrated(*dex) {
+                continue;
+            }
+            if let Some(v) = self.vaults_seen.get(pool_raw) {
+                vault_at[i] = Some(keys.len());
+                keys.push(v[0]);
+                keys.push(v[1]);
+            }
+        }
+
         let (fetched, (blockhash, _)) =
             tokio::try_join!(rpc.accounts_full(&keys), rpc.latest_blockhash())?;
         let mut pool_data = Vec::with_capacity(n);
@@ -802,6 +968,50 @@ impl Trader {
             pool_data.push(a.data.clone());
         }
         let profit_account = fetched.get(n).and_then(Option::as_ref);
+
+        // Turn the fetched vault accounts into balances, and learn the addresses of any
+        // we did not have. The learning branch refuses rather than fetching again: a
+        // second round trip is exactly the latency this path is built to avoid, and the
+        // cycle will come round again within a slot or two already knowing.
+        let mut vaults: Vec<Option<(u64, u64)>> = vec![None; n];
+        let mut unlearned: Option<Pubkey> = None;
+        for (i, (pool_raw, dex)) in plan.pools.iter().enumerate() {
+            if is_concentrated(*dex) {
+                continue;
+            }
+            match vault_at[i] {
+                Some(at) => {
+                    let read = |k: usize| {
+                        fetched.get(k).and_then(Option::as_ref).and_then(|a| Self::spl_amount(&a.data))
+                    };
+                    match (read(at), read(at + 1)) {
+                        (Some(base), Some(quote)) => vaults[i] = Some((base, quote)),
+                        _ => {
+                            return Ok(Attempt::Refused(format!(
+                                "pool {} priced from vaults that did not read back as token \
+                                 accounts",
+                                to_pubkey(pool_raw)
+                            )))
+                        }
+                    }
+                }
+                None => {
+                    if let Ok(info) = cb_dex::raydium_v4::decode_amm_info(&pool_data[i]) {
+                        self.vaults_seen.insert(
+                            *pool_raw,
+                            [to_pubkey(&info.base_vault), to_pubkey(&info.quote_vault)],
+                        );
+                        unlearned = Some(to_pubkey(pool_raw));
+                    }
+                }
+            }
+        }
+        if let Some(pool) = unlearned {
+            return Ok(Attempt::Refused(format!(
+                "learned where pool {pool} keeps its reserves; the next sweep can price it \
+                 without a second round trip"
+            )));
+        }
 
         // Which tick arrays actually exist, in the direction each hop will move the
         // price. Measured per attempt rather than cached: an array is created the
@@ -935,7 +1145,7 @@ impl Trader {
         let priority =
             priority_fee_lamports(self.opts.priority_micro_lamports, self.opts.compute_units);
         let fee_headroom = if wrapping { (BASE_FEE_LAMPORTS + priority) * 5 / 4 } else { 0 };
-        let (hops, spent) = match self.hops_for(plan, &pool_data, &arrays, fee_headroom) {
+        let (hops, spent) = match self.hops_for(plan, &pool_data, &arrays, &vaults, fee_headroom) {
             Ok(h) => h,
             Err(e) => return Ok(Attempt::Refused(e.to_string())),
         };
@@ -1104,14 +1314,18 @@ impl Trader {
     /// If the chain cannot be reached. A refusal to open — because nothing is missing,
     /// or because more are missing than the cap allows — is not an error.
     pub async fn ensure_token_accounts(&self, mints: &[Pubkey32]) -> Result<Option<String>> {
-        let token_program = pk(programs::SPL_TOKEN);
         let wsol = pk(programs::WSOL_MINT);
         // wSOL is deliberately absent: `WrapAndClose` opens and closes it inside every
         // transaction, so its rent is borrowed and returned in the same breath.
-        let wanted: Vec<Pubkey> = mints
+        //
+        // Each mint carries its own program from here on. Opening a Token-2022 mint's
+        // account under the classic program does not fail — it derives a different
+        // address, funds it, and leaves the account the trade actually needs still
+        // missing, having spent the rent.
+        let wanted: Vec<(Pubkey, Pubkey)> = mints
             .iter()
-            .map(to_pubkey)
-            .filter(|m| *m != wsol)
+            .filter(|m| to_pubkey(m) != wsol)
+            .map(|m| (to_pubkey(m), self.token_program_of(m)))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -1121,16 +1335,16 @@ impl Trader {
 
         let atas: Vec<Pubkey> = wanted
             .iter()
-            .map(|m| associated_token_address(&self.owner, m, &token_program))
+            .map(|(m, p)| associated_token_address(&self.owner, m, p))
             .collect();
         let existing = self.exec.rpc.accounts_full(&atas).await?;
 
-        let missing: Vec<(Pubkey, Pubkey)> = wanted
+        let missing: Vec<(Pubkey, Pubkey, Pubkey)> = wanted
             .iter()
             .zip(atas.iter())
             .zip(existing.iter())
             .filter(|(_, acc)| acc.is_none())
-            .map(|((m, a), _)| (*m, *a))
+            .map(|(((m, p), a), _)| (*m, *a, *p))
             .collect();
         if missing.is_empty() {
             tracing::info!("every token account this book needs already exists");
@@ -1159,14 +1373,8 @@ impl Trader {
         // compute units and this runs once. A limit set too low reverts a transaction
         // that had nothing wrong with it, which is a silly way to stay blocked.
         let mut ixs = vec![tx::set_compute_limit(120_000)];
-        for (mint, ata) in &missing {
-            ixs.push(tx::create_ata_idempotent(
-                &self.owner,
-                ata,
-                &self.owner,
-                mint,
-                &token_program,
-            ));
+        for (mint, ata, program) in &missing {
+            ixs.push(tx::create_ata_idempotent(&self.owner, ata, &self.owner, mint, program));
         }
 
         // Sent until it actually lands, unlike a trade.
@@ -1495,12 +1703,15 @@ mod tests {
             opts: TradeOptions { slippage_tenth_bps: 300, ..Default::default() },
             owner: Pubkey::new_unique(),
             ticks_seen: HashMap::new(),
+            vaults_seen: HashMap::new(),
+            token_2022_mints: std::collections::HashSet::new(),
+            accounts_held: std::collections::HashSet::new(),
         };
         let p = plan(3);
         let data = pools_for(&p);
         let arrays = vec![[Pubkey::new_unique(); 3]; 3];
 
-        let (hops, _) = t.hops_for(&p, &data, &arrays, 0).expect("a well formed plan");
+        let (hops, _) = t.hops_for(&p, &data, &arrays, &[], 0).expect("a well formed plan");
         assert_eq!(hops.len(), 3);
         assert_eq!(hops[0].amount_in, 1_000_000);
         for w in hops.windows(2) {
@@ -1522,20 +1733,23 @@ mod tests {
             opts: TradeOptions::default(),
             owner: Pubkey::new_unique(),
             ticks_seen: HashMap::new(),
+            vaults_seen: HashMap::new(),
+            token_2022_mints: std::collections::HashSet::new(),
+            accounts_held: std::collections::HashSet::new(),
         };
         let data = pools_for(&plan(3));
         let arrays = vec![[Pubkey::new_unique(); 3]; 3];
 
         let mut short = plan(3);
         short.mints.pop();
-        assert!(t.hops_for(&short, &data, &arrays, 0).is_err());
+        assert!(t.hops_for(&short, &data, &arrays, &[], 0).is_err());
 
         let mut mismatched = plan(3);
         mismatched.leg_out.pop();
-        assert!(t.hops_for(&mismatched, &data, &arrays, 0).is_err());
+        assert!(t.hops_for(&mismatched, &data, &arrays, &[], 0).is_err());
 
         // Fewer accounts than pools must not silently build a shorter cycle.
-        assert!(t.hops_for(&plan(3), &data[..2], &arrays, 0).is_err());
+        assert!(t.hops_for(&plan(3), &data[..2], &arrays, &[], 0).is_err());
     }
 
     /// Slippage wide enough to zero a floor must refuse, not encode a swap that would
@@ -1547,10 +1761,13 @@ mod tests {
             opts: TradeOptions { slippage_tenth_bps: 100_000, ..Default::default() },
             owner: Pubkey::new_unique(),
             ticks_seen: HashMap::new(),
+            vaults_seen: HashMap::new(),
+            token_2022_mints: std::collections::HashSet::new(),
+            accounts_held: std::collections::HashSet::new(),
         };
         let data = pools_for(&plan(2));
         let arrays = vec![[Pubkey::new_unique(); 3]; 2];
-        let e = t.hops_for(&plan(2), &data, &arrays, 0).unwrap_err().to_string();
+        let e = t.hops_for(&plan(2), &data, &arrays, &[], 0).unwrap_err().to_string();
         assert!(e.contains("zero"), "{e}");
     }
 
@@ -1878,8 +2095,11 @@ mod mainnet {
             opts: TradeOptions { slippage_tenth_bps: 300, ..Default::default() },
             owner,
             ticks_seen: HashMap::new(),
+            vaults_seen: HashMap::new(),
+            token_2022_mints: std::collections::HashSet::new(),
+            accounts_held: std::collections::HashSet::new(),
         };
-        let (hops, _) = t.hops_for(&plan, &pool_data, &arrays, 0).expect("hops");
+        let (hops, _) = t.hops_for(&plan, &pool_data, &arrays, &vec![None; plan.pools.len()], 0).expect("hops");
 
         let opts = RouteOptions {
             compute_units: 600_000,
@@ -1981,13 +2201,16 @@ mod fresh_quote_tests {
             opts: TradeOptions { slippage_tenth_bps: 0, ..Default::default() },
             owner: Pubkey::new_unique(),
             ticks_seen: HashMap::new(),
+            vaults_seen: HashMap::new(),
+            token_2022_mints: std::collections::HashSet::new(),
+            accounts_held: std::collections::HashSet::new(),
         };
 
         let mut p = tests::plan(2);
         let data = tests::pools_for(&p);
         let arrays = vec![[Pubkey::new_unique(); 3]; 2];
 
-        let (honest, _) = t.hops_for(&p, &data, &arrays, 0).expect("a well formed plan");
+        let (honest, _) = t.hops_for(&p, &data, &arrays, &[], 0).expect("a well formed plan");
 
         // Now claim, in the plan only, that every leg returns a hundred times more.
         // The pools handed to `hops_for` are unchanged, so nothing about what the chain
@@ -1995,7 +2218,7 @@ mod fresh_quote_tests {
         for q in &mut p.leg_out {
             *q *= 100;
         }
-        let (inflated, _) = t.hops_for(&p, &data, &arrays, 0).expect("a well formed plan");
+        let (inflated, _) = t.hops_for(&p, &data, &arrays, &[], 0).expect("a well formed plan");
 
         assert_eq!(
             honest.iter().map(|h| h.min_amount_out).collect::<Vec<_>>(),
@@ -2014,10 +2237,13 @@ mod fresh_quote_tests {
             opts: TradeOptions { slippage_tenth_bps: 100, ..Default::default() },
             owner: Pubkey::new_unique(),
             ticks_seen: HashMap::new(),
+            vaults_seen: HashMap::new(),
+            token_2022_mints: std::collections::HashSet::new(),
+            accounts_held: std::collections::HashSet::new(),
         };
         let p = tests::plan(3);
         let (hops, spent) = t
-            .hops_for(&p, &tests::pools_for(&p), &vec![[Pubkey::new_unique(); 3]; 3], 0)
+            .hops_for(&p, &tests::pools_for(&p), &vec![[Pubkey::new_unique(); 3]; 3], &[], 0)
             .expect("a well formed plan");
 
         assert_eq!(spent, p.amount_in, "these fixtures have room for the whole size");
@@ -2035,7 +2261,7 @@ mod fresh_quote_tests {
     /// would quietly reappear.
     #[test]
     fn a_venue_without_an_encoder_cannot_be_re_priced() {
-        assert!(Trader::fresh_leg(Dex::RaydiumAmmV4, [7u8; 32], &[0u8; 300], &[1u8; 32], 2_500)
+        assert!(Trader::fresh_leg(Dex::RaydiumAmmV4, [7u8; 32], &[0u8; 300], &[1u8; 32], 2_500, None)
             .is_none());
     }
 
@@ -2054,6 +2280,9 @@ mod fresh_quote_tests {
             opts: TradeOptions { slippage_tenth_bps: 3, ..Default::default() },
             owner: Pubkey::new_unique(),
             ticks_seen: HashMap::new(),
+            vaults_seen: HashMap::new(),
+            token_2022_mints: std::collections::HashSet::new(),
+            accounts_held: std::collections::HashSet::new(),
         };
         let mut p = tests::plan(2);
         let data = tests::pools_for(&p);
@@ -2063,13 +2292,13 @@ mod fresh_quote_tests {
         // changed, so the honest answer is "trade what is there", not "trade nothing".
         p.amount_in = 100_000_000_000_000_000;
         let (hops, spent) =
-            t.hops_for(&p, &data, &arrays, 0).expect("an oversized plan is still tradeable");
+            t.hops_for(&p, &data, &arrays, &[], 0).expect("an oversized plan is still tradeable");
         assert!(spent < p.amount_in, "it must not pretend the room is there");
 
         // The ceiling is a property of the pools, not of how much was asked for.
         let mut greedier = p.clone();
         greedier.amount_in = p.amount_in * 10;
-        let (_, again) = t.hops_for(&greedier, &data, &arrays, 0).expect("still tradeable");
+        let (_, again) = t.hops_for(&greedier, &data, &arrays, &[], 0).expect("still tradeable");
         assert_eq!(spent, again, "the ceiling is the pools', not the request's");
         assert_eq!(u128::from(hops[0].amount_in), spent, "the first hop spends what was chosen");
 
@@ -2098,10 +2327,13 @@ mod fresh_quote_tests {
                 opts: TradeOptions::default(),
                 owner: Pubkey::new_unique(),
                 ticks_seen: HashMap::new(),
+                vaults_seen: HashMap::new(),
+                token_2022_mints: std::collections::HashSet::new(),
+            accounts_held: std::collections::HashSet::new(),
             };
             let _ = &t;
             let p = tests::plan(2);
-            Trader::fresh_legs(&p, &tests::pools_for(&p)).expect("fixtures price")
+            Trader::fresh_legs(&p, &tests::pools_for(&p), &[]).expect("fixtures price")
         };
         let spend = tests::plan(2).amount_in;
 
@@ -2145,14 +2377,119 @@ mod fresh_quote_tests {
             opts: TradeOptions::default(),
             owner: Pubkey::new_unique(),
             ticks_seen: HashMap::new(),
+            vaults_seen: HashMap::new(),
+            token_2022_mints: std::collections::HashSet::new(),
+            accounts_held: std::collections::HashSet::new(),
         };
         let p = tests::plan(2);
         // Pools that decode but trade the wrong mints cannot be re-priced at all.
         let wrong = vec![tests::whirlpool_with([9u8; 32], [8u8; 32]); 2];
-        let e = t.hops_for(&p, &wrong, &[[Pubkey::new_unique(); 3]; 2], 0).unwrap_err();
+        let e = t.hops_for(&p, &wrong, &[[Pubkey::new_unique(); 3]; 2], &[], 0).unwrap_err();
         assert!(
             e.to_string().contains("could not be re-priced"),
             "an unpriceable hop must say so: {e}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod vault_backed_tests {
+    use super::{has_encoder, is_concentrated, Trader};
+    use cb_core::types::Dex;
+
+    /// A constant-product venue has no ticks and does have vaults, and both branches in
+    /// `attempt` key off this. If it were ever classed as concentrated, the tick loop
+    /// would try to read a tick out of an `AmmInfo` and the vault fetch would be
+    /// skipped, which is two failures wearing one mistake.
+    #[test]
+    fn raydium_v4_is_encodable_and_not_concentrated() {
+        assert!(has_encoder(Dex::RaydiumAmmV4), "the encoder has existed since e654b7d");
+        assert!(!is_concentrated(Dex::RaydiumAmmV4), "its price is two vault balances");
+        assert!(is_concentrated(Dex::OrcaWhirlpool));
+        assert!(is_concentrated(Dex::RaydiumClmm));
+    }
+
+    /// The balance is a little-endian `u64` at offset 64 of an SPL token account, and
+    /// reading it from the wrong place would price a pool from somebody's mint or owner
+    /// key read as a number — a wrong price rather than an error, which is the worst
+    /// kind.
+    #[test]
+    fn a_vault_balance_is_read_from_the_documented_offset() {
+        let mut account = vec![0u8; cb_dex::raydium_v4::SPL_TOKEN_ACCOUNT_LEN];
+        account[64..72].copy_from_slice(&123_456_789_u64.to_le_bytes());
+        assert_eq!(Trader::spl_amount(&account), Some(123_456_789));
+        assert_eq!(Trader::spl_amount(&[0u8; 16]), None, "too short is not zero");
+    }
+
+    /// The property the whole vault cache exists to protect.
+    ///
+    /// A pool account and the vaults it points at are one price only if they are read
+    /// together. Fetching the pool, decoding it to learn the vault addresses and then
+    /// fetching those is two prices from two moments — the exact mistake this file's
+    /// history is made of, and it would be invisible, because the arithmetic still
+    /// produces a number. So the vault keys must join `keys` before the single round
+    /// trip, never after it.
+    #[test]
+    fn vault_keys_are_fetched_with_the_pool_and_not_after_it() {
+        let src = include_str!("execute.rs");
+        let push = src.find("keys.push(v[0]);").expect("vault keys are collected");
+        let fetch = src.find("tokio::try_join!(rpc.accounts_full(&keys)").expect("one round trip");
+        assert!(
+            push < fetch,
+            "vault addresses must be added to the fetch, not read in a second one — \
+             a pool and its vaults from different slots is a price nobody was offered"
+        );
+    }
+}
+
+#[cfg(test)]
+mod account_rent_tests {
+    use super::{tests::plan, Trader, TradeOptions};
+    use cb_core::types::Pubkey32;
+    use std::collections::{HashMap, HashSet};
+
+    fn trader_holding(mints: &[Pubkey32]) -> Trader {
+        let mut t = Trader {
+            exec: super::tests::unreachable_executor(),
+            opts: TradeOptions::default(),
+            owner: solana_sdk::pubkey::Pubkey::new_unique(),
+            ticks_seen: HashMap::new(),
+            vaults_seen: HashMap::new(),
+            token_2022_mints: HashSet::new(),
+            accounts_held: HashSet::new(),
+        };
+        t.accounts_held = mints.iter().copied().collect();
+        t
+    }
+
+    /// A run that has not measured which accounts exist must refuse nothing. The set
+    /// is used as a negative filter, so an empty one meaning "the wallet holds nothing"
+    /// would refuse every cycle in the book on the strength of a reading never taken.
+    #[test]
+    fn an_unmeasured_wallet_blocks_nothing() {
+        let t = trader_holding(&[]);
+        assert!(t.mint_without_an_account(&plan(2)).is_none());
+    }
+
+    /// The rent is charged to the same lamport balance the profit is read from, so a
+    /// cycle through a mint we cannot hold fails its profit check by 2,039,280 lamports
+    /// however good the trade was. Name it before spending two round trips finding out.
+    #[test]
+    fn a_mint_with_no_account_is_named_before_any_round_trip() {
+        let p = plan(2);
+        // A two-hop cycle reads SOL, the intermediate, SOL — so holding only the base
+        // is the real case: the wallet can start the loop and cannot finish it.
+        let t = trader_holding(&[p.mints[0]]);
+        assert_eq!(
+            t.mint_without_an_account(&p),
+            Some(p.mints[1]),
+            "the intermediate is the mint that needs the deposit"
+        );
+
+        let all: Vec<Pubkey32> = p.mints.to_vec();
+        assert!(
+            trader_holding(&all).mint_without_an_account(&p).is_none(),
+            "a wallet holding every mint of the cycle must not be blocked"
         );
     }
 }

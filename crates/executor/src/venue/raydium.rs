@@ -50,6 +50,9 @@ pub fn swap(
     token_program: Pubkey,
     policy: BitmapPolicy,
 ) -> Result<Instruction> {
+    if super::needs_token_2022(ctx) {
+        return swap_v2(ctx, pool_data, policy);
+    }
     let p = cb_dex::raydium_clmm::decode(pool_data)?;
     ensure!(ctx.amount_in > 0, "a swap of zero is not a swap");
     ensure!(
@@ -114,13 +117,88 @@ pub fn swap(
     Ok(Instruction { program_id: program, accounts, data })
 }
 
+/// Build a `swapV2` instruction, which is the only one that accepts a Token-2022 mint.
+///
+/// # Where this account list came from
+///
+/// The same place as Orca's: fifteen mainnet blocks read whole, every instruction on
+/// this program discriminated as `sha256("global:swap_v2")` dumped with its accounts
+/// resolved. 376 of them, in eight shapes from 14 to 22 accounts. The first thirteen
+/// are identical in every one — the shapes differ only in how many tick arrays follow,
+/// which is exactly the v1 structure one position further along.
+///
+/// Two facts fell out of that dump that are worth keeping. Positions 8 and 9 are the
+/// classic token program and the Token-2022 program **both**, always, in that order,
+/// regardless of which one owns which mint — the program picks per mint from positions
+/// 11 and 12. And the argument buffer is unchanged from v1: 41 bytes in every sample,
+/// against Orca's v2 which grew by one.
+///
+/// # Errors
+/// If the account does not decode, or the trade has no size or no output floor.
+pub fn swap_v2(ctx: &SwapContext, pool_data: &[u8], policy: BitmapPolicy) -> Result<Instruction> {
+    let p = cb_dex::raydium_clmm::decode(pool_data)?;
+    ensure!(ctx.amount_in > 0, "a swap of zero is not a swap");
+    ensure!(
+        ctx.min_amount_out > 0,
+        "a swap with no output floor would accept dust; refusing to encode one"
+    );
+
+    let program = pk(cb_dex::raydium_clmm::PROGRAM_ID);
+    let zero_for_one = ctx.input_is_a;
+
+    let (input_vault, output_vault, input_mint, output_mint) = if zero_for_one {
+        (p.vault_0, p.vault_1, p.mint_0, p.mint_1)
+    } else {
+        (p.vault_1, p.vault_0, p.mint_1, p.mint_0)
+    };
+
+    let limit = price_limit(p.sqrt_price_x64, zero_for_one, MIN_SQRT_PRICE_X64, MAX_SQRT_PRICE_X64);
+
+    let mut accounts = vec![
+        AccountMeta::new(ctx.owner, true),
+        AccountMeta::new_readonly(to_pubkey(&p.amm_config), false),
+        AccountMeta::new(ctx.pool, false),
+        AccountMeta::new(ctx.user_source, false),
+        AccountMeta::new(ctx.user_dest, false),
+        AccountMeta::new(to_pubkey(&input_vault), false),
+        AccountMeta::new(to_pubkey(&output_vault), false),
+        AccountMeta::new(to_pubkey(&p.observation), false),
+        AccountMeta::new_readonly(pk(crate::encode::programs::SPL_TOKEN), false),
+        AccountMeta::new_readonly(pk(crate::encode::programs::SPL_TOKEN_2022), false),
+        AccountMeta::new_readonly(pk(crate::encode::programs::MEMO), false),
+        AccountMeta::new_readonly(to_pubkey(&input_mint), false),
+        AccountMeta::new_readonly(to_pubkey(&output_mint), false),
+        AccountMeta::new(ctx.tick_arrays[0], false),
+    ];
+
+    if policy == BitmapPolicy::Include {
+        accounts.push(AccountMeta::new(raydium_bitmap_extension(&ctx.pool, &program), false));
+    }
+    // Distinct arrays only — see the v1 builder for the SBF panic this avoids.
+    for array in &ctx.tick_arrays[1..] {
+        if *array == ctx.tick_arrays[0] || accounts.iter().any(|a| a.pubkey == *array) {
+            continue;
+        }
+        accounts.push(AccountMeta::new(*array, false));
+    }
+
+    let data = Args::anchor("swap_v2")
+        .u64(ctx.amount_in)
+        .u64(ctx.min_amount_out)
+        .u128(limit)
+        .bool(true)
+        .build();
+
+    Ok(Instruction { program_id: program, accounts, data })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::encode::programs;
 
     /// A synthetic CLMM pool laid out at the offsets the decoder reads.
-    fn pool() -> Vec<u8> {
+    pub(super) fn pool() -> Vec<u8> {
         let mut d = vec![0u8; cb_dex::raydium_clmm::POOL_LEN];
         d[9..41].copy_from_slice(&[0x11; 32]); // amm_config
         d[73..105].copy_from_slice(&[0x22; 32]); // mint_0
@@ -137,7 +215,7 @@ mod tests {
         d
     }
 
-    fn ctx(input_is_a: bool) -> SwapContext {
+    pub(super) fn ctx(input_is_a: bool) -> SwapContext {
         let pool = Pubkey::new_unique();
         let program = pk(cb_dex::raydium_clmm::PROGRAM_ID);
         let starts =
@@ -150,6 +228,8 @@ mod tests {
             amount_in: 500_000,
             min_amount_out: 499_000,
             input_is_a,
+            input_token_program: pk(crate::encode::programs::SPL_TOKEN),
+            output_token_program: pk(crate::encode::programs::SPL_TOKEN),
             tick_arrays: [
                 crate::pda::raydium_tick_array(&pool, starts[0], &program),
                 crate::pda::raydium_tick_array(&pool, starts[1], &program),
@@ -294,5 +374,102 @@ mod tests {
                 assert!(seen.insert(m.pubkey), "{} appears twice under {policy:?}", m.pubkey);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod token_2022_tests {
+    use super::*;
+    use crate::encode::programs;
+
+    fn t22() -> Pubkey {
+        pk(programs::SPL_TOKEN_2022)
+    }
+    fn spl() -> Pubkey {
+        pk(programs::SPL_TOKEN)
+    }
+
+    fn ctx_with(zero_for_one: bool, input: Pubkey, output: Pubkey) -> SwapContext {
+        let mut c = super::tests::ctx(zero_for_one);
+        c.input_token_program = input;
+        c.output_token_program = output;
+        c
+    }
+
+    /// A classic pair must keep the exact instruction that has already landed on chain,
+    /// and only a Token-2022 mint may change it.
+    #[test]
+    fn only_a_token_2022_mint_changes_the_instruction() {
+        let data = super::tests::pool();
+        let classic = swap(&ctx_with(true, spl(), spl()), &data, spl(), BitmapPolicy::Omit).unwrap();
+        assert_eq!(&classic.data[..8], &crate::encode::anchor_discriminator("swap"));
+
+        let v2 = swap(&ctx_with(true, spl(), t22()), &data, spl(), BitmapPolicy::Omit).unwrap();
+        assert_eq!(&v2.data[..8], &crate::encode::anchor_discriminator("swap_v2"));
+        assert_eq!(v2.data.len(), classic.data.len(), "v2 takes the same arguments as v1");
+    }
+
+    /// The thirteen fixed accounts, in the order 376 mainnet `swap_v2` calls used.
+    ///
+    /// Positions 8 and 9 are the surprise worth a test of its own: both token programs
+    /// are always passed, always classic-then-2022, whichever one owns whichever mint.
+    /// The program selects per mint from positions 11 and 12 instead. Ordering them by
+    /// role — input's program first — reads more naturally and is wrong.
+    #[test]
+    fn the_v2_account_list_matches_the_one_the_chain_uses() {
+        let data = super::tests::pool();
+        let c = ctx_with(true, t22(), spl());
+        let ix = swap_v2(&c, &data, BitmapPolicy::Omit).unwrap();
+
+        assert_eq!(ix.accounts[0].pubkey, c.owner, "payer");
+        assert!(ix.accounts[0].is_signer);
+        assert_eq!(ix.accounts[1].pubkey, Pubkey::new_from_array([0x11; 32]), "amm_config");
+        assert_eq!(ix.accounts[2].pubkey, c.pool, "pool_state");
+        assert_eq!(ix.accounts[3].pubkey, c.user_source, "input_token_account");
+        assert_eq!(ix.accounts[4].pubkey, c.user_dest, "output_token_account");
+        assert_eq!(ix.accounts[5].pubkey, Pubkey::new_from_array([0x44; 32]), "input_vault");
+        assert_eq!(ix.accounts[6].pubkey, Pubkey::new_from_array([0x55; 32]), "output_vault");
+        assert_eq!(ix.accounts[7].pubkey, Pubkey::new_from_array([0x66; 32]), "observation");
+        assert_eq!(ix.accounts[8].pubkey, spl(), "classic program first, always");
+        assert_eq!(ix.accounts[9].pubkey, t22(), "token-2022 second, always");
+        assert_eq!(ix.accounts[10].pubkey, pk(programs::MEMO), "memo_program");
+        assert_eq!(ix.accounts[11].pubkey, Pubkey::new_from_array([0x22; 32]), "input_vault_mint");
+        assert_eq!(ix.accounts[12].pubkey, Pubkey::new_from_array([0x33; 32]), "output_vault_mint");
+        assert_eq!(ix.accounts.iter().filter(|a| a.is_signer).count(), 1);
+    }
+
+    /// Raydium's list is positional by role, so reversing the direction must reverse
+    /// the vaults and the mints together — including the two mints at 11 and 12, which
+    /// are new in v2 and are the pair most easily left pointing the old way.
+    #[test]
+    fn reversing_the_direction_reverses_the_vaults_and_the_mints_together() {
+        let data = super::tests::pool();
+        let ix = swap_v2(&ctx_with(false, spl(), t22()), &data, BitmapPolicy::Omit).unwrap();
+        assert_eq!(ix.accounts[5].pubkey, Pubkey::new_from_array([0x55; 32]), "vault_1 is input");
+        assert_eq!(ix.accounts[6].pubkey, Pubkey::new_from_array([0x44; 32]), "vault_0 is output");
+        assert_eq!(ix.accounts[11].pubkey, Pubkey::new_from_array([0x33; 32]), "mint_1 is input");
+        assert_eq!(ix.accounts[12].pubkey, Pubkey::new_from_array([0x22; 32]), "mint_0 is output");
+        assert_eq!(ix.accounts[8].pubkey, spl(), "the program pair does not move");
+        assert_eq!(ix.accounts[9].pubkey, t22());
+    }
+
+    /// The bitmap extension and the tick arrays keep the v1 treatment, one position
+    /// later. Repeating an array would make Raydium borrow the same account twice and
+    /// panic the program, which costs the whole transaction.
+    #[test]
+    fn tick_arrays_still_deduplicate_and_the_bitmap_still_leads_them() {
+        let data = super::tests::pool();
+        let mut c = ctx_with(true, t22(), spl());
+        c.tick_arrays = [c.tick_arrays[0], c.tick_arrays[0], c.tick_arrays[0]];
+        let omit = swap_v2(&c, &data, BitmapPolicy::Omit).unwrap();
+        assert_eq!(omit.accounts.len(), 14, "one array, no repeats, no bitmap");
+
+        let include = swap_v2(&c, &data, BitmapPolicy::Include).unwrap();
+        assert_eq!(include.accounts.len(), 15);
+        assert_eq!(
+            include.accounts[14].pubkey,
+            crate::pda::raydium_bitmap_extension(&c.pool, &pk(cb_dex::raydium_clmm::PROGRAM_ID)),
+            "the bitmap leads the remaining accounts"
+        );
     }
 }

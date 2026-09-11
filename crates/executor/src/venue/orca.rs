@@ -27,6 +27,9 @@ const MAX_SQRT_PRICE_X64: u128 = 79_226_673_515_401_279_992_447_579_055;
 /// If the account does not decode as a Whirlpool — which includes adaptive-fee pools,
 /// deliberately, since the decoder refuses those and quoting one understates its cost.
 pub fn swap(ctx: &SwapContext, pool_data: &[u8]) -> Result<Instruction> {
+    if super::needs_token_2022(ctx) {
+        return swap_v2(ctx, pool_data);
+    }
     let w = cb_dex::orca_whirlpool::decode(pool_data)?;
     ensure!(ctx.amount_in > 0, "a swap of zero is not a swap");
     ensure!(
@@ -74,6 +77,87 @@ pub fn swap(ctx: &SwapContext, pool_data: &[u8]) -> Result<Instruction> {
     Ok(Instruction { program_id: program, accounts, data })
 }
 
+/// Build a `swapV2` instruction, which is the only one that accepts a Token-2022 mint.
+///
+/// # Where this account list came from
+///
+/// Not from documentation. Fifteen consecutive mainnet blocks were read whole and
+/// every instruction on this program whose first eight bytes matched
+/// `sha256("global:swap_v2")` was dumped with its accounts resolved — 161 of them,
+/// across two shapes. The fixed prefix is identical in all of them and is what is
+/// written below; the shapes differ only in how many *supplemental* tick arrays follow
+/// the fifteenth account, which this encoder does not use.
+///
+/// Reading it off the chain rather than off a page matters here more than usual. An
+/// account list that is wrong in its *order* produces a transaction that fails, which
+/// is safe and obvious. One that is wrong by a position that happens to type-check
+/// produces a swap against the wrong account, and the simulation is the only thing
+/// standing between that and a signature.
+///
+/// The argument buffer is the v1 buffer plus one byte: `remaining_accounts_info` is an
+/// `Option`, and `None` encodes as a single zero. Observed length 43 against v1's 42.
+///
+/// # Errors
+/// If the account does not decode, or the trade has no size or no output floor.
+pub fn swap_v2(ctx: &SwapContext, pool_data: &[u8]) -> Result<Instruction> {
+    let w = cb_dex::orca_whirlpool::decode(pool_data)?;
+    ensure!(ctx.amount_in > 0, "a swap of zero is not a swap");
+    ensure!(
+        ctx.min_amount_out > 0,
+        "a swap with no output floor would accept dust; refusing to encode one"
+    );
+
+    let program = pk(cb_dex::orca_whirlpool::PROGRAM_ID);
+    let a_to_b = ctx.input_is_a;
+
+    // Same trap as the v1 list: these positions are A and B, not source and
+    // destination. See the module docs.
+    let (owner_a, owner_b) = if a_to_b {
+        (ctx.user_source, ctx.user_dest)
+    } else {
+        (ctx.user_dest, ctx.user_source)
+    };
+    // And the programs travel with the mints, not with the direction.
+    let (program_a, program_b) = if a_to_b {
+        (ctx.input_token_program, ctx.output_token_program)
+    } else {
+        (ctx.output_token_program, ctx.input_token_program)
+    };
+
+    let limit = price_limit(w.sqrt_price_x64, a_to_b, MIN_SQRT_PRICE_X64, MAX_SQRT_PRICE_X64);
+
+    let accounts = vec![
+        AccountMeta::new_readonly(program_a, false),
+        AccountMeta::new_readonly(program_b, false),
+        AccountMeta::new_readonly(pk(programs::MEMO), false),
+        AccountMeta::new_readonly(ctx.owner, true),
+        AccountMeta::new(ctx.pool, false),
+        AccountMeta::new_readonly(to_pubkey(&w.mint_a), false),
+        AccountMeta::new_readonly(to_pubkey(&w.mint_b), false),
+        AccountMeta::new(owner_a, false),
+        AccountMeta::new(to_pubkey(&w.vault_a), false),
+        AccountMeta::new(owner_b, false),
+        AccountMeta::new(to_pubkey(&w.vault_b), false),
+        AccountMeta::new(ctx.tick_arrays[0], false),
+        AccountMeta::new(ctx.tick_arrays[1], false),
+        AccountMeta::new(ctx.tick_arrays[2], false),
+        AccountMeta::new(orca_oracle(&ctx.pool, &program), false),
+    ];
+
+    let data = Args::anchor("swap_v2")
+        .u64(ctx.amount_in)
+        .u64(ctx.min_amount_out)
+        .u128(limit)
+        .bool(true)
+        .bool(a_to_b)
+        // `remaining_accounts_info: Option<RemainingAccountsInfo>` — None. We pass no
+        // supplemental tick arrays, so there is nothing to describe.
+        .bool(false)
+        .build();
+
+    Ok(Instruction { program_id: program, accounts, data })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,7 +166,7 @@ mod tests {
     use solana_sdk::pubkey::Pubkey;
 
     /// A synthetic Whirlpool account laid out at the offsets the decoder reads.
-    fn whirlpool(mint_a: Pubkey32, mint_b: Pubkey32, va: Pubkey32, vb: Pubkey32) -> Vec<u8> {
+    pub(super) fn whirlpool(mint_a: Pubkey32, mint_b: Pubkey32, va: Pubkey32, vb: Pubkey32) -> Vec<u8> {
         let mut d = vec![0u8; cb_dex::orca_whirlpool::WHIRLPOOL_LEN];
         let spacing: u16 = 64;
         d[41..43].copy_from_slice(&spacing.to_le_bytes());
@@ -99,7 +183,7 @@ mod tests {
         d
     }
 
-    fn ctx(input_is_a: bool, src: Pubkey, dst: Pubkey, pool: Pubkey) -> SwapContext {
+    pub(super) fn ctx(input_is_a: bool, src: Pubkey, dst: Pubkey, pool: Pubkey) -> SwapContext {
         SwapContext {
             owner: Pubkey::new_unique(),
             pool,
@@ -108,6 +192,8 @@ mod tests {
             amount_in: 1_000_000,
             min_amount_out: 999_000,
             input_is_a,
+            input_token_program: pk(crate::encode::programs::SPL_TOKEN),
+            output_token_program: pk(crate::encode::programs::SPL_TOKEN),
             tick_arrays: arrays(pool, input_is_a),
         }
     }
@@ -227,5 +313,99 @@ mod tests {
         // Break the seed/spacing agreement, which is the adaptive-fee marker.
         data[43..45].copy_from_slice(&7u16.to_le_bytes());
         assert!(swap(&ctx(true, src, dst, pool), &data).is_err());
+    }
+}
+
+#[cfg(test)]
+mod token_2022_tests {
+    use super::*;
+    use crate::encode::programs;
+    use solana_sdk::pubkey::Pubkey;
+
+    fn t22() -> Pubkey {
+        pk(programs::SPL_TOKEN_2022)
+    }
+    fn spl() -> Pubkey {
+        pk(programs::SPL_TOKEN)
+    }
+
+    fn ctx_with(a_to_b: bool, in_prog: Pubkey, out_prog: Pubkey, pool: Pubkey) -> SwapContext {
+        let mut c = super::tests::ctx(a_to_b, Pubkey::new_unique(), Pubkey::new_unique(), pool);
+        c.input_token_program = in_prog;
+        c.output_token_program = out_prog;
+        c
+    }
+
+    /// The dispatch, which is the whole point: a classic pair keeps the eleven-account
+    /// v1 instruction it has been landing with, and a pair containing a Token-2022 mint
+    /// silently becomes v2 rather than building an instruction the program rejects.
+    #[test]
+    fn a_token_2022_mint_selects_the_v2_instruction_and_nothing_else_does() {
+        let pool = Pubkey::new_unique();
+        let data = super::tests::whirlpool([1; 32], [2; 32], [3; 32], [4; 32]);
+
+        let classic = swap(&ctx_with(true, spl(), spl(), pool), &data).unwrap();
+        assert_eq!(classic.accounts.len(), 11, "a classic pair must not pay for v2");
+        assert_eq!(classic.data.len(), 42);
+
+        for (i, o) in [(t22(), spl()), (spl(), t22()), (t22(), t22())] {
+            let ix = swap(&ctx_with(true, i, o, pool), &data).unwrap();
+            assert_eq!(ix.accounts.len(), 15, "v2 carries fifteen fixed accounts");
+            assert_eq!(ix.data.len(), 43, "v2 adds one byte of remaining-accounts info");
+            assert_eq!(&ix.data[..8], &crate::encode::anchor_discriminator("swap_v2"));
+        }
+    }
+
+    /// The layout, position by position, exactly as 161 mainnet `swap_v2` calls showed
+    /// it. Written out rather than summarised because an account list is only correct
+    /// as a whole, and the failure mode of getting one position wrong is a transaction
+    /// that does something other than what it says.
+    #[test]
+    fn the_v2_account_list_matches_the_one_the_chain_uses() {
+        let pool = Pubkey::new_unique();
+        let data = super::tests::whirlpool([1; 32], [2; 32], [3; 32], [4; 32]);
+        let c = ctx_with(true, t22(), spl(), pool);
+        let ix = swap_v2(&c, &data).unwrap();
+
+        assert_eq!(ix.accounts[0].pubkey, t22(), "token_program_a");
+        assert_eq!(ix.accounts[1].pubkey, spl(), "token_program_b");
+        assert_eq!(ix.accounts[2].pubkey, pk(programs::MEMO), "memo_program");
+        assert_eq!(ix.accounts[3].pubkey, c.owner, "token_authority");
+        assert!(ix.accounts[3].is_signer, "the authority signs and nothing else does");
+        assert_eq!(ix.accounts[4].pubkey, pool, "whirlpool");
+        assert_eq!(ix.accounts[5].pubkey, Pubkey::new_from_array([1; 32]), "token_mint_a");
+        assert_eq!(ix.accounts[6].pubkey, Pubkey::new_from_array([2; 32]), "token_mint_b");
+        assert_eq!(ix.accounts[7].pubkey, c.user_source, "owner account A, spending A");
+        assert_eq!(ix.accounts[8].pubkey, Pubkey::new_from_array([3; 32]), "token_vault_a");
+        assert_eq!(ix.accounts[9].pubkey, c.user_dest, "owner account B");
+        assert_eq!(ix.accounts[10].pubkey, Pubkey::new_from_array([4; 32]), "token_vault_b");
+        for i in 11..14 {
+            assert!(ix.accounts[i].is_writable, "tick array {i} is written");
+        }
+        assert_eq!(ix.accounts.len(), 15);
+        assert_eq!(ix.accounts.iter().filter(|a| a.is_signer).count(), 1);
+    }
+
+    /// The trap from the v1 list survives into v2, and gains a second half: the user
+    /// accounts swap with the direction, and so do the two token programs, because both
+    /// are indexed by token rather than by role. Getting the accounts right and the
+    /// programs backwards would derive nothing wrong and fail at the program's owner
+    /// check, which is a confusing way to discover it.
+    #[test]
+    fn programs_and_accounts_both_follow_the_token_not_the_direction() {
+        let pool = Pubkey::new_unique();
+        let data = super::tests::whirlpool([1; 32], [2; 32], [3; 32], [4; 32]);
+
+        let a = swap_v2(&ctx_with(true, t22(), spl(), pool), &data).unwrap();
+        assert_eq!(a.accounts[0].pubkey, t22(), "spending A: A's program is the input's");
+        assert_eq!(a.accounts[1].pubkey, spl());
+
+        let b = swap_v2(&ctx_with(false, t22(), spl(), pool), &data).unwrap();
+        assert_eq!(b.accounts[0].pubkey, spl(), "spending B: A's program is the output's");
+        assert_eq!(b.accounts[1].pubkey, t22());
+
+        assert_eq!(*a.data.last().unwrap(), 0, "remaining_accounts_info is None");
+        assert_eq!(a.data[a.data.len() - 2], 1, "a_to_b true when spending A");
+        assert_eq!(b.data[b.data.len() - 2], 0, "a_to_b false when spending B");
     }
 }

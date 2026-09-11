@@ -147,6 +147,8 @@ mod tests {
             amount_in: 1_000_000,
             min_amount_out: 999_000,
             input_is_a: true,
+            input_token_program: pk(crate::encode::programs::SPL_TOKEN),
+            output_token_program: pk(crate::encode::programs::SPL_TOKEN),
             tick_arrays: [Pubkey::new_unique(); crate::pda::TICK_ARRAYS_PER_SWAP],
         }
     }

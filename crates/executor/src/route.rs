@@ -50,6 +50,16 @@ pub struct Hop {
     pub output_mint: Pubkey,
     /// True when `input_mint` is the pool's token A / token 0.
     pub input_is_a: bool,
+    /// Which token program owns `input_mint`.
+    ///
+    /// Carried per hop rather than once per route because a cycle can legitimately
+    /// visit both kinds: SOL is classic, and the tokenised equities that rank highest
+    /// on this market's turnover are all Token-2022. Assuming one program for the whole
+    /// route derives the wrong associated account for the other one, which is a wrong
+    /// address rather than an error.
+    pub input_token_program: Pubkey,
+    /// Which token program owns `output_mint`.
+    pub output_token_program: Pubkey,
     pub amount_in: u64,
     pub min_amount_out: u64,
     /// The tick arrays this hop will name. See [`crate::ticks::resolve`].
@@ -184,7 +194,21 @@ pub fn build(owner: &Pubkey, hops: &[Hop], pre_balance: u64, opts: &RouteOptions
          signing it would authorise a loss"
     );
 
-    let token_program = opts.venue.token_program;
+    // Each mint's own program, taken from the hops rather than from one route-wide
+    // setting. `opts.venue.token_program` remains the fallback for a caller that has
+    // not been taught about Token-2022 yet.
+    let program_of = |mint: &Pubkey| -> Pubkey {
+        for h in hops {
+            if h.input_mint == *mint {
+                return h.input_token_program;
+            }
+            if h.output_mint == *mint {
+                return h.output_token_program;
+            }
+        }
+        opts.venue.token_program
+    };
+    let token_program = program_of(&base_mint);
     let wsol = pk(programs::WSOL_MINT);
     let base_ata = associated_token_address(owner, &base_mint, &token_program);
     let wrapping = opts.wsol == WsolPolicy::WrapAndClose && base_mint == wsol;
@@ -205,8 +229,9 @@ pub fn build(owner: &Pubkey, hops: &[Hop], pre_balance: u64, opts: &RouteOptions
             }
         }
         for mint in seen {
-            let ata = associated_token_address(owner, &mint, &token_program);
-            ixs.push(tx::create_ata_idempotent(owner, &ata, owner, &mint, &token_program));
+            let p = program_of(&mint);
+            let ata = associated_token_address(owner, &mint, &p);
+            ixs.push(tx::create_ata_idempotent(owner, &ata, owner, &mint, &p));
         }
     }
 
@@ -219,11 +244,13 @@ pub fn build(owner: &Pubkey, hops: &[Hop], pre_balance: u64, opts: &RouteOptions
         let ctx = SwapContext {
             owner: *owner,
             pool: h.pool,
-            user_source: associated_token_address(owner, &h.input_mint, &token_program),
-            user_dest: associated_token_address(owner, &h.output_mint, &token_program),
+            user_source: associated_token_address(owner, &h.input_mint, &h.input_token_program),
+            user_dest: associated_token_address(owner, &h.output_mint, &h.output_token_program),
             amount_in: h.amount_in,
             min_amount_out: h.min_amount_out,
             input_is_a: h.input_is_a,
+            input_token_program: h.input_token_program,
+            output_token_program: h.output_token_program,
             tick_arrays: h.tick_arrays,
         };
         ixs.push(build_swap(h.dex, &ctx, &h.pool_data, &opts.venue)?);
@@ -293,6 +320,8 @@ mod tests {
                 input_mint: mints[i],
                 output_mint: mints[(i + 1) % n],
                 input_is_a: i % 2 == 0,
+                input_token_program: pk(programs::SPL_TOKEN),
+                output_token_program: pk(programs::SPL_TOKEN),
                 amount_in: 1_000_000,
                 // Each hop guarantees a touch more than the next one spends, and the
                 // last more than the first spent.
@@ -469,5 +498,45 @@ mod sizes {
                 tx::PACKET_LIMIT as i64 - size as i64
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mixed_token_program_tests {
+    use super::*;
+    use crate::encode::programs;
+    use crate::pda::associated_token_address;
+
+    /// A cycle that visits a Token-2022 mint must derive that mint's account under
+    /// Token-2022 and every other one under the classic program.
+    ///
+    /// This is the failure that would not announce itself. The associated-account
+    /// address is a hash of owner, *program* and mint, so using the wrong program does
+    /// not error — it produces a different, perfectly valid address, which the route
+    /// then creates, funds with rent, and swaps against while the account the pool
+    /// actually needs stays missing.
+    #[test]
+    fn each_mint_gets_its_account_under_its_own_program() {
+        let owner = Pubkey::new_unique();
+        let spl = pk(programs::SPL_TOKEN);
+        let t22 = pk(programs::SPL_TOKEN_2022);
+
+        let mut hops = tests::cycle(2);
+        // Second hop's output closes the loop back to the first hop's input, so the
+        // exotic mint is the one in the middle.
+        let exotic = hops[0].output_mint;
+        hops[0].output_token_program = t22;
+        hops[1].input_token_program = t22;
+
+        let route = build(&owner, &hops, 0, &RouteOptions::default()).expect("a mixed cycle builds");
+
+        let wanted = associated_token_address(&owner, &exotic, &t22);
+        let wrong = associated_token_address(&owner, &exotic, &spl);
+        assert_ne!(wanted, wrong, "the two programs must not agree, or this proves nothing");
+
+        let named: Vec<Pubkey> =
+            route.instructions.iter().flat_map(|i| i.accounts.iter().map(|a| a.pubkey)).collect();
+        assert!(named.contains(&wanted), "the Token-2022 account must be the one used");
+        assert!(!named.contains(&wrong), "the classic derivation must appear nowhere");
     }
 }

@@ -28,6 +28,10 @@ struct RawRegistry {
 struct RawMint {
     symbol: String,
     decimals: u8,
+    /// "token-2022" for a mint the classic token program does not own. Absent means
+    /// classic, which is what every mint here was before the tokenised equities.
+    #[serde(default)]
+    token_program: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +49,13 @@ struct RawPool {
 pub struct MintInfo {
     pub symbol: String,
     pub decimals: u8,
+    /// True when this mint belongs to the Token-2022 program.
+    ///
+    /// It settles two things that are wrong in silence rather than loudly if it is
+    /// wrong: which program the associated account is derived under — a different
+    /// program is a different *address*, not an error — and whether a venue has to be
+    /// asked for its v2 swap instruction instead of its v1.
+    pub token_2022: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -97,7 +108,11 @@ impl Registry {
 
         let mut mints = HashMap::with_capacity(raw.mints.len());
         for (addr, m) in raw.mints {
-            mints.insert(pk(&addr)?, MintInfo { symbol: m.symbol, decimals: m.decimals });
+            let token_2022 = m.token_program.as_deref() == Some("token-2022");
+            mints.insert(
+                pk(&addr)?,
+                MintInfo { symbol: m.symbol, decimals: m.decimals, token_2022 },
+            );
         }
 
         let mut pools = Vec::with_capacity(raw.pools.len());

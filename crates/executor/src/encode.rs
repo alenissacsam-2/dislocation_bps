@@ -118,6 +118,10 @@ pub mod programs {
     pub const SPL_TOKEN_2022: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
     pub const ASSOCIATED_TOKEN: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
     pub const COMPUTE_BUDGET: &str = "ComputeBudget111111111111111111111111111111";
+    /// Required in the account list of both venues' Token-2022 swap instructions,
+    /// which may emit a transfer-fee memo. Read off real mainnet `swap_v2` calls
+    /// rather than from documentation — see `venue::orca::swap_v2`.
+    pub const MEMO: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
     /// Wrapped SOL. A mint, not a program, but it belongs with the other constants
     /// that are true of mainnet rather than of a pool.
     pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";

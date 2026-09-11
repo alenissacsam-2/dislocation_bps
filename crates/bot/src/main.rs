@@ -697,7 +697,24 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
         );
     }
 
-    let trader = execute::Trader::new(exec, opts);
+    let mut trader = execute::Trader::new(exec, opts);
+    // Which mints the classic token program does not own. Configuration, read once:
+    // no swap changes a mint's owner, and getting it wrong derives the wrong
+    // associated account rather than raising anything.
+    {
+        let reg = registry::Registry::embedded()?;
+        let t22: Vec<_> =
+            reg.mints.iter().filter(|(_, m)| m.token_2022).map(|(k, _)| *k).collect();
+        if !t22.is_empty() {
+            tracing::info!(
+                "{} of {} mints belong to Token-2022 and will be traded through the venues' \
+                 v2 swap instructions",
+                t22.len(),
+                reg.mints.len()
+            );
+        }
+        trader.set_token_2022_mints(t22);
+    }
     tracing::info!(
         "live executor armed for {} — {} bps slippage floor, {} priority",
         trader.address(),
@@ -749,6 +766,33 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
                 tracing::warn!("opening token accounts failed ({e:#}); retrying");
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
+        }
+    }
+
+    // Now the rest of the book. Not to open — opening every mint in the registry would
+    // be a deliberate spend of 1.68% of this wallet each — but to know, so a cycle
+    // through a mint we cannot hold is refused in one line instead of two round trips
+    // and an unexplained balance shortfall.
+    let all_mints: Vec<_> = registry::Registry::embedded()?.mints.keys().copied().collect();
+    match trader.learn_token_accounts(&all_mints).await {
+        Ok(missing) if missing.is_empty() => {
+            tracing::info!("the wallet holds an account for every mint in the book");
+        }
+        Ok(missing) => {
+            let cost = missing.len() as u64 * cb_executor::route::TOKEN_ACCOUNT_RENT;
+            tracing::warn!(
+                "{} of {} mints have no token account, so cycles through them are refused \
+                 rather than attempted. Opening all of them would deposit {cost} lamports \
+                 of rent; name the ones worth it in extra_token_mints.",
+                missing.len(),
+                all_mints.len()
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "could not read which token accounts exist ({e:#}); cycles through a mint \
+                 the wallet cannot hold will be discovered the slow way instead"
+            );
         }
     }
     Ok(trader)

@@ -64,6 +64,17 @@ pub struct SwapContext {
     pub min_amount_out: u64,
     /// True when the input mint is the pool's token A / token 0.
     pub input_is_a: bool,
+    /// The token program that owns the mint being spent.
+    ///
+    /// Both venues ship two swap instructions: `swap`, which takes a single token
+    /// program and works only when both mints are classic SPL, and `swap_v2`, which
+    /// takes both programs, both mints and the memo program. Carrying the programs on
+    /// the context rather than assuming one is what lets a Token-2022 mint be traded
+    /// at all — and Token-2022 is where the tokenised equities live, which rank
+    /// highest on this market's volume-over-liquidity.
+    pub input_token_program: Pubkey,
+    /// The token program that owns the mint being received.
+    pub output_token_program: Pubkey,
     /// The tick arrays the program will be given, in traversal order.
     ///
     /// An input rather than something the encoder derives, because choosing them
@@ -71,6 +82,20 @@ pub struct SwapContext {
     /// round trip. See [`crate::pda::tick_array_sweep`] for the measurement that forced
     /// this, and [`crate::ticks::resolve`] for the resolver that fills it in.
     pub tick_arrays: [Pubkey; crate::pda::TICK_ARRAYS_PER_SWAP],
+}
+
+/// Whether this swap touches a mint the classic token program does not own, and so
+/// must use the venue's `swap_v2` instruction rather than `swap`.
+///
+/// Asked of the context rather than of a flag, because a flag can be set wrongly and
+/// this cannot: a v1 swap handed a Token-2022 mint fails at the program's own owner
+/// check, and a v2 swap is correct for classic mints too but costs extra accounts in a
+/// transaction that is already near the size limit. So: v2 only when needed, decided
+/// by the same pubkeys the instruction is built from.
+#[must_use]
+pub fn needs_token_2022(ctx: &SwapContext) -> bool {
+    let t22 = pk(crate::encode::programs::SPL_TOKEN_2022);
+    ctx.input_token_program == t22 || ctx.output_token_program == t22
 }
 
 /// Scale a live square-root price into a limit that is in range and will not bind.
@@ -170,6 +195,8 @@ mod tests {
             amount_in: 1,
             min_amount_out: 1,
             input_is_a: true,
+            input_token_program: pk(crate::encode::programs::SPL_TOKEN),
+            output_token_program: pk(crate::encode::programs::SPL_TOKEN),
             tick_arrays: [Pubkey::new_unique(); crate::pda::TICK_ARRAYS_PER_SWAP],
         };
         let extra = VenueExtra::default();

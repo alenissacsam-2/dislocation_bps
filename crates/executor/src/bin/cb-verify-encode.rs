@@ -408,6 +408,8 @@ async fn check_pool(
         amount_in: PROBE_AMOUNT,
         min_amount_out: 1,
         input_is_a: true,
+        input_token_program: token_program,
+        output_token_program: token_program,
         tick_arrays: chosen.arrays,
     };
 
@@ -577,6 +579,8 @@ async fn check_v4(
         amount_in: PROBE_AMOUNT,
         min_amount_out: 1,
         input_is_a: true,
+        input_token_program: token_program,
+        output_token_program: token_program,
         // Unused by this venue. Deliberately the pool, so that if it ever were read the
         // failure names an account this file mentions rather than a random key.
         tick_arrays: [pool; cb_executor::pda::TICK_ARRAYS_PER_SWAP],
