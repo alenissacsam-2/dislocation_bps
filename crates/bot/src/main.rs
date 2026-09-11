@@ -153,6 +153,19 @@ fn tip_cost_usd(gross_profit_usd: f64, sol_price_usd: f64) -> f64 {
 /// Both look identical at detection. Only the fee separates them in advance, and with
 /// one attempt per sweep to spend, spending it on the 23% class instead of the 0%
 /// class is the whole difference between measuring this market and trading it.
+/// # What this number is still not allowed to assume
+///
+/// The table above is 157 attempts, and the 4-7 bps row is 47 of them with no survivor.
+/// Zero out of 47 is consistent with a survival rate anywhere up to about 6%, which at
+/// the grosses that band carries would be worth having — and the 20-40 bps row of the
+/// same table did produce two. So this is a reasonable prior, not a settled fact, and it
+/// rejects thousands of candidates an hour on the strength of it.
+///
+/// A candidate it rejects is never built, so it is never re-priced, so the claim that it
+/// would have lost can never be checked. `Intent::Measure` closes that loop: rejected
+/// candidates are built and simulated anyway, at no cost and with no path to submission,
+/// and the verdicts land in the ledger beside the fee that rejected them. Re-derive this
+/// constant from those rather than from argument.
 const EXECUTABLE_FEE_CEILING_BPS: f64 = 4.0;
 
 /// Whether a cycle's round trip costs more than any real dislocation ever pays for.
@@ -185,6 +198,15 @@ fn too_expensive_to_trade(fee_bps: f64) -> bool {
 /// detection, and the price moves around 0.27 bps in two seconds, so the staleness this
 /// adds stays well inside the floor's tolerance. A larger number would not.
 const MAX_ATTEMPTS_PER_SWEEP: usize = 3;
+
+/// How many candidates one sweep may *measure* without trading them.
+///
+/// A probe simulates and stops. It cannot submit, cannot spend and cannot trip the
+/// breaker, so the only thing it competes for is time — one RPC round trip that a real
+/// candidate might have wanted. One per sweep keeps that cost bounded while still
+/// gathering, over an hour of sweeping, several hundred observations of the thing this
+/// bot most needs to know: whether the routes its filters reject would have worked.
+const MAX_PROBES_PER_SWEEP: usize = 1;
 
 
 /// How long a cycle refused because *the price moved* is left alone. Two sweeps: long
@@ -1166,6 +1188,7 @@ async fn spawn_live(
                     // submitting are different acts with different hazards. See
                     // [`MAX_ATTEMPTS_PER_SWEEP`].
                     let mut attempts_this_sweep: usize = 0;
+                    let mut probes_this_sweep: usize = 0;
                     let mut submitted_this_sweep = false;
                     // Left in the order the scanner produced: best gross profit first.
                     //
@@ -1325,19 +1348,98 @@ async fn spawn_live(
                                                 at.elapsed() < UNFUNDABLE_ENTRY_WINDOW
                                             })
                                         });
-                                    let candidate = if submitted_this_sweep
+                                    // Everything that disqualifies a candidate for
+                                    // reasons that have nothing to do with its fee.
+                                    let barred = submitted_this_sweep
                                         || attempts_this_sweep >= MAX_ATTEMPTS_PER_SWEEP
                                         || on_cooldown
-                                        || too_skewed
-                                        || too_expensive
-                                        || unfundable_entry
-                                    {
+                                        || unfundable_entry;
+                                    // The two filters that reject a candidate by making a
+                                    // claim about what would have happened to it, rather
+                                    // than by observing something that already has. Both
+                                    // were calibrated on samples of a few dozen, both
+                                    // reject thousands of candidates an hour, and neither
+                                    // has been rechecked since. An unchecked claim is an
+                                    // assumption wearing a measurement's clothes.
+                                    let held_back_by_a_claim = too_expensive || too_skewed;
+                                    // A candidate the fee ceiling is the *only* thing
+                                    // standing between and an attempt. This is the class
+                                    // the ceiling has been rejecting sight-unseen — 30,262
+                                    // of them in one seven-hour run, 7,659 of those showing
+                                    // a detected gross over two cents — and the ceiling's
+                                    // own evidence is thin: it rests on 47 attempts in the
+                                    // 4-7 bps band, which is consistent with a survival
+                                    // rate anywhere up to about 6%. At the grosses this
+                                    // band carries, 6% would be worth having. Measure it.
+                                    let worth_measuring = !barred
+                                        && held_back_by_a_claim
+                                        && probes_this_sweep < MAX_PROBES_PER_SWEEP;
+                                    let candidate = if barred || held_back_by_a_claim {
                                         None
                                     } else {
                                         opp.plan.as_ref().filter(|pl| pl.encodable())
                                     };
+                                    let to_measure = if worth_measuring {
+                                        opp.plan.as_ref().filter(|pl| pl.encodable())
+                                    } else {
+                                        None
+                                    };
                                     match candidate {
                                         None => {
+                                            if let Some(probe_plan) = to_measure {
+                                                probes_this_sweep += 1;
+                                                let started = std::time::Instant::now();
+                                                let r = t
+                                                    .attempt(
+                                                        probe_plan,
+                                                        opp.size_usd,
+                                                        net,
+                                                        execute::Intent::Measure,
+                                                    )
+                                                    .await;
+                                                latency_ms =
+                                                    started.elapsed().as_millis() as u64;
+                                                outcome_reason = Some(match r {
+                                                    Ok(cb_executor::Attempt::Probed(found)) => {
+                                                        // A filter being wrong is the most
+                                                        // valuable thing this run can find,
+                                                        // and it is invisible in a file that
+                                                        // is otherwise all refusals. Logged
+                                                        // at ERROR for the same reason a
+                                                        // submission is.
+                                                        if found.would_have_profited() {
+                                                            tracing::error!(
+                                                                fee_bps = opp.fee_bps,
+                                                                slot_spread = opp.slot_spread,
+                                                                gross_usd = opp.gross_profit_usd,
+                                                                "a filter held back a \
+                                                                 route that simulated \
+                                                                 profitably — {found}"
+                                                            );
+                                                        }
+                                                        found.to_string()
+                                                    }
+                                                    // `Measure` cannot come back any other
+                                                    // way, but the refusals on the way in —
+                                                    // no encoder, unfundable entry — are
+                                                    // still worth keeping verbatim.
+                                                    Ok(cb_executor::Attempt::Refused(why)) => {
+                                                        format!("probe not run: {why}")
+                                                    }
+                                                    Ok(other) => {
+                                                        format!("probe returned {other:?}")
+                                                    }
+                                                    Err(e) => format!("probe failed: {e}"),
+                                                });
+                                                // One measurement of a cycle is enough for a
+                                                // while; the budget is better spent on the
+                                                // next distinct loop than on this one again
+                                                // next sweep.
+                                                recent_refusals.insert(
+                                                    opp.cycle_key.clone(),
+                                                    (std::time::Instant::now(), STRUCTURAL_COOLDOWN),
+                                                );
+                                            } else {
                                             outcome_reason = Some(if on_cooldown {
                                                 "not attempted — refused recently and \
                                                  nothing has changed"
@@ -1354,10 +1456,10 @@ async fn spawn_live(
                                                 format!(
                                                     "not attempted — the round trip costs \
                                                      {:.2} bps, over the \
-                                                     {EXECUTABLE_FEE_CEILING_BPS} bps above \
-                                                     which no attempt has ever re-priced \
-                                                     profitably; the gap is a pool nobody \
-                                                     arbitrages, not one we can",
+                                                     {EXECUTABLE_FEE_CEILING_BPS} bps that have \
+                                                     produced every survivor so far; this sweep \
+                                                     had no probe budget left to check whether \
+                                                     that still holds",
                                                     opp.fee_bps
                                                 )
                                             } else if unfundable_entry {
@@ -1382,11 +1484,19 @@ async fn spawn_live(
                                                     MAX_ATTEMPTS_PER_SWEEP
                                                 )
                                             });
+                                            }
                                         }
                                         Some(plan) => {
                                             attempts_this_sweep += 1;
                                             let started = std::time::Instant::now();
-                                            let r = t.attempt(plan, opp.size_usd, net).await;
+                                            let r = t
+                                                .attempt(
+                                                    plan,
+                                                    opp.size_usd,
+                                                    net,
+                                                    execute::Intent::Trade,
+                                                )
+                                                .await;
                                             latency_ms = started.elapsed().as_millis() as u64;
                                             match r {
                                                 Ok(cb_executor::Attempt::Submitted {
@@ -1571,6 +1681,19 @@ async fn spawn_live(
                                                             (std::time::Instant::now(), window),
                                                         );
                                                     }
+                                                }
+                                                // `Intent::Trade` has no path that
+                                                // produces one, and the day it does the
+                                                // right answer is not to pretend a
+                                                // measurement was a trade.
+                                                Ok(cb_executor::Attempt::Probed(found)) => {
+                                                    tracing::error!(
+                                                        "a trade attempt came back as a \
+                                                         measurement, which should be \
+                                                         impossible: {found}"
+                                                    );
+                                                    outcome_reason =
+                                                        Some(format!("unexpected {found}"));
                                                 }
                                                 Err(e) => {
                                                     // An RPC failure is not a defect in what

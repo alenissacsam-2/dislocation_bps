@@ -52,6 +52,21 @@ use cb_executor::{ticks, tx, Attempt, Executor, Plan};
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 
+/// Whether a candidate is being traded or only measured.
+///
+/// The executable filters in `main` reject far more than they accept, and each rejection
+/// is a claim about what would have happened. `Measure` is how those claims get tested:
+/// the candidate is built and re-priced exactly as a trade would be, the chain is asked
+/// what it thinks, and the answer is recorded instead of acted on. It costs an RPC round
+/// trip and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// Submit it if the chain agrees it profits.
+    Trade,
+    /// Find out what the chain thinks and stop, whatever it says.
+    Measure,
+}
+
 /// Everything execution needs to rebuild a detected cycle as instructions.
 ///
 /// Built at detection, from the same legs that produced the quote. Re-deriving it later
@@ -612,7 +627,7 @@ impl Trader {
         Ok((hops, spend_total))
     }
 
-    /// Fetch state, build, simulate, and — unless this is a dry run — submit.
+    /// Fetch state, build, simulate, and — depending on `intent` — submit.
     ///
     /// `size_usd` and `expected_net_usd` are what the *risk gate* judges, and they are
     /// parameters rather than fields on the plan because only the caller knows the USD
@@ -630,6 +645,7 @@ impl Trader {
         plan: &CyclePlan,
         size_usd: f64,
         expected_net_usd: f64,
+        intent: Intent,
     ) -> Result<Attempt> {
         // Cheapest and most fatal first, same principle as the gate itself: a halted
         // run used to still pay for a full account fetch, tick-array resolution, and
@@ -637,8 +653,10 @@ impl Trader {
         // step inside `execute()`. Checked here too so a halt costs nothing while it
         // stands, however long the cooldown before it clears itself.
         self.exec.gate.tick_auto_resume();
-        if let Some(why) = self.exec.gate.halted() {
-            return Ok(Attempt::Refused(format!("trading is halted: {why}")));
+        if intent == Intent::Trade {
+            if let Some(why) = self.exec.gate.halted() {
+                return Ok(Attempt::Refused(format!("trading is halted: {why}")));
+            }
         }
 
         if let Some(dex) = plan.blocking_venue() {
@@ -998,7 +1016,13 @@ impl Trader {
             min_post_balance: built.min_post_balance,
             tx_base64: assembled.tx_base64,
         };
-        plan_to_run.execute(&mut self.exec.gate, rpc, self.opts.dry_run).await
+        match intent {
+            Intent::Trade => {
+                plan_to_run.execute(&mut self.exec.gate, rpc, self.opts.dry_run).await
+            }
+            // No branch here reaches `Rpc::send`. See `Plan::probe`.
+            Intent::Measure => Ok(Attempt::Probed(plan_to_run.probe(rpc).await?)),
+        }
     }
 
     /// The most token accounts this will ever open in one go.
@@ -1110,10 +1134,11 @@ impl Trader {
 
         // Sent until it actually lands, unlike a trade.
         //
-        // `Rpc::send` sets `maxRetries: 0` and never rebroadcasts, deliberately: a
-        // stale arbitrage is worthless and re-sending one is worse than dropping it.
-        // This is the opposite case. There is no race, nothing here goes stale but the
-        // blockhash, and the transaction only has to arrive.
+        // `Rpc::send` asks the node for three rebroadcasts of the same signed bytes
+        // and then stops, because a stale arbitrage is worthless and chasing one is
+        // worse than dropping it. This is the opposite case. There is no race, nothing
+        // here goes stale but the blockhash, and the transaction only has to arrive —
+        // so three rebroadcasts of one blockhash is not enough on its own.
         //
         // Reusing the fire-and-forget path cost a whole run. The first send returned a
         // signature, the account was reported open, and the transaction was never
@@ -1679,12 +1704,16 @@ mod mainnet {
 
         // Real USD figures: a zero size is refused by the gate before anything is
         // fetched, which is what this test caught the first time it ran.
-        let outcome = t.attempt(&plan, 0.18, 0.05).await.expect("the chain answered");
+        let outcome =
+            t.attempt(&plan, 0.18, 0.05, Intent::Trade).await.expect("the chain answered");
         println!("outcome: {outcome:?}");
 
         match outcome {
             Attempt::Submitted { .. } => {
                 panic!("dry_run must never submit — this is the one unacceptable result")
+            }
+            Attempt::Probed(found) => {
+                panic!("a trade intent must never come back as a measurement: {found}")
             }
             Attempt::Refused(why) => {
                 // Refused means it never reached the chain — the risk gate, an
