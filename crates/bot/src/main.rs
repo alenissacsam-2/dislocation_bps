@@ -174,6 +174,63 @@ fn too_expensive_to_trade(fee_bps: f64) -> bool {
     fee_bps > EXECUTABLE_FEE_CEILING_BPS
 }
 
+/// How far behind the feed's own newest slot a cycle's stalest leg may sit.
+///
+/// [`MAX_EXECUTABLE_SLOT_SPREAD`] bounds the gap *between* two legs. It says nothing
+/// about how far the pair together has fallen behind the chain, and those are different
+/// failures: two pools both quoted from four minutes ago have a spread of zero and a
+/// price from four minutes ago. `MAX_STALE_LAG_SLOTS` is the only thing bounding the
+/// second, and it admits 1800 slots — twelve minutes.
+///
+/// # The measurement that produced this number
+///
+/// Over one eleven-hour live run, every recorded detection was compared against the
+/// newest slot the feed itself held at that instant:
+///
+/// | stalest leg behind the head | detections | share |
+/// |-----------------------------|------------|-------|
+/// | 0 – 1 slots                 | 21,457     | 24.0% |
+/// | 2 – 5                       | 19,146     | 21.4% |
+/// | 6 – 12                      | 16,094     | 18.0% |
+/// | 13 – 60                     | 16,254     | 18.2% |
+/// | 61 – 300                    | 11,581     | 13.0% |
+/// | 301 – 1800                  |  4,835     |  5.4% |
+///
+/// Median six slots, ninetieth percentile 121, worst 573. Three quarters of everything
+/// this instrument has ever called an opportunity was priced from state the instrument
+/// already knew was behind.
+///
+/// # Why that is fatal rather than merely untidy
+///
+/// The same run re-priced 2,201 of those candidates against accounts fetched in one
+/// round trip, and the answer was always the same shape: the round trip came back
+/// **3.64 bps short** of its own input against a route fee of **3.00 bps**. Subtract
+/// one from the other and the dislocation that motivated the trade is 0.37 bps, with a
+/// quartile range of −0.96 to +1.84. On fresh, self-consistent state these venues agree.
+/// The disagreement was the lag.
+///
+/// Survival at re-pricing was 2.6%, and it is **flat** in every dimension that would
+/// have to vary if the edges were real and merely decaying: flat in detected edge
+/// (0.6% at 20+ bps against 4.7% at 2-4 bps), flat in fee band, flat in slot spread.
+/// A decay process does not look like that. Selection on one's own measurement error
+/// does, because conditioning on a large apparent edge selects the largest errors.
+///
+/// Two slots is one round trip's worth of head start and no more.
+const MAX_EXECUTABLE_LEG_LAG_SLOTS: u64 = 2;
+
+// The per-pool guard admits 1800 slots, which is the whole reason this gate exists. If
+// it is ever tightened below this one, this gate has become dead code and the argument
+// above it is naming the wrong number as load-bearing.
+const _: () = assert!(live::MAX_STALE_LAG_SLOTS > MAX_EXECUTABLE_LEG_LAG_SLOTS);
+
+/// Whether a cycle was priced from state the feed had already superseded.
+#[must_use]
+fn too_stale_to_trade(newest_slot: u64, cycle_slot: u64) -> bool {
+    // A cycle from a slot *ahead* of the sweep's own is not stale; it is a snapshot
+    // read while an update landed. Saturating rather than signed for that reason.
+    newest_slot.saturating_sub(cycle_slot) > MAX_EXECUTABLE_LEG_LAG_SLOTS
+}
+
 /// How many cycles one sweep may *attempt*, as distinct from how many it may submit.
 ///
 /// # Why these were ever the same number, and why they must not be
@@ -1220,6 +1277,10 @@ async fn spawn_live(
                     // about 1.3, so observing none says nothing.
                     //
                     // Rank by gross. Do not rank by edge — that is worse than a coin flip.
+                    //
+                    // Read before the move, because `too_stale_to_trade` needs the head
+                    // the sweep was taken against and the sweep is about to be consumed.
+                    let sweep_slot = sweep.slot;
                     let opportunities = sweep.opportunities;
                     // Bounded, the same way the event bus is: a cycle refused once and
                     // never seen again must not sit in this map for the life of the
@@ -1329,6 +1390,15 @@ async fn spawn_live(
                                     // See `EXECUTABLE_FEE_CEILING_BPS` for the measured
                                     // table this comes from.
                                     let too_expensive = too_expensive_to_trade(opp.fee_bps);
+                                    // Priced from state the feed had already moved past.
+                                    // `too_skewed` cannot see this: both legs can be
+                                    // equally old, which is a spread of zero and a price
+                                    // from minutes ago. See `MAX_EXECUTABLE_LEG_LAG_SLOTS`
+                                    // for the eleven-hour measurement that says three
+                                    // quarters of this instrument's detections are this,
+                                    // and that what they are worth on fresh state is
+                                    // 0.37 bps against a 3.00 bps fee.
+                                    let too_stale = too_stale_to_trade(sweep_slot, opp.slot);
                                     // Read before the filter so the refusal can say
                                     // *which* venue is missing an encoder, instead of
                                     // leaving it pooled with "somebody else went first".
@@ -1361,7 +1431,8 @@ async fn spawn_live(
                                     // reject thousands of candidates an hour, and neither
                                     // has been rechecked since. An unchecked claim is an
                                     // assumption wearing a measurement's clothes.
-                                    let held_back_by_a_claim = too_expensive || too_skewed;
+                                    let held_back_by_a_claim =
+                                        too_expensive || too_skewed || too_stale;
                                     // A candidate the fee ceiling is the *only* thing
                                     // standing between and an attempt. This is the class
                                     // the ceiling has been rejecting sight-unseen — 30,262
@@ -1444,6 +1515,15 @@ async fn spawn_live(
                                                 "not attempted — refused recently and \
                                                  nothing has changed"
                                                     .to_string()
+                                            } else if too_stale {
+                                                format!(
+                                                    "not attempted — the stalest leg is {} \
+                                                     slots behind the feed's own head, over \
+                                                     the {MAX_EXECUTABLE_LEG_LAG_SLOTS} this \
+                                                     will trade on; on fresh state this class \
+                                                     is worth 0.37 bps against a 3.00 bps fee",
+                                                    sweep_slot.saturating_sub(opp.slot)
+                                                )
                                             } else if too_skewed {
                                                 format!(
                                                     "not attempted — legs priced {} slots \
@@ -1756,6 +1836,7 @@ async fn spawn_live(
                                 cycle_key: opp.cycle_key.clone(),
                                 profit_at_capital_usd: Some(opp.profit_at_capital_usd),
                                 slot_spread: Some(opp.slot_spread),
+                                leg_lag_slots: Some(sweep_slot.saturating_sub(opp.slot)),
                                 // Zero means nothing was attempted, and that is a
                                 // different fact from a fast attempt — so it is
                                 // recorded as "not measured" rather than as speed.
@@ -2086,6 +2167,39 @@ fn report(path: &str) -> anyhow::Result<()> {
         println!("    Where two rungs agree the cycles ran out of depth, not funding.");
         println!("    Borrowed capital cannot widen a tick, so a flat step is the");
         println!("    measurement that says a flash loan would have added nothing.");
+    }
+
+    // Whether the prices were the *current* ones, which is a different question from
+    // whether they were simultaneous and is the one the table below cannot ask.
+    let lag = ledger.lag_audit()?;
+    let lag_measured: u64 = lag.iter().map(|b| b.fills).sum();
+    if lag_measured > 0 {
+        println!("\n  WERE THEY THE PRICES THE CHAIN HAD, OR THE ONES WE STILL HELD?");
+        println!(
+            "    {:<14} {:>9} {:>8} {:>10} {:>10} {:>10}",
+            "behind head", "detections", "share", "mean edge", "mean gross", "survived"
+        );
+        for b in &lag {
+            if b.fills == 0 {
+                continue;
+            }
+            println!(
+                "    {:<14} {:>9} {:>7.1}% {:>10.2} {:>10} {:>10}",
+                b.label,
+                b.fills,
+                b.fills as f64 / lag_measured as f64 * 100.0,
+                b.mean_edge_bps,
+                format!("${:.5}", b.mean_gross_usd),
+                b.built
+            );
+        }
+        println!(
+            "\n    `survived` is the only column that is not a claim: it counts the loops\n    \
+             that still paid once both legs were re-read in one round trip. A band with\n    \
+             a healthy mean edge and no survivors is not an opportunity that got away.\n    \
+             It is this instrument reading its own lag back to itself — the older price\n    \
+             it is differencing against has already gone, and nobody was ever offered it."
+        );
     }
 
     // Whether the reported gaps were ever simultaneously available. A dislocation is a
@@ -2557,6 +2671,52 @@ mod tests {
         let q = quote(1, &[("Orca (Whirlpools)", "a"), ("Raydium CLMM", "b")]);
         assert_eq!(q.venues(), "Orca (Whirlpools)+Raydium CLMM");
     }
+}
+
+#[cfg(test)]
+mod leg_lag_gate_tests {
+    use super::{too_skewed_to_trade, too_stale_to_trade};
+
+    /// State from the head, or one round trip behind it, is what this admits.
+    #[test]
+    fn state_from_the_head_is_tradeable() {
+        assert!(!too_stale_to_trade(500, 500), "the head itself is never stale");
+        assert!(!too_stale_to_trade(500, 498), "two slots is the head start we allow");
+    }
+
+    /// A snapshot read while an update landed can carry a slot ahead of the sweep's
+    /// own. That is the freshest state there is, and subtraction must not wrap it into
+    /// the largest staleness representable.
+    #[test]
+    fn a_leg_ahead_of_the_sweep_is_not_maximally_stale() {
+        assert!(!too_stale_to_trade(500, 503));
+    }
+
+    /// The percentile points the eleven-hour run measured. The median detection sat six
+    /// slots behind the head and the ninetieth sat 121; both classes re-priced to a loss.
+    #[test]
+    fn the_bands_that_measured_as_lag_are_excluded() {
+        for behind in [3u64, 6, 12, 30, 121, 476, 573] {
+            assert!(
+                too_stale_to_trade(1_000_000, 1_000_000 - behind),
+                "{behind} slots behind the head re-priced to a loss and must not trade"
+            );
+        }
+    }
+
+    /// The two gates answer different questions, and this is the case that proves it:
+    /// both legs equally old is a spread of zero — perfectly simultaneous — and a price
+    /// from minutes ago. Nothing in `too_skewed_to_trade` can see it.
+    #[test]
+    fn simultaneous_is_not_the_same_as_current() {
+        let spread = 0;
+        assert!(!too_skewed_to_trade(spread), "both legs from one slot straddle nothing");
+        assert!(
+            too_stale_to_trade(1_000_000, 1_000_000 - 600),
+            "and that one slot can still be four minutes old"
+        );
+    }
+
 }
 
 #[cfg(test)]

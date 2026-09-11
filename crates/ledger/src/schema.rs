@@ -143,6 +143,17 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // figure went to the window and nowhere else. NULL for rows written before it was
     // recorded, and for cycles that were never attempted at all.
     add_column_if_missing(conn, "paper_fills", "latency_ms", "INTEGER")?;
+    // How far the stalest leg of this loop sat behind the newest slot the feed itself
+    // held at that instant.
+    //
+    // `slot_spread` beside it answers a different question and cannot answer this one:
+    // two legs quoted from equally old state have a spread of zero — perfectly
+    // simultaneous — and a price from minutes ago. Measured over one eleven-hour run,
+    // three quarters of every detection sat more than one slot behind the head, with a
+    // median of six and a ninetieth percentile of 121, and re-pricing that class
+    // against fresh accounts returned 3.64 bps less than it cost against a 3.00 bps
+    // fee. The lag was the dislocation. NULL for rows written before it was measured.
+    add_column_if_missing(conn, "paper_fills", "leg_lag_slots", "INTEGER")?;
 
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_fill_cycle ON paper_fills(cycle_key, id);",

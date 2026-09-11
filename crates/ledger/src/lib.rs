@@ -126,9 +126,9 @@ impl Ledger {
               optimal_size_usd, gross_usd, profit_at_optimal_usd, tip_usd, net_usd,
               taken, skipped_reason, cycle_key,
               profit_at_100_usd, profit_at_1k_usd, profit_at_10k_usd, slot_spread,
-              latency_ms)
+              latency_ms, leg_lag_slots)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
-                     ?21)",
+                     ?21,?22)",
             rusqlite::params![
                 f.slot as i64,
                 f.route,
@@ -151,6 +151,7 @@ impl Ledger {
                 f.profit_at_capital_usd.map(|l| l[2]),
                 f.slot_spread.map(|s| s as i64),
                 f.latency_ms.map(|m| m as i64),
+                f.leg_lag_slots.map(|s| s as i64),
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -721,6 +722,57 @@ impl Ledger {
         Ok(out)
     }
 
+    /// Detections by how far behind the feed's own head they were priced, and what each
+    /// band was worth once the route was re-priced against fresh accounts.
+    ///
+    /// # The question this answers, which `spread_audit` structurally cannot
+    ///
+    /// `spread_audit` measures the gap *between* a loop's legs. Two legs read from the
+    /// same slot four minutes ago have a gap of zero and sit in its best band, so the
+    /// whole of the second failure is invisible there: not "were these two prices
+    /// simultaneous" but "were they the current ones".
+    ///
+    /// They came apart under measurement. In one eleven-hour run, three quarters of
+    /// detections were priced more than a slot behind the head, with a median of six
+    /// and a ninetieth percentile of 121 — and the class as a whole re-priced to 3.64
+    /// bps *below* its own input against a 3.00 bps route fee, which is a dislocation
+    /// of 0.37 bps and a fee. The edges were the instrument's own lag being read back
+    /// to it. `built` is the honest column: it counts the loops in each band that
+    /// survived being re-quoted against accounts fetched in one round trip.
+    pub fn lag_audit(&self) -> Result<Vec<LagBand>> {
+        let bands = [
+            ("at the head", 0i64, 1i64),
+            ("2-5 slots", 2, 5),
+            ("6-12", 6, 12),
+            ("13-60", 13, 60),
+            ("61-300", 61, 300),
+            ("over 300", 301, i64::MAX),
+        ];
+        let mut out = Vec::new();
+        for (label, lo, hi) in bands {
+            let row = self.conn.query_row(
+                "SELECT COUNT(*), AVG(edge_bps), AVG(gross_usd),
+                        SUM(CASE WHEN taken = 1 OR skipped_reason LIKE 'simulation:%'
+                                 THEN 1 ELSE 0 END)
+                 FROM paper_fills
+                 WHERE leg_lag_slots IS NOT NULL
+                   AND leg_lag_slots >= ?1 AND leg_lag_slots <= ?2",
+                rusqlite::params![lo, hi],
+                |r| {
+                    Ok(LagBand {
+                        label: label.to_string(),
+                        fills: r.get::<_, i64>(0)? as u64,
+                        mean_edge_bps: r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                        mean_gross_usd: r.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                        built: r.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
+                    })
+                },
+            )?;
+            out.push(row);
+        }
+        Ok(out)
+    }
+
     /// Edge by fee tier, priced twice: over every loop, and over only those whose legs
     /// were read in the **same slot**.
     ///
@@ -883,6 +935,13 @@ pub struct FillRecord {
     /// be compared against: an opportunity that is gone in two seconds cannot be caught
     /// by a path that takes two seconds to walk.
     pub latency_ms: Option<u64>,
+    /// Slots between this loop's stalest leg and the newest slot the feed held.
+    ///
+    /// `slot_spread` says how far the legs are from each other; this says how far both
+    /// of them are from now, and a cycle can be perfect on the first and minutes behind
+    /// on the second. Zero is the only value where the detected edge is a claim about
+    /// the present. `None` for runs that did not measure it.
+    pub leg_lag_slots: Option<u64>,
 }
 
 /// One episode: a gap, from the moment it opened to the moment it closed.
@@ -1036,6 +1095,21 @@ impl FeeTierEdge {
         }
         Some((self.edge_all_bps - self.edge_same_slot_bps) / self.edge_all_bps)
     }
+}
+
+/// Claimed dislocation, grouped by how far behind the feed's head the legs were priced.
+///
+/// `built` is what keeps the rest honest: it counts how many of the band's loops still
+/// paid once re-quoted against accounts fetched in one round trip. A band with a large
+/// mean edge and no survivors is measuring the clock.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LagBand {
+    pub label: String,
+    pub fills: u64,
+    pub mean_edge_bps: f64,
+    pub mean_gross_usd: f64,
+    pub built: u64,
 }
 
 /// Claimed dislocation, grouped by how far apart in time the legs were observed.
@@ -1383,6 +1457,9 @@ mod tests {
             slot_spread: Some(0),
             // Not attempted, which is what a fixture about accounting should say.
             latency_ms: None,
+            // From the head, for the same reason the spread is zero: a fixture that
+            // asserts a dislocation should assert one that was on offer at the time.
+            leg_lag_slots: Some(0),
         }
     }
 
@@ -1420,6 +1497,43 @@ mod tests {
         assert_eq!(
             unattempted, None,
             "a cycle nobody attempted must read as unmeasured, never as an instant one"
+        );
+    }
+
+    /// Two legs from one slot is a spread of zero whether that slot is the head or four
+    /// minutes behind it, so the two columns must be able to disagree in the ledger the
+    /// way they disagree in the market. A run that recorded only the spread spent
+    /// eleven hours unable to see that three quarters of its detections were lag.
+    #[test]
+    fn simultaneous_legs_and_current_legs_are_recorded_separately() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.record_fill(&FillRecord {
+            slot_spread: Some(0),
+            leg_lag_slots: Some(573),
+            ..fill(0.01, true)
+        })
+        .unwrap();
+        l.record_fill(&FillRecord { slot_spread: Some(0), leg_lag_slots: None, ..fill(0.01, false) })
+            .unwrap();
+
+        let (spread, lag): (Option<i64>, Option<i64>) = l
+            .conn
+            .query_row(
+                "SELECT slot_spread, leg_lag_slots FROM paper_fills WHERE taken = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(spread, Some(0), "the legs were simultaneous");
+        assert_eq!(lag, Some(573), "and they were both four minutes old");
+
+        let unmeasured: Option<i64> = l
+            .conn
+            .query_row("SELECT leg_lag_slots FROM paper_fills WHERE taken = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            unmeasured, None,
+            "a run that never measured the lag must not read as having measured zero"
         );
     }
 
