@@ -125,8 +125,10 @@ impl Ledger {
              (slot, route, venues, hops, edge_bps, dislocation_bps, fee_bps, size_usd,
               optimal_size_usd, gross_usd, profit_at_optimal_usd, tip_usd, net_usd,
               taken, skipped_reason, cycle_key,
-              profit_at_100_usd, profit_at_1k_usd, profit_at_10k_usd, slot_spread)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+              profit_at_100_usd, profit_at_1k_usd, profit_at_10k_usd, slot_spread,
+              latency_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
+                     ?21)",
             rusqlite::params![
                 f.slot as i64,
                 f.route,
@@ -148,6 +150,7 @@ impl Ledger {
                 f.profit_at_capital_usd.map(|l| l[1]),
                 f.profit_at_capital_usd.map(|l| l[2]),
                 f.slot_spread.map(|s| s as i64),
+                f.latency_ms.map(|m| m as i64),
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -872,6 +875,14 @@ pub struct FillRecord {
     /// disagreement between venues rather than the market having moved in between.
     /// `None` for runs that did not measure it.
     pub slot_spread: Option<u64>,
+    /// Milliseconds from choosing this cycle to the chain answering, where one was
+    /// attempted at all.
+    ///
+    /// `None` means no attempt was made, which is not the same as a fast one. The
+    /// distinction matters because this is the number the edge's own half-life has to
+    /// be compared against: an opportunity that is gone in two seconds cannot be caught
+    /// by a path that takes two seconds to walk.
+    pub latency_ms: Option<u64>,
 }
 
 /// One episode: a gap, from the moment it opened to the moment it closed.
@@ -1370,6 +1381,8 @@ mod tests {
             // Simultaneous by default: a fixture asserting a dislocation should assert
             // one that was actually observable at a single moment.
             slot_spread: Some(0),
+            // Not attempted, which is what a fixture about accounting should say.
+            latency_ms: None,
         }
     }
 
@@ -1383,6 +1396,31 @@ mod tests {
             skipped_reason: Some("contested — would lose the race".into()),
             ..fill(net, false)
         }
+    }
+
+    /// The number the edge's half-life has to be compared against, so it has to
+    /// survive the trip into the ledger — and "not attempted" has to stay
+    /// distinguishable from "attempted, and it took no time at all".
+    #[test]
+    fn how_long_an_attempt_took_is_kept_and_absence_is_not_read_as_speed() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.record_fill(&FillRecord { latency_ms: Some(612), ..fill(0.01, true) }).unwrap();
+        l.record_fill(&FillRecord { latency_ms: None, ..fill(0.01, false) }).unwrap();
+
+        let measured: Option<i64> = l
+            .conn
+            .query_row("SELECT latency_ms FROM paper_fills WHERE taken = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(measured, Some(612), "an attempt's duration must survive the round trip");
+
+        let unattempted: Option<i64> = l
+            .conn
+            .query_row("SELECT latency_ms FROM paper_fills WHERE taken = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            unattempted, None,
+            "a cycle nobody attempted must read as unmeasured, never as an instant one"
+        );
     }
 
     #[test]

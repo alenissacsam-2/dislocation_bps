@@ -1756,6 +1756,10 @@ async fn spawn_live(
                                 cycle_key: opp.cycle_key.clone(),
                                 profit_at_capital_usd: Some(opp.profit_at_capital_usd),
                                 slot_spread: Some(opp.slot_spread),
+                                // Zero means nothing was attempted, and that is a
+                                // different fact from a fast attempt — so it is
+                                // recorded as "not measured" rather than as speed.
+                                latency_ms: (latency_ms > 0).then_some(latency_ms),
                             };
                             if let Err(e) = l.record_fill(&rec) {
                                 tracing::warn!("could not record fill: {e}");

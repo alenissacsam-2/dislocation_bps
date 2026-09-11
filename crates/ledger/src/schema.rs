@@ -136,6 +136,13 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // price that has already gone. NULL for rows written before it was measured —
     // never zero, which would assert simultaneity nobody checked.
     add_column_if_missing(conn, "paper_fills", "slot_spread", "INTEGER")?;
+    // How long this machine took between choosing a cycle and hearing back about it,
+    // in milliseconds. The reason it is worth a column: a re-priced edge measured on
+    // this ledger is largely gone five slots later, so whatever the instrument spends
+    // between those two moments is the budget it is spending, and until now that
+    // figure went to the window and nowhere else. NULL for rows written before it was
+    // recorded, and for cycles that were never attempted at all.
+    add_column_if_missing(conn, "paper_fills", "latency_ms", "INTEGER")?;
 
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_fill_cycle ON paper_fills(cycle_key, id);",
