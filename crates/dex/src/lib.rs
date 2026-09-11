@@ -5,6 +5,7 @@
 //! testable without a network.
 
 pub mod meteora_damm_v2;
+pub mod meteora_dlmm;
 pub mod orca_whirlpool;
 pub mod pumpswap;
 pub mod raydium_clmm;
