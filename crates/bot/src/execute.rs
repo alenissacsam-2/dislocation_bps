@@ -574,6 +574,7 @@ impl Trader {
 
         let mut hops = Vec::with_capacity(n);
         let mut spend = spend_total;
+        let mut drift_bps: Vec<(&'static str, f64)> = Vec::with_capacity(n);
         for i in 0..n {
             // Price this hop against the state fetched moments ago, not against the
             // quote that motivated the detection.
@@ -621,8 +622,44 @@ impl Trader {
                 tick_arrays: arrays[i],
             });
 
+            // Say how far this leg moved between the detection and this quote, per leg,
+            // named by its venue.
+            //
+            // Everything upstream can only report that the route as a whole no longer
+            // pays. That is the one fact that does not help: a cycle is two or three
+            // legs, they come from different venues over different subscriptions, and
+            // "the edge is gone" is equally consistent with both legs drifting a little
+            // and with one venue's state being wrong every time. Eleven hours of running
+            // could not tell those apart, because nothing recorded the legs separately.
+            //
+            // Rates rather than amounts, because `spend_total` is re-sized against the
+            // room the pools have now and the raw outputs are therefore not comparable.
+            // A rate is, to first order, and the second order is the price impact of a
+            // size change this small.
+            let planned_in = if i == 0 { plan.amount_in } else { plan.leg_out[i - 1] };
+            if planned_in > 0 && spend > 0 {
+                let planned_rate = plan.leg_out[i] as f64 / planned_in as f64;
+                let fresh_rate = fresh as f64 / spend as f64;
+                if planned_rate > 0.0 {
+                    drift_bps.push((
+                        plan.pools[i].1.name(),
+                        (fresh_rate / planned_rate - 1.0) * 10_000.0,
+                    ));
+                }
+            }
+
             // The next hop spends exactly what this one guarantees. See the module docs.
             spend = floor;
+        }
+        if !drift_bps.is_empty() {
+            tracing::info!(
+                "leg drift since detection: {}",
+                drift_bps
+                    .iter()
+                    .map(|(venue, bps)| format!("{venue} {bps:+.2} bps"))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            );
         }
         Ok((hops, spend_total))
     }
