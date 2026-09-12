@@ -224,6 +224,25 @@ impl Default for TradeOptions {
 /// refusal happens before three RPC round trips are spent building one.
 pub const MAX_EXECUTABLE_HOPS: usize = 3;
 
+/// Hops a cycle may have when one of them is on a binned venue.
+///
+/// # Why two and not three
+///
+/// A DLMM `swap2` names nineteen accounts where a Whirlpool swap names eleven, and a
+/// transaction is capped at 1,232 bytes with every distinct account costing 32 of them. A
+/// two-hop wSOL cycle through one measures **1,143 bytes** — 89 bytes of headroom, which
+/// is not another account, let alone another swap. See
+/// `a_two_hop_cycle_through_a_binned_pool_fits_in_one_packet`, which pins the number.
+///
+/// `route::build` would refuse such a cycle anyway, and refuse it correctly, naming the
+/// packet limit. But it refuses *after* the pools, the bins, the balance and a blockhash
+/// have been fetched, and a refusal that costs two round trips every time the router
+/// proposes a shape that cannot exist is a refusal worth moving earlier.
+pub const MAX_HOPS_WITH_A_BINNED_LEG: usize = 2;
+
+/// Binned hops one cycle may have. Two of them do not fit beside each other either.
+pub const MAX_BINNED_HOPS: usize = 1;
+
 /// The same fee headroom `cb_desk::balances::FEE_ALLOWANCE` reserves, for the same
 /// reason: a generous allowance for signature and priority fees on one cycle.
 const FEE_ALLOWANCE_LAMPORTS: u64 = 100_000;
@@ -976,6 +995,26 @@ impl Trader {
             )));
         }
 
+        // A binned hop is nineteen accounts, and two hops through one already fill 1,143
+        // of the 1,232 bytes a packet allows. Refused here rather than after four
+        // accounts fetches and a blockhash — see [`MAX_HOPS_WITH_A_BINNED_LEG`].
+        let binned = plan.pools.iter().filter(|(_, d)| is_binned(*d)).count();
+        if binned > 0 && plan.pools.len() > MAX_HOPS_WITH_A_BINNED_LEG {
+            return Ok(Attempt::Refused(format!(
+                "{} hops will not fit in one transaction beside a {} leg, which needs \
+                 nineteen accounts of the {} bytes a packet holds — this shape needs an \
+                 address lookup table, not a smaller encoding",
+                plan.pools.len(),
+                Dex::MeteoraDlmm.name(),
+                cb_executor::tx::PACKET_LIMIT
+            )));
+        }
+        if binned > MAX_BINNED_HOPS {
+            return Ok(Attempt::Refused(format!(
+                "{binned} binned legs will not fit in one transaction; one is already \
+                 nineteen accounts"
+            )));
+        }
         let rpc = &self.exec.rpc;
         let token_program = pk(programs::SPL_TOKEN);
 
@@ -3032,5 +3071,50 @@ mod meteora_dlmm_tests {
             (1_100..=1_180).contains(&size),
             "the packet budget moved to {size} bytes; if it grew, check what still fits"
         );
+    }
+    /// The shape gate, which exists so a cycle that cannot fit is refused before four
+    /// account fetches rather than after them. The numbers it enforces are the ones
+    /// `a_two_hop_cycle_through_a_binned_pool_fits_in_one_packet` measured.
+    #[tokio::test]
+    async fn a_cycle_too_wide_for_a_packet_is_refused_before_anything_is_fetched() {
+        let mut t = throwaway();
+        // Three hops, one of them binned: over the packet by construction.
+        let mut p = plan(3);
+        p.pools[1].1 = Dex::MeteoraDlmm;
+        let refusal = t
+            .attempt(&p, 5.0, 0.01, Intent::Measure)
+            .await
+            .expect("a refusal is not an error");
+        match refusal {
+            Attempt::Refused(why) => assert!(
+                why.contains("address lookup table"),
+                "unexpected refusal: {why}"
+            ),
+            other => panic!("a three-hop binned cycle must be refused, got {other:?}"),
+        }
+
+        // Two binned legs do not fit beside each other either, even at two hops.
+        let mut two = plan(2);
+        two.pools[0].1 = Dex::MeteoraDlmm;
+        two.pools[1].1 = Dex::MeteoraDlmm;
+        match t.attempt(&two, 5.0, 0.01, Intent::Measure).await.expect("no error") {
+            Attempt::Refused(why) => {
+                assert!(why.contains("binned legs"), "unexpected refusal: {why}")
+            }
+            other => panic!("two binned legs must be refused, got {other:?}"),
+        }
+
+        // And one binned leg in a two-hop cycle must get past this gate — the whole
+        // point is that the shape we can trade is not the one being refused.
+        let mut ok = plan(2);
+        ok.pools[0].1 = Dex::MeteoraDlmm;
+        // Anything other than a refusal means it got past the gate, which is what is
+        // being asserted here.
+        if let Ok(Attempt::Refused(why)) = t.attempt(&ok, 5.0, 0.01, Intent::Measure).await {
+            assert!(
+                !why.contains("address lookup table") && !why.contains("binned legs"),
+                "a tradeable shape was refused by the shape gate: {why}"
+            );
+        }
     }
 }
