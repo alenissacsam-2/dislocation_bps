@@ -23,7 +23,9 @@
 
 use anyhow::{Context, Result};
 use cb_core::types::{Dex, PoolId, PoolState, Pubkey32};
-use cb_dex::{meteora_damm_v2, orca_whirlpool, raydium_clmm, raydium_cpmm, raydium_v4};
+use cb_dex::{meteora_damm_v2, meteora_dlmm, orca_whirlpool, raydium_clmm, raydium_cpmm, raydium_v4};
+use cb_executor::encode::{to_pubkey, to_raw};
+use cb_executor::pda::meteora_bin_array;
 use cb_feed::AccountUpdate;
 use cb_scanner::multi::{find_from_base, survey_from_base};
 use cb_scanner::store::PoolStore;
@@ -47,6 +49,14 @@ const USD_INDEX_ROUNDS: usize = 4;
 
 /// Rows kept on the dashboard leaderboard.
 const LEADERBOARD_ROWS: usize = 12;
+
+/// Bin arrays either side of a binned pool's active one that the watcher subscribes to.
+///
+/// Five accounts per pool, covering 350 bins. Wide enough that the price staying inside
+/// it is the normal case, narrow enough that a handful of these pools does not double
+/// the subscription budget. See [`Venue::MeteoraDlmm`] for what happens when the price
+/// leaves it.
+const BIN_WINDOW: i64 = 2;
 
 /// Slots a pool may go unheard-from before the sweep stops quoting it.
 ///
@@ -87,6 +97,18 @@ enum Venue {
         base_amount: Option<u64>,
         quote_amount: Option<u64>,
     },
+    /// Meteora DLMM. The price is in the pool account and the depth is in separate bin
+    /// accounts, so a window of those is subscribed to alongside it and kept here.
+    ///
+    /// # Why a window and not just the one array that matters
+    ///
+    /// Only the array holding the active bin is strictly needed, but which array that is
+    /// moves with the price, and the subscription list is fixed when the feed starts. A
+    /// window two arrays either side covers 350 bins — 3.5% of price on a
+    /// one-basis-point pool — and when the price does leave it the pool simply stops
+    /// being priceable until `reconcile` repairs it, which is the honest failure rather
+    /// than a quote against bins nobody read.
+    MeteoraDlmm { pair: Box<meteora_dlmm::LbPair>, arrays: HashMap<i64, meteora_dlmm::BinArray> },
     /// Raydium's newer constant-product program. Vaults like v4, fee like CLMM.
     RaydiumCpmm {
         pool: Box<raydium_cpmm::CpmmPool>,
@@ -112,6 +134,14 @@ impl Watch {
     /// pool at all.
     fn vault_state(&self, addr: Pubkey32) -> Option<PoolState> {
         match &self.venue {
+            Venue::MeteoraDlmm { pair, arrays } => {
+                // Only the arrays actually received. The decoder refuses unless the
+                // active bin is among them, which is what makes a price that has walked
+                // out of the subscribed window show up as a pool dropping out of the
+                // sweep rather than as a quote against bins nobody read.
+                let held: Vec<meteora_dlmm::BinArray> = arrays.values().cloned().collect();
+                meteora_dlmm::state_from(addr, pair, &held, self.slot).ok()
+            }
             Venue::RaydiumV4 { info, base_amount, quote_amount } => {
                 raydium_v4::to_pool_state(addr, info, (*base_amount)?, (*quote_amount)?, self.slot)
                     .ok()
@@ -293,6 +323,8 @@ pub struct LiveMarket {
     watches: HashMap<Pubkey32, Watch>,
     /// vault address -> (pool address, is_base_vault)
     vault_index: HashMap<Pubkey32, (Pubkey32, bool)>,
+    /// bin array address -> (pool address, array index)
+    bin_index: HashMap<Pubkey32, (Pubkey32, i64)>,
     pub store: PoolStore,
     pub subscriptions: Vec<Pubkey32>,
     /// USD per *whole* token, rebuilt from live pools rather than assumed.
@@ -315,6 +347,8 @@ impl LiveMarket {
 
         let mut watches: HashMap<Pubkey32, Watch> = HashMap::new();
         let mut vault_index = HashMap::new();
+        let mut bin_index: HashMap<Pubkey32, (Pubkey32, i64)> = HashMap::new();
+        let mut bin_b58: Vec<String> = Vec::new();
         let mut vault_b58: Vec<String> = Vec::new();
         let mut config_b58: Vec<String> = Vec::new();
         let mut clmm_pending: Vec<(Pubkey32, Pubkey32, Vec<u8>)> = Vec::new(); // pool, config, data
@@ -427,6 +461,32 @@ impl LiveMarket {
                     }
                     Err(e) => failures.push(format!("{}: {e:#}", entry.label)),
                 },
+                Dex::MeteoraDlmm => match meteora_dlmm::decode(data) {
+                    Ok(pair) => {
+                        let program = cb_executor::encode::pk(meteora_dlmm::PROGRAM_ID);
+                        let pool_key = to_pubkey(&addr);
+                        let centre = meteora_dlmm::bin_array_index(pair.active_id);
+                        for d in -BIN_WINDOW..=BIN_WINDOW {
+                            let ix = centre + d;
+                            let key = to_raw(&meteora_bin_array(&pool_key, ix, &program));
+                            bin_index.insert(key, (addr, ix));
+                            bin_b58.push(bs58::encode(key).into_string());
+                        }
+                        watches.insert(
+                            addr,
+                            Watch {
+                                label: entry.label.clone(),
+                                dex: entry.dex,
+                                venue: Venue::MeteoraDlmm {
+                                    pair: Box::new(pair),
+                                    arrays: HashMap::new(),
+                                },
+                                slot: boot_slot,
+                            },
+                        );
+                    }
+                    Err(e) => failures.push(format!("{}: {e:#}", entry.label)),
+                },
                 Dex::PumpSwap => failures.push(format!("{}: pumpswap not wired live", entry.label)),
             }
         }
@@ -522,6 +582,31 @@ impl LiveMarket {
             }
         }
 
+        // Seed the bin arrays, so a binned pool is priceable before any update arrives.
+        //
+        // A pool whose active array comes back missing is not dropped: bin arrays are
+        // created when somebody opens a position in that range, so an absent one is a
+        // fact about the market rather than an error, and the decoder already refuses to
+        // quote without the array that matters.
+        if !bin_b58.is_empty() {
+            let (arrays, _) = get_multiple_accounts(&client, rpc_http, &bin_b58).await?;
+            for (b58, data) in bin_b58.iter().zip(arrays.iter()) {
+                let Some(data) = data else { continue };
+                let Ok(decoded) = meteora_dlmm::decode_bin_array(data) else { continue };
+                let Some(&(pool, ix)) = bin_index.get(&pk(b58)?) else { continue };
+                if let Some(Venue::MeteoraDlmm { arrays, .. }) =
+                    watches.get_mut(&pool).map(|w| &mut w.venue)
+                {
+                    arrays.insert(ix, decoded);
+                }
+            }
+            for (addr, w) in &watches {
+                if let Some(ps) = w.vault_state(*addr) {
+                    store.upsert(ps);
+                }
+            }
+        }
+
         anyhow::ensure!(!watches.is_empty(), "no pools decoded — cannot start");
 
         for f in &failures {
@@ -530,6 +615,7 @@ impl LiveMarket {
 
         let mut subscriptions: Vec<Pubkey32> = watches.keys().copied().collect();
         subscriptions.extend(vault_index.keys().copied());
+        subscriptions.extend(bin_index.keys().copied());
 
         let mut market = Self {
             registry,
@@ -537,6 +623,7 @@ impl LiveMarket {
             client,
             watches,
             vault_index,
+            bin_index,
             store,
             subscriptions,
             usd: HashMap::new(),
@@ -566,6 +653,13 @@ impl LiveMarket {
                 Venue::RaydiumClmm { trade_fee_ppm } => {
                     raydium_clmm::to_pool_state(u.pubkey, &u.data, *trade_fee_ppm, u.slot).ok()?
                 }
+                Venue::MeteoraDlmm { pair, .. } => {
+                    // The active bin lives in this account and decides which of the
+                    // arrays already held is the one that prices the pool, so a stale
+                    // copy would price it from the wrong bin.
+                    **pair = meteora_dlmm::decode(&u.data).ok()?;
+                    self.watches.get(&u.pubkey)?.vault_state(u.pubkey)?
+                }
                 Venue::RaydiumV4 { info, .. } => {
                     // The pool account itself moved: fees and uncollected amounts
                     // change, and a stale copy corrupts the reserve calculation.
@@ -584,6 +678,14 @@ impl LiveMarket {
             let w = self.watches.get_mut(&pool)?;
             w.slot = w.slot.max(u.slot);
             w.set_vault(first, amount);
+            self.watches.get(&pool)?.vault_state(pool)?
+        } else if let Some(&(pool, ix)) = self.bin_index.get(&u.pubkey) {
+            let array = meteora_dlmm::decode_bin_array(&u.data).ok()?;
+            let w = self.watches.get_mut(&pool)?;
+            w.slot = w.slot.max(u.slot);
+            if let Venue::MeteoraDlmm { arrays, .. } = &mut w.venue {
+                arrays.insert(ix, array);
+            }
             self.watches.get(&pool)?.vault_state(pool)?
         } else {
             return None;
@@ -816,6 +918,28 @@ impl LiveMarket {
             }
         }
 
+        // Bin arrays next, for the same reason and with the same ordering: a binned pool
+        // must be rebuilt from a coherent set rather than from a fresh pool account
+        // against bins read minutes ago.
+        let bin_b58: Vec<String> =
+            self.bin_index.keys().map(|k| bs58::encode(k).into_string()).collect();
+        if !bin_b58.is_empty() {
+            let (arrays, _) =
+                get_multiple_accounts(&self.client, &self.rpc_http, &bin_b58).await?;
+            for (b58, data) in bin_b58.iter().zip(arrays.iter()) {
+                let Some(data) = data else { continue };
+                let Ok(decoded) = meteora_dlmm::decode_bin_array(data) else { continue };
+                let Ok(key) = pk(b58) else { continue };
+                let Some(&(pool, ix)) = self.bin_index.get(&key) else { continue };
+                if let Some(w) = self.watches.get_mut(&pool) {
+                    w.slot = w.slot.max(slot);
+                    if let Venue::MeteoraDlmm { arrays, .. } = &mut w.venue {
+                        arrays.insert(ix, decoded);
+                    }
+                }
+            }
+        }
+
         let mut report = ReconcileReport { checked: addresses.len(), slot, ..Default::default() };
         for (b58, data) in addresses.iter().zip(accounts.iter()) {
             let Ok(addr) = pk(b58) else { continue };
@@ -849,6 +973,10 @@ impl LiveMarket {
             Venue::MeteoraDammV2 => meteora_damm_v2::to_pool_state(addr, data, slot).ok(),
             Venue::RaydiumClmm { trade_fee_ppm } => {
                 raydium_clmm::to_pool_state(addr, data, *trade_fee_ppm, slot).ok()
+            }
+            Venue::MeteoraDlmm { pair, .. } => {
+                **pair = meteora_dlmm::decode(data).ok()?;
+                self.watches.get(&addr)?.vault_state(addr)
             }
             Venue::RaydiumV4 { info, .. } => {
                 **info = raydium_v4::decode_amm_info(data).ok()?;
@@ -1144,6 +1272,7 @@ mod tests {
             client: reqwest::Client::new(),
             watches: HashMap::new(),
             vault_index: HashMap::new(),
+            bin_index: HashMap::new(),
             store,
             subscriptions: Vec::new(),
             usd: HashMap::new(),

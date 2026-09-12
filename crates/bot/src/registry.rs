@@ -92,6 +92,7 @@ fn parse_dex(s: &str) -> Result<Dex> {
         "raydium_v4" => Dex::RaydiumAmmV4,
         "raydium_cpmm" => Dex::RaydiumCpmm,
         "meteora_damm_v2" => Dex::MeteoraDammV2,
+        "meteora_dlmm" => Dex::MeteoraDlmm,
         "pumpswap" => Dex::PumpSwap,
         other => anyhow::bail!("unknown dex {other:?} in registry"),
     })
@@ -168,11 +169,20 @@ impl Registry {
 
     /// How many WebSocket subscriptions this universe needs.
     ///
-    /// Concentrated pools cost one; Raydium AMM v4 costs three, because its reserves
-    /// live in two separate vault accounts that must be watched alongside the pool.
+    /// Concentrated pools cost one; a vault-backed pool costs three, because its reserves
+    /// live in two separate accounts that must be watched alongside it; a Meteora DLMM
+    /// costs six, because its depth lives in bin arrays and the watcher keeps a window of
+    /// five of them so the price can move without the pool going dark.
     #[must_use]
     pub fn subscription_estimate(&self) -> usize {
-        self.pools.iter().map(|p| if p.dex.is_self_contained() { 1 } else { 3 }).sum()
+        self.pools
+            .iter()
+            .map(|p| match p.dex {
+                Dex::MeteoraDlmm => 6,
+                d if d.is_self_contained() => 1,
+                _ => 3,
+            })
+            .sum()
     }
 
     /// Pools grouped by the unordered mint pair they quote.
@@ -286,9 +296,15 @@ mod tests {
     #[test]
     fn subscription_estimate_charges_vault_backed_pools_for_their_vaults() {
         let r = Registry::embedded().unwrap();
-        let inline = r.pools.iter().filter(|p| p.dex.is_self_contained()).count();
-        let vaulted = r.pools.len() - inline;
-        assert_eq!(r.subscription_estimate(), inline + 3 * vaulted);
+        let binned = r.pools.iter().filter(|p| p.dex == Dex::MeteoraDlmm).count();
+        let inline = r
+            .pools
+            .iter()
+            .filter(|p| p.dex.is_self_contained() && p.dex != Dex::MeteoraDlmm)
+            .count();
+        let vaulted = r.pools.len() - inline - binned;
+        assert_eq!(r.subscription_estimate(), inline + 3 * vaulted + 6 * binned);
+        assert!(binned > 0, "the venue two censuses named as the one holding the mispriced \n                             side must actually be in the universe");
     }
 
     /// Raydium runs four AMM programs, three of which its API labels "Standard". They
@@ -307,6 +323,7 @@ mod tests {
                         | Dex::RaydiumAmmV4
                         | Dex::RaydiumCpmm
                         | Dex::MeteoraDammV2
+                        | Dex::MeteoraDlmm
                 ),
                 "{} claims venue {:?}, which has no live decoder",
                 p.label,

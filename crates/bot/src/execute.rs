@@ -44,7 +44,7 @@ use anyhow::{bail, Context, Result};
 use cb_core::path::Leg;
 use cb_core::types::{Dex, Pubkey32};
 use cb_executor::encode::{pk, programs, to_pubkey};
-use cb_executor::pda::associated_token_address;
+use cb_executor::pda::{self, associated_token_address};
 use cb_executor::route::{self, Hop, RouteOptions, WsolPolicy};
 use cb_executor::venue::raydium::BitmapPolicy;
 use cb_executor::venue::VenueExtra;
@@ -103,7 +103,7 @@ pub struct CyclePlan {
 /// plan the router accepts and the encoder then refuses at the last moment.
 #[must_use]
 pub const fn has_encoder(dex: Dex) -> bool {
-    matches!(dex, Dex::OrcaWhirlpool | Dex::RaydiumClmm | Dex::RaydiumAmmV4)
+    matches!(dex, Dex::OrcaWhirlpool | Dex::RaydiumClmm | Dex::RaydiumAmmV4 | Dex::MeteoraDlmm)
 }
 
 /// Whether a venue prices in ticks, and so needs tick arrays resolved before a swap
@@ -114,6 +114,19 @@ pub const fn has_encoder(dex: Dex) -> bool {
 #[must_use]
 pub const fn is_concentrated(dex: Dex) -> bool {
     matches!(dex, Dex::OrcaWhirlpool | Dex::RaydiumClmm)
+}
+
+/// Whether a venue keeps its liquidity in bin arrays, and so needs those resolved
+/// before a swap on it can be built or priced.
+///
+/// A third shape beside [`is_concentrated`] and the vault-backed venues, and it has to
+/// be its own predicate rather than a branch off either: a binned pool has no tick to
+/// predict and no vaults to cache, but it does have three ordered auxiliary accounts
+/// that must arrive in the same read as the pool — which is exactly the concentrated
+/// shape's requirement and exactly not the vault shape's.
+#[must_use]
+pub const fn is_binned(dex: Dex) -> bool {
+    matches!(dex, Dex::MeteoraDlmm)
 }
 
 /// Whether a cycle on this venue can be re-priced from the accounts an attempt
@@ -132,7 +145,7 @@ pub const fn is_concentrated(dex: Dex) -> bool {
 /// be *priced*, so it is refused before anything is fetched rather than after.
 #[must_use]
 pub const fn can_reprice(dex: Dex) -> bool {
-    matches!(dex, Dex::OrcaWhirlpool | Dex::RaydiumClmm)
+    matches!(dex, Dex::OrcaWhirlpool | Dex::RaydiumClmm | Dex::MeteoraDlmm)
 }
 
 impl CyclePlan {
@@ -270,6 +283,29 @@ struct TickHint {
     mint_a: Pubkey32,
 }
 
+/// What a binned pool looked like the last time this trader decoded it.
+///
+/// The same idea as [`TickHint`] and for the same reason: the bin arrays a swap needs
+/// are derivable, but *which* ones depends on where the price currently sits, and
+/// finding that out first would put a round trip between reading a price and asking the
+/// chain to honour it. So the last known active bin predicts a window, the window is
+/// asked about alongside the pools, and the arrays finally used are chosen from the
+/// active bin read out of the account fetched this attempt.
+///
+/// A DLMM array spans seventy bins, so a window two arrays wide either side covers 350
+/// bins — 3.5% of price on a one-basis-point pool. A price that moves further than that
+/// between two attempts falls back to asking, which is a round trip rather than a wrong
+/// account.
+/// Nothing but the active bin, because the window asked about is symmetric: which way
+/// the swap will walk is decided from the account fetched this attempt, not predicted.
+#[derive(Debug, Clone, Copy)]
+struct BinHint {
+    active_id: i32,
+}
+
+/// Bin arrays either side of the predicted one that a prefetch asks about.
+const BIN_PREFETCH_MARGIN: i64 = 2;
+
 /// The widest per-hop output floor discount this will ever choose, in tenths of a
 /// basis point.
 ///
@@ -297,6 +333,28 @@ const MAX_HAIRCUT_TENTH_BPS: u32 = 60;
 /// had simulation been fee-free, demanding the headroom would have refused good trades
 /// for nothing.
 pub const BASE_FEE_LAMPORTS: u128 = 5_000;
+
+/// The largest share of a trade's own gross profit that may go on the priority bid.
+///
+/// # Why a share and not a number
+///
+/// The configured bid is a constant, and a constant is wrong in both directions at once
+/// on this book. Measured from `getRecentPrioritizationFees` over the pools traded here,
+/// the p75 *winning* fee is 27,673 lamports — $0.0028 at SOL $102.70 — while a one to two
+/// basis point window on a $12 trade is worth about $0.0015. Bidding to win a contested
+/// race therefore costs nearly twice what the race pays, and bidding nothing gets a
+/// transaction nobody has a reason to include: the bot's first ever submission came back
+/// with a signature and was never picked up.
+///
+/// So the bid is priced off the prize. A quarter is the ceiling because the rest of the
+/// gross has to cover the base fee, the slippage margin, and being wrong — and because a
+/// trade that hands more than a quarter of its profit to a validator is close enough to
+/// break-even that losing the race is the better outcome.
+///
+/// The configured `priority_micro_lamports` stays a **ceiling** rather than a target, so
+/// the operator's number still bounds the worst case and the prize decides everything
+/// below it.
+const MAX_BID_SHARE_PERCENT: u128 = 25;
 
 /// What the priority bid will cost, in lamports.
 ///
@@ -333,6 +391,7 @@ fn program_for(dex: Dex) -> Pubkey {
     match dex {
         Dex::OrcaWhirlpool => pk(cb_dex::orca_whirlpool::PROGRAM_ID),
         Dex::RaydiumAmmV4 => pk(cb_dex::raydium_v4::PROGRAM_ID),
+        Dex::MeteoraDlmm => pk(cb_dex::meteora_dlmm::PROGRAM_ID),
         _ => pk(cb_dex::raydium_clmm::PROGRAM_ID),
     }
 }
@@ -343,6 +402,7 @@ fn mint_a_of(dex: Dex, data: &[u8]) -> Result<Pubkey32> {
         Dex::OrcaWhirlpool => Ok(cb_dex::orca_whirlpool::decode(data)?.mint_a),
         Dex::RaydiumClmm => Ok(cb_dex::raydium_clmm::decode(data)?.mint_0),
         Dex::RaydiumAmmV4 => Ok(cb_dex::raydium_v4::decode_amm_info(data)?.base_mint),
+        Dex::MeteoraDlmm => Ok(cb_dex::meteora_dlmm::decode(data)?.token_x_mint),
         other => bail!("{} is not encodable", other.name()),
     }
 }
@@ -363,6 +423,9 @@ pub struct Trader {
     /// the pool account, and their addresses are only knowable by first decoding that
     /// account. Learning them costs the pool one refused attempt, once, ever.
     vaults_seen: HashMap<Pubkey32, [Pubkey; 2]>,
+    /// Where a binned pool's price last sat, so its bin arrays can be predicted rather
+    /// than discovered. See [`BinHint`].
+    bins_seen: HashMap<Pubkey32, BinHint>,
     /// Mints the classic token program does not own.
     ///
     /// Registry configuration, not chain state, so it is loaded once and never
@@ -401,6 +464,7 @@ impl Trader {
             opts,
             owner,
             ticks_seen: HashMap::new(),
+            bins_seen: HashMap::new(),
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
@@ -474,6 +538,37 @@ impl Trader {
         self.owner
     }
 
+    /// The priority bid this specific trade can afford, in micro-lamports per compute
+    /// unit.
+    ///
+    /// `wrapping` says whether the cycle's profit is denominated in lamports, which on a
+    /// wSOL cycle it is. When it is not, the gross is in some other token and converting
+    /// it would need a price this function has no business holding, so the configured
+    /// constant stands — a small, known overpayment on the cycles that are not the main
+    /// case anyway.
+    ///
+    /// See [`MAX_BID_SHARE_PERCENT`] for why the answer is a share of the prize.
+    #[must_use]
+    fn bid_for(&self, plan: &CyclePlan, wrapping: bool) -> u64 {
+        let configured = self.opts.priority_micro_lamports;
+        if !wrapping || self.opts.compute_units == 0 {
+            return configured;
+        }
+        let gross = plan
+            .leg_out
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(plan.amount_in)
+            .saturating_mul(MAX_BID_SHARE_PERCENT)
+            / 100;
+        // Invert `priority_fee_lamports`, which charges `ceil(micro · units / 1e6)`.
+        // Flooring here is deliberate: a bid rounded up would spend a lamport more than
+        // the share allows, which is the one direction this calculation must not err in.
+        let micro = gross.saturating_mul(1_000_000) / u128::from(self.opts.compute_units);
+        u64::try_from(micro.min(u128::from(configured))).unwrap_or(configured)
+    }
+
     /// What this hop would actually return, priced against state read moments ago.
     ///
     /// `None` for a venue with no encoder — those never reach here, because a route
@@ -493,6 +588,7 @@ impl Trader {
         input_mint: &Pubkey32,
         fee_ppm: u32,
         vaults: Option<(u64, u64)>,
+        bins: &[&[u8]],
     ) -> Option<Leg> {
         let state = match dex {
             Dex::OrcaWhirlpool => cb_dex::orca_whirlpool::to_pool_state(address, data, 0).ok()?,
@@ -508,6 +604,14 @@ impl Trader {
                 let (base, quote) = vaults?;
                 let info = cb_dex::raydium_v4::decode_amm_info(data).ok()?;
                 cb_dex::raydium_v4::to_pool_state(address, &info, base, quote, 0).ok()?
+            }
+            // The price is in the pool account and the depth is in separate bin
+            // accounts, so this venue needs both in the same read for the same reason v4
+            // needs its vaults. The fee comes from the pool too, not from the plan: a
+            // DLMM's fee moves with its own volatility, so a cached one is the one
+            // number here that certainly is stale.
+            Dex::MeteoraDlmm => {
+                cb_dex::meteora_dlmm::to_pool_state(address, data, bins, 0).ok()?
             }
             _ => return None,
         };
@@ -584,9 +688,13 @@ impl Trader {
         plan: &CyclePlan,
         pool_data: &[Vec<u8>],
         vaults: &[Option<(u64, u64)>],
+        bins: &[Vec<Vec<u8>>],
     ) -> Result<Vec<Leg>> {
+        let empty: Vec<Vec<u8>> = Vec::new();
         (0..plan.pools.len())
             .map(|i| {
+                let hop_bins = bins.get(i).unwrap_or(&empty);
+                let refs: Vec<&[u8]> = hop_bins.iter().map(Vec::as_slice).collect();
                 Self::fresh_leg(
                     plan.pools[i].1,
                     plan.pools[i].0,
@@ -594,6 +702,7 @@ impl Trader {
                     &plan.mints[i],
                     plan.fee_ppm[i],
                     vaults.get(i).copied().flatten(),
+                    &refs,
                 )
                 .with_context(|| {
                     format!("hop {i} could not be re-priced against the state just fetched")
@@ -626,6 +735,7 @@ impl Trader {
         pool_data: &[Vec<u8>],
         arrays: &[[Pubkey; 3]],
         vaults: &[Option<(u64, u64)>],
+        bins: &[Vec<Vec<u8>>],
         fee_headroom: u128,
     ) -> Result<(Vec<Hop>, u128)> {
         let n = plan.pools.len();
@@ -664,7 +774,7 @@ impl Trader {
         // route still refuses to build unless its last floor beats its first input, and
         // the simulation still has the final say. A smaller trade earns less; it cannot
         // earn something that is not there.
-        let legs = Self::fresh_legs(plan, pool_data, vaults)?;
+        let legs = Self::fresh_legs(plan, pool_data, vaults, bins)?;
         let spend_total = cb_core::path::largest_feasible(&legs, plan.amount_in);
         if spend_total == 0 {
             bail!(
@@ -956,6 +1066,31 @@ impl Trader {
             }
         }
 
+        // Bin arrays for the binned hops, in this same round trip, predicted from where
+        // the price last was.
+        //
+        // The prediction is the same trick the tick arrays use and rests on the same
+        // property: the *address* of a bin array only needs to be right to the precision
+        // of seventy bins, so a window two arrays either side of the last known active
+        // bin covers 3.5% of price movement on the tightest pool in the registry. What
+        // the instruction finally names is chosen from the active bin read out of the
+        // account fetched this attempt, never from the hint.
+        let mut bin_at: Vec<Option<(usize, Vec<i64>)>> = vec![None; n];
+        for (i, (pool_raw, dex)) in plan.pools.iter().enumerate() {
+            if !is_binned(*dex) {
+                continue;
+            }
+            let Some(hint) = self.bins_seen.get(pool_raw) else { continue };
+            let centre = cb_dex::meteora_dlmm::bin_array_index(hint.active_id);
+            let indices: Vec<i64> =
+                (-BIN_PREFETCH_MARGIN..=BIN_PREFETCH_MARGIN).map(|d| centre + d).collect();
+            let program = program_for(*dex);
+            let pool = to_pubkey(pool_raw);
+            let at = keys.len();
+            keys.extend(indices.iter().map(|ix| pda::meteora_bin_array(&pool, *ix, &program)));
+            bin_at[i] = Some((at, indices));
+        }
+
         let (fetched, (blockhash, _)) =
             tokio::try_join!(rpc.accounts_full(&keys), rpc.latest_blockhash())?;
         let mut pool_data = Vec::with_capacity(n);
@@ -1013,6 +1148,95 @@ impl Trader {
             )));
         }
 
+        // Turn the fetched bin arrays into the three each binned hop will walk, and the
+        // bytes its quote will be priced from.
+        //
+        // Both come out of the same place on purpose. The encoder has to name the arrays
+        // the program will traverse, and the quote has to be computed from the contents
+        // of those same accounts; splitting the two would let an instruction walk bins
+        // that a different read priced.
+        let mut bins: Vec<Vec<Vec<u8>>> = vec![Vec::new(); n];
+        let mut bin_arrays: Vec<Option<[Pubkey; 3]>> = vec![None; n];
+        let mut bins_pending: Vec<(usize, Pubkey, i32, bool)> = Vec::new();
+        let mut bins_learned: Vec<(Pubkey32, BinHint)> = Vec::with_capacity(n);
+        for (i, (pool_raw, dex)) in plan.pools.iter().enumerate() {
+            if !is_binned(*dex) {
+                continue;
+            }
+            let pair = cb_dex::meteora_dlmm::decode(&pool_data[i])?;
+            let falling = plan.mints[i] == pair.token_x_mint;
+            bins_learned.push((*pool_raw, BinHint { active_id: pair.active_id }));
+            let pool = to_pubkey(pool_raw);
+            let program = program_for(*dex);
+            let wanted = pda::meteora_bin_array_indices(pair.active_id, falling);
+
+            // Every index the fresh active bin asks for has to be one the prefetch
+            // already asked about. Missing even one means we do not know whether that
+            // account exists, and an unknown bin array is not one a swap may name.
+            let covered = bin_at[i]
+                .as_ref()
+                .is_some_and(|(_, asked)| wanted.iter().all(|ix| asked.contains(ix)));
+            if !covered {
+                bins_pending.push((i, pool, pair.active_id, falling));
+                continue;
+            }
+            let (at, asked) = bin_at[i].as_ref().expect("covered implies present");
+            let mut addresses = [pool; 3];
+            let mut data: Vec<Vec<u8>> = Vec::with_capacity(3);
+            for (slot, ix) in addresses.iter_mut().zip(wanted) {
+                let j = asked.iter().position(|a| *a == ix).expect("checked above");
+                *slot = pda::meteora_bin_array(&pool, ix, &program);
+                if let Some(acc) =
+                    fetched.get(at + j).and_then(Option::as_ref).filter(|a| a.owner == program)
+                {
+                    data.push(acc.data.clone());
+                }
+            }
+            if data.is_empty() {
+                return Ok(Attempt::Refused(format!(
+                    "pool {pool} has no initialised bin arrays to swap through"
+                )));
+            }
+            bins[i] = data;
+            bin_arrays[i] = Some(addresses);
+        }
+
+        // Only the binned hops the prediction could not answer: a pool this trader has
+        // never decoded, or one whose price walked clean out of the prefetched window.
+        if !bins_pending.is_empty() {
+            let asked = bins_pending.iter().map(|&(i, pool, active_id, falling)| {
+                let program = program_for(plan.pools[i].1);
+                let wanted = pda::meteora_bin_array_indices(active_id, falling);
+                let addresses: Vec<Pubkey> =
+                    wanted.iter().map(|ix| pda::meteora_bin_array(&pool, *ix, &program)).collect();
+                async move {
+                    let got = rpc.accounts_full(&addresses).await?;
+                    let data: Vec<Vec<u8>> = got
+                        .iter()
+                        .filter_map(|a| a.as_ref().filter(|a| a.owner == program))
+                        .map(|a| a.data.clone())
+                        .collect();
+                    let mut fixed = [pool; 3];
+                    for (slot, key) in fixed.iter_mut().zip(&addresses) {
+                        *slot = *key;
+                    }
+                    anyhow::Ok((i, pool, fixed, data))
+                }
+            });
+            for (i, pool, addresses, data) in futures::future::try_join_all(asked).await? {
+                if data.is_empty() {
+                    return Ok(Attempt::Refused(format!(
+                        "pool {pool} has no initialised bin arrays to swap through"
+                    )));
+                }
+                bins[i] = data;
+                bin_arrays[i] = Some(addresses);
+            }
+        }
+        for (pool_raw, hint) in bins_learned {
+            self.bins_seen.insert(pool_raw, hint);
+        }
+
         // Which tick arrays actually exist, in the direction each hop will move the
         // price. Measured per attempt rather than cached: an array is created the
         // moment somebody opens a position, so a cached answer goes stale in the
@@ -1036,6 +1260,13 @@ impl Trader {
             // below drops `None`s silently, and a dropped entry would shift every later
             // hop's arrays onto the wrong pool. The value is inert: this venue's
             // encoder never reads it.
+            // A binned hop's three auxiliary accounts were resolved above, from the
+            // same read that priced it. It has no tick and no spacing, so it must not
+            // fall into the sweep.
+            if is_binned(*dex) {
+                arrays[i] = bin_arrays[i];
+                continue;
+            }
             if !is_concentrated(*dex) {
                 arrays[i] = Some([pool; 3]);
                 continue;
@@ -1142,10 +1373,14 @@ impl Trader {
         // `5tQg161Zf4dGFc3s...`, 15:07:16 UTC — came back with a signature and was never
         // included. A transaction nobody has a reason to pick up is not cheap, it is
         // free and worthless.
-        let priority =
-            priority_fee_lamports(self.opts.priority_micro_lamports, self.opts.compute_units);
+        //
+        // The bid itself is priced off this trade's own gross rather than off a constant
+        // — see [`MAX_BID_SHARE_PERCENT`]. The headroom then follows the bid, which is the
+        // point: a smaller prize bids less *and* is asked to clear less.
+        let bid = self.bid_for(plan, wrapping);
+        let priority = priority_fee_lamports(bid, self.opts.compute_units);
         let fee_headroom = if wrapping { (BASE_FEE_LAMPORTS + priority) * 5 / 4 } else { 0 };
-        let (hops, spent) = match self.hops_for(plan, &pool_data, &arrays, &vaults, fee_headroom) {
+        let (hops, spent) = match self.hops_for(plan, &pool_data, &arrays, &vaults, &bins, fee_headroom) {
             Ok(h) => h,
             Err(e) => return Ok(Attempt::Refused(e.to_string())),
         };
@@ -1239,7 +1474,10 @@ impl Trader {
 
         let opts = RouteOptions {
             compute_units: self.opts.compute_units,
-            priority_micro_lamports: self.opts.priority_micro_lamports,
+            // The same bid the headroom above was computed from. Two different numbers
+            // here would mean the route cleared a fee it did not then pay, or paid one it
+            // had not cleared.
+            priority_micro_lamports: bid,
             wsol: self.opts.wsol,
             create_token_accounts: self.opts.create_token_accounts,
             venue: VenueExtra { token_program, bitmap_policy: BitmapPolicy::Include },
@@ -1505,6 +1743,10 @@ impl Trader {
     /// *requested* rather than the amount consumed. A transaction that lands and reverts
     /// pays this in full and returns nothing, which is precisely the loss the daily
     /// budget needs to be able to see.
+    ///
+    /// The configured bid is now a ceiling rather than the bid actually placed — see
+    /// [`Trader::bid_for`] — so this is an upper bound, which is the right side for a
+    /// budget to be wrong on.
     #[must_use]
     pub fn submission_cost_lamports(&self) -> u128 {
         BASE_FEE_LAMPORTS
@@ -1562,6 +1804,13 @@ fn input_is_token_a(dex: Dex, data: &[u8], mint: &Pubkey32) -> Result<bool> {
         Dex::RaydiumAmmV4 => {
             let p = cb_dex::raydium_v4::decode_amm_info(data)?;
             (p.base_mint, p.quote_mint)
+        }
+        // A DLMM calls them x and y. Spending x moves the price down into lower bin
+        // ids, which is the same relationship token A has to the price on the
+        // concentrated venues, so x is token A.
+        Dex::MeteoraDlmm => {
+            let p = cb_dex::meteora_dlmm::decode(data)?;
+            (p.token_x_mint, p.token_y_mint)
         }
         other => bail!("{} is not encodable", other.name()),
     };
@@ -1703,6 +1952,7 @@ mod tests {
             opts: TradeOptions { slippage_tenth_bps: 300, ..Default::default() },
             owner: Pubkey::new_unique(),
             ticks_seen: HashMap::new(),
+            bins_seen: HashMap::new(),
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
@@ -1711,7 +1961,7 @@ mod tests {
         let data = pools_for(&p);
         let arrays = vec![[Pubkey::new_unique(); 3]; 3];
 
-        let (hops, _) = t.hops_for(&p, &data, &arrays, &[], 0).expect("a well formed plan");
+        let (hops, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0).expect("a well formed plan");
         assert_eq!(hops.len(), 3);
         assert_eq!(hops[0].amount_in, 1_000_000);
         for w in hops.windows(2) {
@@ -1733,6 +1983,7 @@ mod tests {
             opts: TradeOptions::default(),
             owner: Pubkey::new_unique(),
             ticks_seen: HashMap::new(),
+            bins_seen: HashMap::new(),
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
@@ -1742,14 +1993,14 @@ mod tests {
 
         let mut short = plan(3);
         short.mints.pop();
-        assert!(t.hops_for(&short, &data, &arrays, &[], 0).is_err());
+        assert!(t.hops_for(&short, &data, &arrays, &[], &[], 0).is_err());
 
         let mut mismatched = plan(3);
         mismatched.leg_out.pop();
-        assert!(t.hops_for(&mismatched, &data, &arrays, &[], 0).is_err());
+        assert!(t.hops_for(&mismatched, &data, &arrays, &[], &[], 0).is_err());
 
         // Fewer accounts than pools must not silently build a shorter cycle.
-        assert!(t.hops_for(&plan(3), &data[..2], &arrays, &[], 0).is_err());
+        assert!(t.hops_for(&plan(3), &data[..2], &arrays, &[], &[], 0).is_err());
     }
 
     /// Slippage wide enough to zero a floor must refuse, not encode a swap that would
@@ -1761,13 +2012,14 @@ mod tests {
             opts: TradeOptions { slippage_tenth_bps: 100_000, ..Default::default() },
             owner: Pubkey::new_unique(),
             ticks_seen: HashMap::new(),
+            bins_seen: HashMap::new(),
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
         };
         let data = pools_for(&plan(2));
         let arrays = vec![[Pubkey::new_unique(); 3]; 2];
-        let e = t.hops_for(&plan(2), &data, &arrays, &[], 0).unwrap_err().to_string();
+        let e = t.hops_for(&plan(2), &data, &arrays, &[], &[], 0).unwrap_err().to_string();
         assert!(e.contains("zero"), "{e}");
     }
 
@@ -1916,7 +2168,7 @@ mod mainnet {
         out
     }
 
-    fn throwaway() -> Trader {
+    pub(super) fn throwaway() -> Trader {
         use cb_executor::risk::Limits;
         use solana_sdk::signer::keypair::Keypair;
         let bytes = Keypair::new().to_bytes();
@@ -2095,11 +2347,12 @@ mod mainnet {
             opts: TradeOptions { slippage_tenth_bps: 300, ..Default::default() },
             owner,
             ticks_seen: HashMap::new(),
+            bins_seen: HashMap::new(),
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
         };
-        let (hops, _) = t.hops_for(&plan, &pool_data, &arrays, &vec![None; plan.pools.len()], 0).expect("hops");
+        let (hops, _) = t.hops_for(&plan, &pool_data, &arrays, &vec![None; plan.pools.len()], &[], 0).expect("hops");
 
         let opts = RouteOptions {
             compute_units: 600_000,
@@ -2201,6 +2454,7 @@ mod fresh_quote_tests {
             opts: TradeOptions { slippage_tenth_bps: 0, ..Default::default() },
             owner: Pubkey::new_unique(),
             ticks_seen: HashMap::new(),
+            bins_seen: HashMap::new(),
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
@@ -2210,7 +2464,7 @@ mod fresh_quote_tests {
         let data = tests::pools_for(&p);
         let arrays = vec![[Pubkey::new_unique(); 3]; 2];
 
-        let (honest, _) = t.hops_for(&p, &data, &arrays, &[], 0).expect("a well formed plan");
+        let (honest, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0).expect("a well formed plan");
 
         // Now claim, in the plan only, that every leg returns a hundred times more.
         // The pools handed to `hops_for` are unchanged, so nothing about what the chain
@@ -2218,7 +2472,7 @@ mod fresh_quote_tests {
         for q in &mut p.leg_out {
             *q *= 100;
         }
-        let (inflated, _) = t.hops_for(&p, &data, &arrays, &[], 0).expect("a well formed plan");
+        let (inflated, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0).expect("a well formed plan");
 
         assert_eq!(
             honest.iter().map(|h| h.min_amount_out).collect::<Vec<_>>(),
@@ -2237,13 +2491,14 @@ mod fresh_quote_tests {
             opts: TradeOptions { slippage_tenth_bps: 100, ..Default::default() },
             owner: Pubkey::new_unique(),
             ticks_seen: HashMap::new(),
+            bins_seen: HashMap::new(),
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
         };
         let p = tests::plan(3);
         let (hops, spent) = t
-            .hops_for(&p, &tests::pools_for(&p), &vec![[Pubkey::new_unique(); 3]; 3], &[], 0)
+            .hops_for(&p, &tests::pools_for(&p), &vec![[Pubkey::new_unique(); 3]; 3], &[], &[], 0)
             .expect("a well formed plan");
 
         assert_eq!(spent, p.amount_in, "these fixtures have room for the whole size");
@@ -2261,7 +2516,7 @@ mod fresh_quote_tests {
     /// would quietly reappear.
     #[test]
     fn a_venue_without_an_encoder_cannot_be_re_priced() {
-        assert!(Trader::fresh_leg(Dex::RaydiumAmmV4, [7u8; 32], &[0u8; 300], &[1u8; 32], 2_500, None)
+        assert!(Trader::fresh_leg(Dex::RaydiumAmmV4, [7u8; 32], &[0u8; 300], &[1u8; 32], 2_500, None, &[])
             .is_none());
     }
 
@@ -2280,6 +2535,7 @@ mod fresh_quote_tests {
             opts: TradeOptions { slippage_tenth_bps: 3, ..Default::default() },
             owner: Pubkey::new_unique(),
             ticks_seen: HashMap::new(),
+            bins_seen: HashMap::new(),
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
@@ -2292,13 +2548,13 @@ mod fresh_quote_tests {
         // changed, so the honest answer is "trade what is there", not "trade nothing".
         p.amount_in = 100_000_000_000_000_000;
         let (hops, spent) =
-            t.hops_for(&p, &data, &arrays, &[], 0).expect("an oversized plan is still tradeable");
+            t.hops_for(&p, &data, &arrays, &[], &[], 0).expect("an oversized plan is still tradeable");
         assert!(spent < p.amount_in, "it must not pretend the room is there");
 
         // The ceiling is a property of the pools, not of how much was asked for.
         let mut greedier = p.clone();
         greedier.amount_in = p.amount_in * 10;
-        let (_, again) = t.hops_for(&greedier, &data, &arrays, &[], 0).expect("still tradeable");
+        let (_, again) = t.hops_for(&greedier, &data, &arrays, &[], &[], 0).expect("still tradeable");
         assert_eq!(spent, again, "the ceiling is the pools', not the request's");
         assert_eq!(u128::from(hops[0].amount_in), spent, "the first hop spends what was chosen");
 
@@ -2327,13 +2583,14 @@ mod fresh_quote_tests {
                 opts: TradeOptions::default(),
                 owner: Pubkey::new_unique(),
                 ticks_seen: HashMap::new(),
+            bins_seen: HashMap::new(),
                 vaults_seen: HashMap::new(),
                 token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
             };
             let _ = &t;
             let p = tests::plan(2);
-            Trader::fresh_legs(&p, &tests::pools_for(&p), &[]).expect("fixtures price")
+            Trader::fresh_legs(&p, &tests::pools_for(&p), &[], &[]).expect("fixtures price")
         };
         let spend = tests::plan(2).amount_in;
 
@@ -2377,6 +2634,7 @@ mod fresh_quote_tests {
             opts: TradeOptions::default(),
             owner: Pubkey::new_unique(),
             ticks_seen: HashMap::new(),
+            bins_seen: HashMap::new(),
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
@@ -2384,7 +2642,7 @@ mod fresh_quote_tests {
         let p = tests::plan(2);
         // Pools that decode but trade the wrong mints cannot be re-priced at all.
         let wrong = vec![tests::whirlpool_with([9u8; 32], [8u8; 32]); 2];
-        let e = t.hops_for(&p, &wrong, &[[Pubkey::new_unique(); 3]; 2], &[], 0).unwrap_err();
+        let e = t.hops_for(&p, &wrong, &[[Pubkey::new_unique(); 3]; 2], &[], &[], 0).unwrap_err();
         assert!(
             e.to_string().contains("could not be re-priced"),
             "an unpriceable hop must say so: {e}"
@@ -2454,6 +2712,7 @@ mod account_rent_tests {
             opts: TradeOptions::default(),
             owner: solana_sdk::pubkey::Pubkey::new_unique(),
             ticks_seen: HashMap::new(),
+            bins_seen: HashMap::new(),
             vaults_seen: HashMap::new(),
             token_2022_mints: HashSet::new(),
             accounts_held: HashSet::new(),
@@ -2491,5 +2750,204 @@ mod account_rent_tests {
             trader_holding(&all).mint_without_an_account(&p).is_none(),
             "a wallet holding every mint of the cycle must not be blocked"
         );
+    }
+}
+
+/// The binned venue, end to end through this file's own predicates and re-pricer.
+#[cfg(test)]
+mod meteora_dlmm_tests {
+    use super::mainnet::throwaway;
+    use super::tests::plan;
+    use super::*;
+
+    fn b64(s: &str) -> Vec<u8> {
+        let table = |c: u8| -> i32 {
+            match c {
+                b'A'..=b'Z' => i32::from(c - b'A'),
+                b'a'..=b'z' => i32::from(c - b'a') + 26,
+                b'0'..=b'9' => i32::from(c - b'0') + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => -1,
+            }
+        };
+        let (mut acc, mut bits, mut out) = (0i32, 0, Vec::new());
+        for &c in s.trim().as_bytes() {
+            let v = table(c);
+            if v < 0 {
+                continue;
+            }
+            acc = (acc << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push(u8::try_from((acc >> bits) & 0xFF).unwrap_or(0));
+            }
+        }
+        out
+    }
+
+    fn pool_and_array() -> (Vec<u8>, Vec<u8>) {
+        (
+            b64(include_str!("../../dex/tests/fixtures/meteora_dlmm_pair.b64")),
+            b64(include_str!("../../dex/tests/fixtures/meteora_dlmm_bin_array.b64")),
+        )
+    }
+
+    fn pool_key() -> Pubkey32 {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(
+            &bs58::decode("HTvjzsfX3yU6BUodCjZ5vZkUrAxMDTrBs3CJaq43ashR").into_vec().unwrap(),
+        );
+        k
+    }
+
+    /// The three predicates have to agree on what shape this venue is, because each one
+    /// gates a different part of the attempt and disagreeing means an account is fetched
+    /// for one purpose and missing for another.
+    #[test]
+    fn the_venue_is_binned_encodable_and_re_priceable_all_at_once() {
+        assert!(has_encoder(Dex::MeteoraDlmm), "the swap2 encoder is wired in");
+        assert!(can_reprice(Dex::MeteoraDlmm), "its bins arrive with its pool account");
+        assert!(is_binned(Dex::MeteoraDlmm));
+        assert!(!is_concentrated(Dex::MeteoraDlmm), "it has no ticks to sweep");
+        // And no other venue may claim to be binned, or it would be sent looking for bin
+        // arrays that do not exist.
+        for other in [
+            Dex::OrcaWhirlpool,
+            Dex::RaydiumClmm,
+            Dex::RaydiumAmmV4,
+            Dex::RaydiumCpmm,
+            Dex::MeteoraDammV2,
+            Dex::PumpSwap,
+        ] {
+            assert!(!is_binned(other), "{other:?} is not a binned venue");
+        }
+    }
+
+    /// A binned hop re-prices from the pool account *and* its bin array, and refuses
+    /// without the array — which is the difference between this venue and the
+    /// concentrated ones, and the reason it needed its own fetch path.
+    #[test]
+    fn a_binned_hop_prices_from_its_bins_and_refuses_without_them() {
+        let (pool, array) = pool_and_array();
+        let pair = cb_dex::meteora_dlmm::decode(&pool).unwrap();
+
+        let leg = Trader::fresh_leg(
+            Dex::MeteoraDlmm,
+            pool_key(),
+            &pool,
+            &pair.token_x_mint,
+            0,
+            None,
+            &[&array],
+        )
+        .expect("a real pool and its real active bin array must price");
+        assert!(leg.max_in > 0, "and must carry the bins' own depth as its bound");
+        assert!(leg.max_in < u128::MAX, "a binned leg is never unbounded");
+        assert!(leg.fee_ppm >= 100, "a one-basis-point pool charges at least a basis point");
+
+        assert!(
+            Trader::fresh_leg(
+                Dex::MeteoraDlmm,
+                pool_key(),
+                &pool,
+                &pair.token_x_mint,
+                0,
+                None,
+                &[]
+            )
+            .is_none(),
+            "with no bin array there is no depth, and a price without depth is the mistake \
+             this venue exists to avoid"
+        );
+    }
+
+    /// The fee must come from the pool, not from the plan. A DLMM's fee moves with its own
+    /// volatility, so the registry's number is the one field here that is certainly stale.
+    #[test]
+    fn the_fee_is_taken_from_the_pool_and_not_from_the_plan() {
+        let (pool, array) = pool_and_array();
+        let pair = cb_dex::meteora_dlmm::decode(&pool).unwrap();
+        let absurd = 900_000; // 90%, which would make any cycle hopeless
+        let leg = Trader::fresh_leg(
+            Dex::MeteoraDlmm,
+            pool_key(),
+            &pool,
+            &pair.token_x_mint,
+            absurd,
+            None,
+            &[&array],
+        )
+        .expect("prices regardless");
+        assert!(leg.fee_ppm < 1_000, "the plan's {absurd} ppm leaked into the leg");
+    }
+
+    /// The direction has to be read from the account. Token X is the one whose spending
+    /// moves the price down, and getting it backwards reverses the swap.
+    #[test]
+    fn token_x_is_this_venues_token_a() {
+        let (pool, _) = pool_and_array();
+        let pair = cb_dex::meteora_dlmm::decode(&pool).unwrap();
+        assert!(input_is_token_a(Dex::MeteoraDlmm, &pool, &pair.token_x_mint).unwrap());
+        assert!(!input_is_token_a(Dex::MeteoraDlmm, &pool, &pair.token_y_mint).unwrap());
+        assert!(input_is_token_a(Dex::MeteoraDlmm, &pool, &[0xAB; 32]).is_err());
+        assert_eq!(mint_a_of(Dex::MeteoraDlmm, &pool).unwrap(), pair.token_x_mint);
+        assert_eq!(program_for(Dex::MeteoraDlmm), pk(cb_dex::meteora_dlmm::PROGRAM_ID));
+    }
+
+    /// The whole point of the prize-scaled bid: a small window bids little, a large one
+    /// bids up to the operator's ceiling and no further.
+    #[test]
+    fn the_bid_follows_the_prize_and_stops_at_the_configured_ceiling() {
+        let mut t = throwaway();
+        t.opts.priority_micro_lamports = 8_000;
+        t.opts.compute_units = 300_000;
+
+        // A window worth about $0.0015 at SOL $102.70 — 14,600 lamports of gross. A
+        // quarter of that is 3,650 lamports, which at a 300,000 limit is 12,166
+        // micro-lamports: more than the ceiling, so the ceiling stands.
+        let mut p = plan(2);
+        p.amount_in = 100_000_000;
+        p.leg_out = vec![0, 100_014_600];
+        assert_eq!(t.bid_for(&p, true), 8_000);
+
+        // A window ten times smaller cannot afford the ceiling and must not pay it.
+        p.leg_out = vec![0, 100_001_460];
+        let small = t.bid_for(&p, true);
+        assert!(small > 0 && small < 8_000, "expected a scaled bid, got {small}");
+        assert_eq!(small, 1_216, "a quarter of 1,460 lamports over a 300,000 unit limit");
+
+        // No prize, no bid. Paying to land a trade that earns nothing is the one case
+        // where losing the race is strictly better.
+        p.leg_out = vec![0, p.amount_in];
+        assert_eq!(t.bid_for(&p, true), 0);
+
+        // And when the profit is not in lamports the share cannot be computed, so the
+        // configured number stands rather than being guessed at.
+        p.leg_out = vec![0, 100_001_460];
+        assert_eq!(t.bid_for(&p, false), 8_000);
+    }
+
+    /// A scaled bid must never cost more than either the operator's ceiling or its own
+    /// share of the prize, at any size.
+    #[test]
+    fn a_scaled_bid_never_exceeds_the_ceiling_or_its_share() {
+        let mut t = throwaway();
+        t.opts.priority_micro_lamports = 8_000;
+        t.opts.compute_units = 300_000;
+        let ceiling = priority_fee_lamports(8_000, 300_000);
+        let mut p = plan(2);
+        p.amount_in = 100_000_000;
+        for gross in [0u128, 100, 1_000, 10_000, 100_000, 10_000_000] {
+            p.leg_out = vec![0, p.amount_in + gross];
+            let bid = t.bid_for(&p, true);
+            let cost = priority_fee_lamports(bid, 300_000);
+            assert!(cost <= ceiling, "a scaled bid of {bid} costs {cost}, over the ceiling");
+            assert!(
+                cost <= gross * MAX_BID_SHARE_PERCENT / 100 + 1,
+                "bid {bid} costs {cost} against a gross of {gross}"
+            );
+        }
     }
 }
