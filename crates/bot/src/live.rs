@@ -108,7 +108,26 @@ enum Venue {
     /// one-basis-point pool — and when the price does leave it the pool simply stops
     /// being priceable until `reconcile` repairs it, which is the honest failure rather
     /// than a quote against bins nobody read.
-    MeteoraDlmm { pair: Box<meteora_dlmm::LbPair>, arrays: HashMap<i64, meteora_dlmm::BinArray> },
+    ///
+    /// # Why each account carries its own slot
+    ///
+    /// The pool account and its bin arrays are separate subscriptions, and a swap writes
+    /// both — but they arrive as two messages. Rebuilding on the first of them publishes a
+    /// *fresh* active bin against *stale* bin contents, which is a torn read: the price has
+    /// moved and the depth behind it has not caught up. The quote that comes out is too good,
+    /// which is the only direction that costs money.
+    ///
+    /// So the state is stamped with the **older** of the two slots. Nothing is suppressed and
+    /// nothing is guessed; the read is simply labelled as old as its oldest part, and the
+    /// lag gate in `main.rs` — which already refuses anything priced more than
+    /// `MAX_EXECUTABLE_LEG_LAG_SLOTS` behind the feed's own head — does the rest.
+    MeteoraDlmm {
+        pair: Box<meteora_dlmm::LbPair>,
+        /// Slot the pool account was last seen at.
+        pair_slot: u64,
+        /// Each held bin array and the slot it arrived at.
+        arrays: HashMap<i64, (u64, meteora_dlmm::BinArray)>,
+    },
     /// Raydium's newer constant-product program. Vaults like v4, fee like CLMM.
     RaydiumCpmm {
         pool: Box<raydium_cpmm::CpmmPool>,
@@ -134,13 +153,20 @@ impl Watch {
     /// pool at all.
     fn vault_state(&self, addr: Pubkey32) -> Option<PoolState> {
         match &self.venue {
-            Venue::MeteoraDlmm { pair, arrays } => {
+            Venue::MeteoraDlmm { pair, pair_slot, arrays } => {
                 // Only the arrays actually received. The decoder refuses unless the
                 // active bin is among them, which is what makes a price that has walked
                 // out of the subscribed window show up as a pool dropping out of the
                 // sweep rather than as a quote against bins nobody read.
-                let held: Vec<meteora_dlmm::BinArray> = arrays.values().cloned().collect();
-                meteora_dlmm::state_from(addr, pair, &held, self.slot).ok()
+                //
+                // The slot is the older of the pool account and the array holding the
+                // active bin, because those two are what a quote is actually made of. See
+                // the variant's own note for why taking the newer of them is a torn read.
+                let active = meteora_dlmm::bin_array_index(pair.active_id);
+                let bins_slot = arrays.get(&active).map(|(slot, _)| *slot)?;
+                let held: Vec<meteora_dlmm::BinArray> =
+                    arrays.values().map(|(_, a)| a.clone()).collect();
+                meteora_dlmm::state_from(addr, pair, &held, (*pair_slot).min(bins_slot)).ok()
             }
             Venue::RaydiumV4 { info, base_amount, quote_amount } => {
                 raydium_v4::to_pool_state(addr, info, (*base_amount)?, (*quote_amount)?, self.slot)
@@ -479,6 +505,7 @@ impl LiveMarket {
                                 dex: entry.dex,
                                 venue: Venue::MeteoraDlmm {
                                     pair: Box::new(pair),
+                                    pair_slot: boot_slot,
                                     arrays: HashMap::new(),
                                 },
                                 slot: boot_slot,
@@ -597,7 +624,7 @@ impl LiveMarket {
                 if let Some(Venue::MeteoraDlmm { arrays, .. }) =
                     watches.get_mut(&pool).map(|w| &mut w.venue)
                 {
-                    arrays.insert(ix, decoded);
+                    arrays.insert(ix, (boot_slot, decoded));
                 }
             }
             for (addr, w) in &watches {
@@ -653,11 +680,12 @@ impl LiveMarket {
                 Venue::RaydiumClmm { trade_fee_ppm } => {
                     raydium_clmm::to_pool_state(u.pubkey, &u.data, *trade_fee_ppm, u.slot).ok()?
                 }
-                Venue::MeteoraDlmm { pair, .. } => {
+                Venue::MeteoraDlmm { pair, pair_slot, .. } => {
                     // The active bin lives in this account and decides which of the
                     // arrays already held is the one that prices the pool, so a stale
                     // copy would price it from the wrong bin.
                     **pair = meteora_dlmm::decode(&u.data).ok()?;
+                    *pair_slot = u.slot;
                     self.watches.get(&u.pubkey)?.vault_state(u.pubkey)?
                 }
                 Venue::RaydiumV4 { info, .. } => {
@@ -684,7 +712,7 @@ impl LiveMarket {
             let w = self.watches.get_mut(&pool)?;
             w.slot = w.slot.max(u.slot);
             if let Venue::MeteoraDlmm { arrays, .. } = &mut w.venue {
-                arrays.insert(ix, array);
+                arrays.insert(ix, (u.slot, array));
             }
             self.watches.get(&pool)?.vault_state(pool)?
         } else {
@@ -934,7 +962,7 @@ impl LiveMarket {
                 if let Some(w) = self.watches.get_mut(&pool) {
                     w.slot = w.slot.max(slot);
                     if let Venue::MeteoraDlmm { arrays, .. } = &mut w.venue {
-                        arrays.insert(ix, decoded);
+                        arrays.insert(ix, (slot, decoded));
                     }
                 }
             }
@@ -974,8 +1002,9 @@ impl LiveMarket {
             Venue::RaydiumClmm { trade_fee_ppm } => {
                 raydium_clmm::to_pool_state(addr, data, *trade_fee_ppm, slot).ok()
             }
-            Venue::MeteoraDlmm { pair, .. } => {
+            Venue::MeteoraDlmm { pair, pair_slot, .. } => {
                 **pair = meteora_dlmm::decode(data).ok()?;
+                *pair_slot = slot;
                 self.watches.get(&addr)?.vault_state(addr)
             }
             Venue::RaydiumV4 { info, .. } => {
@@ -1306,6 +1335,98 @@ mod tests {
         }
     }
 
+    /// A binned pool is two subscriptions, and a quote is made of both. The state must
+    /// therefore be stamped with the **older** of them.
+    ///
+    /// # The failure this stops
+    ///
+    /// A swap writes the pool account and the bin arrays it touched in the same slot, but
+    /// they arrive as two messages. Rebuilding on whichever lands first publishes a fresh
+    /// active bin against bin contents from before the swap — the price has moved and the
+    /// depth behind it has not. That quote is better than the pool will honour, which is
+    /// the one direction that costs money rather than opportunities.
+    ///
+    /// Taking the older slot does not suppress the state or guess at it. It labels the read
+    /// as old as its oldest part, which is what the lag gate in `main.rs` already knows how
+    /// to refuse.
+    #[test]
+    fn a_binned_pool_is_as_stale_as_its_stalest_account() {
+        fn b64(s: &str) -> Vec<u8> {
+            let table = |c: u8| -> i32 {
+                match c {
+                    b'A'..=b'Z' => i32::from(c - b'A'),
+                    b'a'..=b'z' => i32::from(c - b'a') + 26,
+                    b'0'..=b'9' => i32::from(c - b'0') + 52,
+                    b'+' => 62,
+                    b'/' => 63,
+                    _ => -1,
+                }
+            };
+            let (mut acc, mut bits, mut out) = (0i32, 0, Vec::new());
+            for &c in s.trim().as_bytes() {
+                let v = table(c);
+                if v < 0 {
+                    continue;
+                }
+                acc = (acc << 6) | v;
+                bits += 6;
+                if bits >= 8 {
+                    bits -= 8;
+                    out.push(u8::try_from((acc >> bits) & 0xFF).unwrap_or(0));
+                }
+            }
+            out
+        }
+
+        let pool_bytes = b64(include_str!("../../dex/tests/fixtures/meteora_dlmm_pair.b64"));
+        let array_bytes =
+            b64(include_str!("../../dex/tests/fixtures/meteora_dlmm_bin_array.b64"));
+        let pair = meteora_dlmm::decode(&pool_bytes).expect("the fixture decodes");
+        let array = meteora_dlmm::decode_bin_array(&array_bytes).expect("the fixture decodes");
+        let addr = array.lb_pair;
+        let index = meteora_dlmm::bin_array_index(pair.active_id);
+
+        let watch = |pair_slot: u64, array_slot: u64| Watch {
+            label: "SOL/USDC".into(),
+            dex: Dex::MeteoraDlmm,
+            venue: Venue::MeteoraDlmm {
+                pair: Box::new(pair),
+                pair_slot,
+                arrays: HashMap::from([(index, (array_slot, array.clone()))]),
+            },
+            // Deliberately newer than either. The watch's own slot says when we last
+            // heard anything at all; it is not what the quote was made of.
+            slot: 1_000,
+        };
+
+        // Both fresh: the state is as fresh as they are.
+        let both = watch(900, 900).vault_state(addr).expect("a coherent read prices");
+        assert_eq!(both.slot, 900);
+
+        // Pool account moved, bins have not caught up — the torn read.
+        let torn = watch(900, 850).vault_state(addr).expect("still prices");
+        assert_eq!(torn.slot, 850, "a fresh price over stale depth must report the stale slot");
+
+        // And the other way round, which is equally torn.
+        let other = watch(850, 900).vault_state(addr).expect("still prices");
+        assert_eq!(other.slot, 850);
+
+        // The watch's own slot never leaks into the quote.
+        assert!(torn.slot < 1_000 && both.slot < 1_000);
+
+        // And with no array for the active bin there is nothing to price at all.
+        let blind = Watch {
+            label: "SOL/USDC".into(),
+            dex: Dex::MeteoraDlmm,
+            venue: Venue::MeteoraDlmm {
+                pair: Box::new(pair),
+                pair_slot: 900,
+                arrays: HashMap::new(),
+            },
+            slot: 900,
+        };
+        assert!(blind.vault_state(addr).is_none());
+    }
     #[test]
     fn fee_labels_read_the_way_a_trader_says_them() {
         assert_eq!(fee_label(100), "1bp");
