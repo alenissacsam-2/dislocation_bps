@@ -2950,4 +2950,87 @@ mod meteora_dlmm_tests {
             );
         }
     }
+    /// Whether a cycle with a binned leg still fits in one packet.
+    ///
+    /// Not a formality. A DLMM `swap2` names nineteen accounts against a Whirlpool swap's
+    /// eleven, and a transaction is capped at 1,232 bytes with every distinct account
+    /// costing 32 of them. If a two-hop cycle through this venue did not fit, the encoder
+    /// would be perfectly correct and the venue would still be untradeable — and that
+    /// failure arrives as `route::build` refusing every cycle at run time, which reads
+    /// like a market condition rather than an arithmetic one.
+    #[test]
+    fn a_two_hop_cycle_through_a_binned_pool_fits_in_one_packet() {
+        use cb_executor::tx;
+        use solana_sdk::hash::Hash;
+
+        let (pool, _) = pool_and_array();
+        let pair = cb_dex::meteora_dlmm::decode(&pool).unwrap();
+        let owner = Pubkey::new_unique();
+        let wsol = pk(programs::WSOL_MINT);
+        let usdc = to_pubkey(&pair.token_y_mint);
+        let token_program = pk(programs::SPL_TOKEN);
+        let dlmm_pool = to_pubkey(&pool_key());
+
+        let hops = vec![
+            Hop {
+                pool: dlmm_pool,
+                dex: Dex::MeteoraDlmm,
+                pool_data: pool.clone(),
+                input_mint: wsol,
+                output_mint: usdc,
+                input_is_a: true,
+                input_token_program: token_program,
+                output_token_program: token_program,
+                amount_in: 100_000_000,
+                min_amount_out: 1,
+                tick_arrays: cb_executor::venue::meteora_dlmm::bin_arrays_for(
+                    &dlmm_pool,
+                    pair.active_id,
+                    true,
+                ),
+            },
+            Hop {
+                pool: Pubkey::new_unique(),
+                dex: Dex::OrcaWhirlpool,
+                pool_data: super::tests::whirlpool_with(pair.token_y_mint, wsol.to_bytes()),
+                input_mint: usdc,
+                output_mint: wsol,
+                input_is_a: true,
+                input_token_program: token_program,
+                output_token_program: token_program,
+                amount_in: 1,
+                min_amount_out: 100_000_001,
+                tick_arrays: [Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique()],
+            },
+        ];
+
+        let opts = RouteOptions {
+            compute_units: 300_000,
+            priority_micro_lamports: 8_000,
+            wsol: WsolPolicy::WrapAndClose,
+            create_token_accounts: true,
+            venue: VenueExtra::default(),
+        };
+        let built = route::build(&owner, &hops, 200_000_000, &opts)
+            .expect("these hops close and guarantee more than they spend");
+        let size = tx::measure(&owner, &built.instructions, Hash::default())
+            .expect("a two-hop cycle must serialise");
+        assert!(
+            size <= tx::PACKET_LIMIT,
+            "a two-hop cycle through a DLMM serialises to {size} bytes against a {} byte \
+             packet — the venue would be correctly encoded and still untradeable",
+            tx::PACKET_LIMIT
+        );
+        // Measured at 1,143 bytes on 2026-09-12: 89 bytes of headroom out of 1,232.
+        // Worth pinning as a number rather than only as a bound, because the margin is
+        // the real finding. Eighty-nine bytes is not another account, let alone another
+        // hop, so a three-hop cycle through this venue — or a two-hop with a DLMM on
+        // both legs — will not fit. `route::build` refuses those cleanly, so nothing is
+        // lost but the attempt, and buying the room back needs an address lookup table
+        // rather than a smaller encoding.
+        assert!(
+            (1_100..=1_180).contains(&size),
+            "the packet budget moved to {size} bytes; if it grew, check what still fits"
+        );
+    }
 }
