@@ -21,6 +21,7 @@ pub enum Dex {
     RaydiumClmm,
     RaydiumCpmm,
     MeteoraDammV2,
+    MeteoraDlmm,
 }
 
 impl Dex {
@@ -34,6 +35,7 @@ impl Dex {
             Dex::RaydiumClmm => "Raydium CLMM",
             Dex::RaydiumCpmm => "Raydium CP-Swap",
             Dex::MeteoraDammV2 => "Meteora DAMM v2",
+            Dex::MeteoraDlmm => "Meteora DLMM",
         }
     }
 
@@ -47,6 +49,7 @@ impl Dex {
             Dex::RaydiumClmm => "RAY-CL",
             Dex::RaydiumCpmm => "RAY-CP",
             Dex::MeteoraDammV2 => "MET-D2",
+            Dex::MeteoraDlmm => "MET-DL",
         }
     }
 
@@ -90,6 +93,44 @@ pub enum PoolMath {
         sqrt_price_x64: u128,
         sqrt_lo_x64: u128,
         sqrt_hi_x64: u128,
+    },
+    /// A curve quoted from an explicit rate, exact only up to a bound, and with a
+    /// different rate in each direction.
+    ///
+    /// # What this is for
+    ///
+    /// A binned venue — Meteora DLMM — holds liquidity at discrete prices. Inside one
+    /// bin the price does not move at all: the bin is constant-*sum*, and it stops dead
+    /// when its reserve on the output side runs out. Neither other variant describes
+    /// that. [`PoolMath::ConstantProduct`] would quote straight past the bin, and
+    /// [`PoolMath::Concentrated`] derives its bound from a tick geometry this venue
+    /// does not have.
+    ///
+    /// # Why the two directions cannot share one number
+    ///
+    /// A bin holds only the token the price has not yet reached, so on a live pool the
+    /// bin that fills a sale and the bin that fills a purchase are frequently *not the
+    /// same bin*. Their prices then differ by at least one bin step, and a single
+    /// reserve ratio cannot sit on the safe side of both — whichever one it flatters is
+    /// a quote the pool will not honour. So each direction carries its own rate and its
+    /// own depth, and `cb_dex::meteora_dlmm` fills them from the specific bin that
+    /// direction will actually be filled by.
+    ///
+    /// The rates are output-per-input in Q64 raw base units. [`PoolState::leg_for_input`]
+    /// turns one into a constant-product leg over reserves large enough that the curve
+    /// through them is flat to a rounding error across the whole permitted range, so the
+    /// quote lands a hair **under** the constant-sum truth — the only direction an
+    /// approximation of a fill is allowed to err in.
+    Bounded {
+        /// Output per unit of input when spending token A, Q64. Zero when that
+        /// direction cannot be filled at all.
+        rate_a_x64: u128,
+        /// Largest input, in A's base units, this rate is exact for.
+        max_in_a: u128,
+        /// Output per unit of input when spending token B, Q64.
+        rate_b_x64: u128,
+        /// Largest input, in B's base units, this rate is exact for.
+        max_in_b: u128,
     },
 }
 
@@ -161,6 +202,12 @@ impl PoolState {
                 }
                 Some(Leg::cp(r_in, r_out, self.fee_ppm))
             }
+            PoolMath::Bounded { rate_a_x64, max_in_a, rate_b_x64, max_in_b } => {
+                let (rate, max_in) =
+                    if a_to_b { (rate_a_x64, max_in_a) } else { (rate_b_x64, max_in_b) };
+                let (r_in, r_out) = flat_reserves(rate, max_in)?;
+                Some(Leg::bounded(r_in, r_out, self.fee_ppm, max_in))
+            }
             PoolMath::Concentrated { liquidity, sqrt_price_x64, sqrt_lo_x64, sqrt_hi_x64 } => {
                 let (r_in, r_out) =
                     clmm::virtual_reserves_for_input(liquidity, sqrt_price_x64, a_to_b)?;
@@ -203,11 +250,17 @@ impl PoolState {
     }
 
     /// Reserve of token A — real for a constant-product pool, virtual for a
-    /// concentrated one. For display and depth comparison only.
+    /// concentrated one, and the depth of the fillable bin for a binned one. For
+    /// display and depth comparison only.
     #[must_use]
     pub fn reserve_a(&self) -> u128 {
         match self.math {
             PoolMath::ConstantProduct { reserve_a, .. } => reserve_a,
+            // Deliberately the *real* depth and not the flat reserve the quote is
+            // built from: that number is an arithmetic device chosen to be enormous,
+            // and reporting it as a reserve would put a fictional depth on the
+            // dashboard and in every depth comparison that ranks pools.
+            PoolMath::Bounded { max_in_a, .. } => max_in_a,
             PoolMath::Concentrated { liquidity, sqrt_price_x64, .. } => {
                 clmm::virtual_reserves_for_input(liquidity, sqrt_price_x64, true)
                     .map_or(0, |(r_in, _)| r_in)
@@ -220,6 +273,7 @@ impl PoolState {
     pub fn reserve_b(&self) -> u128 {
         match self.math {
             PoolMath::ConstantProduct { reserve_b, .. } => reserve_b,
+            PoolMath::Bounded { max_in_b, .. } => max_in_b,
             PoolMath::Concentrated { liquidity, sqrt_price_x64, .. } => {
                 clmm::virtual_reserves_for_input(liquidity, sqrt_price_x64, false)
                     .map_or(0, |(r_in, _)| r_in)
@@ -232,6 +286,20 @@ impl PoolState {
     /// A reporting number: it feeds the dashboard's price column, never a trade size.
     #[must_use]
     pub fn spot_price(&self) -> Option<f64> {
+        // A binned pool's two depths are in different tokens and their ratio is not a
+        // price, so the rate is read directly. Either direction will do — they differ
+        // by a bin step — and one of them can legitimately be missing, because a bin
+        // holds only the token the price has not reached yet.
+        if let PoolMath::Bounded { rate_a_x64, rate_b_x64, .. } = self.math {
+            let q64 = clmm::Q64 as f64;
+            return if rate_a_x64 > 0 {
+                Some(rate_a_x64 as f64 / q64)
+            } else if rate_b_x64 > 0 {
+                Some(q64 / rate_b_x64 as f64)
+            } else {
+                None
+            };
+        }
         let (a, b) = (self.reserve_a(), self.reserve_b());
         if a == 0 {
             return None;
@@ -248,6 +316,51 @@ impl PoolState {
     pub fn quotable_depth(&self, input_mint: &Pubkey32) -> Option<u128> {
         self.leg_for_input(input_mint).map(|l| l.max_in)
     }
+}
+
+/// Narrowest headroom, as a power of two, between a flat curve's permitted size and the
+/// reserves it is built from.
+///
+/// The constant-product quote over those reserves falls short of the flat truth by
+/// about `amount_in / reserve_in`, so this bounds the shortfall at `2⁻²⁰` — under a
+/// hundredth of a basis point, which is two orders of magnitude below the rounding in
+/// the fee itself. Any less headroom and the approximation starts to be visible in the
+/// only number that matters.
+const MIN_FLAT_HEADROOM_BITS: u32 = 20;
+/// Headroom aimed for before settling for less. `2⁻⁴⁰` is beneath integer resolution at
+/// every size this trades.
+const FLAT_HEADROOM_BITS: u32 = 40;
+
+/// Constant-product reserves whose curve is flat, at rate `rate_x64`, across `max_in`.
+///
+/// # Why reserves at all
+///
+/// Everything downstream of [`PoolState`] quotes through one formula — see
+/// [`crate::path::Leg`] — and a flat rate is not that formula. Rather than give the
+/// router a second kind of leg to reason about, the rate is expressed *as* a
+/// constant-product pool so deep that its curvature vanishes over the whole range the
+/// quote is allowed to cover. Deep enough is made precise by
+/// [`MIN_FLAT_HEADROOM_BITS`], and the residual curvature always bends the quote
+/// **down**, so what comes out is a floor on the real fill rather than a hope.
+///
+/// `None` when no headroom in range avoids overflowing a `u128`, or when the rate is too
+/// small to survive the scaling — both of which mean this is not a leg anyone can size,
+/// and refusing is the honest answer.
+fn flat_reserves(rate_x64: u128, max_in: u128) -> Option<(u128, u128)> {
+    if rate_x64 == 0 || max_in == 0 {
+        return None;
+    }
+    for bits in (MIN_FLAT_HEADROOM_BITS..=FLAT_HEADROOM_BITS).rev() {
+        let Some(r_in) = max_in.checked_mul(1u128 << bits) else { continue };
+        let Some(r_out) = clmm::mul_shr_q64(r_in, rate_x64) else { continue };
+        // A rate this small rounds the whole output side away, which would quote zero
+        // for every size rather than a small number.
+        if r_out == 0 {
+            continue;
+        }
+        return Some((r_in, r_out));
+    }
+    None
 }
 
 /// A detected (not executed) arbitrage opportunity.

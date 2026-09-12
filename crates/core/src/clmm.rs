@@ -74,6 +74,26 @@ fn narrow(x: U256) -> Option<u128> {
     x.try_into().ok()
 }
 
+/// `(a · b) >> 64`, exact, with no intermediate overflow.
+///
+/// Lives here because Q64 is this module's unit, and it is public because a venue that
+/// quotes from an explicit Q64 rate — see [`crate::types::PoolMath::Bounded`] — needs
+/// the same multiply and must not grow a second copy of it.
+#[must_use]
+pub fn mul_shr_q64(a: u128, b: u128) -> Option<u128> {
+    narrow((u256(a) * u256(b)) >> 64)
+}
+
+/// `(a << 64) / b`, exact, with no intermediate overflow. `None` for a zero divisor or
+/// a result too large to be an amount.
+#[must_use]
+pub fn shl_q64_div(a: u128, b: u128) -> Option<u128> {
+    if b == 0 {
+        return None;
+    }
+    narrow((u256(a) << 64) / u256(b))
+}
+
 /// `√(1.0001^tick) · 2⁶⁴`, the price at a tick index.
 ///
 /// Computed in `f64`. That is a deliberate choice, not a shortcut: this value is
