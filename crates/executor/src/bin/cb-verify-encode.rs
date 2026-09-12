@@ -127,6 +127,7 @@ fn supported(dex: &str) -> Option<Dex> {
         "orca_whirlpool" => Some(Dex::OrcaWhirlpool),
         "raydium_clmm" => Some(Dex::RaydiumClmm),
         "raydium_v4" => Some(Dex::RaydiumAmmV4),
+        "meteora_dlmm" => Some(Dex::MeteoraDlmm),
         _ => None,
     }
 }
@@ -158,6 +159,11 @@ async fn check_pool(
     // oracle, no arrays to find — so they take their own much shorter route.
     if dex == Dex::RaydiumAmmV4 {
         return check_v4(rpc, simulate_as, raw, pool, &pool_data, checks).await;
+    }
+    // And a binned venue shares even less: no tick, no spacing, and an oracle the pool
+    // account names rather than one that is derived.
+    if dex == Dex::MeteoraDlmm {
+        return check_dlmm(rpc, simulate_as, raw, pool, &pool_data, checks).await;
     }
 
     let (mint_a, mint_b, vault_a, vault_b, tick, spacing, liquidity, program) = match dex {
@@ -702,4 +708,258 @@ fn summarise(reports: &[PoolReport]) {
     println!("swap a token the address does not hold, so they prove the instruction is");
     println!("well formed and stop at the balance. Whether a cycle is *profitable* is a");
     println!("different question, and the only honest answer to it is a funded dry run.");
+}
+
+/// Meteora DLMM, which shares almost nothing with the other three.
+///
+/// No ticks, no spacing, no oracle to derive — the oracle is named by the pool account
+/// itself — and its depth lives in bin arrays whose addresses are derived from the active
+/// bin. The derivation is the thing most worth checking, because a bin array seed's
+/// endianness is not something any amount of reading settles: this venue seeds an `i64`
+/// little-endian while Raydium seeds its tick arrays big-endian, and both produce real
+/// addresses.
+///
+/// The probe always spends the wrapped-SOL side, wrapping it inside the probe. That is
+/// not for convenience: a simulation needs a source account with a balance, and a wallet
+/// holds *native* SOL rather than wSOL, so any other choice would make the check depend
+/// on which tokens the address passed to `--as` happens to hold.
+async fn check_dlmm(
+    rpc: &Rpc,
+    simulate_as: Option<Pubkey>,
+    raw: &RawPool,
+    pool: Pubkey,
+    pool_data: &[u8],
+    mut checks: Vec<Check>,
+) -> Result<PoolReport> {
+    let dex = Dex::MeteoraDlmm;
+    let report = |checks| {
+        Ok(PoolReport { address: raw.address.clone(), label: raw.label.clone(), dex, checks })
+    };
+
+    let pair = match cb_dex::meteora_dlmm::decode(pool_data) {
+        Ok(p) => p,
+        Err(e) => {
+            checks.push(Check { name: "pool", verdict: Verdict::Fail, detail: e.to_string() });
+            return report(checks);
+        }
+    };
+    checks.push(Check {
+        name: "pool",
+        verdict: Verdict::Pass,
+        detail: format!(
+            "LbPair decodes, bin step {} ({:.2} bp base fee), active bin {} in array {}",
+            pair.bin_step,
+            pair.base_fee_bps(),
+            pair.active_id,
+            cb_dex::meteora_dlmm::bin_array_index(pair.active_id)
+        ),
+    });
+
+    // The reserves the encoder names come out of the pool account, so a wrong offset
+    // would be wrong here in a way no simulation error would explain.
+    let reserves =
+        rpc.accounts_full(&[to_pubkey(&pair.reserve_x), to_pubkey(&pair.reserve_y)]).await?;
+    for (name, slot, want) in [
+        ("reserve_x", reserves.first(), pair.token_x_mint),
+        ("reserve_y", reserves.get(1), pair.token_y_mint),
+    ] {
+        let check = match slot.and_then(Option::as_ref) {
+            None => Check {
+                name,
+                verdict: Verdict::Fail,
+                detail: "the reserve named by LbPair does not exist".into(),
+            },
+            Some(acc) => match token_account_mint(&acc.data) {
+                Err(e) => Check { name, verdict: Verdict::Fail, detail: e.to_string() },
+                Ok(mint) if mint == want => Check {
+                    name,
+                    verdict: Verdict::Pass,
+                    detail: "holds the mint LbPair says it does".into(),
+                },
+                Ok(_) => Check {
+                    name,
+                    verdict: Verdict::Fail,
+                    detail: "reserve holds a different mint than LbPair claims — bad offsets"
+                        .into(),
+                },
+            },
+        };
+        let failed = check.verdict == Verdict::Fail;
+        checks.push(check);
+        if failed {
+            return report(checks);
+        }
+    }
+
+    // The derivation, both ways. A swap walks one way, but the question here is whether
+    // the seeds land on real arrays that name this pool, and a pool whose liquidity all
+    // sits on one side of the price has nothing to find on the other.
+    let mut active_bytes: Option<Vec<u8>> = None;
+    // Every array either direction turns up, because that is what the live watcher holds:
+    // it subscribes to a window around the active bin, not to one account. Pricing this
+    // check off a single array would report a pool as unquotable that the bot quotes
+    // perfectly well.
+    let mut window: Vec<Vec<u8>> = Vec::new();
+    for falling in [true, false] {
+        let arrays = venue::meteora_dlmm::bin_arrays_for(&pool, pair.active_id, falling);
+        let fetched = rpc.accounts_full(&arrays).await?;
+        let mut live = 0;
+        let mut foreign = 0;
+        for acc in fetched.iter().flatten() {
+            match cb_dex::meteora_dlmm::decode_bin_array(&acc.data) {
+                Ok(a) if a.lb_pair == pool.to_bytes() => {
+                    live += 1;
+                    if !window.contains(&acc.data) {
+                        window.push(acc.data.clone());
+                    }
+                    if a.index == cb_dex::meteora_dlmm::bin_array_index(pair.active_id) {
+                        active_bytes = Some(acc.data.clone());
+                    }
+                }
+                Ok(_) => foreign += 1,
+                Err(_) => foreign += 1,
+            }
+        }
+        let side = if falling { "downwards" } else { "upwards" };
+        checks.push(if foreign > 0 {
+            Check {
+                name: "bin arrays",
+                verdict: Verdict::Fail,
+                detail: format!(
+                    "{foreign} of the three addresses derived {side} hold something that is \
+                     not this pool's bin array — the seed layout is wrong"
+                ),
+            }
+        } else if live == 0 {
+            Check {
+                name: "bin arrays",
+                verdict: Verdict::Inconclusive,
+                detail: format!("none of the three arrays derived {side} exist yet"),
+            }
+        } else {
+            Check {
+                name: "bin arrays",
+                verdict: Verdict::Pass,
+                detail: format!("{live} of 3 derived {side} exist and name this pool"),
+            }
+        });
+    }
+
+    // And the quote has to come out of those bins, which is the check that the decoder
+    // and the encoder are looking at the same pool.
+    let held: Vec<&[u8]> = window.iter().map(Vec::as_slice).collect();
+    let Some(_active) = active_bytes else {
+        checks.push(Check {
+            name: "quote",
+            verdict: Verdict::Inconclusive,
+            detail: "the array holding the active bin does not exist, so there is nothing to \
+                     price from"
+                .into(),
+        });
+        return report(checks);
+    };
+    checks.push(
+        match cb_dex::meteora_dlmm::to_pool_state(pool.to_bytes(), pool_data, &held, 0) {
+            Err(e) => Check { name: "quote", verdict: Verdict::Fail, detail: e.to_string() },
+            Ok(state) => Check {
+                name: "quote",
+                verdict: Verdict::Pass,
+                detail: format!(
+                    "prices at {:.6} raw with {} ppm from {} arrays, depth {} / {} base units",
+                    state.spot_price().unwrap_or(0.0),
+                    state.fee_ppm,
+                    held.len(),
+                    state.reserve_a(),
+                    state.reserve_b()
+                ),
+            },
+        },
+    );
+
+    let Some(owner) = simulate_as else {
+        checks.push(Check {
+            name: "swap",
+            verdict: Verdict::Inconclusive,
+            detail: "skipped: pass --as <funded address> to check the instruction".into(),
+        });
+        return report(checks);
+    };
+
+    let wsol = pk(programs::WSOL_MINT);
+    let (input_mint, output_mint) = if to_pubkey(&pair.token_x_mint) == wsol {
+        (pair.token_x_mint, pair.token_y_mint)
+    } else if to_pubkey(&pair.token_y_mint) == wsol {
+        (pair.token_y_mint, pair.token_x_mint)
+    } else {
+        checks.push(Check {
+            name: "swap",
+            verdict: Verdict::Inconclusive,
+            detail: "neither side is wrapped SOL, so the probe cannot fund itself".into(),
+        });
+        return report(checks);
+    };
+    let input_is_a = input_mint == pair.token_x_mint;
+
+    let token_program = pk(programs::SPL_TOKEN);
+    let source = associated_token_address(&owner, &to_pubkey(&input_mint), &token_program);
+    let dest = associated_token_address(&owner, &to_pubkey(&output_mint), &token_program);
+    let ctx = SwapContext {
+        owner,
+        pool,
+        user_source: source,
+        user_dest: dest,
+        amount_in: PROBE_AMOUNT,
+        min_amount_out: 1,
+        input_is_a,
+        input_token_program: token_program,
+        output_token_program: token_program,
+        tick_arrays: venue::meteora_dlmm::bin_arrays_for(&pool, pair.active_id, input_is_a),
+    };
+
+    let ix = match venue::build_swap(dex, &ctx, pool_data, &VenueExtra::default()) {
+        Ok(i) => i,
+        Err(e) => {
+            checks.push(Check { name: "swap", verdict: Verdict::Fail, detail: e.to_string() });
+            return report(checks);
+        }
+    };
+
+    let mut probe = vec![tx::set_compute_limit(600_000)];
+    for mint in [&input_mint, &output_mint] {
+        let m = to_pubkey(mint);
+        let ata = associated_token_address(&owner, &m, &token_program);
+        probe.push(tx::create_ata_idempotent(&owner, &ata, &owner, &m, &token_program));
+    }
+    // Wrap the probe amount, so the source account has the balance the swap will spend.
+    probe.push(tx::transfer_lamports(&owner, &source, PROBE_AMOUNT));
+    probe.push(tx::sync_native(&source));
+    probe.push(ix);
+    probe.push(tx::close_account(&source, &owner, &owner));
+
+    let (blockhash, _) = rpc.latest_blockhash().await?;
+    let compiled = match tx::compile_unsigned(&owner, &probe, blockhash) {
+        Ok(a) => a,
+        Err(e) => {
+            checks.push(Check { name: "swap", verdict: Verdict::Fail, detail: e.to_string() });
+            return report(checks);
+        }
+    };
+    let sim = rpc.simulate(&compiled.tx_base64, &[]).await?;
+    checks.push(match &sim.err {
+        None => Check {
+            name: "swap",
+            verdict: Verdict::Pass,
+            detail: format!(
+                "swap2 simulated cleanly, wrapping {PROBE_AMOUNT} lamports and naming three \
+                 derived bin arrays ({} compute units)",
+                sim.units_consumed.unwrap_or(0)
+            ),
+        },
+        Some(err) => {
+            let (verdict, detail) = classify(err, &sim.logs);
+            Check { name: "swap", verdict, detail }
+        }
+    });
+
+    report(checks)
 }

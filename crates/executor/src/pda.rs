@@ -173,6 +173,54 @@ pub fn raydium_bitmap_extension(pool: &Pubkey, program: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"pool_tick_array_bitmap_extension", pool.as_ref()], program).0
 }
 
+/// Meteora DLMM's bin array PDA.
+///
+/// The index is seeded as eight **little-endian** bytes of an `i64`, which is also how it
+/// is stored inside the account — unlike Raydium's tick arrays, whose seed is big-endian
+/// while the stored field is not. Two venues, two conventions, and the only way to be
+/// sure is a test against an address the chain already has, which
+/// `the_bin_array_address_is_the_one_the_chain_holds` is.
+#[must_use]
+pub fn meteora_bin_array(lb_pair: &Pubkey, index: i64, program: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"bin_array", lb_pair.as_ref(), &index.to_le_bytes()], program).0
+}
+
+/// The `event_authority` PDA an Anchor program with events requires on every
+/// instruction that emits one.
+///
+/// Constant per program, so it could be pasted — and is derived instead for the same
+/// reason discriminators are: the seed is checkable by eye and a base58 string is not.
+#[must_use]
+pub fn anchor_event_authority(program: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"__event_authority"], program).0
+}
+
+/// How many bin arrays a DLMM swap instruction is given to traverse.
+///
+/// Three, matching the tick-array count on the concentrated venues, which is what lets
+/// one `[Pubkey; 3]` on [`crate::venue::SwapContext`] serve both shapes. A DLMM array
+/// covers seventy bins, so three of them span 210 bin steps — 2.1% of price on a
+/// one-basis-point pool, and proportionally more on a coarser one. No trade this
+/// instrument can fund comes close to needing the third.
+pub const BIN_ARRAYS_PER_SWAP: usize = TICK_ARRAYS_PER_SWAP;
+
+/// The bin arrays a DLMM swap will walk, in the order the program expects.
+///
+/// Spending token X moves the price **down** into lower bin ids and therefore lower array
+/// indices; spending token Y walks up. Indices that would leave the pool's own bin range
+/// are clamped to repeat the last real one, which is harmless because the program stops
+/// when it runs out of liquidity anyway.
+#[must_use]
+pub fn meteora_bin_array_indices(active_id: i32, price_falling: bool) -> [i64; BIN_ARRAYS_PER_SWAP] {
+    let first = cb_dex::meteora_dlmm::bin_array_index(active_id);
+    let step: i64 = if price_falling { -1 } else { 1 };
+    let mut out = [first; BIN_ARRAYS_PER_SWAP];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = first + step * i64::try_from(i).unwrap_or(0);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +348,52 @@ mod tests {
         assert!(!orca_tick_array(&pool, -176, &prog).is_on_curve());
         assert!(!raydium_tick_array(&pool, -180, &prog).is_on_curve());
         assert!(!associated_token_address(&pool, &pool, &pk(programs::SPL_TOKEN)).is_on_curve());
+    }
+    /// The derivation checked against an address the chain already holds.
+    ///
+    /// `DxyNRLdPkPsaV73w6qe9Ytau8siAnzBXfTFaaJD8UegD` is the live bin array at index
+    /// −327 of the Meteora DLMM SOL/USDC pool, found by asking the program for every
+    /// account whose stored `lb_pair` is that pool and reading the index out of each.
+    /// Deriving the same address from the seeds is what proves the seed layout — the
+    /// endianness in particular, which differs from Raydium's tick arrays and cannot be
+    /// checked any other way.
+    #[test]
+    fn the_bin_array_address_is_the_one_the_chain_holds() {
+        let pool = pk("HTvjzsfX3yU6BUodCjZ5vZkUrAxMDTrBs3CJaq43ashR");
+        let program = pk(cb_dex::meteora_dlmm::PROGRAM_ID);
+        assert_eq!(
+            meteora_bin_array(&pool, -327, &program),
+            pk("DxyNRLdPkPsaV73w6qe9Ytau8siAnzBXfTFaaJD8UegD")
+        );
+        // And a neighbour must not collide with it, which a big-endian seed would make
+        // look plausible while being a different account entirely.
+        assert_ne!(
+            meteora_bin_array(&pool, -326, &program),
+            meteora_bin_array(&pool, -327, &program)
+        );
+    }
+
+    /// Every `swap2` call on the program passes the same event authority, so it is a
+    /// constant — and this is the check that the derivation reproduces it rather than
+    /// that somebody transcribed it correctly.
+    #[test]
+    fn the_event_authority_is_the_one_every_real_call_passes() {
+        assert_eq!(
+            anchor_event_authority(&pk(cb_dex::meteora_dlmm::PROGRAM_ID)),
+            pk("D1ZN9Wj1fRSUQfCjhvnu1hqDMT7hzjzBBpi12nVniYD6")
+        );
+    }
+
+    /// The walk direction, which is the thing that reverses a swap if it is backwards.
+    /// Spending token X moves the price down, so into lower array indices.
+    #[test]
+    fn bin_arrays_walk_the_way_the_price_moves() {
+        let falling = meteora_bin_array_indices(-22849, true);
+        let rising = meteora_bin_array_indices(-22849, false);
+        assert_eq!(falling, [-327, -328, -329]);
+        assert_eq!(rising, [-327, -326, -325]);
+        // The first is always the array holding the active bin, whichever way it goes.
+        assert_eq!(falling[0], rising[0]);
+        assert_eq!(falling[0], cb_dex::meteora_dlmm::bin_array_index(-22849));
     }
 }

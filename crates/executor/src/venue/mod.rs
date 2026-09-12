@@ -34,6 +34,7 @@
 //! always in range without knowing the exact extreme, and it is a real circuit breaker
 //! against a size that would move the pool by more than any plausible trade should.
 
+pub mod meteora_dlmm;
 pub mod orca;
 pub mod raydium;
 pub mod raydium_v4;
@@ -127,6 +128,7 @@ pub fn build_swap(
         Dex::OrcaWhirlpool => orca::swap(ctx, pool_data),
         Dex::RaydiumClmm => raydium::swap(ctx, pool_data, extra.token_program, extra.bitmap_policy),
         Dex::RaydiumAmmV4 => raydium_v4::swap(ctx, pool_data),
+        Dex::MeteoraDlmm => meteora_dlmm::swap(ctx, pool_data),
         other => bail!(
             "{} swaps are not encoded — see crates/executor/src/venue/mod.rs for why",
             other.name()
