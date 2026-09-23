@@ -1253,7 +1253,7 @@ impl Trader {
         }
 
         let (fetched, (blockhash, _)) =
-            tokio::try_join!(rpc.accounts_full(&keys), rpc.latest_blockhash())?;
+            tokio::try_join!(rpc.accounts_latest(&keys), rpc.latest_blockhash())?;
         let mut pool_data = Vec::with_capacity(n);
         for (key, acc) in keys.iter().zip(fetched.iter()).take(n) {
             let Some(a) = acc.as_ref() else {
@@ -1371,7 +1371,7 @@ impl Trader {
                 let addresses: Vec<Pubkey> =
                     wanted.iter().map(|ix| pda::meteora_bin_array(&pool, *ix, &program)).collect();
                 async move {
-                    let got = rpc.accounts_full(&addresses).await?;
+                    let got = rpc.accounts_latest(&addresses).await?;
                     let data: Vec<Vec<u8>> = got
                         .iter()
                         .filter_map(|a| a.as_ref().filter(|a| a.owner == program))
@@ -3111,7 +3111,7 @@ mod vault_backed_tests {
     fn vault_keys_are_fetched_with_the_pool_and_not_after_it() {
         let src = include_str!("execute.rs");
         let push = src.find("keys.push(v[0]);").expect("vault keys are collected");
-        let fetch = src.find("tokio::try_join!(rpc.accounts_full(&keys)").expect("one round trip");
+        let fetch = src.find("tokio::try_join!(rpc.accounts_latest(&keys)").expect("one round trip");
         assert!(
             push < fetch,
             "vault addresses must be added to the fetch, not read in a second one — \

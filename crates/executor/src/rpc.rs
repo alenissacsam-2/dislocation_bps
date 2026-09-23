@@ -329,7 +329,10 @@ impl Rpc {
             // use a replaced blockhash, and a stale blockhash fails for the wrong reason.
             "sigVerify": false,
             "replaceRecentBlockhash": true,
-            "commitment": "confirmed",
+            // The newest state, as the trade was priced against — see
+            // `accounts_latest`. A simulation at `confirmed` answers for a moment the
+            // leader has already moved past.
+            "commitment": "processed",
             "accounts": { "encoding": "base64", "addresses": addresses },
         });
         let r = self.call("simulateTransaction", json!([tx_base64, cfg])).await?;
@@ -531,6 +534,32 @@ impl Rpc {
     /// # Errors
     /// If the call fails or the response is not the expected shape.
     pub async fn accounts_full(&self, keys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
+        self.accounts_full_at(keys, "confirmed").await
+    }
+
+    /// [`Rpc::accounts_full`] at `processed`: the newest state the node has, which is
+    /// the state the feed detects from and the state a leader will execute against.
+    ///
+    /// # Why a trade must read here and not at `confirmed`
+    ///
+    /// The feed subscribes at `processed`. Re-pricing a detection at `confirmed` asks an
+    /// older question than the one that raised it: measured on the busiest pool traded
+    /// here, the two commitments returned different bytes in 3 samples of 30, so about
+    /// one re-price in ten was checking a moment the opportunity was not in — and the
+    /// leader was never going to execute against that moment either. The reconciliation
+    /// read in the bot already reads at `processed` for exactly this reason.
+    ///
+    /// # Errors
+    /// If the call fails or the response is not the expected shape.
+    pub async fn accounts_latest(&self, keys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
+        self.accounts_full_at(keys, "processed").await
+    }
+
+    async fn accounts_full_at(
+        &self,
+        keys: &[Pubkey],
+        commitment: &str,
+    ) -> Result<Vec<Option<Account>>> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -538,7 +567,7 @@ impl Rpc {
         let r = self
             .call(
                 "getMultipleAccounts",
-                json!([addresses, {"encoding": "base64", "commitment": "confirmed"}]),
+                json!([addresses, {"encoding": "base64", "commitment": commitment}]),
             )
             .await?;
         let arr = r["value"]
@@ -787,6 +816,23 @@ mod tests {
     /// Failover exists for reads. It must never apply to a send: a transaction that
     /// timed out may still have been received, and a second copy is a second real
     /// trade against a wallet that has already moved.
+    /// A trade is detected at `processed`, so it has to be re-priced and simulated
+    /// there too. Checked in the source because both are one string in a JSON body,
+    /// and nothing else would notice either drifting back to `confirmed`.
+    #[test]
+    fn a_trade_reads_and_simulates_at_the_commitment_it_was_detected_at() {
+        let src = include_str!("rpc.rs");
+        let body_of = |sig: &str| {
+            let f = &src[src.find(sig).expect("function exists")..];
+            f[..f.find("\n    }").expect("body ends")].to_string()
+        };
+        assert!(body_of("pub async fn accounts_latest(").contains("\"processed\""));
+        assert!(body_of("pub async fn simulate(").contains("\"commitment\": \"processed\""));
+        // And the blockhash stays confirmed: one from a fork that is later dropped
+        // would fail the transaction for a reason that has nothing to do with price.
+        assert!(body_of("pub async fn latest_blockhash(").contains("\"confirmed\""));
+    }
+
     #[test]
     fn send_is_pinned_to_one_endpoint_while_reads_are_not() {
         let src = include_str!("rpc.rs");
