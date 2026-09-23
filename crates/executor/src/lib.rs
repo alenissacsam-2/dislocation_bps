@@ -18,8 +18,18 @@
 //! That reverses the usual relationship between this codebase and its own arithmetic.
 //! Everywhere else, the quote is the answer. Here the quote is only a reason to ask the
 //! chain, and the chain's answer is what decides.
+//!
+//! # The one exception, and why it is safe
+//!
+//! [`SendVia::Jito`] with `simulate_first: false` sends without our own simulation. It
+//! is only reachable on a wSOL cycle whose last floor guarantees the base fee and the tip
+//! on chain ([`route::RouteOptions::min_gain`]), and only as a bundle of one, which the
+//! block engine simulates itself and drops rather than lands if it would fail. A wrong
+//! encoder therefore still costs nothing, and a right one cannot land at a loss — the
+//! programs enforce the floor whatever our arithmetic says. It is off by default.
 
 pub mod encode;
+pub mod jito;
 pub mod pda;
 pub mod risk;
 pub mod route;
@@ -94,7 +104,7 @@ impl std::fmt::Display for Probe {
         match self {
             Self::WouldHaveProfited { after, needed, units_consumed } => write!(
                 f,
-                "probe: would have profited — simulated {after} against the {needed} it                  had to reach{}",
+                "probe: would have profited — simulated {after} against the {needed} it had to reach{}",
                 units_consumed.map_or(String::new(), |u| format!(", {u} compute units"))
             ),
             Self::MissedFloor { reason, units_consumed } => write!(
@@ -104,12 +114,33 @@ impl std::fmt::Display for Probe {
             ),
             Self::ShortOfFloor { after, needed, units_consumed } => write!(
                 f,
-                "probe: simulated {after}, under the {needed} that would have meant                  profit{}",
+                "probe: simulated {after}, under the {needed} that would have meant profit{}",
                 units_consumed.map_or(String::new(), |u| format!(", {u} compute units"))
             ),
             Self::Rejected { reason } => write!(f, "probe: rejected — {reason}"),
         }
     }
+}
+
+/// Where a trade that clears every check is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendVia {
+    /// `sendTransaction` on the configured RPC. A transaction that misses its floor by
+    /// the time it lands is included, reverts, and pays its fee.
+    Rpc,
+    /// Jito's block engine as a bundle of one. A miss is dropped and costs nothing; see
+    /// [`rpc::Rpc::send_jito`].
+    Jito {
+        /// The block engine's `/api/v1/transactions` URL, with `bundleOnly=true`.
+        url: String,
+        /// Run our own simulation first.
+        ///
+        /// With revert protection a failing trade is free, so the simulation no longer
+        /// guards the budget — the floors do, on chain. It still costs a round trip
+        /// between pricing and sending. Kept on by default until a live run has shown
+        /// the floors doing that job; turning it off is then worth one round trip.
+        simulate_first: bool,
+    },
 }
 
 /// A trade that has been priced and is ready to be considered.
@@ -141,6 +172,7 @@ impl Plan {
         gate: &mut RiskGate,
         rpc: &Rpc,
         dry_run: bool,
+        via: &SendVia,
     ) -> Result<Attempt> {
         let proposal = Proposal {
             size_usd: self.size_usd,
@@ -151,6 +183,35 @@ impl Plan {
             Decision::Refuse(r) | Decision::Halt(r) => return Ok(Attempt::Refused(r)),
         }
 
+        // A dry run always simulates: reporting what the chain would have done is the
+        // only thing a dry run is for.
+        let simulate = dry_run
+            || match via {
+                SendVia::Rpc => true,
+                SendVia::Jito { simulate_first, .. } => *simulate_first,
+            };
+        if simulate {
+            if let Some(rejected) = self.simulate_for(gate, rpc).await? {
+                return Ok(rejected);
+            }
+        }
+
+        if dry_run {
+            return Ok(Attempt::Refused(
+                "dry run — the trade simulated profitably and was not sent".into(),
+            ));
+        }
+
+        let signature = match via {
+            SendVia::Rpc => rpc.send(&self.tx_base64, true).await?,
+            SendVia::Jito { url, .. } => rpc.send_jito(url, &self.tx_base64).await?,
+        };
+        Ok(Attempt::Submitted { signature, expected_net_usd: self.expected_net_usd })
+    }
+
+    /// The simulation half of [`Plan::execute`]: `Some` is the rejection to return,
+    /// `None` means the trade may go ahead.
+    async fn simulate_for(&self, gate: &mut RiskGate, rpc: &Rpc) -> Result<Option<Attempt>> {
         // The chain's opinion, before anything irreversible.
         let sim = rpc.simulate(&self.tx_base64, &[self.profit.address()]).await?;
         if !sim.succeeded() {
@@ -187,7 +248,7 @@ impl Plan {
             // simulation nineteen times, missed the floor on fifteen of them, and spent
             // the gaps refusing everything with "trading is halted".
             gate.record(if missed_floor { Outcome::Missed } else { Outcome::Failed });
-            return Ok(Attempt::SimulationRejected { reason, observed_net_usd: None });
+            return Ok(Some(Attempt::SimulationRejected { reason, observed_net_usd: None }));
         }
 
         // Read the balance from whichever place this route's profit lands in. Reading a
@@ -199,31 +260,23 @@ impl Plan {
         };
         let Some(after) = observed else {
             gate.record(Outcome::Failed);
-            return Ok(Attempt::SimulationRejected {
+            return Ok(Some(Attempt::SimulationRejected {
                 reason: "simulation returned no balance for the profit account".into(),
                 observed_net_usd: None,
-            });
+            }));
         };
 
         if after < self.min_post_balance {
-            return Ok(Attempt::SimulationRejected {
+            return Ok(Some(Attempt::SimulationRejected {
                 reason: format!(
                     "simulated balance {after} is below the {} this trade must reach \
                      to have profited",
                     self.min_post_balance
                 ),
                 observed_net_usd: None,
-            });
+            }));
         }
-
-        if dry_run {
-            return Ok(Attempt::Refused(
-                "dry run — the trade simulated profitably and was not sent".into(),
-            ));
-        }
-
-        let signature = rpc.send(&self.tx_base64, true).await?;
-        Ok(Attempt::Submitted { signature, expected_net_usd: self.expected_net_usd })
+        Ok(None)
     }
 
     /// Ask the chain what would have happened, and stop there.

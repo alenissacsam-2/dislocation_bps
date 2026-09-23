@@ -160,7 +160,25 @@ halt_cooldown_secs = 600
 slippage_tenth_bps = 3
 
 # Priority bid in micro-lamports per compute unit. 0 pays the base fee only.
+# Only used with submit_via = "rpc"; through Jito the tip does this job.
 priority_micro_lamports = 0
+
+# Where live trades go.
+#
+# "jito" (the default) sends each trade as a bundle of one through Jito's block engine.
+# A trade whose floor is missed by the time a leader reaches it is dropped and costs
+# nothing, and every floor guarantees the base fee and the tip on chain, so a trade that
+# lands has paid for itself. "rpc" is ordinary sendTransaction: a miss lands, reverts,
+# and pays the whole fee.
+submit_via = "jito"
+# Blank means Jito's global endpoint with bundleOnly=true.
+jito_url = ""
+# The most one tip may be, in lamports. The tip is a quarter of the trade's gross, at
+# least Jito's 1,000-lamport minimum, and only paid when the trade lands.
+jito_tip_max_lamports = 20000
+# Simulate before sending through Jito. The on-chain floors protect the budget either
+# way; switching this off saves one round trip (~100 ms) per trade.
+jito_simulate_first = true
 
 # Build, sign and simulate every trade — and submit none.
 #

@@ -12,7 +12,7 @@ mod live_log;
 mod registry;
 mod sim;
 
-use cb_core::config::{Config, FeedSource, Mode};
+use cb_core::config::{Config, FeedSource, Mode, SubmitVia};
 use cb_feed::WsFeed;
 use cb_server::{routes, Event, EventBus, RouteRow};
 use std::net::SocketAddr;
@@ -639,7 +639,8 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
     };
     limits.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
     tracing::info!(
-        "risk limits from config.toml: max position ${:.2}, min net ${:.4}, daily loss ${:.2}, {} consecutive failures, {} trades/day, halt cooldown {}s{}",
+        "risk limits from config.toml: max position ${:.2}, min net ${:.4}, daily loss ${:.2}, \
+         {} consecutive failures, {} trades/day, halt cooldown {}s{}",
         limits.max_position_usd,
         limits.min_net_profit_usd,
         limits.max_daily_loss_usd,
@@ -669,6 +670,13 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
         dry_run: cfg.dry_run,
         create_token_accounts: true,
         wsol: cb_executor::route::WsolPolicy::WrapAndClose,
+        submit: match cfg.submit_via {
+            SubmitVia::Rpc => execute::Submit::Rpc,
+            SubmitVia::Jito => execute::Submit::Jito {
+                tip_max_lamports: cfg.jito_tip_max_lamports,
+                simulate_first: cfg.jito_simulate_first,
+            },
+        },
     };
     let exec = cb_executor::Executor::new(wallet, rpc, limits, cfg.dry_run)?;
 
@@ -679,9 +687,14 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
         );
     } else {
         tracing::error!(
-            "LIVE ARMED, SUBMITTING: {address} will sign and send real transactions. \
-             Every trade is still simulated first and abandoned unless the simulated \
-             balance clears the profit floor."
+            "LIVE ARMED, SUBMITTING: {address} will sign and send real transactions. {}",
+            if cfg.submit_via == SubmitVia::Jito && !cfg.jito_simulate_first {
+                "Trades go to Jito unsimulated: the on-chain floors guarantee the fee and \
+                 tip, and a trade that misses them is dropped for free."
+            } else {
+                "Every trade is still simulated first and abandoned unless the simulated \
+                 balance clears the profit floor."
+            }
         );
     }
     // A cycle longer than this cannot be executed atomically, so searching for them in
@@ -698,6 +711,25 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
     }
 
     let mut trader = execute::Trader::new(exec, opts);
+    trader.set_jito_url(&cfg.jito_url);
+    match opts.submit {
+        execute::Submit::Jito { tip_max_lamports, simulate_first } => tracing::info!(
+            "trades go to Jito as bundles of one: a missed floor is dropped and costs \
+             nothing, and every floor guarantees the base fee and the tip on chain — tip a \
+             quarter of the gross, {} to {tip_max_lamports} lamports; {}",
+            cb_executor::jito::MIN_TIP_LAMPORTS,
+            if simulate_first {
+                "each is still simulated first"
+            } else {
+                "sent without our own simulation, one round trip sooner"
+            }
+        ),
+        execute::Submit::Rpc => tracing::warn!(
+            "trades go through sendTransaction on the RPC: a floor missed by the time one \
+             lands reverts it on chain and pays the whole fee (submit_via = \"jito\" \
+             makes that free)"
+        ),
+    }
     // Which mints the classic token program does not own. Configuration, read once:
     // no swap changes a mint's owner, and getting it wrong derives the wrong
     // associated account rather than raising anything.
@@ -849,6 +881,10 @@ async fn main() -> anyhow::Result<()> {
             max_hops: 3,
             slippage_tenth_bps: 300,
             priority_micro_lamports: 0,
+            submit_via: SubmitVia::Jito,
+            jito_url: String::new(),
+            jito_tip_max_lamports: 20_000,
+            jito_simulate_first: true,
             dry_run: true,
             max_position_usd: 25.0,
             max_daily_loss_usd: 5.0,
@@ -1209,7 +1245,8 @@ async fn spawn_live(
                     if feed_stalled != was_stalled {
                         if feed_stalled {
                             tracing::warn!(
-                                "feed silent for over {FEED_STALL_SECS}s — pausing the ledger; sweeps continue but nothing is recorded"
+                                "feed silent for over {FEED_STALL_SECS}s — pausing the ledger; \
+                                 sweeps continue but nothing is recorded"
                             );
                         } else {
                             tracing::info!("feed recovered — recording resumed");
@@ -1697,6 +1734,20 @@ async fn spawn_live(
                                                                  nothing"
                                                             );
                                                             "submitted, landed, reverted".into()
+                                                        }
+                                                        None if t.sends_via_jito() => {
+                                                            // A bundle is included whole or
+                                                            // not at all, and one that is not
+                                                            // is dropped: nothing was paid, and
+                                                            // nothing was taken either.
+                                                            landed = false;
+                                                            tracing::warn!(
+                                                                "{sig} was not included — a Jito \
+                                                                 bundle that misses is dropped and \
+                                                                 costs nothing"
+                                                            );
+                                                            "sent to Jito; not included, cost \
+                                                             nothing".into()
                                                         }
                                                         None => {
                                                             tracing::warn!(
@@ -2215,7 +2266,8 @@ fn report(path: &str) -> anyhow::Result<()> {
             if ladder.measured_episodes == 1 { "" } else { "s" },
             if ladder.unmeasured_episodes > 0 {
                 format!(
-                    ";\n    {} more predate the ladder and are left out rather than counted as zero",
+                    ";\n    {} more predate the ladder and are left out rather than counted as \
+                     zero",
                     ladder.unmeasured_episodes
                 )
             } else {
@@ -2552,7 +2604,8 @@ async fn verify(cfg: &Config) -> anyhow::Result<()> {
         );
     }
 
-    println!("\n  {checked} checked, {skipped} skipped, {faults} faults, {off_premise} off-premise");
+    println!("\n  {checked} checked, {skipped} skipped, {faults} faults, {off_premise} \
+              off-premise");
     if faults == 0 {
         println!("  No pool quotes better than the router can route. Decoders look honest.");
     } else {
@@ -2688,7 +2741,9 @@ mod tests {
         let reconcile_ms = RECONCILE_INTERVAL.as_millis() as u64;
         assert!(
             guard_ms >= reconcile_ms * 2,
-            "the staleness guard ({guard_ms} ms) must outlast two reconciles              ({reconcile_ms} ms each), or it excludes pools reconcile has already              proven correct and quietly shrinks the search space"
+            "the staleness guard ({guard_ms} ms) must outlast two reconciles ({reconcile_ms} \
+             ms each), or it excludes pools reconcile has already proven correct and quietly \
+             shrinks the search space"
         );
     }
 

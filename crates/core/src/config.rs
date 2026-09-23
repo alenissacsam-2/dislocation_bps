@@ -36,6 +36,21 @@ pub enum FeedSource {
     Simulated,
 }
 
+/// How a live trade reaches a leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SubmitVia {
+    /// Jito's block engine, as a bundle of one. A trade whose floor is missed by the
+    /// time a leader reaches it is dropped and costs nothing, and the floors guarantee
+    /// the fee and tip on chain. The default, because it is the one where losing a
+    /// race is free.
+    #[default]
+    Jito,
+    /// Ordinary `sendTransaction` through `rpc_http_url`, with a priority bid. A missed
+    /// floor lands, reverts, and pays the whole fee.
+    Rpc,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -117,8 +132,36 @@ pub struct Config {
     pub slippage_tenth_bps: u32,
 
     /// Priority bid, in micro-lamports per compute unit. Zero pays the base fee only.
+    ///
+    /// Only used with `submit_via = "rpc"`. Through Jito the tip does this job.
     #[serde(default)]
     pub priority_micro_lamports: u64,
+
+    /// Where live trades are sent. See [`SubmitVia`].
+    #[serde(default)]
+    pub submit_via: SubmitVia,
+
+    /// The block engine URL for `submit_via = "jito"`. Empty means Jito's global
+    /// endpoint with `bundleOnly=true`; a regional one near this machine is faster.
+    #[serde(default)]
+    pub jito_url: String,
+
+    /// The most one Jito tip may be, in lamports.
+    ///
+    /// The tip is a quarter of the trade's own gross, never under Jito's 1,000-lamport
+    /// minimum, and never over this. It is only paid when the trade lands, and the
+    /// floors make any trade that lands cover it.
+    #[serde(default = "default_jito_tip_max_lamports")]
+    pub jito_tip_max_lamports: u64,
+
+    /// Simulate before sending through Jito.
+    ///
+    /// Through Jito the simulation no longer protects the budget — a failing trade is
+    /// dropped for free and a landing one is guaranteed net positive by its floors — but
+    /// it does cost a round trip between pricing and sending. On until a live run has
+    /// shown the floors doing their job; switching it off is worth about 100 ms.
+    #[serde(default = "default_true")]
+    pub jito_simulate_first: bool,
 
     /// Extra mints to hold a token account for, beyond the registry's base mints.
     ///
@@ -175,6 +218,15 @@ pub struct Config {
     pub halt_cooldown_secs: u64,
 }
 
+/// Twenty thousand lamports, about two tenths of a cent. Above the gross of most
+/// trades this book finds, so in practice the quarter-share decides; a ceiling rather
+/// than a target.
+fn default_jito_tip_max_lamports() -> u64 {
+    20_000
+}
+fn default_true() -> bool {
+    true
+}
 fn default_capital() -> f64 {
     100.0
 }
@@ -305,6 +357,10 @@ mod tests {
             max_hops: 3,
             slippage_tenth_bps: 300,
             priority_micro_lamports: 0,
+            submit_via: SubmitVia::Jito,
+            jito_url: String::new(),
+            jito_tip_max_lamports: 20_000,
+            jito_simulate_first: true,
             extra_token_mints: Vec::new(),
             dry_run: true,
             max_position_usd: 25.0,
@@ -428,7 +484,8 @@ min_profit_lamports = 0
         let slippage_bps = f64::from(cfg.slippage_tenth_bps) / 10.0;
         assert!(
             slippage_bps < plausible_edge_bps / hops,
-            "slippage of {slippage_bps} bps cannot be satisfied by a {plausible_edge_bps} bp              edge over {hops} hops — every route would refuse as a guaranteed loss"
+            "slippage of {slippage_bps} bps cannot be satisfied by a {plausible_edge_bps} bp \
+             edge over {hops} hops — every route would refuse as a guaranteed loss"
         );
 
         // The risk limits must come from the file too, not from Default. The bot ignored

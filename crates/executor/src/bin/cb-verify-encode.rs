@@ -261,7 +261,9 @@ async fn check_pool(
             name: "tick_array",
             verdict: Verdict::Inconclusive,
             detail: format!(
-                "the pool has no tick arrays at any of the {} addresses swept in both                  directions, so nothing can swap through it whatever the encoding                  (tick {tick}, spacing {spacing}, liquidity {liquidity})",
+                "the pool has no tick arrays at any of the {} addresses swept in both \
+                 directions, so nothing can swap through it whatever the encoding (tick \
+                 {tick}, spacing {spacing}, liquidity {liquidity})",
                 ticks::SWEEP_WIDTH * 2
             ),
         }
@@ -361,7 +363,8 @@ async fn check_pool(
             None => Check {
                 name: "oracle",
                 verdict: Verdict::Inconclusive,
-                detail: "the derived oracle does not exist, which is normal for a pool without adaptive fees - the program treats it as a placeholder"
+                detail: "the derived oracle does not exist, which is normal for a pool without \
+                         adaptive fees - the program treats it as a placeholder"
                     .into(),
             },
         });
@@ -380,7 +383,8 @@ async fn check_pool(
         checks.push(Check {
             name: "swap",
             verdict: Verdict::Inconclusive,
-            detail: "skipped: this pool has no tick arrays, so a swap through it cannot                      be built by anyone and simulating one says nothing about the encoder"
+            detail: "skipped: this pool has no tick arrays, so a swap through it cannot be \
+                     built by anyone and simulating one says nothing about the encoder"
                 .into(),
         });
         return Ok(PoolReport {

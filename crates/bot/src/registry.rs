@@ -304,7 +304,8 @@ mod tests {
             .count();
         let vaulted = r.pools.len() - inline - binned;
         assert_eq!(r.subscription_estimate(), inline + 3 * vaulted + 6 * binned);
-        assert!(binned > 0, "the venue two censuses named as the one holding the mispriced \n                             side must actually be in the universe");
+        assert!(binned > 0, "the venue two censuses named as the one holding the mispriced \
+                             side must actually be in the universe");
     }
 
     /// Raydium runs four AMM programs, three of which its API labels "Standard". They

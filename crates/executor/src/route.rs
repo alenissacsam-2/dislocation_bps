@@ -22,6 +22,15 @@
 //!
 //! Neither check depends on this codebase's arithmetic being right. That is what makes
 //! them worth more than the quote that motivated the trade.
+//!
+//! # And, when the fee is paid from the same balance, the fee too
+//!
+//! Invariant 2 alone guarantees one base unit more back than was spent. On a wSOL cycle
+//! the fee and any Jito tip leave that same balance, so a trade landing after the price
+//! moved could clear its floor and still lose the fee. [`RouteOptions::min_gain`] closes
+//! that gap on chain: the last floor must exceed the input by the cost of landing, so a
+//! transaction the programs let through has paid for itself. Until then the simulation
+//! was the only thing standing there, and a simulation is a prediction.
 
 use crate::encode::{pk, programs, to_pubkey};
 use crate::pda::associated_token_address;
@@ -115,6 +124,20 @@ pub struct RouteOptions {
     /// a session and pure overhead afterwards, so it is a switch rather than always-on.
     pub create_token_accounts: bool,
     pub venue: VenueExtra,
+    /// How much more than its input the last hop must guarantee, beyond the one base
+    /// unit invariant 2 already demands.
+    ///
+    /// Set to the base fee plus the tip on a wSOL cycle, whose costs leave the balance
+    /// the profit is measured in; then a trade that lands is net positive *on chain*,
+    /// not merely in a simulation run a round trip earlier. Zero keeps the old contract.
+    pub min_gain: u64,
+    /// A Jito tip: this many lamports from the owner to this tip account, as the last
+    /// instruction.
+    ///
+    /// Inside the trade rather than in a transaction of its own, so the tip is paid only
+    /// when the trade itself executes — a separate tipping transaction can be landed
+    /// without the trade it was paying for.
+    pub tip: Option<(Pubkey, u64)>,
 }
 
 impl Default for RouteOptions {
@@ -127,6 +150,8 @@ impl Default for RouteOptions {
             wsol: WsolPolicy::default(),
             create_token_accounts: false,
             venue: VenueExtra::default(),
+            min_gain: 0,
+            tip: None,
         }
     }
 }
@@ -193,6 +218,23 @@ pub fn build(owner: &Pubkey, hops: &[Hop], pre_balance: u64, opts: &RouteOptions
         "this route spends {amount_in} and guarantees only {guaranteed_out} back — \
          signing it would authorise a loss"
     );
+    // Invariant 2 again, with the cost of landing included. A second check rather than
+    // a stricter first one so the two refusals stay distinguishable: the first says the
+    // market is gone, this one says what is left does not pay for the trip.
+    ensure!(
+        guaranteed_out - amount_in > opts.min_gain,
+        "this route guarantees {} more than it spends, and landing it costs {} — the \
+         floor would let through a trade that loses its own fee",
+        guaranteed_out - amount_in,
+        opts.min_gain
+    );
+    if let Some((_, tip)) = opts.tip {
+        ensure!(
+            tip <= opts.min_gain,
+            "a tip of {tip} lamports is not covered by the {} this route must gain",
+            opts.min_gain
+        );
+    }
 
     // Each mint's own program, taken from the hops rather than from one route-wide
     // setting. `opts.venue.token_program` remains the fallback for a caller that has
@@ -212,6 +254,14 @@ pub fn build(owner: &Pubkey, hops: &[Hop], pre_balance: u64, opts: &RouteOptions
     let wsol = pk(programs::WSOL_MINT);
     let base_ata = associated_token_address(owner, &base_mint, &token_program);
     let wrapping = opts.wsol == WsolPolicy::WrapAndClose && base_mint == wsol;
+    // `min_gain` and the tip are lamports. On any other cycle the gain is counted in a
+    // token and the tip leaves a balance the floors never see, so neither guarantee
+    // would mean what it says.
+    ensure!(
+        wrapping || (opts.min_gain == 0 && opts.tip.is_none()),
+        "a lamport-denominated gain and tip can only be guaranteed on a cycle that starts \
+         and ends in SOL; this one starts in {base_mint}"
+    );
 
     let mut ixs = vec![tx::set_compute_limit(opts.compute_units)];
     if opts.priority_micro_lamports > 0 {
@@ -261,12 +311,19 @@ pub fn build(owner: &Pubkey, hops: &[Hop], pre_balance: u64, opts: &RouteOptions
         // The lamport balance already contains everything else the owner holds, and
         // the fee will come out of it, so the floor is the current balance plus the
         // guaranteed gain minus nothing — the fee is what makes this conservative.
-        let gain = guaranteed_out.saturating_sub(amount_in);
+        // The costs in `min_gain` leave this very balance, so the floor is net of them:
+        // demanding the gross here as well would count the fee twice and refuse every
+        // trade that covers it exactly.
+        let gain = guaranteed_out.saturating_sub(amount_in).saturating_sub(opts.min_gain);
         (Profit::Lamports(*owner), pre_balance.saturating_add(gain))
     } else {
         let gain = guaranteed_out.saturating_sub(amount_in);
         (Profit::TokenAccount(base_ata), pre_balance.saturating_add(gain))
     };
+
+    if let Some((tip_account, lamports)) = opts.tip {
+        ixs.push(tx::transfer_lamports(owner, &tip_account, lamports));
+    }
 
     Ok(Route { instructions: ixs, profit, min_post_balance, base_mint, amount_in })
 }
@@ -431,6 +488,72 @@ mod tests {
         assert!(matches!(wrapped.profit, Profit::Lamports(k) if k == owner));
         // compute + transfer + sync + 3 swaps + close
         assert_eq!(wrapped.instructions.len(), 7);
+    }
+
+    /// A wSOL cycle whose last hop guarantees `gain` over its input.
+    fn wsol_cycle(gain: u64) -> Vec<Hop> {
+        let mut hops = cycle(2);
+        let wsol = pk(programs::WSOL_MINT);
+        hops[0].input_mint = wsol;
+        hops[1].output_mint = wsol;
+        hops[1].min_amount_out = hops[0].amount_in + gain;
+        hops
+    }
+
+    /// The Jito shape: the tip is the last instruction, the floor covers it and the
+    /// base fee, and the balance the simulation must show is net of both — demanding
+    /// the gross there as well would count the costs twice.
+    #[test]
+    fn a_jito_route_tips_last_and_is_judged_net_of_its_costs() {
+        let owner = Pubkey::new_unique();
+        let tip_to = crate::jito::tip_account(3);
+        let o = RouteOptions {
+            wsol: WsolPolicy::WrapAndClose,
+            min_gain: 6_000,
+            tip: Some((tip_to, 1_000)),
+            ..opts()
+        };
+        let r = build(&owner, &wsol_cycle(6_001), 500_000_000, &o).expect("covers its costs");
+
+        let last = r.instructions.last().expect("instructions");
+        assert_eq!(last.program_id, pk(programs::SYSTEM), "the tip is a transfer");
+        assert_eq!(last.accounts[1].pubkey, tip_to);
+        assert!(last.accounts[1].is_writable);
+        assert_eq!(r.min_post_balance, 500_000_001, "pre + (6,001 − 6,000)");
+    }
+
+    /// One lamport short of the cost of landing is a loss the programs would let
+    /// through, so it must not build.
+    #[test]
+    fn a_floor_that_only_matches_the_cost_of_landing_is_refused() {
+        let o = RouteOptions { wsol: WsolPolicy::WrapAndClose, min_gain: 6_000, ..opts() };
+        let e = build(&Pubkey::new_unique(), &wsol_cycle(6_000), 0, &o).unwrap_err();
+        assert!(e.to_string().contains("loses its own fee"), "{e}");
+    }
+
+    /// A tip is part of the cost; one bigger than what the floor covers would come out
+    /// of principal.
+    #[test]
+    fn a_tip_the_floor_does_not_cover_is_refused() {
+        let o = RouteOptions {
+            wsol: WsolPolicy::WrapAndClose,
+            min_gain: 6_000,
+            tip: Some((crate::jito::tip_account(0), 7_000)),
+            ..opts()
+        };
+        let e = build(&Pubkey::new_unique(), &wsol_cycle(50_000), 0, &o).unwrap_err();
+        assert!(e.to_string().contains("is not covered"), "{e}");
+    }
+
+    /// Lamport guarantees on a cycle counted in some other token would compare
+    /// lamports with token units, and mean nothing.
+    #[test]
+    fn lamport_guarantees_on_a_token_cycle_are_refused() {
+        let o = RouteOptions { min_gain: 6_000, ..opts() };
+        let mut hops = cycle(2);
+        hops[1].min_amount_out = hops[0].amount_in + 50_000;
+        let e = build(&Pubkey::new_unique(), &hops, 0, &o).unwrap_err();
+        assert!(e.to_string().contains("starts and ends in SOL"), "{e}");
     }
 
     #[test]

@@ -175,6 +175,30 @@ pub struct TradeOptions {
     pub create_token_accounts: bool,
     /// How wrapped SOL is handled.
     pub wsol: WsolPolicy,
+    /// Where a trade that clears every check goes. See [`Submit`].
+    pub submit: Submit,
+}
+
+/// How a live trade reaches a leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Submit {
+    /// An ordinary `sendTransaction`, with a priority bid. A floor missed by the time it
+    /// lands reverts on chain and pays the whole fee.
+    #[default]
+    Rpc,
+    /// Jito's block engine as a bundle of one, tipping instead of bidding.
+    ///
+    /// A floor missed by the time a leader reaches it drops the bundle and costs
+    /// nothing, and the last hop's floor is raised by the base fee and the tip so that
+    /// one which does land has paid for itself on chain. Together those make every
+    /// submission either net positive or free. See [`cb_executor::rpc::Rpc::send_jito`].
+    Jito {
+        /// The most any one tip may be, in lamports. The tip itself is a share of the
+        /// trade's own gross, never under [`cb_executor::jito::MIN_TIP_LAMPORTS`].
+        tip_max_lamports: u64,
+        /// Simulate before sending. See [`cb_executor::SendVia::Jito`].
+        simulate_first: bool,
+    },
 }
 
 impl Default for TradeOptions {
@@ -210,6 +234,7 @@ impl Default for TradeOptions {
             // stricter in the right direction: the fee comes out of the same balance, so
             // a trade must beat its own fee to pass rather than merely beat zero.
             wsol: WsolPolicy::WrapAndClose,
+            submit: Submit::Rpc,
         }
     }
 }
@@ -472,6 +497,11 @@ pub struct Trader {
     /// Empty means never measured, which is deliberately not the same as "the wallet
     /// holds nothing": an unmeasured set refuses nothing and the old behaviour stands.
     accounts_held: std::collections::HashSet<Pubkey32>,
+    /// Where [`Submit::Jito`] sends. The block engine's default unless configured.
+    jito_url: String,
+    /// When the last Jito send went, so the next waits out the block engine's
+    /// one-a-second limit here rather than being answered with a 429 there.
+    last_jito_send: Option<std::time::Instant>,
 }
 
 impl Trader {
@@ -487,7 +517,54 @@ impl Trader {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
+            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            last_jito_send: None,
         }
+    }
+
+    /// Send [`Submit::Jito`] trades to this block engine URL instead of the default.
+    ///
+    /// An empty string keeps the default, so a config that leaves the key blank cannot
+    /// point trades at nothing.
+    pub fn set_jito_url(&mut self, url: &str) {
+        if !url.trim().is_empty() {
+            self.jito_url = url.trim().to_string();
+        }
+    }
+
+    /// The Jito tip a trade grossing `gross` lamports will pay if it lands; zero off Jito.
+    ///
+    /// The same quarter-of-the-prize rule as [`Trader::bid_for`], for the same reasons,
+    /// with the block engine's minimum as a floor and the configured ceiling above.
+    ///
+    /// `gross` must be the *fresh* one — see [`Trader::fresh_gross`]. The plan's own
+    /// figure is the detection-time quote, and three quarters of detections are priced
+    /// behind the feed's head: a lagged 30 bp "edge" would tip twenty thousand lamports
+    /// on a trade whose real edge is under one basis point, the tip would join the gain
+    /// the last floor must guarantee, and a trade that could pay a small tip would be
+    /// refused for failing to pay a large one.
+    #[must_use]
+    fn tip_for(&self, gross: u128) -> u64 {
+        let Submit::Jito { tip_max_lamports, .. } = self.opts.submit else {
+            return 0;
+        };
+        let min = cb_executor::jito::MIN_TIP_LAMPORTS;
+        let share = gross.saturating_mul(MAX_BID_SHARE_PERCENT) / 100;
+        u64::try_from(share).unwrap_or(u64::MAX).clamp(min, tip_max_lamports.max(min))
+    }
+
+    /// What this cycle grosses against the state just fetched, at the size the pools
+    /// can carry now and with no haircut. Zero when it grosses nothing or cannot be
+    /// priced; the attempt then refuses further on, with the reason.
+    fn fresh_gross(
+        plan: &CyclePlan,
+        pool_data: &[Vec<u8>],
+        vaults: &[Option<(u64, u64)>],
+        bins: &[Vec<Vec<u8>>],
+    ) -> u128 {
+        let Ok(legs) = Self::fresh_legs(plan, pool_data, vaults, bins) else { return 0 };
+        let spend = cb_core::path::largest_feasible(&legs, plan.amount_in);
+        Self::floor_chain(&legs, spend, 0).map_or(0, |(quoted, _)| quoted.saturating_sub(spend))
     }
 
     /// Tell this trader which mints belong to Token-2022, from the registry.
@@ -692,14 +769,22 @@ impl Trader {
     /// `None` when the edge cannot support any width at all — which is not this
     /// function's business to explain. Left to [`cb_executor::route::build`], whose
     /// refusal names the two amounts and is the one an operator can read.
-    fn widest_buildable_haircut(legs: &[Leg], spend: u128, floor_tenth_bps: u32) -> Option<u32> {
+    /// `required_gain` is how far past `spend` the last floor must reach — zero for the
+    /// bare invariant, the cost of landing when that is paid from the same balance.
+    fn widest_buildable_haircut(
+        legs: &[Leg],
+        spend: u128,
+        floor_tenth_bps: u32,
+        required_gain: u128,
+    ) -> Option<u32> {
         // Wider is better on every axis, and the floor falls monotonically as the
         // haircut grows, so the first hit walking down is the answer. The ceiling never
         // sits below a deliberately configured floor.
         let ceiling = MAX_HAIRCUT_TENTH_BPS.max(floor_tenth_bps);
+        let needed = spend.saturating_add(required_gain);
         (floor_tenth_bps.max(1)..=ceiling)
             .rev()
-            .find(|t| Self::floor_chain(legs, spend, *t).is_some_and(|(_, f)| f > spend))
+            .find(|t| Self::floor_chain(legs, spend, *t).is_some_and(|(_, f)| f > needed))
     }
 
     /// Every leg of this cycle as the chain has it right now.
@@ -748,6 +833,7 @@ impl Trader {
     /// # Errors
     /// If the plan is malformed, if a hop cannot be re-priced against the state just
     /// fetched, or if a hop's floor collapses to zero under slippage.
+    #[allow(clippy::too_many_arguments)]
     pub fn hops_for(
         &self,
         plan: &CyclePlan,
@@ -756,6 +842,7 @@ impl Trader {
         vaults: &[Option<(u64, u64)>],
         bins: &[Vec<Vec<u8>>],
         fee_headroom: u128,
+        required_gain: u128,
     ) -> Result<(Vec<Hop>, u128)> {
         let n = plan.pools.len();
         if n < 2 || plan.mints.len() != n + 1 || plan.leg_out.len() != n {
@@ -816,6 +903,7 @@ impl Trader {
             &legs,
             spend_total,
             self.opts.slippage_tenth_bps,
+            required_gain,
         ) {
             None => self.opts.slippage_tenth_bps,
             Some(widest) => {
@@ -862,9 +950,19 @@ impl Trader {
                 )
             })?;
 
-            let floor = haircut(fresh, tenth_bps);
+            let mut floor = haircut(fresh, tenth_bps);
             if floor == 0 {
                 bail!("hop {i} floors at zero after {tenth_bps} tenths of a bp of slippage");
+            }
+            // When the cost of landing is guaranteed on chain, the last floor need be no
+            // higher than exactly that: input, plus the cost, plus one. Anything above it
+            // is tolerance given away for nothing — the trade is already net positive at
+            // that floor — and tolerance is what decides whether a trade still lands a
+            // slot after it was priced. Lowered only, never raised: if the haircut floor
+            // sits below this line, `route::build` refuses the trade and says why.
+            if required_gain > 0 && i + 1 == n {
+                let break_even = spend_total.saturating_add(required_gain).saturating_add(1);
+                floor = floor.min(break_even);
             }
             let amount_in = u64::try_from(spend).context("hop input exceeds u64")?;
             let min_amount_out = u64::try_from(floor).context("hop floor exceeds u64")?;
@@ -958,6 +1056,20 @@ impl Trader {
             if let Some(why) = self.exec.gate.halted() {
                 return Ok(Attempt::Refused(format!("trading is halted: {why}")));
             }
+            // The block engine allows one send a second from this address. Refused
+            // before any round trip, since a trade built now could not be sent until its
+            // price was a second old.
+            if matches!(self.opts.submit, Submit::Jito { .. }) && !self.opts.dry_run {
+                if let Some(at) = self.last_jito_send {
+                    let gap = at.elapsed().as_millis();
+                    if gap < u128::from(cb_executor::jito::MIN_SEND_GAP_MS) {
+                        return Ok(Attempt::Refused(format!(
+                            "the last Jito send was {gap} ms ago and the block engine \
+                             allows one a second"
+                        )));
+                    }
+                }
+            }
         }
 
         // A cycle whose intermediate mint the wallet has no account for cannot clear
@@ -990,7 +1102,8 @@ impl Trader {
         }
         if plan.pools.len() > MAX_EXECUTABLE_HOPS {
             return Ok(Attempt::Refused(format!(
-                "{} hops will not fit in one transaction without an address lookup table                  (the ceiling is {MAX_EXECUTABLE_HOPS})",
+                "{} hops will not fit in one transaction without an address lookup table \
+                 (the ceiling is {MAX_EXECUTABLE_HOPS})",
                 plan.pools.len()
             )));
         }
@@ -1053,6 +1166,15 @@ impl Trader {
         let base_mint = to_pubkey(&plan.mints[0]);
         let wsol = pk(programs::WSOL_MINT);
         let wrapping = self.opts.wsol == WsolPolicy::WrapAndClose && base_mint == wsol;
+        let jito = matches!(self.opts.submit, Submit::Jito { .. });
+        // A bundle's fee and tip are lamports, and the floors can only promise to cover
+        // them when the profit is counted in lamports too.
+        if jito && !wrapping {
+            return Ok(Attempt::Refused(format!(
+                "this cycle starts in {base_mint}, and a Jito trade can only guarantee on \
+                 chain that it covers its fee when it starts and ends in SOL"
+            )));
+        }
         // The account this route's profit will be read from, whichever kind it is. The
         // owner's lamports and a token account's data come back from the same call, and
         // at the same commitment `balance()` used, so nothing about the wrap-shortfall
@@ -1416,10 +1538,31 @@ impl Trader {
         // The bid itself is priced off this trade's own gross rather than off a constant
         // — see [`MAX_BID_SHARE_PERCENT`]. The headroom then follows the bid, which is the
         // point: a smaller prize bids less *and* is asked to clear less.
-        let bid = self.bid_for(plan, wrapping);
+        //
+        // Through Jito all of that changes shape. There is no priority bid — the tip
+        // buys the place in the block — and the fee is not a margin the simulation
+        // checks but a gain the last floor guarantees, so the chain itself refuses a
+        // trade that would land short of it. The headroom is then zero, because nothing
+        // is left for it to protect.
+        let tip = if jito {
+            self.tip_for(Self::fresh_gross(plan, &pool_data, &vaults, &bins))
+        } else {
+            0
+        };
+        let bid = if jito { 0 } else { self.bid_for(plan, wrapping) };
         let priority = priority_fee_lamports(bid, self.opts.compute_units);
-        let fee_headroom = if wrapping { (BASE_FEE_LAMPORTS + priority) * 5 / 4 } else { 0 };
-        let (hops, spent) = match self.hops_for(plan, &pool_data, &arrays, &vaults, &bins, fee_headroom) {
+        let fee_headroom =
+            if wrapping && !jito { (BASE_FEE_LAMPORTS + priority) * 5 / 4 } else { 0 };
+        let required_gain = if jito { BASE_FEE_LAMPORTS + u128::from(tip) } else { 0 };
+        let (hops, spent) = match self.hops_for(
+            plan,
+            &pool_data,
+            &arrays,
+            &vaults,
+            &bins,
+            fee_headroom,
+            required_gain,
+        ) {
             Ok(h) => h,
             Err(e) => return Ok(Attempt::Refused(e.to_string())),
         };
@@ -1478,7 +1621,9 @@ impl Trader {
             let amount_in_u64 = u64::try_from(spent).unwrap_or(u64::MAX);
             if let Some(reserved) = wrap_shortfall(amount_in_u64, distinct_mints, bal) {
                 return Ok(Attempt::Refused(format!(
-                    "wrapping {amount_in_u64} lamports would leave less than the                      {reserved} lamports this transaction needs for account rent and                      fees, against a balance of {bal} — sizing must leave that headroom,                      not spend into it"
+                    "wrapping {amount_in_u64} lamports would leave less than the {reserved} \
+                     lamports this transaction needs for account rent and fees, against a \
+                     balance of {bal} — sizing must leave that headroom, not spend into it"
                 )));
             }
             bal
@@ -1520,6 +1665,15 @@ impl Trader {
             wsol: self.opts.wsol,
             create_token_accounts: self.opts.create_token_accounts,
             venue: VenueExtra { token_program, bitmap_policy: BitmapPolicy::Include },
+            min_gain: u64::try_from(required_gain).unwrap_or(u64::MAX),
+            // Any of the eight accounts will do; spreading by the blockhash keeps
+            // successive tips off one write lock without a random-number generator.
+            tip: jito.then(|| {
+                let seed = u64::from_le_bytes(
+                    blockhash.to_bytes()[..8].try_into().expect("a hash is 32 bytes"),
+                );
+                (cb_executor::jito::tip_account(seed), tip)
+            }),
         };
 
         let built = match route::build(&self.owner, &hops, pre_balance, &opts) {
@@ -1542,7 +1696,20 @@ impl Trader {
         };
         match intent {
             Intent::Trade => {
-                plan_to_run.execute(&mut self.exec.gate, rpc, self.opts.dry_run).await
+                let via = match self.opts.submit {
+                    Submit::Rpc => cb_executor::SendVia::Rpc,
+                    Submit::Jito { simulate_first, .. } => cb_executor::SendVia::Jito {
+                        url: self.jito_url.clone(),
+                        simulate_first,
+                    },
+                };
+                let r = plan_to_run.execute(&mut self.exec.gate, rpc, self.opts.dry_run, &via).await;
+                // Counted from any send that reached the wire or failed trying: a send
+                // that errored may still have been received, and was a request either way.
+                if jito && matches!(r, Ok(Attempt::Submitted { .. }) | Err(_)) {
+                    self.last_jito_send = Some(std::time::Instant::now());
+                }
+                r
             }
             // No branch here reaches `Rpc::send`. See `Plan::probe`.
             Intent::Measure => Ok(Attempt::Probed(plan_to_run.probe(rpc).await?)),
@@ -1788,8 +1955,23 @@ impl Trader {
     /// budget to be wrong on.
     #[must_use]
     pub fn submission_cost_lamports(&self) -> u128 {
-        BASE_FEE_LAMPORTS
-            + priority_fee_lamports(self.opts.priority_micro_lamports, self.opts.compute_units)
+        match self.opts.submit {
+            Submit::Rpc => {
+                BASE_FEE_LAMPORTS
+                    + priority_fee_lamports(self.opts.priority_micro_lamports, self.opts.compute_units)
+            }
+            // A bundle that fails is dropped and costs nothing, so this is only ever
+            // charged if one somehow lands and reverts — which revert protection exists
+            // to prevent. Priced at the most it could be, in case it does.
+            Submit::Jito { tip_max_lamports, .. } => BASE_FEE_LAMPORTS
+                + u128::from(tip_max_lamports.max(cb_executor::jito::MIN_TIP_LAMPORTS)),
+        }
+    }
+
+    /// Whether trades go out as Jito bundles, whose misses cost nothing.
+    #[must_use]
+    pub fn sends_via_jito(&self) -> bool {
+        matches!(self.opts.submit, Submit::Jito { .. })
     }
 
     #[must_use]
@@ -1995,12 +2177,14 @@ mod tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
+            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            last_jito_send: None,
         };
         let p = plan(3);
         let data = pools_for(&p);
         let arrays = vec![[Pubkey::new_unique(); 3]; 3];
 
-        let (hops, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0).expect("a well formed plan");
+        let (hops, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0, 0).expect("a well formed plan");
         assert_eq!(hops.len(), 3);
         assert_eq!(hops[0].amount_in, 1_000_000);
         for w in hops.windows(2) {
@@ -2026,20 +2210,22 @@ mod tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
+            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            last_jito_send: None,
         };
         let data = pools_for(&plan(3));
         let arrays = vec![[Pubkey::new_unique(); 3]; 3];
 
         let mut short = plan(3);
         short.mints.pop();
-        assert!(t.hops_for(&short, &data, &arrays, &[], &[], 0).is_err());
+        assert!(t.hops_for(&short, &data, &arrays, &[], &[], 0, 0).is_err());
 
         let mut mismatched = plan(3);
         mismatched.leg_out.pop();
-        assert!(t.hops_for(&mismatched, &data, &arrays, &[], &[], 0).is_err());
+        assert!(t.hops_for(&mismatched, &data, &arrays, &[], &[], 0, 0).is_err());
 
         // Fewer accounts than pools must not silently build a shorter cycle.
-        assert!(t.hops_for(&plan(3), &data[..2], &arrays, &[], &[], 0).is_err());
+        assert!(t.hops_for(&plan(3), &data[..2], &arrays, &[], &[], 0, 0).is_err());
     }
 
     /// Slippage wide enough to zero a floor must refuse, not encode a swap that would
@@ -2055,10 +2241,12 @@ mod tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
+            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            last_jito_send: None,
         };
         let data = pools_for(&plan(2));
         let arrays = vec![[Pubkey::new_unique(); 3]; 2];
-        let e = t.hops_for(&plan(2), &data, &arrays, &[], &[], 0).unwrap_err().to_string();
+        let e = t.hops_for(&plan(2), &data, &arrays, &[], &[], 0, 0).unwrap_err().to_string();
         assert!(e.contains("zero"), "{e}");
     }
 
@@ -2390,8 +2578,10 @@ mod mainnet {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
+            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            last_jito_send: None,
         };
-        let (hops, _) = t.hops_for(&plan, &pool_data, &arrays, &vec![None; plan.pools.len()], &[], 0).expect("hops");
+        let (hops, _) = t.hops_for(&plan, &pool_data, &arrays, &vec![None; plan.pools.len()], &[], 0, 0).expect("hops");
 
         let opts = RouteOptions {
             compute_units: 600_000,
@@ -2402,6 +2592,8 @@ mod mainnet {
                 token_program: pk(programs::SPL_TOKEN),
                 bitmap_policy: BitmapPolicy::Include,
             },
+            min_gain: 0,
+            tip: None,
         };
         let built = route::build(&owner, &hops, pre, &opts).expect("route builds");
         assert!(
@@ -2436,6 +2628,76 @@ mod mainnet {
         // The assertion is structural: it must fit and it must measure lamports. Whether
         // this particular cycle profits is a market question, not an encoding one.
         assert!(compiled.size_bytes <= tx::PACKET_LIMIT);
+    }
+
+    /// The Jito tip, run for real against mainnet state and never sent.
+    ///
+    /// Market-independent on purpose: it wraps, closes, and tips with no swap in between,
+    /// so nothing about today's prices can make it pass or fail. What it proves is the
+    /// accounting `route::build` relies on — that the tip executes inside the trade,
+    /// after the wSOL account has closed, from the very balance the profit is read from,
+    /// so the balance falls by exactly the base fee and the tip and nothing else.
+    ///
+    /// ```text
+    /// CB_SIM_AS=<funded pubkey> cargo test -p cb-bot a_jito_tip -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "hits mainnet; needs CB_SIM_AS"]
+    async fn a_jito_tip_leaves_the_profit_balance_by_exactly_itself() {
+        use cb_executor::tx;
+        let Ok(who) = std::env::var("CB_SIM_AS") else {
+            println!("set CB_SIM_AS to a funded public address; skipping");
+            return;
+        };
+        let owner: Pubkey = who.parse().expect("CB_SIM_AS must be a public key");
+        let rpc = Rpc::new("https://api.mainnet-beta.solana.com").expect("client");
+
+        let token = pk(programs::SPL_TOKEN);
+        let wsol = pk(programs::WSOL_MINT);
+        let ata = cb_executor::pda::associated_token_address(&owner, &wsol, &token);
+        let tip = 1_000u64;
+        let ixs = vec![
+            tx::set_compute_limit(100_000),
+            tx::create_ata_idempotent(&owner, &ata, &owner, &wsol, &token),
+            tx::transfer_lamports(&owner, &ata, 2_000_000),
+            tx::sync_native(&ata),
+            tx::close_account(&ata, &owner, &owner),
+            tx::transfer_lamports(&owner, &cb_executor::jito::tip_account(5), tip),
+        ];
+        // Compared against the same trade without the tip, simulated back to back,
+        // rather than against a balance read: `getBalance` and `simulateTransaction`
+        // answer at different commitments, and on a busy address those differ by
+        // whatever moved in between. Two simulations of the same state differ by the tip
+        // and nothing else — the base fee is charged to both. A few tries, because even
+        // two back-to-back simulations can straddle a slot on an address this busy.
+        let untipped = ixs[..ixs.len() - 1].to_vec();
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let (bh, _) = rpc.latest_blockhash().await.expect("rpc");
+            let run = |set: Vec<solana_sdk::instruction::Instruction>| {
+                let rpc = &rpc;
+                async move {
+                    let c = tx::compile_unsigned(&owner, &set, bh).expect("fits");
+                    rpc.simulate(&c.tx_base64, &[owner]).await.expect("rpc")
+                }
+            };
+            let (with, without) = tokio::join!(run(ixs.clone()), run(untipped.clone()));
+            for sim in [&with, &without] {
+                if let Some(e) = &sim.err {
+                    for l in &sim.logs {
+                        println!("  log: {l}");
+                    }
+                    panic!("the wrap-and-close failed: {e}");
+                }
+            }
+            let (a, b) = (without.post_lamports[0], with.post_lamports[0]);
+            println!("without tip {a}, with tip {b}");
+            if a.checked_sub(b) == Some(tip) {
+                return;
+            }
+            seen.push((a, b));
+        }
+        panic!("the tip never showed up as exactly {tip} lamports: {seen:?}");
     }
 
     /// The exact numbers from the live run this fix came from: a wallet holding
@@ -2497,13 +2759,15 @@ mod fresh_quote_tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
+            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            last_jito_send: None,
         };
 
         let mut p = tests::plan(2);
         let data = tests::pools_for(&p);
         let arrays = vec![[Pubkey::new_unique(); 3]; 2];
 
-        let (honest, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0).expect("a well formed plan");
+        let (honest, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0, 0).expect("a well formed plan");
 
         // Now claim, in the plan only, that every leg returns a hundred times more.
         // The pools handed to `hops_for` are unchanged, so nothing about what the chain
@@ -2511,7 +2775,7 @@ mod fresh_quote_tests {
         for q in &mut p.leg_out {
             *q *= 100;
         }
-        let (inflated, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0).expect("a well formed plan");
+        let (inflated, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0, 0).expect("a well formed plan");
 
         assert_eq!(
             honest.iter().map(|h| h.min_amount_out).collect::<Vec<_>>(),
@@ -2534,10 +2798,12 @@ mod fresh_quote_tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
+            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            last_jito_send: None,
         };
         let p = tests::plan(3);
         let (hops, spent) = t
-            .hops_for(&p, &tests::pools_for(&p), &vec![[Pubkey::new_unique(); 3]; 3], &[], &[], 0)
+            .hops_for(&p, &tests::pools_for(&p), &vec![[Pubkey::new_unique(); 3]; 3], &[], &[], 0, 0)
             .expect("a well formed plan");
 
         assert_eq!(spent, p.amount_in, "these fixtures have room for the whole size");
@@ -2578,6 +2844,8 @@ mod fresh_quote_tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
+            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            last_jito_send: None,
         };
         let mut p = tests::plan(2);
         let data = tests::pools_for(&p);
@@ -2587,13 +2855,13 @@ mod fresh_quote_tests {
         // changed, so the honest answer is "trade what is there", not "trade nothing".
         p.amount_in = 100_000_000_000_000_000;
         let (hops, spent) =
-            t.hops_for(&p, &data, &arrays, &[], &[], 0).expect("an oversized plan is still tradeable");
+            t.hops_for(&p, &data, &arrays, &[], &[], 0, 0).expect("an oversized plan is still tradeable");
         assert!(spent < p.amount_in, "it must not pretend the room is there");
 
         // The ceiling is a property of the pools, not of how much was asked for.
         let mut greedier = p.clone();
         greedier.amount_in = p.amount_in * 10;
-        let (_, again) = t.hops_for(&greedier, &data, &arrays, &[], &[], 0).expect("still tradeable");
+        let (_, again) = t.hops_for(&greedier, &data, &arrays, &[], &[], 0, 0).expect("still tradeable");
         assert_eq!(spent, again, "the ceiling is the pools', not the request's");
         assert_eq!(u128::from(hops[0].amount_in), spent, "the first hop spends what was chosen");
 
@@ -2626,6 +2894,8 @@ mod fresh_quote_tests {
                 vaults_seen: HashMap::new(),
                 token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
+            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            last_jito_send: None,
             };
             let _ = &t;
             let p = tests::plan(2);
@@ -2633,7 +2903,7 @@ mod fresh_quote_tests {
         };
         let spend = tests::plan(2).amount_in;
 
-        let widest = Trader::widest_buildable_haircut(&legs, spend, 1).expect("some width works");
+        let widest = Trader::widest_buildable_haircut(&legs, spend, 1, 0).expect("some width works");
         let (quoted, floor) = Trader::floor_chain(&legs, spend, widest).expect("it chains");
 
         assert!(floor > spend, "however wide, the route must still guarantee a profit");
@@ -2664,6 +2934,115 @@ mod fresh_quote_tests {
         }
     }
 
+    fn jito_trader(tip_max_lamports: u64) -> Trader {
+        Trader {
+            exec: unreachable_executor(),
+            opts: TradeOptions {
+                submit: Submit::Jito { tip_max_lamports, simulate_first: true },
+                ..Default::default()
+            },
+            owner: Pubkey::new_unique(),
+            ticks_seen: HashMap::new(),
+            bins_seen: HashMap::new(),
+            vaults_seen: HashMap::new(),
+            token_2022_mints: std::collections::HashSet::new(),
+            accounts_held: std::collections::HashSet::new(),
+            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            last_jito_send: None,
+        }
+    }
+
+    /// Through Jito the last floor carries the cost of landing, so the chain itself
+    /// refuses a trade that would land short of its fee — and it carries exactly that,
+    /// no more, because every lamport above it is tolerance given away.
+    #[test]
+    fn a_jito_floor_guarantees_the_cost_of_landing_and_not_a_lamport_more() {
+        let t = jito_trader(20_000);
+        let p = tests::plan(2);
+        let data = tests::pools_for(&p);
+        let arrays = vec![[Pubkey::new_unique(); 3]; 2];
+
+        // The fixture's two pools sit at tick 32 and return about 58 bps round trip on
+        // a 1,000,000 input, so a 3,000-unit cost fits with room to spare.
+        let cost = 3_000u128;
+        let (hops, spent) =
+            t.hops_for(&p, &data, &arrays, &[], &[], 0, cost).expect("a well formed plan");
+        let last = hops.last().expect("two hops");
+        assert_eq!(
+            u128::from(last.min_amount_out),
+            spent + cost + 1,
+            "the last floor should sit exactly one unit above input plus cost"
+        );
+        // And every earlier hop still funds the next.
+        assert!(hops[0].min_amount_out >= hops[1].amount_in);
+
+        // The same trade with the cost stripped out keeps the old, higher haircut
+        // floor: the lowering applies only where the cost is guaranteed.
+        let (plain, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0, 0).expect("well formed");
+        assert!(plain.last().unwrap().min_amount_out > last.min_amount_out);
+    }
+
+    /// A cost the edge cannot carry is not lowered into a loss: the floor stays where
+    /// the haircut put it, and `route::build` refuses the trade by name.
+    #[test]
+    fn a_cost_the_edge_cannot_carry_is_refused_rather_than_absorbed() {
+        let t = jito_trader(20_000);
+        let p = tests::plan(2);
+        let data = tests::pools_for(&p);
+        let arrays = vec![[Pubkey::new_unique(); 3]; 2];
+
+        let cost = 50_000u128; // five per cent of the input: far past the edge.
+        let (hops, spent) =
+            t.hops_for(&p, &data, &arrays, &[], &[], 0, cost).expect("a well formed plan");
+        assert!(u128::from(hops.last().unwrap().min_amount_out) < spent + cost);
+
+        let mut wsol_hops = hops.clone();
+        wsol_hops[0].input_mint = pk(programs::WSOL_MINT);
+        wsol_hops[1].output_mint = pk(programs::WSOL_MINT);
+        let opts = RouteOptions {
+            wsol: WsolPolicy::WrapAndClose,
+            min_gain: u64::try_from(cost).unwrap(),
+            tip: Some((cb_executor::jito::tip_account(1), 1_000)),
+            ..RouteOptions::default()
+        };
+        let e = route::build(&Pubkey::new_unique(), &wsol_hops, 1_000_000_000, &opts)
+            .expect_err("a floor below the cost of landing must not build")
+            .to_string();
+        assert!(e.contains("loses its own fee"), "unexpected refusal: {e}");
+    }
+
+    /// A quarter of the prize, never under the block engine's minimum, never over the
+    /// configured ceiling — and nothing at all off Jito.
+    #[test]
+    fn the_tip_is_a_quarter_of_the_prize_between_the_minimum_and_the_ceiling() {
+        let t = jito_trader(20_000);
+        let min = cb_executor::jito::MIN_TIP_LAMPORTS;
+
+        assert_eq!(t.tip_for(400), min, "a small prize still pays the minimum");
+        assert_eq!(t.tip_for(40_000), 10_000, "a quarter of 40,000");
+        assert_eq!(t.tip_for(4_000_000), 20_000, "capped at the ceiling");
+        assert_eq!(t.tip_for(0), min, "a cycle grossing nothing still tips the minimum");
+
+        let rpc = Trader { opts: TradeOptions::default(), ..jito_trader(20_000) };
+        assert_eq!(rpc.tip_for(40_000), 0, "no tip when not sending through Jito");
+    }
+
+    /// The tip follows what the pools pay now, not what the plan said they paid when it
+    /// was detected, which is the number three quarters of detections have wrong.
+    #[test]
+    fn the_tip_is_priced_from_the_fresh_quote_and_not_the_plan() {
+        let t = jito_trader(20_000);
+        let mut p = tests::plan(2);
+        let data = tests::pools_for(&p);
+        let honest = Trader::fresh_gross(&p, &data, &[], &[]);
+        assert!(honest > 0, "the fixture grosses about 58 bps");
+
+        // Claim, in the plan only, a gross a hundred times larger.
+        p.leg_out = vec![p.leg_out[0] * 100, p.amount_in * 100];
+        assert_eq!(Trader::fresh_gross(&p, &data, &[], &[]), honest);
+        assert_eq!(t.tip_for(Trader::fresh_gross(&p, &data, &[], &[])), t.tip_for(honest));
+    }
+
     /// Sizing down has a floor of its own: a cycle with no room anywhere is refused,
     /// and says so in terms an operator can act on.
     #[test]
@@ -2677,11 +3056,13 @@ mod fresh_quote_tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
+            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            last_jito_send: None,
         };
         let p = tests::plan(2);
         // Pools that decode but trade the wrong mints cannot be re-priced at all.
         let wrong = vec![tests::whirlpool_with([9u8; 32], [8u8; 32]); 2];
-        let e = t.hops_for(&p, &wrong, &[[Pubkey::new_unique(); 3]; 2], &[], &[], 0).unwrap_err();
+        let e = t.hops_for(&p, &wrong, &[[Pubkey::new_unique(); 3]; 2], &[], &[], 0, 0).unwrap_err();
         assert!(
             e.to_string().contains("could not be re-priced"),
             "an unpriceable hop must say so: {e}"
@@ -2755,6 +3136,8 @@ mod account_rent_tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: HashSet::new(),
             accounts_held: HashSet::new(),
+            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            last_jito_send: None,
         };
         t.accounts_held = mints.iter().copied().collect();
         t
@@ -3049,11 +3432,41 @@ mod meteora_dlmm_tests {
             wsol: WsolPolicy::WrapAndClose,
             create_token_accounts: true,
             venue: VenueExtra::default(),
+            min_gain: 0,
+            tip: None,
         };
         let built = route::build(&owner, &hops, 200_000_000, &opts)
             .expect("these hops close and guarantee more than they spend");
         let size = tx::measure(&owner, &built.instructions, Hash::default())
             .expect("a two-hop cycle must serialise");
+
+        // The same cycle shaped for Jito: no price instruction, one tip transfer, and a
+        // last floor that covers both. The tip account is a new key; the system program
+        // is already present for the wrap. Must fit too, or sending this way would be
+        // refused on the one venue that most needs the room.
+        let mut jito_hops = hops.clone();
+        jito_hops[1].min_amount_out = 100_010_000;
+        let jito_opts = RouteOptions {
+            priority_micro_lamports: 0,
+            min_gain: 6_000,
+            tip: Some((cb_executor::jito::tip_account(0), 1_000)),
+            ..opts
+        };
+        let jito_built = route::build(&owner, &jito_hops, 200_000_000, &jito_opts)
+            .expect("the jito shape closes and covers its costs");
+        let jito_size = tx::measure(&owner, &jito_built.instructions, Hash::default())
+            .expect("the jito shape must serialise");
+        assert!(
+            jito_size <= tx::PACKET_LIMIT,
+            "a two-hop DLMM cycle sent through Jito serialises to {jito_size} bytes \
+             against a {} byte packet",
+            tx::PACKET_LIMIT
+        );
+        // One key and one small instruction in, one small instruction out.
+        assert!(
+            jito_size > size && jito_size - size <= 48,
+            "the Jito shape should cost about one account more: {size} -> {jito_size}"
+        );
         assert!(
             size <= tx::PACKET_LIMIT,
             "a two-hop cycle through a DLMM serialises to {size} bytes against a {} byte \

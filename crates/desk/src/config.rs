@@ -128,7 +128,10 @@ pub fn validate(p: &Params) -> Result<(), String> {
         p.slippage_tenth_bps.saturating_mul(u32::try_from(p.max_hops).unwrap_or(u32::MAX));
     if total > WIDEST_DEFENSIBLE_TOTAL_TENTH_BPS {
         return Err(format!(
-            "A floor of {} bps over {} hops gives away {} bps in total, wider than any edge that has survived the trip to the chain here. A route only builds when its last floor beats its first input, so every cycle would be refused as a guaranteed loss. Keep the total under {} bps.",
+            "A floor of {} bps over {} hops gives away {} bps in total, wider than any edge \
+             that has survived the trip to the chain here. A route only builds when its last \
+             floor beats its first input, so every cycle would be refused as a guaranteed \
+             loss. Keep the total under {} bps.",
             f64::from(p.slippage_tenth_bps) / 10.0,
             p.max_hops,
             f64::from(total) / 10.0,
@@ -141,7 +144,8 @@ pub fn validate(p: &Params) -> Result<(), String> {
             // unedited would configure a URL that authenticates as nobody, and the
             // failure would arrive later as an opaque 401 from inside a sweep.
             return Err(format!(
-                "This endpoint still has the placeholder in it — replace YOUR_KEY with                  the key from that provider's dashboard: {line}"
+                "This endpoint still has the placeholder in it — replace YOUR_KEY with the key \
+                 from that provider's dashboard: {line}"
             ));
         }
         if !line.starts_with("https://") && !line.starts_with("http://") {
@@ -560,7 +564,8 @@ max_position_lamports = 20000000
     /// be the thing that deletes it.
     #[test]
     fn switching_mode_keeps_the_rest_of_the_file_intact() {
-        let body = "# why this is paper\nmode = \"paper\"\n\n# the capital note\ncapital_usd = 100.0\n";
+        let body = "# why this is paper\nmode = \"paper\"\n\n# the capital note\ncapital_usd = \
+                    100.0\n";
         let p = mode_file("comments", body);
         write_mode(&p, "live").unwrap();
         let after = std::fs::read_to_string(&p).unwrap();

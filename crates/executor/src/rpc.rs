@@ -408,6 +408,56 @@ impl Rpc {
             .ok_or_else(|| anyhow!("sendTransaction did not return a signature"))
     }
 
+    /// Send through Jito's block engine as a single-transaction bundle.
+    ///
+    /// # Why this and not [`Rpc::send`]
+    ///
+    /// `bundleOnly=true` makes the block engine treat the transaction as a bundle of
+    /// one, and a bundle either executes whole or is dropped before it reaches a block.
+    /// So a trade whose floor is missed by the time a leader gets to it costs nothing at
+    /// all — not the base fee, not the tip. Through an ordinary RPC the same miss lands
+    /// as a reverted transaction and pays in full, which is how both transactions this
+    /// bot has ever landed ended: 6,000 lamports each, returning nothing.
+    ///
+    /// # Why exactly one request
+    ///
+    /// The block engine allows one request a second per IP without authentication and
+    /// answers a burst with 429. Retrying after a back-off would put the trade on the
+    /// wire half a second after its price, which is later than useless — and the
+    /// caller already spaces sends, so a 429 here means something else is wrong and
+    /// should be read, not retried. The key-bearing URL never appears in an error: the
+    /// block engine takes none, and every message is passed through the redactor anyway.
+    ///
+    /// # Errors
+    /// If the request fails or the block engine refuses the transaction.
+    pub async fn send_jito(&self, url: &str, tx_base64: &str) -> Result<String> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [tx_base64, {"encoding": "base64"}],
+        });
+        let resp = match self.http.post(url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => bail!(
+                "Jito sendTransaction failed: {}",
+                cb_core::redact::redact_urls_in(&e.to_string())
+            ),
+        };
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let parsed: Value = serde_json::from_str(&text).map_err(|_| {
+            anyhow!("Jito answered {status} rather than JSON ({} bytes)", text.len())
+        })?;
+        if let Some(e) = parsed.get("error") {
+            bail!("Jito refused the transaction ({status}): {e}");
+        }
+        parsed["result"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow!("Jito sendTransaction did not return a signature"))
+    }
+
     /// `Ok(None)` means the node has not seen it yet, which is not the same as failure.
     ///
     /// # Errors
