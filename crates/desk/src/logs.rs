@@ -14,6 +14,13 @@ use std::path::Path;
 /// how large the file has grown.
 const READ_WINDOW: u64 = 512 * 1024;
 
+/// Bytes allowed per requested line, and the most any one read will take. A poll asks
+/// for a few hundred lines and stays inside [`READ_WINDOW`]; the Live view's start-up
+/// read asks for twenty thousand, to rebuild a whole run's drift, and needs more room
+/// than that. Scaling with the request keeps the poll cheap and the big read whole.
+const BYTES_PER_LINE: u64 = 256;
+const MAX_WINDOW: u64 = 8 * 1024 * 1024;
+
 /// The last `lines` lines of `path`, oldest first. A missing or unreadable file is an
 /// empty result rather than an error: the log not existing yet is the normal state
 /// before the first run, not a fault the UI should have to interpret.
@@ -30,7 +37,8 @@ pub fn tail(path: &Path, lines: usize) -> Vec<String> {
     let Ok(len) = file.metadata().map(|m| m.len()) else {
         return Vec::new();
     };
-    let start = len.saturating_sub(READ_WINDOW);
+    let window = (lines as u64).saturating_mul(BYTES_PER_LINE).clamp(READ_WINDOW, MAX_WINDOW);
+    let start = len.saturating_sub(window);
     if file.seek(SeekFrom::Start(start)).is_err() {
         return Vec::new();
     }

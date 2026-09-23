@@ -129,8 +129,20 @@ pub fn sync_native(account: &Pubkey) -> Instruction {
 /// Close a token account, returning its rent and any wrapped SOL to `destination`.
 #[must_use]
 pub fn close_account(account: &Pubkey, destination: &Pubkey, owner: &Pubkey) -> Instruction {
+    close_token_account(account, destination, owner, &pk(programs::SPL_TOKEN))
+}
+
+/// [`close_account`] under a named token program. A Token-2022 account has to be
+/// closed by Token-2022; the classic program refuses an account it does not own.
+#[must_use]
+pub fn close_token_account(
+    account: &Pubkey,
+    destination: &Pubkey,
+    owner: &Pubkey,
+    program: &Pubkey,
+) -> Instruction {
     Instruction {
-        program_id: pk(programs::SPL_TOKEN),
+        program_id: *program,
         accounts: vec![
             AccountMeta::new(*account, false),
             AccountMeta::new(*destination, false),

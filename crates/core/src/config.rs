@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 /// Environment variable that forms the second half of the live-trading guard.
 pub const LIVE_ENV_VAR: &str = "CRYPTOBOT_ALLOW_LIVE";
 
+const fn default_token_account_slots() -> usize {
+    6
+}
+
 fn default_rpc_http() -> String {
     "https://api.mainnet-beta.solana.com".to_string()
 }
@@ -178,6 +182,15 @@ pub struct Config {
     /// rent is refundable the moment an account is closed.
     #[serde(default)]
     pub extra_token_mints: Vec<String>,
+
+    /// How many token accounts the bot may hold for intermediate mints it chose itself,
+    /// on top of the base mints and `extra_token_mints`. It opens one for a mint that
+    /// attempts keep asking for, swaps out the least asked-for when full, and closes
+    /// any nothing asked for in a day. Each is a refundable deposit of about 0.002 SOL,
+    /// so this is what bounds how much of the wallet sits in deposits. Zero turns the
+    /// rotation off.
+    #[serde(default = "default_token_account_slots")]
+    pub token_account_slots: usize,
 
     /// Simulate every trade and submit none.
     ///
@@ -362,6 +375,7 @@ mod tests {
             jito_tip_max_lamports: 20_000,
             jito_simulate_first: true,
             extra_token_mints: Vec::new(),
+            token_account_slots: default_token_account_slots(),
             dry_run: true,
             max_position_usd: 25.0,
             max_daily_loss_usd: 5.0,

@@ -6,6 +6,7 @@
 //!
 //! See `docs/superpowers/specs/` for the design and `docs/research/` for the numbers.
 
+mod demand;
 mod execute;
 mod live;
 mod live_log;
@@ -295,6 +296,95 @@ const LOG_COOLDOWN: Duration = Duration::from_secs(20);
 
 /// Where the measurement goes. The dashboard is a window; this is the record.
 const LEDGER_PATH: &str = "cryptobot.db";
+
+/// Where the rolling record of which mints attempts needed is kept, so a restart does
+/// not forget a day of it. See `demand`.
+const DEMAND_PATH: &str = "token-demand.json";
+/// How often that record is saved, and idle accounts are looked for.
+const DEMAND_SAVE_INTERVAL: Duration = Duration::from_secs(300);
+/// At most this many accounts opened mid-run in any hour. Each is a refundable deposit
+/// and a base fee; the cap is what stops a burst of one-off detections from turning
+/// into a burst of opens.
+const MAX_ACCOUNT_OPENS_PER_HOUR: usize = 6;
+/// At most this many idle accounts closed per save tick, so one tick cannot block the
+/// sweep for long.
+const MAX_ACCOUNT_CLOSES_PER_TICK: usize = 2;
+
+/// Record that an attempt needed each intermediate mint of `plan` that is not a base
+/// or pinned one. See `demand`.
+fn note_demand(
+    demand: &mut demand::Demand,
+    plan: &execute::CyclePlan,
+    net_usd: f64,
+    protected: &std::collections::HashSet<cb_core::types::Pubkey32>,
+) {
+    let now = now_ms() / 1_000;
+    let inner = plan.mints.len().saturating_sub(1);
+    for m in plan.mints.iter().take(inner).skip(1) {
+        if !protected.contains(m) {
+            demand.record(now, m, net_usd);
+        }
+    }
+}
+
+/// Open — or swap in — the account an attempt on `plan` was just refused for, once
+/// the mint has been asked for often enough to earn one. See `demand::on_missing`.
+///
+/// Blocks the sweep while the open confirms, usually a second or two. Rare by
+/// construction (`MAX_ACCOUNT_OPENS_PER_HOUR`), and the reconcile pass repairs any
+/// feed drift a long wait lets in.
+async fn rotate_for(
+    t: &mut execute::Trader,
+    plan: &execute::CyclePlan,
+    demand: &demand::Demand,
+    protected: &std::collections::HashSet<cb_core::types::Pubkey32>,
+    slots: usize,
+    opens: &mut std::collections::VecDeque<std::time::Instant>,
+) {
+    let Some(mint) = t.missing_account(plan) else { return };
+    if protected.contains(&mint) {
+        return;
+    }
+    opens.retain(|at| at.elapsed() < Duration::from_secs(3_600));
+    if opens.len() >= MAX_ACCOUNT_OPENS_PER_HOUR {
+        return;
+    }
+    let managed = t.managed_accounts(protected);
+    let Some(mv) = demand::on_missing(demand, &managed, slots, &mint) else { return };
+    opens.push_back(std::time::Instant::now());
+    let (open, close) = match mv {
+        demand::Move::Open(o) => (o, None),
+        demand::Move::Replace { open, close } => (open, Some(close)),
+    };
+    let name = |m: &cb_core::types::Pubkey32| bs58::encode(m).into_string();
+    if let Some(c) = close {
+        match t.close_account(&c).await {
+            Ok(true) => tracing::warn!(
+                "closed the account for {} to make room for {}, which attempts ask for more",
+                name(&c),
+                name(&open)
+            ),
+            // Kept because it holds a balance, or a dry run: no slot was freed.
+            Ok(false) => return,
+            Err(e) => {
+                tracing::warn!("could not close {} to make room: {e:#}", name(&c));
+                return;
+            }
+        }
+    }
+    let score = demand.scores().get(&open).copied().unwrap_or_default();
+    match t.open_account(&open).await {
+        Ok(true) => tracing::warn!(
+            "opened a token account for {}: asked for {} times in the last day, ${:.4} \
+             expected between them. The deposit comes back when the account is closed.",
+            name(&open),
+            score.asks,
+            score.usd
+        ),
+        Ok(false) => tracing::info!("the account for {} was not opened (dry run)", name(&open)),
+        Err(e) => tracing::warn!("could not open an account for {}: {e:#}", name(&open)),
+    }
+}
 /// The encrypted key, beside the ledger and the config. Never read without a
 /// passphrase, and never written by this binary.
 const WALLET_FILE: &str = "keypair-encrypted.json";
@@ -875,6 +965,7 @@ async fn main() -> anyhow::Result<()> {
             // Empty, like every other default here: this fallback is the paper-mode
             // path, and paying rent is not something a run with no config should decide.
             extra_token_mints: Vec::new(),
+            token_account_slots: 0,
             capital_usd: 100.0,
             fee_buffer_usd: 0.20,
             min_trade_usd: 10.0,
@@ -1136,6 +1227,17 @@ async fn spawn_live(
     // correct by accident the moment execution exists.
     let paper_run = matches!(cfg.mode, Mode::Paper);
 
+    // Accounts the rotation in `demand` must never close: where every cycle starts and
+    // ends, and whatever the operator pinned by name.
+    let mut protected: std::collections::HashSet<cb_core::types::Pubkey32> =
+        registry::Registry::embedded()?.base_mints.into_iter().collect();
+    for m in &cfg.extra_token_mints {
+        if let Ok(k) = registry::pk(m) {
+            protected.insert(k);
+        }
+    }
+    let token_slots = cfg.token_account_slots;
+
     tokio::spawn(async move {
         // Owned by the sweep task, because the risk gate is per-run state and there is
         // exactly one place trades are decided. `None` in paper mode, and then no code
@@ -1188,9 +1290,53 @@ async fn spawn_live(
         // that fires five times a second is a warning nobody reads.
         let mut was_stalled = false;
         let mut last_stale_excluded = 0usize;
+        // Which intermediate mints attempts have needed over the last day. See `demand`.
+        let demand_path = std::path::Path::new(DEMAND_PATH);
+        let mut demand = demand::Demand::load(demand_path, now_ms() / 1_000);
+        let mut demand_timer = tokio::time::interval(DEMAND_SAVE_INTERVAL);
+        let mut account_opens: std::collections::VecDeque<std::time::Instant> =
+            std::collections::VecDeque::new();
 
         loop {
             tokio::select! {
+                _ = demand_timer.tick() => {
+                    if let Err(e) = demand.save(demand_path) {
+                        tracing::warn!("could not save {DEMAND_PATH}: {e}");
+                    }
+                    // The priority order the rotation works from, on the record: which
+                    // mints attempts asked for over the last day, most valuable first.
+                    let ranking = demand.ranking();
+                    if !ranking.is_empty() {
+                        let held = trader.as_ref().map(|t| t.managed_accounts(&protected));
+                        let line: Vec<String> = ranking
+                            .iter()
+                            .take(10)
+                            .map(|(m, s)| {
+                                let b = bs58::encode(m).into_string();
+                                let mark = if held.as_ref().is_some_and(|h| h.contains(m)) {
+                                    "held"
+                                } else {
+                                    "no account"
+                                };
+                                format!("{}… {} asks ${:.4} ({mark})", &b[..6], s.asks, s.usd)
+                            })
+                            .collect();
+                        tracing::info!("token demand, last day: {}", line.join(" · "));
+                    }
+                    if let Some(t) = trader.as_mut() {
+                        let managed = t.managed_accounts(&protected);
+                        let idle = demand::idle(&demand, &managed, now_ms() / 1_000);
+                        for mint in idle.into_iter().take(MAX_ACCOUNT_CLOSES_PER_TICK) {
+                            match t.close_account(&mint).await {
+                                Ok(true) => tracing::warn!(
+                                    "closed an account no attempt asked for in a day, to trade                                      its deposit instead"
+                                ),
+                                Ok(false) => {}
+                                Err(e) => tracing::warn!("could not close an idle account: {e:#}"),
+                            }
+                        }
+                    }
+                }
                 received = rx.recv() => {
                     match received {
                         Some(update) => { market.apply(&update, &bus); }
@@ -1540,12 +1686,31 @@ async fn spawn_live(
                                     let worth_measuring = !barred
                                         && held_back_by_a_claim
                                         && probes_this_sweep < MAX_PROBES_PER_SWEEP;
-                                    let candidate = if barred || held_back_by_a_claim {
+                                    // Under Jito the measurement *is* the trade. A probe
+                                    // re-prices on fresh state and simulates, then stops;
+                                    // an attempt does exactly the same and then sends a
+                                    // bundle whose floor guarantees the fee and the tip on
+                                    // chain, and which costs nothing if it misses. The
+                                    // claims above were written to save the fee a failed
+                                    // RPC send paid — under Jito there is no such fee left
+                                    // to save, and holding them to a probe only means a
+                                    // route that simulates profitably is written down
+                                    // instead of taken. That happened on 2026-09-23 at
+                                    // 13:09: a probe cleared its floor by 8,958 lamports
+                                    // and was logged, not sent.
+                                    //
+                                    // Same budget as the probe it replaces, so the RPC load
+                                    // does not change.
+                                    let promoted = worth_measuring && t.sends_via_jito();
+                                    if promoted {
+                                        probes_this_sweep += 1;
+                                    }
+                                    let candidate = if barred || (held_back_by_a_claim && !promoted) {
                                         None
                                     } else {
                                         opp.plan.as_ref().filter(|pl| pl.encodable())
                                     };
-                                    let to_measure = if worth_measuring {
+                                    let to_measure = if worth_measuring && !promoted {
                                         opp.plan.as_ref().filter(|pl| pl.encodable())
                                     } else {
                                         None
@@ -1554,6 +1719,7 @@ async fn spawn_live(
                                         None => {
                                             if let Some(probe_plan) = to_measure {
                                                 probes_this_sweep += 1;
+                                                note_demand(&mut demand, probe_plan, net, &protected);
                                                 let started = std::time::Instant::now();
                                                 let r = t
                                                     .attempt(
@@ -1663,6 +1829,7 @@ async fn spawn_live(
                                         }
                                         Some(plan) => {
                                             attempts_this_sweep += 1;
+                                            note_demand(&mut demand, plan, net, &protected);
                                             let started = std::time::Instant::now();
                                             let r = t
                                                 .attempt(
@@ -1672,6 +1839,17 @@ async fn spawn_live(
                                                     execute::Intent::Trade,
                                                 )
                                                 .await;
+                                            if matches!(r, Ok(cb_executor::Attempt::Refused(_))) {
+                                                rotate_for(
+                                                    t,
+                                                    plan,
+                                                    &demand,
+                                                    &protected,
+                                                    token_slots,
+                                                    &mut account_opens,
+                                                )
+                                                .await;
+                                            }
                                             latency_ms = started.elapsed().as_millis() as u64;
                                             match r {
                                                 Ok(cb_executor::Attempt::Submitted {

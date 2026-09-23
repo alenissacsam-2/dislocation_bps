@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <title>cryptobot</title>
@@ -7,83 +7,94 @@
 </head>
 <body>
 
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-live" viewBox="0 0 20 20"><path d="M2 10.5h3.2l2.1-5.2 3.4 9.4 2.2-5.6.9 1.4H18"/></symbol>
+  <symbol id="i-history" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.2V10l2.7 1.7"/></symbol>
+  <symbol id="i-params" viewBox="0 0 20 20"><path d="M4 5.5h7M14.5 5.5H16M4 10h2.5M10 10h6M4 14.5h7M14.5 14.5H16"/><circle cx="12.8" cy="5.5" r="1.7"/><circle cx="8.2" cy="10" r="1.7"/><circle cx="12.8" cy="14.5" r="1.7"/></symbol>
+  <symbol id="i-runs" viewBox="0 0 20 20"><rect x="3" y="4" width="14" height="4" rx="1.4"/><path d="M4.4 8v6.6a1.4 1.4 0 0 0 1.4 1.4h8.4a1.4 1.4 0 0 0 1.4-1.4V8M8.2 11h3.6"/></symbol>
+  <symbol id="i-log" viewBox="0 0 20 20"><path d="M4 5h12M4 8.3h8M4 11.7h12M4 15h6"/></symbol>
+  <symbol id="i-info" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.2"/><path d="M10 9v5"/><circle cx="10" cy="6.3" r=".35" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-play" viewBox="0 0 20 20"><path d="M7 5.2v9.6l7.4-4.8z" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 20 20"><rect x="5.6" y="5.6" width="8.8" height="8.8" rx="1.6" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 20 20"><rect x="7" y="7" width="9" height="9" rx="1.8"/><path d="M13 7V5.4A1.4 1.4 0 0 0 11.6 4H5.4A1.4 1.4 0 0 0 4 5.4v6.2A1.4 1.4 0 0 0 5.4 13H7"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 20 20"><path d="M15.6 8.2A6 6 0 0 0 4.7 7M4.4 11.8A6 6 0 0 0 15.3 13"/><path d="M15.8 4.4v3.8H12M4.2 15.6v-3.8H8"/></symbol>
+  <symbol id="i-theme" viewBox="0 0 20 20"><path d="M15.8 12.4A6.4 6.4 0 0 1 7.6 4.2a6.4 6.4 0 1 0 8.2 8.2z"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 20 20"><path d="M10 4v8M6.6 8.8 10 12.2l3.4-3.4M4 13.5v1.1A1.4 1.4 0 0 0 5.4 16h9.2a1.4 1.4 0 0 0 1.4-1.4v-1.1"/></symbol>
+  <symbol id="i-search" viewBox="0 0 20 20"><circle cx="8.8" cy="8.8" r="4.8"/><path d="m12.4 12.4 3.8 3.8"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 20 20"><path d="M7.5 5.5v9M12.5 5.5v9"/></symbol>
+</svg>
+
 <aside class="rail">
   <div class="brand">
-    <svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true">
-      <path d="M4.6 15.2A8 8 0 1 1 17.4 15.2" fill="none" stroke="var(--accent)"
+    <svg class="mark" width="26" height="26" viewBox="0 0 22 22" aria-hidden="true">
+      <path d="M4.6 15.2A8 8 0 1 1 17.4 15.2" fill="none" stroke="currentColor"
             stroke-width="2.1" stroke-linecap="round"/>
-      <path d="M11 11 L15 7.9" stroke="var(--accent)" stroke-width="2" stroke-linecap="round"/>
-      <circle cx="11" cy="11" r="1.7" fill="var(--accent)"/>
+      <path d="M11 11 L15 7.9" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      <circle cx="11" cy="11" r="1.7" fill="currentColor"/>
     </svg>
     <div>
       <div class="brand-name">cryptobot</div>
-      <div class="brand-sub">instrument</div>
+      <div class="brand-sub">desk</div>
     </div>
   </div>
 
-  <div class="state-card">
-    <div class="state-top">
-      <span class="dot" id="dot"></span>
-      <span id="stateLabel">Checking…</span>
+  <section class="module power" aria-label="Bot">
+    <div class="power-head">
+      <span class="led" id="dot"></span>
+      <div>
+        <div class="power-state" id="stateLabel">Checking…</div>
+        <div class="power-note" id="stateNote"></div>
+      </div>
     </div>
-    <div class="state-note" id="stateNote"></div>
-    <div class="controls">
-      <button id="btnStart" class="primary" disabled>Start</button>
-      <button id="btnStop" disabled>Stop</button>
+    <div class="keys">
+      <button id="btnStart" class="key key-go" disabled><svg class="ic"><use href="#i-play"/></svg>Start</button>
+      <button id="btnStop" class="key" disabled><svg class="ic"><use href="#i-stop"/></svg>Stop</button>
     </div>
-    <!-- Separate row, and deliberately not styled as a primary action: it ends the
-         measurement in progress. Nothing is deleted — the ledger moves to the archive
-         and stays readable from the History view. -->
-    <div class="controls">
-      <button id="btnArchive" class="ghost" disabled>Archive &amp; start fresh</button>
-    </div>
-  </div>
+    <button id="btnArchive" class="link-key" disabled><svg class="ic"><use href="#i-archive"/></svg>Archive &amp; start fresh</button>
+  </section>
 
-  <!-- Mode and money, beside the Start button rather than three screens away.
-       Whether this run signs anything and what it would sign with are the two facts
-       that belong next to the control that starts it. -->
-  <div class="rail-mode">
-    <div class="rail-mode-head">
-      <span class="rail-label">Mode</span>
+  <section class="module" aria-label="Mode">
+    <div class="mod-head">
+      <span class="label">Mode</span>
       <span id="railModeBadge" class="badge badge-demo">DEMO</span>
     </div>
-
     <div class="seg" role="group" aria-label="Trading mode">
       <button id="segDemo" class="seg-btn on" type="button">Demo</button>
       <button id="segLive" class="seg-btn" type="button">Live</button>
     </div>
-
-    <div id="railArm" hidden>
-      <label for="railConfirm" class="rail-hint">Type <code>LIVE</code> to confirm</label>
-      <input type="text" id="railConfirm" autocomplete="off" spellcheck="false"
-             placeholder="LIVE">
-      <div class="rail-actions">
-        <button id="railApply" class="primary" type="button">Arm live</button>
-        <button id="railCancel" type="button">Cancel</button>
+    <div id="railArm" class="arm" hidden>
+      <label for="railConfirm" class="hint">Type <code>LIVE</code> to arm real trading</label>
+      <input type="text" id="railConfirm" autocomplete="off" spellcheck="false" placeholder="LIVE">
+      <div class="keys">
+        <button id="railApply" class="key key-hot" type="button">Arm live</button>
+        <button id="railCancel" class="key" type="button">Cancel</button>
       </div>
     </div>
+    <div id="railArmedNote" class="hint" hidden></div>
+  </section>
 
-    <div id="railArmedNote" class="rail-hint" hidden></div>
-
-    <div class="rail-wallet">
-      <div class="rail-label">Wallet</div>
-      <div id="railAddr" class="rail-addr" title="Click to copy">no key</div>
-      <div id="railBal" class="rail-bal">—</div>
-      <div id="railReady" class="rail-ready"></div>
-      <button id="railRefresh" class="ghost" type="button">Refresh balance</button>
+  <section class="module" aria-label="Wallet">
+    <div class="mod-head">
+      <span class="label">Wallet</span>
+      <button id="railRefresh" class="icon-key" type="button" aria-label="Refresh balance" title="Refresh balance"><svg class="ic"><use href="#i-refresh"/></svg></button>
     </div>
-  </div>
+    <div class="well wallet-well">
+      <div id="railBal" class="rail-bal">—</div>
+      <button id="railAddr" class="rail-addr" type="button" title="Copy address">no key</button>
+    </div>
+    <div id="railReady" class="rail-ready"></div>
+  </section>
 
-  <nav>
-    <button data-view="live" class="on">Live</button>
-    <button data-view="history">History</button>
-    <button data-view="config">Parameters</button>
-    <button data-view="runs">Runs</button>
-    <button data-view="log">Log</button>
+  <nav aria-label="Views">
+    <button data-view="live" class="on"><svg class="ic"><use href="#i-live"/></svg>Live</button>
+    <button data-view="history"><svg class="ic"><use href="#i-history"/></svg>History</button>
+    <button data-view="config"><svg class="ic"><use href="#i-params"/></svg>Parameters</button>
+    <button data-view="runs"><svg class="ic"><use href="#i-runs"/></svg>Runs</button>
+    <button data-view="log"><svg class="ic"><use href="#i-log"/></svg>Log</button>
   </nav>
 
   <div class="rail-foot">
-    <button id="themeBtn">Toggle theme</button>
+    <button id="themeBtn" class="icon-key" type="button" aria-label="Toggle theme" title="Toggle light and dark"><svg class="ic"><use href="#i-theme"/></svg></button>
     <div class="rail-path" id="railPath"></div>
   </div>
 </aside>
@@ -92,464 +103,386 @@
 
   <!-- ── LIVE ─────────────────────────────────────────────────────────── -->
   <section class="view" id="view-live">
-    <div class="strip">
-      <div class="cell">
-        <div class="k">Tradeable edge</div>
-        <div class="v dim" id="mEdge">—</div>
-        <div class="s" id="mEdgeSub">nothing deep enough</div>
+    <div class="faceplate wells4">
+      <div class="well readout" id="wBot">
+        <div class="r-head"><span class="label">Bot</span><span class="led sm" id="wBotLed"></span></div>
+        <div class="r-val" id="wBotState">—</div>
+        <div class="r-sub" id="wBotSub">not connected</div>
+        <div class="r-foot" id="wBotLast">no trade sent this run</div>
       </div>
-      <div class="cell">
-        <div class="k">Price dislocation</div>
-        <div class="v" id="mDisl">—</div>
-        <div class="s">between venues, before fees</div>
+      <div class="well readout ch-amber" id="wEdge">
+        <div class="r-head"><span class="label">Best tradeable edge</span>
+          <button class="info" type="button" data-tip="Edge is what the best cycle deep enough to trade would earn after fees, in basis points (1 bp = 0.01%). The bar puts the price gap between venues against the fee wall of crossing them: the dashed mark is where a trade starts to pay."><svg class="ic"><use href="#i-info"/></svg></button></div>
+        <div class="r-val num" id="mEdge">—</div>
+        <div class="gauge" aria-hidden="true"><div class="gauge-fill" id="gEdgeFill"></div><div class="gauge-mark" id="gEdgeMark"></div></div>
+        <div class="r-sub" id="mEdgeSub">nothing deep enough</div>
       </div>
-      <div class="cell">
-        <div class="k">Fee wall</div>
-        <div class="v" id="mFee">—</div>
-        <div class="s">cost of crossing them</div>
+      <div class="well readout ch-teal" id="wMoney">
+        <div class="r-head"><span class="label">Money this run</span>
+          <button class="info" type="button" data-tip="Realised profit and loss from trades that actually executed since this run started, against the daily loss limit set under Parameters. A Jito bundle that is not included costs nothing and moves nothing."><svg class="ic"><use href="#i-info"/></svg></button></div>
+        <div class="r-val num" id="wMoneyVal">$0.0000</div>
+        <div class="gauge" aria-hidden="true"><div class="gauge-fill" id="gBudgetFill"></div></div>
+        <div class="r-sub" id="wMoneySub">of the loss budget used</div>
       </div>
-      <div class="cell">
-        <div class="k">Cheapest loop</div>
-        <div class="v" id="mFloor">—</div>
-        <div class="s">the floor to clear</div>
-      </div>
-      <div class="cell">
-        <div class="k">Pools live</div>
-        <div class="v" id="mPools">—</div>
-        <div class="s" id="mPoolsSub">across venues</div>
+      <div class="well readout ch-violet" id="wFeed">
+        <div class="r-head"><span class="label">Feed</span><span class="led sm" id="wFeedLed"></span></div>
+        <div class="r-val num" id="wFeedVal">—</div>
+        <div class="r-sub" id="wFeedSub">waiting for the bot</div>
+        <div class="r-foot" id="wFeedFoot"></div>
       </div>
     </div>
 
-    <div class="panel span8">
-      <h2>Venue divergence — where the arbitrage actually is</h2>
-      <canvas id="divChart"></canvas>
-      <p class="note">
-        Every venue quoting one pair, drawn as distance in basis points from their own
-        consensus. Absolute price hides this: a 2 bp gap on a $90 asset is invisible on
-        a price axis. Where the lines separate is the entire business.
-      </p>
-    </div>
+    <div class="grid">
+      <section class="module span8" aria-labelledby="hFunnel">
+        <div class="mod-head">
+          <h2 id="hFunnel">Where opportunities die</h2>
+          <span class="scope" id="funnelScope">since —</span>
+          <button class="info" type="button" data-tip="Every opportunity the bot surfaces, followed through the pipeline: net of the tip, past the executable filters, re-priced and built against fresh state, simulated, sent to Jito, and included in a block. Each chamber is the count that got that far; under each drop is the most common reason it stopped there. Counted from the live event stream since the time shown, and kept if the window reloads during the same run."><svg class="ic"><use href="#i-info"/></svg></button>
+        </div>
+        <div class="funnel" id="funnel"></div>
+      </section>
 
-    <div class="panel span4">
-      <h2>Distance to profitable</h2>
-      <canvas id="feeChart"></canvas>
-      <p class="note">
-        Dislocation against the fee wall. The gap between them is what the market would
-        have to move before anything clears.
-      </p>
-    </div>
+      <section class="module span4" aria-labelledby="hReasons">
+        <div class="mod-head">
+          <h2 id="hReasons">Why trades stop</h2>
+          <button class="info" type="button" data-tip="Every outcome the pipeline reported, grouped by cause and ranked. Grey is the market or a filter doing its job. Red is a fault: a halt, a reverted trade, a rejection that means something was built wrong, or an error."><svg class="ic"><use href="#i-info"/></svg></button>
+        </div>
+        <div class="reasons" id="reasons"></div>
+      </section>
 
-    <div class="panel span12">
-      <h2>Leaderboard — tradeable now</h2>
-      <table id="routesTable">
-        <thead>
-          <tr>
-            <th>Route</th><th>Venues</th>
-            <th class="n">Edge</th><th class="n">Gap</th>
-            <th class="n">Fees</th><th class="n">Depth</th>
-          </tr>
-        </thead>
-        <tbody id="routesBody"></tbody>
-      </table>
-      <div class="empty" id="routesEmpty">Not connected to a running instrument.</div>
+      <section class="module span8" aria-labelledby="hDiv">
+        <div class="mod-head">
+          <h2 id="hDiv">Venue divergence</h2>
+          <span class="scope" id="divScope"></span>
+          <button class="info" type="button" data-tip="Every venue quoting one pair, drawn as distance in basis points from their own consensus. Absolute price hides this: a 2 bp gap on a $90 asset is invisible on a price axis. Where the lines separate is the entire business."><svg class="ic"><use href="#i-info"/></svg></button>
+        </div>
+        <canvas id="divChart" class="chart tall"></canvas>
+      </section>
+
+      <section class="module span4" aria-labelledby="hDrift">
+        <div class="mod-head">
+          <h2 id="hDrift">Price drift by venue</h2>
+          <button class="info" type="button" data-tip="How far each venue's price moved between the moment a cycle was detected and the moment it was re-priced against fresh state, a round trip later. Negative means the price had moved against the trade. A venue far below the others points at stale data from that venue rather than at the market. Read from the log for this run."><svg class="ic"><use href="#i-info"/></svg></button>
+        </div>
+        <div class="drift" id="drift"></div>
+      </section>
+
+      <section class="module span6" aria-labelledby="hHealth">
+        <div class="mod-head">
+          <h2 id="hHealth">Feed &amp; RPC health</h2>
+          <button class="info" type="button" data-tip="Traces sampled from the bot's status every two seconds while this window is open. Lag is how many slots the newest price trails the chain; data age is seconds since the last update; drift is how many pools a periodic full re-read found out of step with the websocket. Credit use at the RPC provider is not exposed to this app, so it is not shown here — a full websocket feed on a free plan can exceed the monthly allowance; check the provider's dashboard."><svg class="ic"><use href="#i-info"/></svg></button>
+        </div>
+        <div class="traces" id="traces"></div>
+        <div class="counters" id="counters"></div>
+      </section>
+
+      <section class="module span6" aria-labelledby="hWall">
+        <div class="mod-head">
+          <h2 id="hWall">Distance to profitable</h2>
+          <button class="info" type="button" data-tip="The best cycle's price gap between venues (amber) against the fees it has to cross (dashed). Nothing clears until the amber line rises above the dashed one; the space between them is what the market would have to move."><svg class="ic"><use href="#i-info"/></svg></button>
+        </div>
+        <canvas id="feeChart" class="chart"></canvas>
+      </section>
+
+      <section class="module span12" aria-labelledby="hBoard">
+        <div class="mod-head">
+          <h2 id="hBoard">Closest cycles right now</h2>
+          <button class="info" type="button" data-tip="The best-priced cycles from the latest sweep. Edge is after fees; gap is the raw price difference between venues; depth is how much the thinnest pool can carry. A cycle whose depth is below the minimum trade is shown faint: priced, but too shallow to take."><svg class="ic"><use href="#i-info"/></svg></button>
+        </div>
+        <table id="routesTable" class="table">
+          <thead>
+            <tr>
+              <th>Route</th><th>Venues</th>
+              <th class="n">Edge</th><th class="bar-col" aria-label="Edge against fees"></th>
+              <th class="n">Gap</th><th class="n">Fees</th><th class="n">Depth</th>
+            </tr>
+          </thead>
+          <tbody id="routesBody"></tbody>
+        </table>
+        <div class="empty" id="routesEmpty">Not connected to a running bot.</div>
+      </section>
     </div>
   </section>
 
   <!-- ── HISTORY ──────────────────────────────────────────────────────── -->
   <section class="view" id="view-history" hidden>
-    <div class="strip">
-      <div class="cell">
-        <div class="k">Observed</div>
-        <div class="v" id="hHours">—</div>
-        <div class="s" id="hWindow"></div>
-      </div>
-      <div class="cell">
-        <div class="k">Opportunities</div>
-        <div class="v" id="hOpps">—</div>
-        <div class="s">episodes, not detections</div>
-      </div>
-      <div class="cell">
-        <div class="k">Taken</div>
-        <div class="v" id="hTaken">—</div>
-        <div class="s" id="hTakenSub"></div>
-      </div>
-      <div class="cell">
-        <div class="k">Realised</div>
-        <div class="v" id="hNet">—</div>
-        <div class="s">paper, net of tips</div>
-      </div>
-      <div class="cell">
-        <div class="k">Median opportunity</div>
-        <div class="v" id="hMedian">—</div>
-        <div class="s">whole pie, any capital</div>
-      </div>
+    <div class="banner" id="archiveBanner" hidden></div>
+    <div class="faceplate wells5">
+      <div class="well readout"><div class="r-head"><span class="label">Observed</span></div>
+        <div class="r-val num" id="hHours">—</div><div class="r-sub" id="hWindow"></div></div>
+      <div class="well readout ch-amber"><div class="r-head"><span class="label">Opportunities</span>
+        <button class="info" type="button" data-tip="Episodes, not detections: one opportunity seen across many sweeps counts once."><svg class="ic"><use href="#i-info"/></svg></button></div>
+        <div class="r-val num" id="hOpps">—</div><div class="r-sub">episodes</div></div>
+      <div class="well readout ch-amber"><div class="r-head"><span class="label">Taken</span></div>
+        <div class="r-val num" id="hTaken">—</div><div class="r-sub" id="hTakenSub"></div></div>
+      <div class="well readout ch-teal"><div class="r-head"><span class="label">Realised</span>
+        <button class="info" type="button" data-tip="Net of tips. In Demo mode this is what would have been taken on paper; in Live it is only what actually landed."><svg class="ic"><use href="#i-info"/></svg></button></div>
+        <div class="r-val num" id="hNet">—</div><div class="r-sub">net of tips</div></div>
+      <div class="well readout ch-amber"><div class="r-head"><span class="label">Median opportunity</span>
+        <button class="info" type="button" data-tip="The whole pie: what the median opportunity was worth at the size that maximises profit, at any capital."><svg class="ic"><use href="#i-info"/></svg></button></div>
+        <div class="r-val num" id="hMedian">—</div><div class="r-sub">whole pie, any capital</div></div>
     </div>
 
-    <div class="panel span7">
-      <h2>Realised P&amp;L</h2>
-      <canvas id="pnlChart"></canvas>
-      <p class="note" id="pnlNote"></p>
-    </div>
-
-    <div class="panel span5">
-      <h2>What a bigger book would have taken</h2>
-      <div class="bars" id="ladder"></div>
-      <p class="note">
-        The same opportunities, priced at each book size. Not extrapolated — measured
-        at every rung on every episode.
-      </p>
-    </div>
-
-    <div class="panel span7">
-      <h2>Value against lifetime</h2>
-      <canvas id="scatter"></canvas>
-      <p class="note">
-        Both axes logarithmic; horizontal is how long the opportunity survived, vertical
-        is what it was worth. The two run in opposite directions, and that is the
-        finding the whole project rests on.
-      </p>
-    </div>
-
-    <div class="panel span5">
-      <h2>Is the contest model measuring anything?</h2>
-      <div id="contest"></div>
-    </div>
-
-    <div class="panel span12">
-      <h2>What refusing contested races costs</h2>
-      <div class="bars" id="race"></div>
-      <p class="note">
-        A contested cycle is charged a tip large enough to win the race and then refused
-        for being contested — competition priced twice, once as a haircut and again as a
-        refusal. A lost race costs the base fee or nothing at all, because the bundle
-        does not land, so the downside of trying is close to zero. Which rung is real
-        cannot be settled on paper; only trying settles it.
-      </p>
+    <div class="grid">
+      <section class="module span7">
+        <div class="mod-head"><h2>Realised P&amp;L</h2><span class="scope" id="pnlNote"></span></div>
+        <canvas id="pnlChart" class="chart"></canvas>
+      </section>
+      <section class="module span5">
+        <div class="mod-head"><h2>What a bigger book would have taken</h2>
+          <button class="info" type="button" data-tip="The same opportunities, priced at each book size. Not extrapolated — measured at every rung on every episode."><svg class="ic"><use href="#i-info"/></svg></button></div>
+        <div class="bars" id="ladder"></div>
+      </section>
+      <section class="module span7">
+        <div class="mod-head"><h2>Value against lifetime</h2>
+          <button class="info" type="button" data-tip="Both axes logarithmic; horizontal is how long the opportunity survived, vertical is what it was worth. The two run in opposite directions, and that is the finding the whole project rests on. Teal points were taken; amber were contested."><svg class="ic"><use href="#i-info"/></svg></button></div>
+        <canvas id="scatter" class="chart"></canvas>
+      </section>
+      <section class="module span5">
+        <div class="mod-head"><h2>Is the contest model measuring anything?</h2></div>
+        <div id="contest"></div>
+      </section>
+      <section class="module span12">
+        <div class="mod-head"><h2>What refusing contested races costs</h2>
+          <button class="info" type="button" data-tip="A contested cycle is charged a tip large enough to win the race and then refused for being contested — competition priced twice, once as a haircut and again as a refusal. A lost race costs the base fee or nothing at all, because the bundle does not land, so the downside of trying is close to zero. Which rung is real cannot be settled on paper; only trying settles it."><svg class="ic"><use href="#i-info"/></svg></button></div>
+        <div class="bars" id="race"></div>
+      </section>
     </div>
   </section>
 
   <!-- ── PARAMETERS ───────────────────────────────────────────────────── -->
   <section class="view" id="view-config" hidden>
-    <div class="panel span6">
-      <h2>Trading parameters</h2>
-      <div class="warn">
-        <b>Saving ends the current run.</b> The ledger is archived and a new measurement
-        begins. Rows recorded under different parameters aggregate by different rules,
-        and nothing downstream would show the mixture — so the run is cut rather than
-        quietly contaminated.
-      </div>
-      <div class="field">
-        <label for="fCapital">Working capital (USD)</label>
-        <input type="number" id="fCapital" step="1" min="1">
-        <div class="hint">
-          Caps every trade size. The ladder opposite measures what larger books would
-          have taken from the identical opportunities. <b>Maximum position, under Risk
-          limits, should match this number</b> — that field is a second, independent
-          cap enforced right before signing, and if it is set looser than this one it
-          never actually binds; if it is set tighter, this field is not really the cap
-          it claims to be. One relationship, so it is worth stating rather than leaving
-          two numbers to look unrelated.
+    <div class="grid">
+      <section class="module span6">
+        <div class="mod-head"><h2>Trading</h2></div>
+        <p class="caution">Saving ends the current run and archives its ledger.
+          <button class="info" type="button" data-tip="Rows recorded under different parameters aggregate by different rules, and nothing downstream would show the mixture — so the run is cut rather than quietly contaminated."><svg class="ic"><use href="#i-info"/></svg></button></p>
+        <div class="fields">
+          <div class="field">
+            <label for="fCapital">Working capital <span class="unit">USD</span>
+              <button class="info" type="button" data-tip="Caps every trade size. The ladder under History measures what larger books would have taken from the identical opportunities. Maximum position, under Risk limits, should match this number — that field is a second, independent cap enforced right before signing, and if it is set looser than this one it never actually binds; if it is set tighter, this field is not really the cap it claims to be."><svg class="ic"><use href="#i-info"/></svg></button></label>
+            <input type="number" id="fCapital" step="1" min="1">
+          </div>
+          <div class="field">
+            <label for="fBuffer">Fee buffer <span class="unit">USD</span>
+              <button class="info" type="button" data-tip="Held back for transaction fees and rent; not tradable."><svg class="ic"><use href="#i-info"/></svg></button></label>
+            <input type="number" id="fBuffer" step="0.05" min="0">
+          </div>
+          <div class="field">
+            <label for="fMinTrade">Minimum trade <span class="unit">USD</span>
+              <button class="info" type="button" data-tip="Set by fixed cost, not by the book. A transaction costs what it costs whether it carries $5 or $5,000, so below some size the fee eats the edge."><svg class="ic"><use href="#i-info"/></svg></button></label>
+            <input type="number" id="fMinTrade" step="1" min="0.01">
+          </div>
+          <div class="field">
+            <label for="fHops">Maximum hops
+              <button class="info" type="button" data-tip="2 is a direct round trip, 3 adds triangles, 4 explodes the search for little added reach."><svg class="ic"><use href="#i-info"/></svg></button></label>
+            <input type="number" id="fHops" step="1" min="2" max="4">
+          </div>
+          <div class="field">
+            <label for="fSlippage">Output floor per hop <span class="unit">0.1 bp</span>
+              <button class="info" type="button" data-tip="How far below its quote each hop's floor is written into the swap instruction, in tenths of a basis point — so 3 means 0.3 bps. Must be smaller than the edge divided by the hop count: a route only builds when its last floor beats its first input. This was 30 bps, which made every route refuse as a guaranteed loss; you cannot tolerate more slippage than the profit you are chasing."><svg class="ic"><use href="#i-info"/></svg></button></label>
+            <input type="number" id="fSlippage" step="1" min="0" max="100">
+          </div>
+          <div class="field">
+            <label for="fPriority">Priority bid <span class="unit">µ-lamports / CU</span>
+              <button class="info" type="button" data-tip="Only used when trades go through the RPC (submit_via = &quot;rpc&quot;). Through Jito, the default, the tip does this job and this number is ignored. 0 pays the base fee only."><svg class="ic"><use href="#i-info"/></svg></button></label>
+            <input type="number" id="fPriority" step="1" min="0">
+          </div>
         </div>
-      </div>
-      <div class="field">
-        <label for="fBuffer">Fee buffer (USD)</label>
-        <input type="number" id="fBuffer" step="0.05" min="0">
-        <div class="hint">Held back for transaction fees and rent; not tradable.</div>
-      </div>
-      <div class="field">
-        <label for="fMinTrade">Minimum trade (USD)</label>
-        <input type="number" id="fMinTrade" step="1" min="0.01">
-        <div class="hint">
-          Set by fixed cost, not by the book. A transaction costs what it costs whether
-          it carries $5 or $5,000, so below some size the fee eats the edge.
-        </div>
-      </div>
-      <div class="field">
-        <label for="fHops">Maximum hops</label>
-        <input type="number" id="fHops" step="1" min="2" max="4">
-        <div class="hint">
-          2 is a direct round trip, 3 adds triangles, 4 explodes the search for little
-          added reach.
-        </div>
-      </div>
-      <div class="field">
-        <label for="fSlippage">Output floor per hop (tenths of a bp)</label>
-        <input type="number" id="fSlippage" step="1" min="0" max="100">
-        <div class="hint">
-          How far below its quote each hop's floor is written into the swap instruction,
-          in tenths of a basis point — so <b>3 means 0.3 bps</b>.
-          <b>Must be smaller than the edge divided by the hop count</b> — a route only
-          builds when its last floor beats its first input. This was 30 bps, which made
-          every route refuse as a guaranteed loss; you cannot tolerate more slippage than
-          the profit you are chasing. The unit is tenths because a whole basis point is
-          also too wide here: the largest edge that has ever survived the trip to the
-          chain on this instrument measured 1.93 bps, and two hops at 1 bp each took all
-          of it.
-        </div>
-      </div>
-      <div class="field">
-        <label for="fPriority">Priority bid (micro-lamports per compute unit)</label>
-        <input type="number" id="fPriority" step="1" min="0">
-        <div class="hint">
-          0 pays the base fee only. Raising it buys inclusion against competing
-          searchers, out of the same profit the trade was worth.
-        </div>
-      </div>
-      <h2 style="margin-top:20px">Data source</h2>
-      <div class="hint" style="margin-bottom:10px">
-        <b>The setting that most affects what this instrument measures.</b> A dropped
-        subscription looks exactly like a quiet pool, so a lossy feed inflates the gap
-        between when a cycle's two legs were seen — and stale legs were measured to
-        account for <b>87% of the profit this instrument used to report</b>. A better
-        endpoint does not create edge. It deletes the fake edge that bad data invents.
-      </div>
-      <div class="field">
-        <label for="fRpcHttp">RPC endpoints — one per line, best first</label>
-        <textarea id="fRpcHttp" rows="3" autocomplete="off" spellcheck="false"
-                  placeholder="https://api.mainnet-beta.solana.com"></textarea>
-        <div class="providers" id="rpcProviders">
-          <span class="rail-label">Add</span>
-          <button type="button" data-rpc="https://lb.drpc.org/ogrpc?network=solana&amp;dkey=YOUR_KEY">dRPC</button>
-          <button type="button" data-rpc="https://solana-mainnet.g.alchemy.com/v2/YOUR_KEY">Alchemy</button>
-          <button type="button" data-rpc="https://mainnet.helius-rpc.com/?api-key=YOUR_KEY">Helius</button>
-          <button type="button" data-rpc="https://solana-mainnet.core.chainstack.com/YOUR_KEY">Chainstack</button>
-          <button type="button" data-rpc="https://rpc.ankr.com/solana">Ankr</button>
-          <button type="button" data-rpc="https://api.mainnet-beta.solana.com">Public</button>
-        </div>
-        <div class="hint">
-          Free tiers, as advertised: <b>dRPC</b> ~50M CU/mo · <b>Alchemy</b> 30M CU/mo ·
-          <b>QuickNode</b> 10M credits/mo · <b>Chainstack</b> 3M req/mo · <b>Helius</b>
-          1M credits at 10 rps · <b>Ankr</b> 30 rps. For this bot the <i>rate</i> limit
-          binds before the monthly quota does — it sweeps at 5 Hz and reads a hundred
-          accounts a time — so a generous rps matters more than a big monthly number.
-          Each button inserts that provider's URL shape; replace <code>YOUR_KEY</code>
-          with the endpoint from its dashboard, which is the authority on the exact form.
-        </div>
-        <div class="hint">
-          Reads fail over down the list when one stops answering — 48 execution attempts
-          died on the public endpoint returning an error page mid-trade. <b>A send never
-          fails over</b>: a transaction that timed out may still have been received, and
-          re-sending it elsewhere is how one trade becomes two. Leave blank for the
-          public endpoint.
-        </div>
-      </div>
-      <div class="field">
-        <label for="fRpcWs">WebSocket endpoint</label>
-        <input type="text" id="fRpcWs" autocomplete="off" spellcheck="false"
-               placeholder="wss://api.mainnet-beta.solana.com">
-        <div class="hint">
-          Where pool updates arrive. Leave blank for the public one. A provider URL
-          carries your API key in it: it is stored in plain text in
-          <code>config.toml</code> (which is gitignored), and the panels show the host
-          with the key masked. Set <code>CRYPTOBOT_RPC_HTTP_URL</code> and
-          <code>CRYPTOBOT_RPC_WS_URL</code> in the environment instead if you would
-          rather it never touched the file.
-        </div>
-      </div>
-      <button id="btnSave" class="primary">Save, archive and restart</button>
-      <p class="note" id="saveResult"></p>
-    </div>
 
-    <div class="panel span6">
-      <h2>Submission</h2>
-      <div class="warn">
-        <b>This is the last switch before real money moves.</b> It is separate from Mode
-        on purpose: arming Live and allowing spending are two decisions, and this is the
-        second one.
-      </div>
-      <p class="note" id="dryState">Checking…</p>
-      <div class="field" id="spendConfirmWrap" hidden>
-        <label for="fSpendConfirm">Type <code>SPEND</code> to allow real transactions</label>
-        <input type="text" id="fSpendConfirm" autocomplete="off" spellcheck="false">
-      </div>
-      <div class="acct-actions">
-        <button id="btnAllowSpend">Allow real transactions</button>
-        <button id="btnDryRun" class="primary">Back to dry run</button>
-      </div>
-      <p class="note" id="dryResult"></p>
-    </div>
-
-    <div class="panel span6">
-      <h2>Startup</h2>
-      <div class="field">
-        <label><input type="checkbox" id="fAutostart" style="width:auto"> Launch with Windows</label>
-        <div class="hint">The app starts with the session and sits in the tray.</div>
-      </div>
-      <div class="field">
-        <label><input type="checkbox" id="fAutorestart" style="width:auto"> Restart the bot if it dies</label>
-        <div class="hint">
-          Off by default, deliberately. An instrument that silently resurrects itself
-          hides the failures this app exists to make visible, and what it starts is a
-          new run rather than a continuation of the old one.
-        </div>
-      </div>
-      <h2 style="margin-top:20px">Mode</h2>
-      <div class="field">
-        <label><input type="radio" name="mode" id="modeDemo" value="paper" style="width:auto">
-          <b>Demo</b> — price every cycle and record what would have cleared. Signs nothing.</label>
-        <label style="margin-top:8px"><input type="radio" name="mode" id="modeLive" value="live" style="width:auto">
-          <b>Live</b> — sign and submit real transactions with the configured key.</label>
-      </div>
-      <div id="liveAccount" hidden></div>
-      <p class="note" id="modeState">Checking…</p>
-      <div class="field" id="modeConfirmWrap" hidden>
-        <label for="fModeConfirm">Type <code>LIVE</code> to confirm</label>
-        <input type="text" id="fModeConfirm" autocomplete="off" spellcheck="false">
-        <div class="hint">
-          Switching either way archives the current run. The ledger has no column saying
-          which mode produced a row, so a run that changed mode part way through would
-          leave a P&amp;L that is part simulation and part real money with no way to
-          separate them.
-        </div>
-      </div>
-      <button id="btnSetMode">Apply mode</button>
-      <p class="note" id="modeResult"></p>
-
-      <h2 style="margin-top:20px">Wallet</h2>
-      <div class="warn">
-        <b>The measured edge is currently negative.</b> The instrument's own leaderboard
-        shows a typical tradeable edge below the 2 bps it costs to cross two pools, and
-        §4 of HANDOVER records an unexplained result that makes the headline profit
-        unproven. A key here does not change that. Use a wallet holding only what you
-        are prepared to lose.
-      </div>
-
-      <p class="note" id="walletState">Checking…</p>
-
-      <div id="accountPanel" class="account" hidden>
-        <div class="acct-row">
-          <span class="acct-key">Address</span>
-          <code id="accAddress" class="acct-addr">—</code>
-          <button id="btnCopyAddr" class="ghost" type="button">Copy</button>
-        </div>
-        <div class="acct-row">
-          <span class="acct-key">Holdings</span>
-          <div id="accBalances" class="acct-holdings">not loaded</div>
-        </div>
-        <div id="accReadiness" class="acct-verdict"></div>
-        <div class="acct-actions">
-          <button id="btnRefreshBalances" type="button">Refresh balances</button>
-          <span class="note" id="accSource"></span>
-        </div>
-      </div>
-
-      <div id="walletSetup">
+        <div class="mod-head sub"><h3>Data source</h3>
+          <button class="info" type="button" data-tip="The setting that most affects what this bot measures. A dropped subscription looks exactly like a quiet pool, so a lossy feed inflates the gap between when a cycle's legs were seen — stale legs were measured to account for 87% of the profit this instrument used to report. A better endpoint does not create edge; it deletes the fake edge bad data invents."><svg class="ic"><use href="#i-info"/></svg></button></div>
         <div class="field">
-          <label for="fSecret">Private key</label>
-          <input type="password" id="fSecret" autocomplete="off" spellcheck="false"
-                 placeholder="base58, or a [1,2,3,…] array from solana-keygen">
-          <div class="hint">
-            Encrypted immediately and never stored in the clear. It is not written to
-            <code>config.toml</code>, never logged, and the field is cleared as soon as
-            it is read.
+          <label for="fRpcHttp">RPC endpoints <span class="unit">one per line, best first</span>
+            <button class="info" type="button" data-tip="Reads fail over down the list when one stops answering — 48 execution attempts once died on the public endpoint returning an error page mid-trade. A send never fails over: a transaction that timed out may still have been received, and re-sending it elsewhere is how one trade becomes two. Leave blank for the public endpoint. Free tiers, as advertised: dRPC ~50M CU/mo · Alchemy 30M CU/mo · QuickNode 10M credits/mo · Chainstack 3M req/mo · Helius 1M credits at 10 rps · Ankr 30 rps."><svg class="ic"><use href="#i-info"/></svg></button></label>
+          <textarea id="fRpcHttp" rows="3" autocomplete="off" spellcheck="false"
+                    placeholder="https://api.mainnet-beta.solana.com"></textarea>
+          <div class="chips" id="rpcProviders">
+            <span class="unit">Insert</span>
+            <button type="button" class="chip" data-rpc="https://lb.drpc.org/ogrpc?network=solana&amp;dkey=YOUR_KEY">dRPC</button>
+            <button type="button" class="chip" data-rpc="https://solana-mainnet.g.alchemy.com/v2/YOUR_KEY">Alchemy</button>
+            <button type="button" class="chip" data-rpc="https://mainnet.helius-rpc.com/?api-key=YOUR_KEY">Helius</button>
+            <button type="button" class="chip" data-rpc="https://solana-mainnet.core.chainstack.com/YOUR_KEY">Chainstack</button>
+            <button type="button" class="chip" data-rpc="https://rpc.ankr.com/solana">Ankr</button>
+            <button type="button" class="chip" data-rpc="https://api.mainnet-beta.solana.com">Public</button>
           </div>
         </div>
         <div class="field">
-          <label for="fPass">Passphrase</label>
-          <input type="password" id="fPass" autocomplete="off">
-          <div class="hint">
-            Encrypts the key at rest with Argon2id. There is no recovery if it is lost —
-            re-import the original key instead.
+          <label for="fRpcWs">WebSocket endpoint
+            <button class="info" type="button" data-tip="Where pool updates arrive. Leave blank for the public one. A provider URL carries your API key: it is stored in plain text in config.toml (which is gitignored), and panels show the host with the key masked. Set CRYPTOBOT_RPC_HTTP_URL and CRYPTOBOT_RPC_WS_URL in the environment instead if you would rather it never touched the file."><svg class="ic"><use href="#i-info"/></svg></button></label>
+          <input type="text" id="fRpcWs" autocomplete="off" spellcheck="false" placeholder="wss://api.mainnet-beta.solana.com">
+        </div>
+        <div class="actions">
+          <button id="btnSave" class="key key-go">Save, archive and restart</button>
+          <span class="result" id="saveResult"></span>
+        </div>
+      </section>
+
+      <div class="span6 stack">
+        <section class="module">
+          <div class="mod-head"><h2>Submission</h2></div>
+          <p class="caution hot">The last switch before real money moves.
+            <button class="info" type="button" data-tip="Separate from Mode on purpose: arming Live and allowing spending are two decisions, and this is the second one."><svg class="ic"><use href="#i-info"/></svg></button></p>
+          <p class="state-text" id="dryState">Checking…</p>
+          <div class="field" id="spendConfirmWrap" hidden>
+            <label for="fSpendConfirm">Type <code>SPEND</code> to allow real transactions</label>
+            <input type="text" id="fSpendConfirm" autocomplete="off" spellcheck="false">
           </div>
-        </div>
-        <button id="btnImport" class="primary">Encrypt and save key</button>
-      </div>
+          <div class="actions">
+            <button id="btnAllowSpend" class="key key-hot">Allow real transactions</button>
+            <button id="btnDryRun" class="key key-go">Back to dry run</button>
+          </div>
+          <p class="result" id="dryResult"></p>
+        </section>
 
-      <div id="walletUnlock" hidden>
-        <div class="field">
-          <label for="fUnlockPass">Passphrase</label>
-          <input type="password" id="fUnlockPass" autocomplete="off">
-          <div class="hint">Unlocks the key for this session only.</div>
-        </div>
-        <button id="btnUnlock" class="primary">Unlock</button>
-        <button id="btnForget">Remove key</button>
-      </div>
-      <p class="note" id="walletResult"></p>
+        <section class="module">
+          <div class="mod-head"><h2>Mode</h2></div>
+          <div class="choice">
+            <label class="opt"><input type="radio" name="mode" id="modeDemo" value="paper">
+              <span><b>Demo</b> — price every cycle and record what would have cleared. Signs nothing.</span></label>
+            <label class="opt"><input type="radio" name="mode" id="modeLive" value="live">
+              <span><b>Live</b> — sign and submit real transactions with the configured key.</span></label>
+          </div>
+          <div id="liveAccount" hidden></div>
+          <p class="state-text" id="modeState">Checking…</p>
+          <div class="field" id="modeConfirmWrap" hidden>
+            <label for="fModeConfirm">Type <code>LIVE</code> to confirm
+              <button class="info" type="button" data-tip="Switching either way archives the current run. The ledger has no column saying which mode produced a row, so a run that changed mode part way through would leave a P&amp;L that is part simulation and part real money with no way to separate them."><svg class="ic"><use href="#i-info"/></svg></button></label>
+            <input type="text" id="fModeConfirm" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="actions">
+            <button id="btnSetMode" class="key">Apply mode</button>
+            <span class="result" id="modeResult"></span>
+          </div>
+        </section>
 
-      <h2 style="margin-top:20px">Risk limits</h2>
-      <div class="hint" style="margin-bottom:10px">
-        Hard stops, not targets. Nothing is signed that breaches one, and a tripped
-        breaker stays tripped until it is cleared deliberately.
-      </div>
-      <div class="field">
-        <label for="fMaxPos">Maximum position (USD)</label>
-        <input type="number" id="fMaxPos" step="1" min="0.01">
-        <div class="hint">
-          The most any single trade may carry, checked by the risk gate right before
-          signing. <b>Keep this equal to Working capital</b>, under Trading Parameters —
-          looser and it never binds because sizing never proposes that much; tighter and
-          it silently overrides what sizing already capped, refusing trades that looked
-          fine when they were found.
-        </div>
-      </div>
-      <div class="field">
-        <label for="fMaxLoss">Maximum daily loss (USD)</label>
-        <input type="number" id="fMaxLoss" step="0.5" min="0.01">
-        <div class="hint">Realised losses reaching this halt trading for the day.</div>
-      </div>
-      <div class="field">
-        <label for="fMinNet">Minimum net profit (USD)</label>
-        <input type="number" id="fMinNet" step="0.001" min="0">
-        <div class="hint">
-          Below this a trade is indistinguishable from noise in the estimate that
-          produced it — and that estimate is what is being trusted when it signs.
-        </div>
-      </div>
-      <div class="field">
-        <label for="fMaxFails">Consecutive failures before stopping</label>
-        <input type="number" id="fMaxFails" step="1" min="1">
-        <div class="hint">
-          A lost race does not count. Only reverts and rejections, which mean something
-          is wrong that retrying will not fix.
-        </div>
-      </div>
-      <div class="field">
-        <label for="fHaltCooldown">Halt cooldown (seconds)</label>
-        <input type="number" id="fHaltCooldown" step="1" min="0">
-        <div class="hint">
-          How long a stop above stands before trading tries again on its own. This is
-          not a claim that whatever tripped it is fixed — only a bound on how long the
-          bot sits idle before finding out by trying again.
-          <b>0 disables this</b> — a stop then stands until the app is restarted, which
-          used to be the only way out, since nothing ever called resume automatically.
-        </div>
-      </div>
-      <button id="btnSaveLimits" class="primary">Save limits</button>
-      <p class="note" id="limitsResult"></p>
+        <section class="module">
+          <div class="mod-head"><h2>Wallet</h2>
+            <button class="info" type="button" data-tip="The measured edge is currently negative: the typical tradeable edge sits below the ~2 bps it costs to cross two pools, and HANDOVER §4 records an unexplained result that makes the headline profit unproven. A key here does not change that. Use a wallet holding only what you are prepared to lose."><svg class="ic"><use href="#i-info"/></svg></button></div>
+          <p class="state-text" id="walletState">Checking…</p>
+          <div id="accountPanel" class="account" hidden>
+            <div class="acct-row">
+              <span class="label">Address</span>
+              <code id="accAddress" class="acct-addr">—</code>
+              <button id="btnCopyAddr" class="icon-key" type="button" aria-label="Copy address" title="Copy address"><svg class="ic"><use href="#i-copy"/></svg></button>
+            </div>
+            <div class="acct-row top">
+              <span class="label">Holdings</span>
+              <div id="accBalances" class="acct-holdings">not loaded</div>
+            </div>
+            <div id="accReadiness" class="acct-verdict"></div>
+            <div class="actions">
+              <button id="btnRefreshBalances" class="key" type="button"><svg class="ic"><use href="#i-refresh"/></svg>Refresh balances</button>
+              <span class="result" id="accSource"></span>
+            </div>
+          </div>
+          <div id="walletSetup">
+            <div class="field">
+              <label for="fSecret">Private key
+                <button class="info" type="button" data-tip="Encrypted immediately and never stored in the clear. It is not written to config.toml, never logged, and the field is cleared as soon as it is read."><svg class="ic"><use href="#i-info"/></svg></button></label>
+              <input type="password" id="fSecret" autocomplete="off" spellcheck="false"
+                     placeholder="base58, or a [1,2,3,…] array from solana-keygen">
+            </div>
+            <div class="field">
+              <label for="fPass">Passphrase
+                <button class="info" type="button" data-tip="Encrypts the key at rest with Argon2id. There is no recovery if it is lost — re-import the original key instead."><svg class="ic"><use href="#i-info"/></svg></button></label>
+              <input type="password" id="fPass" autocomplete="off">
+            </div>
+            <div class="actions"><button id="btnImport" class="key key-go">Encrypt and save key</button></div>
+          </div>
+          <div id="walletUnlock" hidden>
+            <div class="field">
+              <label for="fUnlockPass">Passphrase <span class="unit">unlocks for this session only</span></label>
+              <input type="password" id="fUnlockPass" autocomplete="off">
+            </div>
+            <div class="actions">
+              <button id="btnUnlock" class="key key-go">Unlock</button>
+              <button id="btnForget" class="key key-danger">Remove key</button>
+            </div>
+          </div>
+          <p class="result" id="walletResult"></p>
+        </section>
 
-      <h2 style="margin-top:20px">Recording to</h2>
-      <p class="note">
-        <code id="fRoot">…</code>
-      </p>
-      <div class="hint">
-        The config, the ledger and the archives all live here. Run from a checkout this
-        is the repository; installed, it is a per-user folder, because the folder the
-        app is installed into is not writable by the account running it.
+        <section class="module">
+          <div class="mod-head"><h2>Risk limits</h2>
+            <button class="info" type="button" data-tip="Hard stops, not targets. Nothing is signed that breaches one, and a tripped breaker stays tripped until it is cleared deliberately or its cooldown ends."><svg class="ic"><use href="#i-info"/></svg></button></div>
+          <div class="fields">
+            <div class="field">
+              <label for="fMaxPos">Maximum position <span class="unit">USD</span>
+                <button class="info" type="button" data-tip="The most any single trade may carry, checked by the risk gate right before signing. Keep this equal to Working capital — looser and it never binds because sizing never proposes that much; tighter and it silently overrides what sizing already capped, refusing trades that looked fine when they were found."><svg class="ic"><use href="#i-info"/></svg></button></label>
+              <input type="number" id="fMaxPos" step="1" min="0.01">
+            </div>
+            <div class="field">
+              <label for="fMaxLoss">Maximum daily loss <span class="unit">USD</span>
+                <button class="info" type="button" data-tip="Realised losses reaching this halt trading for the day."><svg class="ic"><use href="#i-info"/></svg></button></label>
+              <input type="number" id="fMaxLoss" step="0.5" min="0.01">
+            </div>
+            <div class="field">
+              <label for="fMinNet">Minimum net profit <span class="unit">USD</span>
+                <button class="info" type="button" data-tip="Below this a trade is indistinguishable from noise in the estimate that produced it — and that estimate is what is being trusted when it signs."><svg class="ic"><use href="#i-info"/></svg></button></label>
+              <input type="number" id="fMinNet" step="0.001" min="0">
+            </div>
+            <div class="field">
+              <label for="fMaxFails">Failures before stopping
+                <button class="info" type="button" data-tip="Consecutive failures. A lost race does not count — only reverts and rejections, which mean something is wrong that retrying will not fix."><svg class="ic"><use href="#i-info"/></svg></button></label>
+              <input type="number" id="fMaxFails" step="1" min="1">
+            </div>
+            <div class="field">
+              <label for="fHaltCooldown">Halt cooldown <span class="unit">seconds</span>
+                <button class="info" type="button" data-tip="How long a stop stands before trading tries again on its own. Not a claim that whatever tripped it is fixed — only a bound on how long the bot sits idle before finding out by trying again. 0 disables this: a stop then stands until the app is restarted."><svg class="ic"><use href="#i-info"/></svg></button></label>
+              <input type="number" id="fHaltCooldown" step="1" min="0">
+            </div>
+          </div>
+          <div class="actions">
+            <button id="btnSaveLimits" class="key key-go">Save limits</button>
+            <span class="result" id="limitsResult"></span>
+          </div>
+        </section>
+
+        <section class="module">
+          <div class="mod-head"><h2>Startup</h2></div>
+          <label class="toggle"><input type="checkbox" id="fAutostart"><span class="track"></span>
+            <span>Launch with Windows</span>
+            <button class="info" type="button" data-tip="The app starts with the session and sits in the tray."><svg class="ic"><use href="#i-info"/></svg></button></label>
+          <label class="toggle"><input type="checkbox" id="fAutorestart"><span class="track"></span>
+            <span>Restart the bot if it dies</span>
+            <button class="info" type="button" data-tip="Off by default, deliberately. A bot that silently resurrects itself hides the failures this app exists to make visible, and what it starts is a new run rather than a continuation of the old one."><svg class="ic"><use href="#i-info"/></svg></button></label>
+          <div class="path-line"><span class="label">Recording to</span> <code id="fRoot">…</code>
+            <button class="info" type="button" data-tip="The config, the ledger and the archives all live here. Run from a checkout this is the repository; installed, it is a per-user folder, because the folder the app is installed into is not writable by the account running it."><svg class="ic"><use href="#i-info"/></svg></button></div>
+        </section>
       </div>
     </div>
   </section>
 
   <!-- ── RUNS ─────────────────────────────────────────────────────────── -->
   <section class="view" id="view-runs" hidden>
-    <div class="panel span12">
-      <h2>Archived runs</h2>
-      <table>
-        <thead>
-          <tr><th>Run</th><th class="n">Size</th><th style="width:170px"></th></tr>
-        </thead>
-        <tbody id="runsBody"></tbody>
-      </table>
-      <div class="empty" id="runsEmpty">No archived runs yet.</div>
-      <p class="note" id="runsNote"></p>
-    </div>
+    <section class="module">
+      <div class="mod-head"><h2>Archived runs</h2>
+        <span class="scope" id="runsNote"></span>
+        <button class="info" type="button" data-tip="Every ledger that was filed away when a run ended — by Archive &amp; start fresh, by saving parameters, or by switching mode. Opening one shows it under History, read-only; the live ledger is untouched."><svg class="ic"><use href="#i-info"/></svg></button></div>
+      <div class="runs" id="runsBody"></div>
+      <div class="empty" id="runsEmpty">No archived runs yet. Archiving the current run files its ledger here.</div>
+    </section>
   </section>
 
   <!-- ── LOG ──────────────────────────────────────────────────────────── -->
   <section class="view" id="view-log" hidden>
-    <div class="panel span12">
-      <h2>Bot log</h2>
-      <pre class="log" id="logBody">No log yet.</pre>
-    </div>
+    <section class="module log-module">
+      <div class="mod-head">
+        <h2>Bot log</h2>
+        <div class="chips" id="logFilters" role="group" aria-label="Filter the log">
+          <button class="chip on" data-f="all" type="button">All</button>
+          <button class="chip" data-f="trade" type="button">Trades</button>
+          <button class="chip" data-f="refused" type="button">Refusals</button>
+          <button class="chip" data-f="warn" type="button">Warnings</button>
+          <button class="chip" data-f="error" type="button">Faults</button>
+        </div>
+        <label class="search"><svg class="ic"><use href="#i-search"/></svg>
+          <input type="search" id="logSearch" placeholder="Search the log" autocomplete="off" spellcheck="false"></label>
+        <button id="logPause" class="icon-key" type="button" aria-pressed="false" aria-label="Pause following" title="Pause following"><svg class="ic"><use href="#i-pause"/></svg></button>
+      </div>
+      <div class="log" id="logBody" role="log" aria-live="off">No log yet.</div>
+    </section>
   </section>
 
 </main>
@@ -561,10 +494,13 @@
   <span><i>pools</i> <b id="sPools">—</b></span>
   <span><i>stale</i> <b id="sStale">—</b></span>
   <span><i>sweep</i> <b id="sSweep">—</b></span>
+  <span><i>SOL</i> <b id="sSol">—</b></span>
   <span class="sep"></span>
   <span><i>ledger</i> <b id="sLedger">—</b></span>
   <span><b id="sMode">—</b></span>
 </footer>
+
+<div id="tip" class="tip" role="tooltip" hidden></div>
 
 <script src="app.js"></script>
 </body>

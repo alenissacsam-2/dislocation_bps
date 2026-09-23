@@ -63,3 +63,8 @@ crates/desk/binaries/
 # unrelated to this project, and swept in once by a `git add -A`. Never push it.
 Claude.mobileconfig
 *.mobileconfig
+
+# Retired artifacts moved aside on 2026-09-23: old ledgers, stale builds. Safe to delete.
+_retired/
+token-demand.json
+token-demand.json.tmp

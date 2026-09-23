@@ -180,6 +180,20 @@ jito_tip_max_lamports = 20000
 # way; switching this off saves one round trip (~100 ms) per trade.
 jito_simulate_first = true
 
+# Token accounts for intermediate mints, rotated by measured demand.
+#
+# A cycle through a mint the wallet holds no account for cannot pass its profit check,
+# because the account's rent would come out of the balance the profit is read from.
+# The bot records which mints its execution attempts needed over a rolling day
+# (token-demand.json). It opens an account for a mint asked for twice, and when all
+# slots are taken it swaps out the least-asked one if the new mint is clearly worth
+# more. It closes an empty account that nothing asked for in a whole day. Each account
+# is a refundable deposit of about 0.002 SOL. Zero slots turns opening off.
+#
+# `extra_token_mints` are pins: opened at startup and never closed by the rotation.
+# token_account_slots = 6
+# extra_token_mints = []
+
 # Build, sign and simulate every trade — and submit none.
 #
 # The last switch before real money moves, and deliberately separate from `mode`.

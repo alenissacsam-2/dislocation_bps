@@ -1079,8 +1079,8 @@ impl Trader {
         if let Some(mint) = self.mint_without_an_account(plan) {
             return Ok(Attempt::Refused(format!(
                 "the wallet holds no token account for {}, and opening one costs {} lamports \
-                 of rent out of the same balance this trade's profit is measured in — add \
-                 the mint to extra_token_mints to pay that deposit on purpose",
+                 of rent out of the same balance this trade's profit is measured in — the \
+                 bot opens one itself once attempts keep asking for this mint",
                 to_pubkey(&mint),
                 route::TOKEN_ACCOUNT_RENT
             )));
@@ -1888,6 +1888,110 @@ impl Trader {
              was {}. Cycles through those mints stay blocked until one lands.",
             last_signature.unwrap_or_else(|| "—".into())
         )
+    }
+
+    /// The accounts [`crate::demand`] may close: held, and not in `protected` (the base
+    /// mints and whatever the operator pinned). wSOL is never one of them.
+    #[must_use]
+    pub fn managed_accounts(
+        &self,
+        protected: &std::collections::HashSet<Pubkey32>,
+    ) -> std::collections::HashSet<Pubkey32> {
+        let wsol = *pk(programs::WSOL_MINT).as_array();
+        self.accounts_held
+            .iter()
+            .filter(|m| **m != wsol && !protected.contains(*m))
+            .copied()
+            .collect()
+    }
+
+    /// The first mint of `plan` the wallet holds no account for, if the set is known.
+    #[must_use]
+    pub fn missing_account(&self, plan: &CyclePlan) -> Option<Pubkey32> {
+        self.mint_without_an_account(plan)
+    }
+
+    /// Open the account for one mint, mid-run, and start treating it as held.
+    ///
+    /// The same path as the startup open — simulated first, re-sent until confirmed —
+    /// so everything said on [`Trader::ensure_token_accounts`] holds. Returns whether
+    /// the account exists afterwards; `false` in a dry run, which opens nothing.
+    ///
+    /// # Errors
+    /// If the chain cannot be reached or the open does not simulate cleanly.
+    pub async fn open_account(&mut self, mint: &Pubkey32) -> Result<bool> {
+        self.ensure_token_accounts(std::slice::from_ref(mint)).await?;
+        let missing = self.learn_token_accounts(std::slice::from_ref(mint)).await?;
+        Ok(missing.is_empty())
+    }
+
+    /// Close the wallet's account for `mint` and take its deposit back, if it is empty.
+    ///
+    /// Returns whether the account is gone afterwards. An account that still holds a
+    /// balance is left alone and reported as `false`: closing one would fail on chain,
+    /// and emptying it is a trade, which is not this function's to make.
+    ///
+    /// # Errors
+    /// If the chain cannot be reached, or the close does not simulate cleanly.
+    pub async fn close_account(&mut self, mint: &Pubkey32) -> Result<bool> {
+        let program = self.token_program_of(mint);
+        let ata = associated_token_address(&self.owner, &to_pubkey(mint), &program);
+        let found = self.exec.rpc.accounts_full(std::slice::from_ref(&ata)).await?;
+        let Some(acc) = found.into_iter().next().flatten() else {
+            self.accounts_held.remove(mint);
+            return Ok(true);
+        };
+        // A token account's amount sits at bytes 64..72 under both programs.
+        let amount = acc
+            .data
+            .get(64..72)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map_or(u64::MAX, u64::from_le_bytes);
+        if amount != 0 {
+            tracing::info!(
+                "kept the account for {}: it holds {amount} base units, and only an empty \
+                 account can be closed",
+                to_pubkey(mint)
+            );
+            return Ok(false);
+        }
+        let ixs = vec![
+            tx::set_compute_limit(20_000),
+            tx::close_token_account(&ata, &self.owner, &self.owner, &program),
+        ];
+        let (blockhash, _) = self.exec.rpc.latest_blockhash().await?;
+        let assembled = tx::assemble(&self.exec.wallet, &ixs, blockhash)?;
+        let sim = self.exec.rpc.simulate(&assembled.tx_base64, &[]).await?;
+        if !sim.succeeded() {
+            anyhow::bail!(
+                "closing the account for {} did not simulate cleanly, so nothing was sent: {} {}",
+                to_pubkey(mint),
+                sim.err.clone().unwrap_or_else(|| "unknown".into()),
+                sim.error_context().unwrap_or_default()
+            );
+        }
+        if self.opts.dry_run {
+            tracing::info!("dry run — closing the account for {} simulated cleanly", to_pubkey(mint));
+            return Ok(false);
+        }
+        let signature = self.exec.rpc.send(&assembled.tx_base64, true).await?;
+        match self.confirm(&signature, 10).await {
+            Some(true) => {
+                self.accounts_held.remove(mint);
+                tracing::warn!(
+                    "closed the account for {} and took back its {} lamport deposit: {signature}",
+                    to_pubkey(mint),
+                    acc.lamports
+                );
+                Ok(true)
+            }
+            Some(false) => anyhow::bail!("closing the account reverted on chain: {signature}"),
+            None => {
+                // Not known is not failed. Re-read next time rather than guess.
+                tracing::warn!("{signature} (closing an account) has not confirmed yet");
+                Ok(false)
+            }
+        }
     }
 
     /// Wait briefly for a submitted signature to reach the chain, and say what happened.

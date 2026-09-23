@@ -181,8 +181,9 @@ crates/desk       the Windows application. runner.rs (process control behind one
                   archive.rs, history.rs (cb-ledger read-only), paths.rs, ui/
 scripts           build.ps1 (Windows build), installer.ps1 (the NSIS bundle),
                   build_registry.py (regenerates the pool registry).
-                  env.sh/build.sh/run-forever.sh are the WSL-era scripts and are kept
-                  only because build_registry.py is still driven from a shell.
+                  The WSL-era env.sh/build.sh/run-forever.sh were removed on 2026-09-23:
+                  they built into a different target directory and could start a
+                  second bot beside the desk's.
 .github/workflows ci.yml (clippy + tests on windows-latest), release.yml (builds the
                   installer and attaches it to a tag)
 ```
