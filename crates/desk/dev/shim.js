@@ -62,4 +62,14 @@
     throw new Error("shim: no fixture for " + cmd);
   }
   window.__TAURI__ = { core: { invoke } };
+
+  // #view=history&theme=light, so a headless browser can capture any view in either
+  // theme without clicking.
+  const want = new URLSearchParams(location.hash.slice(1));
+  if (want.get("theme")) document.documentElement.setAttribute("data-theme", want.get("theme"));
+  if (want.get("view")) {
+    addEventListener("load", () => setTimeout(() => {
+      document.querySelector(`[data-view="${want.get("view")}"]`)?.click();
+    }, 300));
+  }
 })();

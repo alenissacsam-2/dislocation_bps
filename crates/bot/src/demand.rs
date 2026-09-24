@@ -45,6 +45,13 @@ pub const MIN_ASKS_TO_OPEN: u32 = 2;
 /// base fees each time for no change in reach.
 pub const REPLACE_MARGIN: f64 = 1.5;
 
+/// The least a mint's asks must have expected between them, in USD, before an account
+/// is opened for it: about the two base fees that opening and later closing cost.
+///
+/// Measured the first morning: the rotation opened an account for a mint asked for
+/// twice at $0.0000 expected, because every ask had cleared the base fee by a hair.
+pub const MIN_USD_TO_OPEN: f64 = 0.001;
+
 /// How much one mint has been asked for over the window.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Score {
@@ -169,7 +176,7 @@ pub fn on_missing(
     let scores = demand.scores();
     let score_of = |m: &Pubkey32| scores.get(m).copied().unwrap_or_default();
     let want = score_of(wanted);
-    if want.asks < MIN_ASKS_TO_OPEN {
+    if want.asks < MIN_ASKS_TO_OPEN || want.usd < MIN_USD_TO_OPEN {
         return None;
     }
     if managed.len() < slots {
@@ -216,6 +223,15 @@ mod tests {
         assert_eq!(on_missing(&d, &set(&[]), 4, &m(1)), None);
         d.record(20, &m(1), 0.01);
         assert_eq!(on_missing(&d, &set(&[]), 4, &m(1)), Some(Move::Open(m(1))));
+    }
+
+    #[test]
+    fn a_mint_asked_for_often_but_worth_nothing_does_not_get_an_account() {
+        let mut d = Demand::new(0);
+        for t in 0..9 {
+            d.record(t, &m(4), 0.000_01);
+        }
+        assert_eq!(on_missing(&d, &set(&[]), 4, &m(4)), None);
     }
 
     #[test]

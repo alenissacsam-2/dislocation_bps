@@ -46,7 +46,15 @@ const $ = (id) => document.getElementById(id);
 const fmt = (n, d = 2) => (Number.isFinite(n) ? n.toFixed(d) : "—");
 const money = (n) => (Number.isFinite(n) ? (n < 0 ? "−$" : "$") + Math.abs(n).toFixed(Math.abs(n) < 1 ? 4 : 2) : "—");
 const bps = (n) => (Number.isFinite(n) ? (n < 0 ? "−" : "") + Math.abs(n).toFixed(2) : "—");
-const int = (n) => (Number.isFinite(n) ? Math.round(n).toLocaleString() : "—");
+const int = (n) => (Number.isFinite(n) ? Math.round(n).toLocaleString("en-US") : "—");
+/** Dollars at a glance: $5, $5.8k, $127k, $1.3M. Digit grouping follows the locale otherwise, and en-IN writes $1,26,982. */
+const usdCompact = (n) => {
+  if (!Number.isFinite(n)) return "—";
+  const a = Math.abs(n);
+  if (a >= 1e6) return "$" + (n / 1e6).toFixed(a >= 1e7 ? 0 : 1) + "M";
+  if (a >= 1e3) return "$" + (n / 1e3).toFixed(a >= 1e4 ? 0 : 1) + "k";
+  return "$" + Math.round(n);
+};
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 function esc(s) {
@@ -286,7 +294,7 @@ function onRoutes(e) {
       `<td><div class="mini"><i style="width:${(r.dislocationBps / scale) * 100}%"></i><s style="left:${(r.feeBps / scale) * 100}%"></s></div></td>` +
       `<td class="n">${fmt(r.dislocationBps)}</td>` +
       `<td class="n">${fmt(r.feeBps)}</td>` +
-      `<td class="n">${Number.isFinite(r.depthUsd) ? "$" + Math.round(r.depthUsd).toLocaleString() : "—"}</td>`;
+      `<td class="n">${usdCompact(r.depthUsd)}</td>`;
     body.appendChild(tr);
   }
   $("routesEmpty").hidden = S.routes.length > 0;
@@ -551,6 +559,7 @@ function onOpportunity(ev) {
 }
 
 function onExecution(ev) {
+  if (!ev.paper) { recordAttempt(classifyAttempt(ev.reason || ""), ev.tsMs || Date.now(), ev.tipPaidUsd || 0); paintAttempts(); }
   if (!RUN.store) return;
   const st = RUN.store;
   if (ev.paper) {
@@ -707,14 +716,127 @@ function ingestLog(lines, reset) {
       if (/^live mode: waiting for the wallet passphrase|^mode: PAPER/.test(msg)) { start = i; break; }
     }
     LOGA.drift = new Map(); LOGA.gaps = 0;
+    ATT.pts = []; ATT.rate = 0; ATT.accounts = 0; ATT.tipsUsd = 0;
     lines = lines.slice(start);
   }
   for (const line of lines) {
     const { msg } = parseLogLine(line);
     if (/^feed silent for over/.test(msg)) LOGA.gaps += 1;
     ingestDrift(msg);
+    ingestAttempt(msg, parseLogLine(line).ts);
   }
-  paintDrift(); paintHealth();
+  paintDrift(); paintHealth(); paintAttempts();
+}
+
+/* ── attempts ─────────────────────────────────────────────────────────────
+ * Every cycle the bot actually tried — fetched fresh state, re-priced, built a floor —
+ * and where the fresh price landed against that floor. The funnel says how many; this
+ * says by how much, which is the number that decides whether anything will ever clear.
+ * Backfilled from the log for the current run at start, then fed by execution events. */
+const ATT = { pts: [], rate: 0, accounts: 0, tipsUsd: 0 };
+const ATT_KINDS = {
+  loss: { name: "loss on fresh price", tone: "--coral" },
+  fee: { name: "cleared price, not fee", tone: "--amber" },
+  sim: { name: "failed simulation", tone: "--amber" },
+  miss: { name: "sent, not included", tone: "--violet" },
+  revert: { name: "landed, reverted", tone: "--coral" },
+  landed: { name: "landed", tone: "--teal" },
+};
+
+function classifyAttempt(msg) {
+  let m = msg.match(/spends (\d+) and guarantees only (\d+) back/);
+  if (m) return { kind: "loss", bps: ((+m[2] - +m[1]) / +m[1]) * 1e4 };
+  if (/guarantees \d+ more than it spends, and landing it costs \d+/.test(msg)) return { kind: "fee", bps: null };
+  if (/not included/.test(msg)) return { kind: "miss", bps: null };
+  if (/landed and reverted|landed, reverted/.test(msg)) return { kind: "revert", bps: null };
+  if (/^LANDED |submitted and landed/.test(msg)) return { kind: "landed", bps: null };
+  if (/^(refused: |probe not run: )?simulation/.test(msg)) return { kind: "sim", bps: null };
+  if (/the last Jito send was/.test(msg)) return { rate: true };
+  // Both the startup open and the rotation confirm with this one line; the rotation's
+  // own summary line follows it and would count the same account twice.
+  if (/^opened \d+ token account\(s\), confirmed/.test(msg)) return { account: true };
+  return null;
+}
+
+function recordAttempt(c, t, tipUsd) {
+  if (!c) return;
+  if (c.rate) { ATT.rate += 1; return; }
+  if (c.account) { ATT.accounts += 1; return; }
+  ATT.pts.push({ t, kind: c.kind, bps: c.bps });
+  if (c.kind === "landed") ATT.tipsUsd += tipUsd || 0;
+  if (ATT.pts.length > 5000) ATT.pts.shift();
+}
+
+function ingestAttempt(msg, ts) {
+  const t = ts ? Date.parse(ts + "Z") : Date.now();
+  recordAttempt(classifyAttempt(msg), t, 0);
+}
+
+function paintAttempts() {
+  if (S.view !== "live") return;
+  drawAttempts();
+  const n = {};
+  for (const p of ATT.pts) n[p.kind] = (n[p.kind] || 0) + 1;
+  const sent = (n.miss || 0) + (n.landed || 0) + (n.revert || 0);
+  $("attLegend").innerHTML = Object.entries(ATT_KINDS)
+    .filter(([k]) => n[k])
+    .map(([k, v]) => `<span class="lg"><i style="background:var(${v.tone})"></i>${esc(v.name)} <b>${int(n[k])}</b></span>`)
+    .join("") || `<span class="lg muted">No attempt yet this run.</span>`;
+  const losses = ATT.pts.filter((p) => p.kind === "loss" && Number.isFinite(p.bps)).map((p) => p.bps);
+  const kv = [
+    ["Real attempts", int(ATT.pts.length)],
+    ["Median miss", losses.length ? fmt(median(losses)) + " bp" : "—"],
+    ["Closest miss", losses.length ? fmt(Math.max(...losses)) + " bp" : "—"],
+    ["Sent to Jito", int(sent)],
+    ["Landed", int(n.landed || 0), n.landed ? "ok" : ""],
+    ["Not included, free", int(n.miss || 0)],
+    ["Tips paid", ATT.tipsUsd ? "$" + ATT.tipsUsd.toFixed(4) : "$0"],
+    ["Turned away by the 1/s limit", int(ATT.rate)],
+    ["Token accounts opened", int(ATT.accounts)],
+  ];
+  $("jitoKv").innerHTML = kv
+    .map(([k, v, cls]) => `<div class="kv-row"><span>${esc(k)}</span><b class="num ${cls || ""}">${esc(v)}</b></div>`)
+    .join("");
+}
+
+function drawAttempts() {
+  const cv = $("attChart"); if (!cv) return;
+  const p = prep(cv); if (!p) return;
+  const { g, w, h } = p;
+  const pad = { l: 44, r: 16, t: 12, b: 20 };
+  if (!ATT.pts.length) return empty(g, w, h, "no attempt has reached a fresh re-price yet this run");
+
+  const t0 = Math.min(...ATT.pts.map((q) => q.t));
+  const t1 = Math.max(Date.now(), t0 + 60_000);
+  const ys = ATT.pts.filter((q) => Number.isFinite(q.bps)).map((q) => q.bps).sort((a, b) => a - b);
+  const lo = Math.min(-2, ys.length ? ys[Math.floor(ys.length * 0.05)] * 1.15 : -10);
+  const hi = 3;
+  const X = (t) => pad.l + ((w - pad.l - pad.r) * (t - t0)) / (t1 - t0);
+  const Y = (v) => h - pad.b - ((clamp(v, lo, hi) - lo) / (hi - lo)) * (h - pad.t - pad.b);
+  const ticks = [lo, lo / 2, 0, hi];
+  grid(g, w, h, pad, ticks.map(Y));
+  for (const v of ticks) label(g, (v > 0 ? "+" : "") + v.toFixed(v === 0 ? 0 : 1), pad.l - 8, Y(v));
+
+  // The floor: fee and tip guaranteed on chain. Above it a trade can be sent.
+  g.strokeStyle = css("--teal"); g.globalAlpha = 0.55; g.setLineDash([4, 4]); g.lineWidth = 1;
+  g.beginPath(); g.moveTo(pad.l, Y(0)); g.lineTo(w - pad.r, Y(0)); g.stroke();
+  g.setLineDash([]); g.globalAlpha = 1;
+  label(g, "floor", w - pad.r, Y(0) - 8, "right", css("--teal"));
+
+  // Where a point has no measured distance, it sits just under the floor (refused for
+  // something other than price) or above it (sent), so its outcome still reads.
+  const yOf = (q) => Number.isFinite(q.bps) ? q.bps
+    : q.kind === "miss" || q.kind === "landed" || q.kind === "revert" ? hi * 0.55 : -0.4;
+  for (const q of ATT.pts) {
+    const big = q.kind === "landed" || q.kind === "miss" || q.kind === "revert";
+    g.fillStyle = css(ATT_KINDS[q.kind].tone);
+    g.globalAlpha = big ? 1 : 0.7;
+    g.beginPath(); g.arc(X(q.t), Y(yOf(q)), big ? 4.5 : 2.6, 0, 7); g.fill();
+  }
+  g.globalAlpha = 1;
+  const mins = Math.round((t1 - t0) / 60_000);
+  label(g, mins >= 120 ? Math.round(mins / 60) + " h ago" : mins + " min ago", pad.l, h - 6, "left");
+  label(g, "now", w - pad.r, h - 6, "right");
 }
 
 function median(a) {
@@ -850,7 +972,13 @@ let historyInFlight = false;
 async function loadHistory(path) {
   if (historyInFlight) return;
   historyInFlight = true;
-  if (!S.history) $("pnlNote").textContent = "reading the ledger…";
+  if (!S.history) {
+    // A long live ledger takes seconds to aggregate. Say so in every panel rather than
+    // leaving five empty frames that read as broken.
+    $("pnlNote").textContent = "reading the ledger…";
+    const wait = `<div class="loading"><i></i><i></i><i></i><span>Reading the ledger — a long run takes a few seconds.</span></div>`;
+    for (const id of ["ladder", "contest", "race"]) $(id).innerHTML = wait;
+  }
   try {
     S.history = path ? await invoke("read_history_at", { path }) : await invoke("read_history");
     S.viewingArchive = path || null;
@@ -914,7 +1042,7 @@ function paintLadder(L) {
   const rungs = L.rungs || [];
   if (!rungs.length) { el.innerHTML = '<div class="empty">No ladder measured yet.</div>'; return; }
   const ceiling = Math.max(L.atOptimalUsd || 0, ...rungs.map((r) => r[1]), 1e-9);
-  el.innerHTML = rungs.map(([book, paid]) => barRow("$" + book.toLocaleString(), paid, ceiling)).join("")
+  el.innerHTML = rungs.map(([book, paid]) => barRow("$" + book.toLocaleString("en-US"), paid, ceiling)).join("")
     + barRow("unlimited", L.atOptimalUsd || 0, ceiling, "faint")
     + barRow("actual", L.realisedUsd || 0, ceiling, "teal");
 }
@@ -1077,7 +1205,7 @@ function setView(v) {
 }
 
 function drawAll() {
-  if (S.view === "live") { drawDivergence(); drawWall(); paintDrift(); paintHealth(); }
+  if (S.view === "live") { drawDivergence(); drawWall(); paintDrift(); paintHealth(); paintAttempts(); }
   if (S.view === "history" && S.history && S.history.available) { drawPnl(S.history.curve || []); drawScatter(S.history.episodes || []); }
 }
 
@@ -1522,14 +1650,14 @@ function renderLog() {
   const body = $("logBody");
   const q = LOGV.query;
   const out = [];
-  if (LOGV.banner) out.push(`<div class="ln fault"><span></span><span></span><span class="msg raw">${esc(LOGV.banner)}</span></div>`);
+  if (LOGV.banner) out.push(`<div class="ln k-fault"><span></span><span></span><span class="msg raw">${esc(LOGV.banner)}</span></div>`);
   let prev = null, rep = 0;
   const flush = () => {
     if (!prev) return;
     const { p, kind } = prev;
     let msg = esc(p.msg);
     if (q) msg = msg.replace(new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), (x) => `<mark>${x}</mark>`);
-    out.push(`<div class="ln ${kind}"><span class="ts">${esc(p.ts ? p.ts.slice(11, 19) : "")}</span>` +
+    out.push(`<div class="ln k-${kind}"><span class="ts">${esc(p.ts ? p.ts.slice(11, 19) : "")}</span>` +
       `<span class="lv ${p.lv}">${esc(p.lv)}</span><span class="msg">${msg}${rep > 1 ? `<span class="rep">×${rep}</span>` : ""}</span></div>`);
   };
   for (const line of LOGV.lines) {

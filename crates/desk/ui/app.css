@@ -29,6 +29,7 @@
   --violet-soft: rgba(163, 147, 242, 0.16);
   --green: #6fd08c;
   --coral: #ff6f5e;
+  --on-coral: #2a0c07;
   --coral-soft: rgba(255, 111, 94, 0.14);
 
   --hi: rgba(255, 255, 255, 0.045);
@@ -68,6 +69,7 @@
   --violet-soft: rgba(91, 72, 196, 0.12);
   --green: #25864a;
   --coral: #c93a26;
+  --on-coral: #ffffff;
   --coral-soft: rgba(201, 58, 38, 0.12);
 
   --hi: rgba(255, 255, 255, 0.85);
@@ -173,13 +175,14 @@ button { font: inherit; color: inherit; }
 .key .ic { width: 16px; height: 16px; }
 .key:hover:not(:disabled) { background: color-mix(in srgb, var(--plate-2) 88%, var(--ink)); }
 .key:active:not(:disabled) { box-shadow: var(--press); transform: translateY(1px); }
-.key:disabled { opacity: 0.4; cursor: default; box-shadow: none; background: var(--plate); }
+.key:disabled { opacity: 1; color: var(--ink-3); cursor: default; box-shadow: none; background: color-mix(in srgb, var(--plate) 60%, transparent); }
 .key-go { color: var(--ground); background: var(--green); }
 .key-go:hover:not(:disabled) { background: color-mix(in srgb, var(--green) 88%, white); }
 .key-go .ic { stroke: currentColor; }
-.key-hot { color: #fff; background: var(--coral); }
+.key-hot { color: var(--on-coral); background: var(--coral); }
 .key-hot:hover:not(:disabled) { background: color-mix(in srgb, var(--coral) 88%, white); }
 .key-danger { color: var(--coral); }
+.key-danger:hover:not(:disabled) { color: color-mix(in srgb, var(--coral) 70%, white); }
 :root[data-theme="light"] .key-go { color: #fff; }
 
 .link-key {
@@ -200,7 +203,7 @@ button { font: inherit; color: inherit; }
 
 .badge { font: 600 11px/1 var(--sans); letter-spacing: 0.08em; padding: 5px 9px; border-radius: 999px; margin-left: auto; }
 .badge-demo { color: var(--ink-2); background: var(--well); box-shadow: var(--press); }
-.badge-live { color: #fff; background: var(--coral); }
+.badge-live { color: var(--on-coral); background: var(--coral); }
 
 .seg {
   display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px;
@@ -507,10 +510,10 @@ p.result { margin: 10px 0 0; }
 .log .lv.INFO { color: var(--ink-3); }
 .log .lv.WARN { color: var(--amber); }
 .log .lv.ERROR { color: var(--coral); }
-.log .ln.trade .msg { color: var(--teal); }
-.log .ln.fault .msg { color: var(--coral); }
-.log .ln.refused .msg { color: var(--ink-2); }
-.log .ln.drift .msg { color: var(--violet); }
+.log .ln.k-trade .msg { color: var(--teal); }
+.log .ln.k-fault .msg { color: var(--coral); }
+.log .ln.k-refused .msg { color: var(--ink-2); }
+.log .ln.k-drift .msg { color: var(--violet); }
 .log .rep { color: var(--ink-3); margin-left: 8px; }
 .log mark { background: var(--amber-soft); color: var(--ink); border-radius: 3px; }
 .log .raw { color: var(--ink); }
@@ -530,3 +533,23 @@ p.result { margin: 10px 0 0; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
 }
+
+/* ── attempts and Jito ── */
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; font-size: 12px; color: var(--ink-2); }
+.legend .lg { display: inline-flex; align-items: center; gap: 6px; }
+.legend .lg i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.legend .lg b { font-family: var(--mono); font-weight: 600; color: var(--ink); }
+.legend .muted { color: var(--ink-3); }
+.kv { display: grid; gap: 2px; }
+.kv-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 7px 10px; border-radius: 10px; font-size: 13px; color: var(--ink-2); }
+.kv-row:nth-child(odd) { background: color-mix(in srgb, var(--well) 55%, transparent); }
+.kv-row b { font-family: var(--mono); font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
+.kv-row b.ok { color: var(--teal); }
+
+/* ── loading ── */
+.loading { display: flex; align-items: center; gap: 6px; padding: 18px 4px; color: var(--ink-3); font-size: 13px; }
+.loading i { width: 6px; height: 6px; border-radius: 50%; background: var(--amber); opacity: 0.35; animation: pulse 1.2s ease-in-out infinite; }
+.loading i:nth-child(2) { animation-delay: 0.15s; } .loading i:nth-child(3) { animation-delay: 0.3s; }
+.loading span { margin-left: 6px; }
+@keyframes pulse { 50% { opacity: 1; transform: translateY(-2px); } }
+@media (prefers-reduced-motion: reduce) { .loading i { animation: none; opacity: 0.7; } }

@@ -133,7 +133,8 @@
     </div>
 
     <div class="grid">
-      <section class="module span8" aria-labelledby="hFunnel">
+      <div class="span8 stack">
+      <section class="module" aria-labelledby="hFunnel">
         <div class="mod-head">
           <h2 id="hFunnel">Where opportunities die</h2>
           <span class="scope" id="funnelScope">since —</span>
@@ -142,15 +143,17 @@
         <div class="funnel" id="funnel"></div>
       </section>
 
-      <section class="module span4" aria-labelledby="hReasons">
+      <section class="module" aria-labelledby="hAttempts">
         <div class="mod-head">
-          <h2 id="hReasons">Why trades stop</h2>
-          <button class="info" type="button" data-tip="Every outcome the pipeline reported, grouped by cause and ranked. Grey is the market or a filter doing its job. Red is a fault: a halt, a reverted trade, a rejection that means something was built wrong, or an error."><svg class="ic"><use href="#i-info"/></svg></button>
+          <h2 id="hAttempts">Every real attempt</h2>
+          <span class="scope" id="attScope">this run</span>
+          <button class="info" type="button" data-tip="Each dot is one cycle the bot actually tried: it fetched fresh state, re-priced the route and built the floor. Height is how far the fresh price landed from that floor — above the line the trade cleared and went to Jito, below it the price had already moved and nothing was sent. Coral is a loss on the fresh price, amber cleared the price but not the fee, violet was sent and not included, teal landed. Read from the log at start, then live."><svg class="ic"><use href="#i-info"/></svg></button>
         </div>
-        <div class="reasons" id="reasons"></div>
+        <canvas id="attChart" class="chart"></canvas>
+        <div class="legend" id="attLegend"></div>
       </section>
 
-      <section class="module span8" aria-labelledby="hDiv">
+      <section class="module" aria-labelledby="hDiv">
         <div class="mod-head">
           <h2 id="hDiv">Venue divergence</h2>
           <span class="scope" id="divScope"></span>
@@ -158,14 +161,33 @@
         </div>
         <canvas id="divChart" class="chart tall"></canvas>
       </section>
+      </div>
 
-      <section class="module span4" aria-labelledby="hDrift">
+      <div class="span4 stack">
+      <section class="module" aria-labelledby="hReasons">
+        <div class="mod-head">
+          <h2 id="hReasons">Why trades stop</h2>
+          <button class="info" type="button" data-tip="Every outcome the pipeline reported, grouped by cause and ranked. Grey is the market or a filter doing its job. Red is a fault: a halt, a reverted trade, a rejection that means something was built wrong, or an error."><svg class="ic"><use href="#i-info"/></svg></button>
+        </div>
+        <div class="reasons" id="reasons"></div>
+      </section>
+
+      <section class="module" aria-labelledby="hJito">
+        <div class="mod-head">
+          <h2 id="hJito">Jito</h2>
+          <button class="info" type="button" data-tip="What reached the block engine this run. A bundle that is not included costs nothing; one that lands pays the base fee and its tip, both guaranteed on chain by the floor. Rate-limited counts attempts turned away before any work because the engine takes one send a second."><svg class="ic"><use href="#i-info"/></svg></button>
+        </div>
+        <div class="kv" id="jitoKv"></div>
+      </section>
+
+      <section class="module" aria-labelledby="hDrift">
         <div class="mod-head">
           <h2 id="hDrift">Price drift by venue</h2>
           <button class="info" type="button" data-tip="How far each venue's price moved between the moment a cycle was detected and the moment it was re-priced against fresh state, a round trip later. Negative means the price had moved against the trade. A venue far below the others points at stale data from that venue rather than at the market. Read from the log for this run."><svg class="ic"><use href="#i-info"/></svg></button>
         </div>
         <div class="drift" id="drift"></div>
       </section>
+      </div>
 
       <section class="module span6" aria-labelledby="hHealth">
         <div class="mod-head">
@@ -253,7 +275,8 @@
   <!-- ── PARAMETERS ───────────────────────────────────────────────────── -->
   <section class="view" id="view-config" hidden>
     <div class="grid">
-      <section class="module span6">
+      <div class="span6 stack">
+      <section class="module">
         <div class="mod-head"><h2>Trading</h2></div>
         <p class="caution">Saving ends the current run and archives its ledger.
           <button class="info" type="button" data-tip="Rows recorded under different parameters aggregate by different rules, and nothing downstream would show the mixture — so the run is cut rather than quietly contaminated."><svg class="ic"><use href="#i-info"/></svg></button></p>
@@ -317,6 +340,55 @@
           <span class="result" id="saveResult"></span>
         </div>
       </section>
+
+        <section class="module">
+          <div class="mod-head"><h2>Risk limits</h2>
+            <button class="info" type="button" data-tip="Hard stops, not targets. Nothing is signed that breaches one, and a tripped breaker stays tripped until it is cleared deliberately or its cooldown ends."><svg class="ic"><use href="#i-info"/></svg></button></div>
+          <div class="fields">
+            <div class="field">
+              <label for="fMaxPos">Maximum position <span class="unit">USD</span>
+                <button class="info" type="button" data-tip="The most any single trade may carry, checked by the risk gate right before signing. Keep this equal to Working capital — looser and it never binds because sizing never proposes that much; tighter and it silently overrides what sizing already capped, refusing trades that looked fine when they were found."><svg class="ic"><use href="#i-info"/></svg></button></label>
+              <input type="number" id="fMaxPos" step="1" min="0.01">
+            </div>
+            <div class="field">
+              <label for="fMaxLoss">Maximum daily loss <span class="unit">USD</span>
+                <button class="info" type="button" data-tip="Realised losses reaching this halt trading for the day."><svg class="ic"><use href="#i-info"/></svg></button></label>
+              <input type="number" id="fMaxLoss" step="0.5" min="0.01">
+            </div>
+            <div class="field">
+              <label for="fMinNet">Minimum net profit <span class="unit">USD</span>
+                <button class="info" type="button" data-tip="Below this a trade is indistinguishable from noise in the estimate that produced it — and that estimate is what is being trusted when it signs."><svg class="ic"><use href="#i-info"/></svg></button></label>
+              <input type="number" id="fMinNet" step="0.001" min="0">
+            </div>
+            <div class="field">
+              <label for="fMaxFails">Failures before stopping
+                <button class="info" type="button" data-tip="Consecutive failures. A lost race does not count — only reverts and rejections, which mean something is wrong that retrying will not fix."><svg class="ic"><use href="#i-info"/></svg></button></label>
+              <input type="number" id="fMaxFails" step="1" min="1">
+            </div>
+            <div class="field">
+              <label for="fHaltCooldown">Halt cooldown <span class="unit">seconds</span>
+                <button class="info" type="button" data-tip="How long a stop stands before trading tries again on its own. Not a claim that whatever tripped it is fixed — only a bound on how long the bot sits idle before finding out by trying again. 0 disables this: a stop then stands until the app is restarted."><svg class="ic"><use href="#i-info"/></svg></button></label>
+              <input type="number" id="fHaltCooldown" step="1" min="0">
+            </div>
+          </div>
+          <div class="actions">
+            <button id="btnSaveLimits" class="key key-go">Save limits</button>
+            <span class="result" id="limitsResult"></span>
+          </div>
+        </section>
+
+        <section class="module">
+          <div class="mod-head"><h2>Startup</h2></div>
+          <label class="toggle"><input type="checkbox" id="fAutostart"><span class="track"></span>
+            <span>Launch with Windows</span>
+            <button class="info" type="button" data-tip="The app starts with the session and sits in the tray."><svg class="ic"><use href="#i-info"/></svg></button></label>
+          <label class="toggle"><input type="checkbox" id="fAutorestart"><span class="track"></span>
+            <span>Restart the bot if it dies</span>
+            <button class="info" type="button" data-tip="Off by default, deliberately. A bot that silently resurrects itself hides the failures this app exists to make visible, and what it starts is a new run rather than a continuation of the old one."><svg class="ic"><use href="#i-info"/></svg></button></label>
+          <div class="path-line"><span class="label">Recording to</span> <code id="fRoot">…</code>
+            <button class="info" type="button" data-tip="The config, the ledger and the archives all live here. Run from a checkout this is the repository; installed, it is a per-user folder, because the folder the app is installed into is not writable by the account running it."><svg class="ic"><use href="#i-info"/></svg></button></div>
+        </section>
+      </div>
 
       <div class="span6 stack">
         <section class="module">
@@ -403,53 +475,6 @@
           <p class="result" id="walletResult"></p>
         </section>
 
-        <section class="module">
-          <div class="mod-head"><h2>Risk limits</h2>
-            <button class="info" type="button" data-tip="Hard stops, not targets. Nothing is signed that breaches one, and a tripped breaker stays tripped until it is cleared deliberately or its cooldown ends."><svg class="ic"><use href="#i-info"/></svg></button></div>
-          <div class="fields">
-            <div class="field">
-              <label for="fMaxPos">Maximum position <span class="unit">USD</span>
-                <button class="info" type="button" data-tip="The most any single trade may carry, checked by the risk gate right before signing. Keep this equal to Working capital — looser and it never binds because sizing never proposes that much; tighter and it silently overrides what sizing already capped, refusing trades that looked fine when they were found."><svg class="ic"><use href="#i-info"/></svg></button></label>
-              <input type="number" id="fMaxPos" step="1" min="0.01">
-            </div>
-            <div class="field">
-              <label for="fMaxLoss">Maximum daily loss <span class="unit">USD</span>
-                <button class="info" type="button" data-tip="Realised losses reaching this halt trading for the day."><svg class="ic"><use href="#i-info"/></svg></button></label>
-              <input type="number" id="fMaxLoss" step="0.5" min="0.01">
-            </div>
-            <div class="field">
-              <label for="fMinNet">Minimum net profit <span class="unit">USD</span>
-                <button class="info" type="button" data-tip="Below this a trade is indistinguishable from noise in the estimate that produced it — and that estimate is what is being trusted when it signs."><svg class="ic"><use href="#i-info"/></svg></button></label>
-              <input type="number" id="fMinNet" step="0.001" min="0">
-            </div>
-            <div class="field">
-              <label for="fMaxFails">Failures before stopping
-                <button class="info" type="button" data-tip="Consecutive failures. A lost race does not count — only reverts and rejections, which mean something is wrong that retrying will not fix."><svg class="ic"><use href="#i-info"/></svg></button></label>
-              <input type="number" id="fMaxFails" step="1" min="1">
-            </div>
-            <div class="field">
-              <label for="fHaltCooldown">Halt cooldown <span class="unit">seconds</span>
-                <button class="info" type="button" data-tip="How long a stop stands before trading tries again on its own. Not a claim that whatever tripped it is fixed — only a bound on how long the bot sits idle before finding out by trying again. 0 disables this: a stop then stands until the app is restarted."><svg class="ic"><use href="#i-info"/></svg></button></label>
-              <input type="number" id="fHaltCooldown" step="1" min="0">
-            </div>
-          </div>
-          <div class="actions">
-            <button id="btnSaveLimits" class="key key-go">Save limits</button>
-            <span class="result" id="limitsResult"></span>
-          </div>
-        </section>
-
-        <section class="module">
-          <div class="mod-head"><h2>Startup</h2></div>
-          <label class="toggle"><input type="checkbox" id="fAutostart"><span class="track"></span>
-            <span>Launch with Windows</span>
-            <button class="info" type="button" data-tip="The app starts with the session and sits in the tray."><svg class="ic"><use href="#i-info"/></svg></button></label>
-          <label class="toggle"><input type="checkbox" id="fAutorestart"><span class="track"></span>
-            <span>Restart the bot if it dies</span>
-            <button class="info" type="button" data-tip="Off by default, deliberately. A bot that silently resurrects itself hides the failures this app exists to make visible, and what it starts is a new run rather than a continuation of the old one."><svg class="ic"><use href="#i-info"/></svg></button></label>
-          <div class="path-line"><span class="label">Recording to</span> <code id="fRoot">…</code>
-            <button class="info" type="button" data-tip="The config, the ledger and the archives all live here. Run from a checkout this is the repository; installed, it is a per-user folder, because the folder the app is installed into is not writable by the account running it."><svg class="ic"><use href="#i-info"/></svg></button></div>
-        </section>
       </div>
     </div>
   </section>
