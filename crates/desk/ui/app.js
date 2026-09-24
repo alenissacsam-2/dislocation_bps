@@ -738,6 +738,7 @@ const ATT_KINDS = {
   loss: { name: "loss on fresh price", tone: "--coral" },
   fee: { name: "cleared price, not fee", tone: "--amber" },
   sim: { name: "failed simulation", tone: "--amber" },
+  packet: { name: "cleared, too big for one packet", tone: "--green" },
   miss: { name: "sent, not included", tone: "--violet" },
   revert: { name: "landed, reverted", tone: "--coral" },
   landed: { name: "landed", tone: "--teal" },
@@ -751,6 +752,11 @@ function classifyAttempt(msg) {
   if (/landed and reverted|landed, reverted/.test(msg)) return { kind: "revert", bps: null };
   if (/^LANDED |submitted and landed/.test(msg)) return { kind: "landed", bps: null };
   if (/^(refused: |probe not run: )?simulation/.test(msg)) return { kind: "sim", bps: null };
+  // Priced clear on fresh state, then too many accounts for one packet: the case an
+  // address lookup table would turn into a trade.
+  if (/byte limit|address lookup table/.test(msg) && !/^\d+ hops will not fit/.test(msg.replace(/^refused: /, ""))) {
+    return { kind: "packet", bps: null };
+  }
   if (/the last Jito send was/.test(msg)) return { rate: true };
   // Both the startup open and the rotation confirm with this one line; the rotation's
   // own summary line follows it and would count the same account twice.
@@ -813,7 +819,8 @@ function drawAttempts() {
   const hi = 3;
   const X = (t) => pad.l + ((w - pad.l - pad.r) * (t - t0)) / (t1 - t0);
   const Y = (v) => h - pad.b - ((clamp(v, lo, hi) - lo) / (hi - lo)) * (h - pad.t - pad.b);
-  const ticks = [lo, lo / 2, 0, hi];
+  // Labels closer than a line apart overprint; the floor always keeps its own.
+  const ticks = [0, lo, lo / 2, hi].filter((v, i, all) => all.slice(0, i).every((u) => Math.abs(Y(u) - Y(v)) >= 14));
   grid(g, w, h, pad, ticks.map(Y));
   for (const v of ticks) label(g, (v > 0 ? "+" : "") + v.toFixed(v === 0 ? 0 : 1), pad.l - 8, Y(v));
 
@@ -826,9 +833,10 @@ function drawAttempts() {
   // Where a point has no measured distance, it sits just under the floor (refused for
   // something other than price) or above it (sent), so its outcome still reads.
   const yOf = (q) => Number.isFinite(q.bps) ? q.bps
-    : q.kind === "miss" || q.kind === "landed" || q.kind === "revert" ? hi * 0.55 : -0.4;
+    : q.kind === "miss" || q.kind === "landed" || q.kind === "revert" ? hi * 0.55
+    : q.kind === "packet" ? hi * 0.3 : -0.4;
   for (const q of ATT.pts) {
-    const big = q.kind === "landed" || q.kind === "miss" || q.kind === "revert";
+    const big = q.kind === "landed" || q.kind === "miss" || q.kind === "revert" || q.kind === "packet";
     g.fillStyle = css(ATT_KINDS[q.kind].tone);
     g.globalAlpha = big ? 1 : 0.7;
     g.beginPath(); g.arc(X(q.t), Y(yOf(q)), big ? 4.5 : 2.6, 0, 7); g.fill();

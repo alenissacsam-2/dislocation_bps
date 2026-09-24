@@ -197,7 +197,89 @@ pub fn enumerate_from_base(snap: &Snapshot, base_mint: &Pubkey32, max_hops: usiz
             Path { pools: vec![first.id], mints: vec![*base_mint, mid], legs: vec![leg] };
         collect(snap, base_mint, &mut path, max_hops, &mut found);
     }
+    if max_hops >= 3 {
+        lollipops(snap, base_mint, &mut found);
+    }
     found
+}
+
+/// How many of the cheapest pools on a base/hub pair a [`lollipops`] loop may enter or
+/// leave through.
+///
+/// Every extra choice multiplies the loops by itself on both ends, and the entry and
+/// exit are the part of the trip that should cost least: a deep 1 bp SOL/USDC pool is
+/// the point. Two keeps a spare for when the cheapest one is the pool the inner round
+/// trip itself uses.
+pub const LOLLIPOP_ENTRY_POOLS: usize = 2;
+
+/// Four-hop loops that enter a hub mint from the base, run a round trip between two
+/// pools on one hub pair, and come back: SOL → USDC → STONK → USDC → SOL.
+///
+/// # Why they are worth a special case
+///
+/// Some of the disagreements that last are between two pools that both quote a token
+/// against USDC and nothing else — tokenised equities on Raydium at 18 bp and 25 bp are
+/// the measured case. The simple-cycle search cannot see them from SOL, because the
+/// loop visits USDC twice, and trading them from USDC needs a USDC balance to spend.
+/// Entering and leaving through the cheapest SOL/USDC pools reaches the same round
+/// trip with the capital left in SOL, for about two basis points of extra fee.
+///
+/// Emitted whenever the hop cap allows triangles, because raising the cap to four for
+/// every shape multiplies the search; this shape is bounded by
+/// [`LOLLIPOP_ENTRY_POOLS`] on each end and by the round trips each hub actually has.
+fn lollipops(snap: &Snapshot, base_mint: &Pubkey32, out: &mut Vec<Cycle>) {
+    // The cheapest pools on each base/hub pair, grouped by hub.
+    let mut by_hub: std::collections::HashMap<Pubkey32, Vec<usize>> =
+        std::collections::HashMap::new();
+    for &i in snap.pools_trading(base_mint) {
+        if let Some(hub) = snap.at(i).other_mint(base_mint) {
+            by_hub.entry(hub).or_default().push(i);
+        }
+    }
+    for (hub, mut ends) in by_hub {
+        if ends.len() < 2 {
+            // Entry and exit must be different pools; one pool cannot be both.
+            continue;
+        }
+        ends.sort_by_key(|&i| (snap.at(i).fee_ppm, snap.at(i).id.0));
+        ends.truncate(LOLLIPOP_ENTRY_POOLS.max(2));
+
+        for &j in snap.pools_trading(&hub) {
+            let out_leg = snap.at(j);
+            let Some(x) = out_leg.other_mint(&hub) else { continue };
+            if x == *base_mint || x == hub {
+                continue;
+            }
+            for &k in snap.pools_trading(&x) {
+                let back = snap.at(k);
+                if back.id == out_leg.id || back.other_mint(&x) != Some(hub) {
+                    continue;
+                }
+                for &e in &ends {
+                    for &r in &ends {
+                        let (enter, exit) = (snap.at(e), snap.at(r));
+                        if enter.id == exit.id {
+                            continue;
+                        }
+                        let legs = [
+                            enter.leg_for_input(base_mint),
+                            out_leg.leg_for_input(&hub),
+                            back.leg_for_input(&x),
+                            exit.leg_for_input(&hub),
+                        ];
+                        if legs.iter().any(Option::is_none) {
+                            continue;
+                        }
+                        out.push(Cycle {
+                            pools: vec![enter.id, out_leg.id, back.id, exit.id],
+                            mints: vec![*base_mint, hub, x, hub, *base_mint],
+                            legs: legs.into_iter().flatten().collect(),
+                        });
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Every cycle from `base_mint`, priced for its marginal edge. Sorted best first.
@@ -400,6 +482,38 @@ mod tests {
 
     fn pool_at(id: u8, a: [u8; 32], b: [u8; 32], ra: u128, rb: u128, slot: u64) -> PoolState {
         PoolState::constant_product(PoolId([id; 32]), Dex::OrcaWhirlpool, a, b, ra, rb, 100, slot)
+    }
+
+    /// Two pools quoting one token against USDC disagree. From SOL the only way to reach
+    /// that is in through one SOL/USDC pool and out through another — a loop that visits
+    /// USDC twice, which the simple-cycle search never emits.
+    #[test]
+    fn a_round_trip_behind_a_hub_is_reachable_from_sol_without_holding_the_hub() {
+        let stonk = [9u8; 32];
+        let enter = fee_pool(1, SOL, USDC, 1_000_000_000, 100_000_000_000, 100);
+        let exit = fee_pool(2, SOL, USDC, 1_000_000_000, 100_000_000_000, 200);
+        let pricey = fee_pool(3, SOL, USDC, 1_000_000_000, 100_000_000_000, 3000);
+        let cheap = fee_pool(4, stonk, USDC, 1_000_000_000, 10_000_000_000, 1800);
+        let dear = fee_pool(5, stonk, USDC, 1_000_000_000, 10_400_000_000, 2500);
+        let snap = Snapshot::new(vec![enter, exit, pricey, cheap, dear]);
+
+        let all = enumerate_from_base(&snap, &SOL, 3);
+        let lollies: Vec<_> = all.iter().filter(|c| c.hops() == 4).collect();
+        // Two round-trip directions, each entered and left through the two cheapest
+        // SOL/USDC pools in either order; the 30 bp pool is never an end.
+        assert_eq!(lollies.len(), 4, "{lollies:?}");
+        assert!(lollies.iter().all(|c| !c.pools.contains(&pricey.id)));
+        assert!(lollies.iter().all(|c| c.mints == vec![SOL, USDC, c.mints[2], USDC, SOL]));
+
+        // Buying where it is cheap and selling where it is dear clears both pool fees and
+        // both entry legs.
+        let found = find_from_base(&snap, &SOL, 3, 10_000_000);
+        assert!(
+            found.iter().any(|p| p.cycle.hops() == 4 && p.profit > 0),
+            "the dislocation behind USDC is profitable from SOL"
+        );
+        // And none of it exists when triangles are not allowed.
+        assert!(enumerate_from_base(&snap, &SOL, 2).iter().all(|c| c.hops() == 2));
     }
 
     /// An arbitrage is a claim that two venues disagree *at one moment*. When every

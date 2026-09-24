@@ -160,6 +160,13 @@ impl CyclePlan {
     pub fn blocking_venue(&self) -> Option<Dex> {
         self.pools.iter().find(|(_, d)| !has_encoder(*d)).map(|(_, d)| *d)
     }
+
+    /// A four-hop loop that enters a hub, runs a round trip behind it and comes back:
+    /// SOL → USDC → X → USDC → SOL. See `cb_scanner::multi::lollipops`.
+    #[must_use]
+    pub fn is_lollipop(&self) -> bool {
+        self.pools.len() == 4 && self.mints.len() == 5 && self.mints[1] == self.mints[3]
+    }
 }
 
 /// Tunables that are not per-trade.
@@ -1100,7 +1107,12 @@ impl Trader {
                 dex.name()
             )));
         }
-        if plan.pools.len() > MAX_EXECUTABLE_HOPS {
+        // A lollipop is let through to be re-priced even though four hops measured 64 bytes
+        // over the packet: it shares its hub's token account between two legs, which is
+        // one account nearer, and whether any of them ever clears on fresh state is the
+        // measurement that decides whether an address lookup table is worth its rent. One
+        // that clears and still does not fit is refused by `tx::assemble`, naming the size.
+        if plan.pools.len() > MAX_EXECUTABLE_HOPS && !plan.is_lollipop() {
             return Ok(Attempt::Refused(format!(
                 "{} hops will not fit in one transaction without an address lookup table \
                  (the ceiling is {MAX_EXECUTABLE_HOPS})",
@@ -2196,6 +2208,15 @@ mod tests {
             leg_out: (0..n).map(|_| 1_010_000).collect(),
             fee_ppm: (0..n).map(|_| 3_000).collect(),
         }
+    }
+
+    #[test]
+    fn only_a_loop_that_returns_to_its_hub_is_a_lollipop() {
+        let mut p = plan(4);
+        assert!(!p.is_lollipop(), "four distinct mints is an ordinary four-hop cycle");
+        p.mints[3] = p.mints[1];
+        assert!(p.is_lollipop());
+        assert!(!plan(3).is_lollipop());
     }
 
     /// Pool accounts that actually trade the mints the plan names. A fixture whose

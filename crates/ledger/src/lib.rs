@@ -38,6 +38,12 @@ impl Ledger {
         // WAL lets the dashboard read while the bot writes.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // SQLite reuses the write-ahead log after a checkpoint but never shrinks the
+        // file. One slow reader — a history query over a gigabyte ledger — holds
+        // checkpoints back while the bot keeps writing, and the log it grew in the
+        // meantime then stays that size for the rest of the run: 1.28 GB on 2026-09-24.
+        // With a limit, each completed checkpoint truncates it back down.
+        conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
         schema::migrate(&conn)?;
         Ok(Self { conn })
     }
