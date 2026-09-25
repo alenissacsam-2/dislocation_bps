@@ -385,6 +385,15 @@ const MAX_HAIRCUT_TENTH_BPS: u32 = 60;
 /// for nothing.
 pub const BASE_FEE_LAMPORTS: u128 = 5_000;
 
+/// A Jito tip no larger than `room`, the gain the floor can guarantee, leaves after the
+/// base fee — and never below the block engine's minimum, where the floor then refuses
+/// the trade and says so.
+#[must_use]
+pub fn cap_tip(wanted: u64, room: u128) -> u64 {
+    let afford = room.saturating_sub(BASE_FEE_LAMPORTS + 1);
+    wanted.min(u64::try_from(afford).unwrap_or(u64::MAX)).max(cb_executor::jito::MIN_TIP_LAMPORTS)
+}
+
 /// The largest share of a trade's own gross profit that may go on the priority bid.
 ///
 /// # Why a share and not a number
@@ -572,6 +581,20 @@ impl Trader {
         let Ok(legs) = Self::fresh_legs(plan, pool_data, vaults, bins) else { return 0 };
         let spend = cb_core::path::largest_feasible(&legs, plan.amount_in);
         Self::floor_chain(&legs, spend, 0).map_or(0, |(quoted, _)| quoted.saturating_sub(spend))
+    }
+
+    /// What the last floor can guarantee past the spend at the configured haircut, on
+    /// the state just fetched. The most the fee and tip together can be paid out of.
+    fn fresh_floor_gain(
+        plan: &CyclePlan,
+        pool_data: &[Vec<u8>],
+        vaults: &[Option<(u64, u64)>],
+        bins: &[Vec<Vec<u8>>],
+        tenth_bps: u32,
+    ) -> u128 {
+        let Ok(legs) = Self::fresh_legs(plan, pool_data, vaults, bins) else { return 0 };
+        let spend = cb_core::path::largest_feasible(&legs, plan.amount_in);
+        Self::floor_chain(&legs, spend, tenth_bps).map_or(0, |(_, floor)| floor.saturating_sub(spend))
     }
 
     /// Tell this trader which mints belong to Token-2022, from the registry.
@@ -1556,8 +1579,24 @@ impl Trader {
         // checks but a gain the last floor guarantees, so the chain itself refuses a
         // trade that would land short of it. The headroom is then zero, because nothing
         // is left for it to protect.
+        //
+        // And no more than the floor can pay. A quarter of the gross is the bid a trade
+        // wants to make; what it can make is whatever the guaranteed gain leaves after
+        // the base fee. Sized the other way round, 9 of 39 near-misses on 2026-09-24
+        // guaranteed 6,069-7,331 lamports and were refused against costs of
+        // 6,530-7,338 that only the tip had pushed past them. A smaller tip lands less
+        // often; a refused trade never does.
         let tip = if jito {
-            self.tip_for(Self::fresh_gross(plan, &pool_data, &vaults, &bins))
+            cap_tip(
+                self.tip_for(Self::fresh_gross(plan, &pool_data, &vaults, &bins)),
+                Self::fresh_floor_gain(
+                    plan,
+                    &pool_data,
+                    &vaults,
+                    &bins,
+                    self.opts.slippage_tenth_bps,
+                ),
+            )
         } else {
             0
         };
@@ -1676,7 +1715,8 @@ impl Trader {
             priority_micro_lamports: bid,
             wsol: self.opts.wsol,
             create_token_accounts: self.opts.create_token_accounts,
-            venue: VenueExtra { token_program, bitmap_policy: BitmapPolicy::Include },
+            others_exist: !self.accounts_held.is_empty(),
+            venue: VenueExtra { token_program, bitmap_policy: BitmapPolicy::Auto },
             min_gain: u64::try_from(required_gain).unwrap_or(u64::MAX),
             // Any of the eight accounts will do; spreading by the blockhash keeps
             // successive tips off one write lock without a random-number generator.
@@ -2211,6 +2251,16 @@ mod tests {
     }
 
     #[test]
+    fn a_tip_never_costs_a_trade_the_gain_it_could_have_kept() {
+        // Guaranteed 7,331 wanting a 2,338 tip: 5,000 + 2,338 > 7,331, refused before.
+        assert_eq!(cap_tip(2_338, 7_331), 2_330, "the most that leaves one lamport");
+        assert!(u128::from(cap_tip(2_338, 7_331)) + BASE_FEE_LAMPORTS < 7_331);
+        assert_eq!(cap_tip(1_500, 100_000), 1_500, "room to spare keeps the full bid");
+        assert_eq!(cap_tip(3_000, 5_200), 1_000, "never under the block engine minimum");
+        assert_eq!(cap_tip(3_000, 0), 1_000);
+    }
+
+    #[test]
     fn only_a_loop_that_returns_to_its_hub_is_a_lollipop() {
         let mut p = plan(4);
         assert!(!p.is_lollipop(), "four distinct mints is an ordinary four-hop cycle");
@@ -2713,6 +2763,7 @@ mod mainnet {
             priority_micro_lamports: 0,
             wsol: WsolPolicy::WrapAndClose,
             create_token_accounts: true,
+            others_exist: false,
             venue: VenueExtra {
                 token_program: pk(programs::SPL_TOKEN),
                 bitmap_policy: BitmapPolicy::Include,
@@ -3556,6 +3607,7 @@ mod meteora_dlmm_tests {
             priority_micro_lamports: 8_000,
             wsol: WsolPolicy::WrapAndClose,
             create_token_accounts: true,
+            others_exist: false,
             venue: VenueExtra::default(),
             min_gain: 0,
             tip: None,

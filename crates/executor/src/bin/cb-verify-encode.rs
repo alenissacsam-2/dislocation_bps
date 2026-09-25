@@ -435,6 +435,7 @@ async fn check_pool(
         let name = match policy {
             Some(BitmapPolicy::Include) => "swap(bitmap)",
             Some(BitmapPolicy::Omit) => "swap(no bitmap)",
+            Some(BitmapPolicy::Auto) => "swap(bitmap if needed)",
             None => "swap",
         };
         let ix = match venue::build_swap(dex, &ctx, &pool_data, &extra) {

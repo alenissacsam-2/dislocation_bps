@@ -38,6 +38,35 @@ pub enum BitmapPolicy {
     Include,
     /// Pass only tick arrays.
     Omit,
+    /// Pass it only when the swap can reach a tick array outside the range the pool
+    /// account's own bitmap covers, which is the only case the program reads it.
+    ///
+    /// Thirty-two bytes a Raydium leg, and the difference that matters: on 2026-09-24
+    /// five two-hop Raydium cycles cleared their floor on fresh state and were refused
+    /// at 1,292 bytes against a 1,232-byte packet — two extension accounts over.
+    Auto,
+}
+
+/// Tick arrays either side of zero the pool account's own bitmap records. Raydium's
+/// `TICK_ARRAY_BITMAP_SIZE`; past this the extension account holds the bits.
+const DEFAULT_BITMAP_ARRAYS: i64 = 512;
+/// Ticks per tick array, Raydium's `TICK_ARRAY_SIZE`.
+const TICKS_PER_ARRAY: i64 = 60;
+/// Arrays of margin kept from that edge: a swap here names at most three, and the
+/// price can move by a few before it lands.
+const BITMAP_MARGIN_ARRAYS: i64 = 4;
+
+/// Resolve [`BitmapPolicy::Auto`] against the pool as it stands now.
+fn resolve(policy: BitmapPolicy, tick_current: i32, tick_spacing: u16) -> BitmapPolicy {
+    if policy != BitmapPolicy::Auto {
+        return policy;
+    }
+    let reach = (DEFAULT_BITMAP_ARRAYS - BITMAP_MARGIN_ARRAYS) * TICKS_PER_ARRAY * i64::from(tick_spacing);
+    if i64::from(tick_current).abs() < reach {
+        BitmapPolicy::Omit
+    } else {
+        BitmapPolicy::Include
+    }
 }
 
 /// Build a `swap` instruction against a Raydium CLMM pool.
@@ -61,6 +90,7 @@ pub fn swap(
     );
 
     let program = pk(cb_dex::raydium_clmm::PROGRAM_ID);
+    let policy = resolve(policy, p.tick_current, p.tick_spacing);
     // Spending token 0 moves the price down, which is `zero_for_one`.
     let zero_for_one = ctx.input_is_a;
 
@@ -144,6 +174,7 @@ pub fn swap_v2(ctx: &SwapContext, pool_data: &[u8], policy: BitmapPolicy) -> Res
     );
 
     let program = pk(cb_dex::raydium_clmm::PROGRAM_ID);
+    let policy = resolve(policy, p.tick_current, p.tick_spacing);
     let zero_for_one = ctx.input_is_a;
 
     let (input_vault, output_vault, input_mint, output_mint) = if zero_for_one {
@@ -269,6 +300,16 @@ mod tests {
         assert_eq!(&ix.data[8..16], &500_000u64.to_le_bytes());
         assert_eq!(&ix.data[16..24], &499_000u64.to_le_bytes());
         assert_eq!(*ix.data.last().unwrap(), 1, "is_base_input must be set");
+    }
+
+    #[test]
+    fn auto_passes_the_extension_only_near_the_edge_of_the_default_bitmap() {
+        // Spacing 1: the pool's own bitmap reaches 30,720 ticks either side of zero.
+        assert_eq!(resolve(BitmapPolicy::Auto, -21_600, 1), BitmapPolicy::Omit, "SOL/USDC-like");
+        assert_eq!(resolve(BitmapPolicy::Auto, 30_500, 1), BitmapPolicy::Include, "inside the margin");
+        assert_eq!(resolve(BitmapPolicy::Auto, -400_000, 10), BitmapPolicy::Include);
+        assert_eq!(resolve(BitmapPolicy::Auto, 100_000, 10), BitmapPolicy::Omit);
+        assert_eq!(resolve(BitmapPolicy::Include, 0, 1), BitmapPolicy::Include, "explicit wins");
     }
 
     #[test]

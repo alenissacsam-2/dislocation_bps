@@ -123,6 +123,13 @@ pub struct RouteOptions {
     /// Costs one instruction and six accounts per mint. Worth it on the first trade of
     /// a session and pure overhead afterwards, so it is a switch rather than always-on.
     pub create_token_accounts: bool,
+    /// The caller has checked that every mint but the base already has its account, so
+    /// only the base's create is emitted.
+    ///
+    /// About ten bytes a mint, and a two-hop Raydium cycle through Jito has six to spare.
+    /// A wrong `true` does not lose money: the swap into a missing account fails, and a
+    /// failed bundle is dropped.
+    pub others_exist: bool,
     pub venue: VenueExtra,
     /// How much more than its input the last hop must guarantee, beyond the one base
     /// unit invariant 2 already demands.
@@ -149,6 +156,7 @@ impl Default for RouteOptions {
             priority_micro_lamports: 0,
             wsol: WsolPolicy::default(),
             create_token_accounts: false,
+            others_exist: false,
             venue: VenueExtra::default(),
             min_gain: 0,
             tip: None,
@@ -279,6 +287,9 @@ pub fn build(owner: &Pubkey, hops: &[Hop], pre_balance: u64, opts: &RouteOptions
             }
         }
         for mint in seen {
+            if opts.others_exist && mint != base_mint {
+                continue;
+            }
             let p = program_of(&mint);
             let ata = associated_token_address(owner, &mint, &p);
             ixs.push(tx::create_ata_idempotent(owner, &ata, owner, &mint, &p));
@@ -661,5 +672,167 @@ mod mixed_token_program_tests {
             route.instructions.iter().flat_map(|i| i.accounts.iter().map(|a| a.pubkey)).collect();
         assert!(named.contains(&wanted), "the Token-2022 account must be the one used");
         assert!(!named.contains(&wrong), "the classic derivation must appear nowhere");
+    }
+}
+
+#[cfg(test)]
+mod raydium_packet {
+    use super::*;
+    use crate::venue::raydium::BitmapPolicy;
+    use solana_sdk::hash::Hash;
+
+    /// A Raydium CLMM pool quoting wSOL against `mint_1`, with its own config, vaults and
+    /// observation so two of them share nothing by accident.
+    fn clmm(seed: u8, mint_1: &Pubkey, tick: i32) -> Vec<u8> {
+        let mut d = vec![0u8; cb_dex::raydium_clmm::POOL_LEN];
+        d[9..41].copy_from_slice(&[seed; 32]);
+        d[73..105].copy_from_slice(&pk(programs::WSOL_MINT).to_bytes());
+        d[105..137].copy_from_slice(&mint_1.to_bytes());
+        d[137..169].copy_from_slice(&[seed.wrapping_add(1); 32]);
+        d[169..201].copy_from_slice(&[seed.wrapping_add(2); 32]);
+        d[201..233].copy_from_slice(&[seed.wrapping_add(3); 32]);
+        d[233] = 9;
+        d[234] = 6;
+        d[235..237].copy_from_slice(&1u16.to_le_bytes());
+        d[237..253].copy_from_slice(&1_000_000_000u128.to_le_bytes());
+        d[253..269].copy_from_slice(&(1u128 << 64).to_le_bytes());
+        d[269..273].copy_from_slice(&tick.to_le_bytes());
+        d
+    }
+
+    fn two_hop(policy: BitmapPolicy, tick: i32) -> usize {
+        sized(policy, tick, false)
+    }
+
+    fn sized(policy: BitmapPolicy, tick: i32, others_exist: bool) -> usize {
+        let owner = Pubkey::new_unique();
+        let wsol = pk(programs::WSOL_MINT);
+        let token = Pubkey::new_unique();
+        let (classic, t22) = (pk(programs::SPL_TOKEN), pk(programs::SPL_TOKEN_2022));
+        let arrays = || [Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique()];
+        let hops = vec![
+            Hop {
+                pool: Pubkey::new_unique(),
+                dex: Dex::RaydiumClmm,
+                pool_data: clmm(0x10, &token, tick),
+                input_mint: wsol,
+                output_mint: token,
+                input_is_a: true,
+                input_token_program: classic,
+                output_token_program: t22,
+                amount_in: 100_000_000,
+                min_amount_out: 1_000,
+                tick_arrays: arrays(),
+            },
+            Hop {
+                pool: Pubkey::new_unique(),
+                dex: Dex::RaydiumClmm,
+                pool_data: clmm(0x20, &token, tick),
+                input_mint: token,
+                output_mint: wsol,
+                input_is_a: false,
+                input_token_program: t22,
+                output_token_program: classic,
+                amount_in: 1_000,
+                min_amount_out: 100_010_000,
+                tick_arrays: arrays(),
+            },
+        ];
+        let opts = RouteOptions {
+            compute_units: 400_000,
+            priority_micro_lamports: 0,
+            wsol: WsolPolicy::WrapAndClose,
+            create_token_accounts: true,
+            others_exist,
+            venue: crate::venue::VenueExtra { token_program: classic, bitmap_policy: policy },
+            min_gain: 6_000,
+            tip: Some((crate::jito::tip_account(0), 1_000)),
+        };
+        let built = build(&owner, &hops, 200_000_000, &opts).expect("the route closes");
+        tx::measure(&owner, &built.instructions, Hash::default()).expect("it serialises")
+    }
+
+    /// The shape refused five times on 2026-09-24 after clearing its floor on fresh
+    /// state: SOL → Token-2022 mint → SOL across two Raydium CLMM pools, through Jito.
+    /// With both bitmap extensions it measured 1,292 bytes live; without them it must fit.
+    #[test]
+    fn a_two_hop_raydium_jito_cycle_fits_once_the_unneeded_extensions_are_dropped() {
+        let with = two_hop(BitmapPolicy::Include, 0);
+        let auto = two_hop(BitmapPolicy::Auto, 0);
+        assert!(with > tx::PACKET_LIMIT, "the old shape was over the packet: {with}");
+        assert_eq!(with, 1_292, "the size measured live on 2026-09-24");
+        assert_eq!(with - auto, 66, "two extensions: a 32-byte key and a 1-byte index each");
+        assert!(auto <= tx::PACKET_LIMIT, "{auto} bytes against {}", tx::PACKET_LIMIT);
+        // Near the edge of the default bitmap the extension comes back, and the
+        // cycle is then correctly refused as too wide rather than sent broken.
+        assert_eq!(two_hop(BitmapPolicy::Auto, 30_600), with);
+        // And with the token's account known to exist, its create is not sent at all.
+        let lean = sized(BitmapPolicy::Auto, 0, true);
+        assert!(lean < auto, "skipping a redundant create saves room: {auto} -> {lean}");
+    }
+}
+
+#[cfg(test)]
+mod lollipop_packet {
+    use super::*;
+    use crate::venue::raydium::BitmapPolicy;
+    use solana_sdk::hash::Hash;
+
+    fn clmm(seed: u8, a: &Pubkey, b: &Pubkey) -> Vec<u8> {
+        let mut d = vec![0u8; cb_dex::raydium_clmm::POOL_LEN];
+        d[9..41].copy_from_slice(&[seed; 32]);
+        d[73..105].copy_from_slice(&a.to_bytes());
+        d[105..137].copy_from_slice(&b.to_bytes());
+        d[137..169].copy_from_slice(&[seed.wrapping_add(1); 32]);
+        d[169..201].copy_from_slice(&[seed.wrapping_add(2); 32]);
+        d[201..233].copy_from_slice(&[seed.wrapping_add(3); 32]);
+        d[233] = 9;
+        d[234] = 6;
+        d[235..237].copy_from_slice(&1u16.to_le_bytes());
+        d[237..253].copy_from_slice(&1_000_000_000u128.to_le_bytes());
+        d[253..269].copy_from_slice(&(1u128 << 64).to_le_bytes());
+        d
+    }
+
+    /// SOL → USDC → STONK → USDC → SOL, every leg Raydium CLMM, STONK Token-2022,
+    /// through Jito. Measured so the address lookup table question has a number.
+    #[test]
+    fn a_four_hop_raydium_lollipop_needs_a_lookup_table() {
+        let owner = Pubkey::new_unique();
+        let (wsol, usdc, stonk) = (pk(programs::WSOL_MINT), Pubkey::new_unique(), Pubkey::new_unique());
+        let (classic, t22) = (pk(programs::SPL_TOKEN), pk(programs::SPL_TOKEN_2022));
+        let arrays = || [Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique()];
+        let hop = |seed, i: Pubkey, o: Pubkey, ip, op, a_first: bool, amt, out| Hop {
+            pool: Pubkey::new_unique(),
+            dex: Dex::RaydiumClmm,
+            pool_data: if a_first { clmm(seed, &i, &o) } else { clmm(seed, &o, &i) },
+            input_mint: i,
+            output_mint: o,
+            input_is_a: a_first,
+            input_token_program: ip,
+            output_token_program: op,
+            amount_in: amt,
+            min_amount_out: out,
+            tick_arrays: arrays(),
+        };
+        let hops = vec![
+            hop(0x10, wsol, usdc, classic, classic, true, 100_000_000, 10_000),
+            hop(0x20, usdc, stonk, classic, t22, true, 10_000, 1_000),
+            hop(0x30, stonk, usdc, t22, classic, true, 1_000, 10_000),
+            hop(0x40, usdc, wsol, classic, classic, false, 10_000, 100_010_000),
+        ];
+        let opts = RouteOptions {
+            wsol: WsolPolicy::WrapAndClose,
+            create_token_accounts: true,
+            others_exist: true,
+            venue: crate::venue::VenueExtra { token_program: classic, bitmap_policy: BitmapPolicy::Auto },
+            min_gain: 6_000,
+            tip: Some((crate::jito::tip_account(0), 1_000)),
+            ..RouteOptions::default()
+        };
+        let built = build(&owner, &hops, 200_000_000, &opts).expect("the route closes");
+        let size = tx::measure(&owner, &built.instructions, Hash::default()).expect("serialises");
+        eprintln!("four-hop Raydium lollipop: {size} bytes");
+        assert!(size > tx::PACKET_LIMIT, "{size}: if this fits, the lookup table is not needed");
     }
 }
