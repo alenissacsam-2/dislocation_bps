@@ -37,20 +37,47 @@ pub fn archive_ledger(
     std::fs::create_dir_all(archive_dir)?;
     let stem = ledger.file_stem().and_then(|s| s.to_str()).unwrap_or("cryptobot");
     let target = archive_dir.join(format!("{stem}-{stamp}.db"));
+    // All three move, or none does. A database separated from its write-ahead log is
+    // the one outcome worse than not archiving: the log holds the newest pages, and the
+    // next writer to open the old name finds it beside an empty file. Measured on
+    // 2026-09-25 when Windows refused to move a log another handle still had open.
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     for suffix in SUFFIXES {
         let from = PathBuf::from(format!("{}{suffix}", ledger.display()));
         if !from.exists() {
             continue;
         }
         let to = PathBuf::from(format!("{}{suffix}", target.display()));
-        // Rename first: same volume, atomic, and cheap on a 138 MB file. Fall back to
-        // copy-then-remove only when the archive sits on another volume.
-        if std::fs::rename(&from, &to).is_err() {
-            std::fs::copy(&from, &to)?;
-            std::fs::remove_file(&from)?;
+        if let Err(e) = move_file(&from, &to) {
+            for (back_from, back_to) in moved.iter().rev() {
+                if let Err(undo) = move_file(back_to, back_from) {
+                    anyhow::bail!(
+                        "archiving stopped at {}: {e}; and {} could not be put back: {undo}",
+                        from.display(),
+                        back_to.display()
+                    );
+                }
+            }
+            anyhow::bail!("could not archive {} ({e}); nothing was moved", from.display());
         }
+        moved.push((from, to));
     }
     Ok(Some(target))
+}
+
+/// Rename, which is atomic and instant on one volume; copy and remove when the archive
+/// is on another. A copy whose source then cannot be removed is deleted again, so a
+/// failure leaves the source where it was and no second copy behind.
+fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(from, to)?;
+    if let Err(e) = std::fs::remove_file(from) {
+        let _ = std::fs::remove_file(to);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Archived runs, newest first. The stamp sorts lexicographically because it is
@@ -83,6 +110,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// The failure seen on 2026-09-25: the write-ahead log is held open by another
+    /// handle, so Windows refuses to move it. The database must not move without it.
+    #[cfg(windows)]
+    #[test]
+    fn a_log_that_cannot_move_keeps_the_database_where_it_is() {
+        let d = scratch("held");
+        let db = d.join("cryptobot.db");
+        std::fs::write(&db, b"db").unwrap();
+        std::fs::write(d.join("cryptobot.db-wal"), b"wal").unwrap();
+        std::fs::write(d.join("cryptobot.db-shm"), b"shm").unwrap();
+        // Shared for reading and writing but not deletion, as SQLite opens it: rename
+        // and remove both fail while this handle lives.
+        let _held = {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x1;
+            const FILE_SHARE_WRITE: u32 = 0x2;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(d.join("cryptobot.db-wal"))
+                .unwrap()
+        };
+
+        let err = archive_ledger(&db, &d.join("archive"), "x").expect_err("the log is held");
+        assert!(err.to_string().contains("nothing was moved"), "{err}");
+        for name in ["cryptobot.db", "cryptobot.db-wal", "cryptobot.db-shm"] {
+            assert!(d.join(name).exists(), "{name} must still be in place");
+        }
+        assert!(!d.join("archive").join("cryptobot-x.db").exists(), "no half archive left behind");
+        assert!(!d.join("archive").join("cryptobot-x.db-wal").exists(), "no stray copy left behind");
     }
 
     /// A SQLite database in WAL mode is three files. Moving only the `.db` silently

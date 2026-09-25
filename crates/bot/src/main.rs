@@ -1311,7 +1311,7 @@ async fn spawn_live(
         loop {
             tokio::select! {
                 _ = demand_timer.tick() => {
-                    if let Err(e) = demand.save(demand_path) {
+                    if let Err(e) = demand.save(demand_path, now_ms() / 1_000) {
                         tracing::warn!("could not save {DEMAND_PATH}: {e}");
                     }
                     // The priority order the rotation works from, on the record: which
@@ -1343,7 +1343,7 @@ async fn spawn_live(
                         for mint in due.into_iter().take(MAX_ACCOUNT_CLOSES_PER_TICK) {
                             match t.close_account(&mint).await {
                                 Ok(true) => tracing::warn!(
-                                    "closed an account no attempt asked for in a day, to trade                                      its deposit instead"
+                                    "closed an account no attempt asked for in a day, to trade its deposit instead"
                                 ),
                                 Ok(false) => { kept_open.insert(mint, std::time::Instant::now()); }
                                 Err(e) => tracing::warn!("could not close an idle account: {e:#}"),

@@ -22,6 +22,14 @@ pub struct App {
     /// itself hides exactly the failures this application exists to make visible, and
     /// what it starts is a new run rather than a continuation of the old one.
     pub auto_restart: Arc<AtomicBool>,
+    /// Held while the live ledger is being read for History or moved into the archive.
+    ///
+    /// Windows will not rename a file another handle has open. On 2026-09-25 a start
+    /// from the desk archived the ledger while the window's own History read still had
+    /// it open: the database moved, its 1.28 GB write-ahead log could not, and the bot
+    /// started a fresh ledger beside the old log. Nothing was lost — SQLite replayed the
+    /// log into the new file — but only because that log happened to hold every page.
+    pub ledger: Arc<std::sync::Mutex<()>>,
 }
 
 impl App {
@@ -41,6 +49,7 @@ impl App {
             runner,
             custody: crate::wallet::Custody::default(),
             auto_restart: Arc::new(AtomicBool::new(false)),
+            ledger: Arc::new(std::sync::Mutex::new(())),
         }
     }
 }
@@ -85,9 +94,14 @@ pub async fn bot_start(app: tauri::State<'_, App>) -> Result<(), String> {
     let runner = Arc::clone(&app.runner);
     let secret = live_passphrase(&app);
     let paths = app.paths.clone();
+    let ledger = Arc::clone(&app.ledger);
     tauri::async_runtime::spawn_blocking(move || {
-        // Only from a stopped bot: the ledger is never moved out from under a writer.
-        if !matches!(runner.probe(), RunState::Running | RunState::Starting)
+        // Only from a stopped bot, and only when nothing in this window is reading the
+        // ledger: the files are never moved out from under a handle. A History read in
+        // progress means skipping the archive this once, not waiting a minute to start.
+        let quiet = ledger.try_lock();
+        if quiet.is_ok()
+            && !matches!(runner.probe(), RunState::Running | RunState::Starting)
             && should_auto_archive(ledger_bytes(&paths.ledger()))
         {
             let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
@@ -97,6 +111,7 @@ pub async fn bot_start(app: tauri::State<'_, App>) -> Result<(), String> {
                 eprintln!("could not archive the large ledger before starting: {e:#}");
             }
         }
+        drop(quiet);
         runner.start(secret).map_err(|e| e.to_string())
     })
     .await
@@ -189,6 +204,7 @@ pub async fn archive_run(
 ) -> Result<serde_json::Value, String> {
     let runner = Arc::clone(&app.runner);
     let paths = app.paths.clone();
+    let ledger = Arc::clone(&app.ledger);
     // Captured out here: `app` is a borrow and cannot cross into a 'static task.
     let secret = live_passphrase(&app);
     // Off the main thread: the ledger and its WAL run to hundreds of megabytes, and
@@ -199,8 +215,11 @@ pub async fn archive_run(
             runner.stop().map_err(|e| e.to_string())?;
         }
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-        let archived = archive::archive_ledger(&paths.ledger(), &paths.archive_dir(), &stamp)
-            .map_err(|e| e.to_string())?;
+        let archived = {
+            let _reading = ledger.lock().map_err(|e| e.to_string())?;
+            archive::archive_ledger(&paths.ledger(), &paths.archive_dir(), &stamp)
+                .map_err(|e| e.to_string())?
+        };
         let mut restarted = false;
         let mut restart_error = None;
         if restart && was_running {
@@ -244,6 +263,7 @@ pub async fn save_config(
     config::validate(&params)?;
     let runner = Arc::clone(&app.runner);
     let paths = app.paths.clone();
+    let ledger = Arc::clone(&app.ledger);
     // Captured out here: `app` is a borrow and cannot cross into a 'static task.
     let secret = live_passphrase(&app);
     // Off the main thread: archiving moves the database and its WAL, which are hundreds
@@ -255,8 +275,11 @@ pub async fn save_config(
         }
         config::write_params(&paths.config(), &params).map_err(|e| e.to_string())?;
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-        let archived = archive::archive_ledger(&paths.ledger(), &paths.archive_dir(), &stamp)
-            .map_err(|e| e.to_string())?;
+        let archived = {
+            let _reading = ledger.lock().map_err(|e| e.to_string())?;
+            archive::archive_ledger(&paths.ledger(), &paths.archive_dir(), &stamp)
+                .map_err(|e| e.to_string())?
+        };
         let mut restarted = false;
         let mut restart_error = None;
         if restart && was_running {
@@ -296,7 +319,11 @@ pub async fn save_config(
 #[tauri::command]
 pub async fn read_history(app: tauri::State<'_, App>) -> Result<serde_json::Value, String> {
     let db = app.paths.ledger();
-    tauri::async_runtime::spawn_blocking(move || history::snapshot(&db))
+    let ledger = Arc::clone(&app.ledger);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _reading = ledger.lock();
+        history::snapshot(&db)
+    })
         .await
         .map_err(|e| e.to_string())
 }
@@ -545,6 +572,7 @@ pub async fn set_mode(
 
     let runner = Arc::clone(&app.runner);
     let paths = app.paths.clone();
+    let ledger = Arc::clone(&app.ledger);
     // From the mode being *set*, not the one on disk. `live_passphrase` reads the file,
     // which still says the old mode here — using it would start a live run with no
     // passphrase, and the bot would sit blocked on stdin looking like a hang.
@@ -557,8 +585,11 @@ pub async fn set_mode(
         // Archive before the write, so a crash in between leaves the old rows filed
         // under the mode that produced them rather than orphaned beside a new config.
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-        let archived = archive::archive_ledger(&paths.ledger(), &paths.archive_dir(), &stamp)
-            .map_err(|e| e.to_string())?;
+        let archived = {
+            let _reading = ledger.lock().map_err(|e| e.to_string())?;
+            archive::archive_ledger(&paths.ledger(), &paths.archive_dir(), &stamp)
+                .map_err(|e| e.to_string())?
+        };
         config::write_mode(&paths.config(), &mode).map_err(|e| e.to_string())?;
 
         let mut restarted = false;

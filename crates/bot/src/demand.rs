@@ -67,13 +67,21 @@ pub struct Demand {
     /// When recording began, in unix seconds. A mint cannot be judged idle for a day
     /// before a day has been watched.
     since: u64,
+    /// When the window was last saved. A gap between this and the next load is time
+    /// the bot was not running, and is not counted as time nobody asked.
+    #[serde(default)]
+    saved: u64,
     events: VecDeque<(u64, String, f64)>,
 }
+
+/// A save older than this at load time means the bot was stopped in between. The save
+/// interval is five minutes, so three of them missed is a restart, not a hiccup.
+pub const DOWNTIME_GRACE_SECS: u64 = 15 * 60;
 
 impl Demand {
     #[must_use]
     pub fn new(now: u64) -> Self {
-        Self { since: now, events: VecDeque::new() }
+        Self { since: now, saved: now, events: VecDeque::new() }
     }
 
     /// Load the persisted window, or start a fresh one if there is none or it cannot be
@@ -86,6 +94,13 @@ impl Demand {
             .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
             .filter(|d| d.since <= now)
             .unwrap_or_else(|| Self::new(now));
+        // Downtime is not evidence. On 2026-09-25 the bot started after a day switched
+        // off, found every account 'idle for a day', and closed two of them within
+        // five seconds. The watched time now excludes the gap.
+        if d.saved > 0 && now > d.saved + DOWNTIME_GRACE_SECS {
+            d.since = d.since.saturating_add(now - d.saved).min(now);
+        }
+        d.saved = now;
         d.prune(now);
         d
     }
@@ -95,7 +110,8 @@ impl Demand {
     ///
     /// # Errors
     /// If the file cannot be written.
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+    pub fn save(&mut self, path: &Path, now: u64) -> std::io::Result<()> {
+        self.saved = now;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(self).map_err(std::io::Error::other)?)?;
         std::fs::rename(tmp, path)
@@ -278,13 +294,29 @@ mod tests {
     }
 
     #[test]
+    fn a_day_switched_off_is_not_a_day_nobody_asked() {
+        let dir = std::env::temp_dir().join(format!("cb-demand-off-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token-demand.json");
+        let mut d = Demand::new(0);
+        d.record(3_600, &m(7), 0.02);
+        d.save(&path, 7_200).unwrap(); // two hours watched, then stopped
+        let back_at = 7_200 + 30 * 3_600; // restarted a day and a bit later
+        let back = Demand::load(&path, back_at);
+        assert!(!back.covers_window(back_at), "only two hours were watched");
+        assert!(idle(&back, &set(&[7, 8]), back_at).is_empty(), "nothing is closed on restart");
+        assert!(back.covers_window(back_at + WINDOW_SECS - 7_200), "a full day of watching counts");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn the_window_survives_a_restart() {
         let dir = std::env::temp_dir().join(format!("cb-demand-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("token-demand.json");
         let mut d = Demand::new(0);
         d.record(10, &m(7), 0.02);
-        d.save(&path).unwrap();
+        d.save(&path, 10).unwrap();
         let back = Demand::load(&path, 20);
         assert_eq!(back.scores().get(&m(7)).map(|s| s.asks), Some(1));
         assert!(!back.covers_window(20));
