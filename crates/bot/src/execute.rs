@@ -140,12 +140,13 @@ pub const fn is_binned(dex: Dex) -> bool {
 ///
 /// A v4 pool's reserves are not in its pool account. They are the balances of two
 /// separate vault accounts, minus the protocol fees accrued in them, and the attempt
-/// path fetches one account per pool. Until it fetches three for this venue, a v4
-/// cycle can be *built* — the encoder is verified against all five pools — and cannot
-/// be *priced*, so it is refused before anything is fetched rather than after.
+/// path fetches one account per pool. It now fetches three for this venue — the
+/// vault addresses are cached per pool and join the same call (0f67a67) — but this
+/// guard was not updated with it, and refused every v4 cycle up front for a fortnight:
+/// 13 times in one 10-hour run, before the working path could be reached.
 #[must_use]
 pub const fn can_reprice(dex: Dex) -> bool {
-    matches!(dex, Dex::OrcaWhirlpool | Dex::RaydiumClmm | Dex::MeteoraDlmm)
+    matches!(dex, Dex::OrcaWhirlpool | Dex::RaydiumClmm | Dex::MeteoraDlmm | Dex::RaydiumAmmV4)
 }
 
 impl CyclePlan {
@@ -2517,12 +2518,12 @@ mod tests {
         assert!(!is_concentrated(Dex::RaydiumAmmV4), "v4 is constant-product, it has no ticks");
     }
 
-    /// The two facts are separate and v4 is currently one and not the other. When
-    /// re-pricing learns to fetch its vaults, this test is the thing that says so.
+    /// The two facts are separate. v4 re-prices from its vaults, fetched beside the
+    /// pool, so it is now both.
     #[test]
     fn a_venue_that_can_be_built_but_not_priced_is_refused_before_anything_is_fetched() {
         assert!(has_encoder(Dex::RaydiumAmmV4));
-        assert!(!can_reprice(Dex::RaydiumAmmV4));
+        assert!(can_reprice(Dex::RaydiumAmmV4), "its vaults join the pool in one read");
         // Nothing may be repriceable without also being encodable; that pairing would
         // build a route the encoder then refuses at the last moment.
         for dex in [
