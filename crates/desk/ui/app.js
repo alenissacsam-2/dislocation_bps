@@ -559,7 +559,13 @@ function onOpportunity(ev) {
 }
 
 function onExecution(ev) {
-  if (!ev.paper) { recordAttempt(classifyAttempt(ev.reason || ""), ev.tsMs || Date.now(), ev.tipPaidUsd || 0); paintAttempts(); }
+  // A probe measures and never sends, so it is not an attempt; and an event from before
+  // the log backfill ends is already in it.
+  const t = ev.tsMs || Date.now();
+  if (!ev.paper && !/^probe/.test(ev.reason || "") && t > ATT.logUntil) {
+    recordAttempt(classifyAttempt(ev.reason || ""), t, ev.tipPaidUsd || 0);
+    paintAttempts();
+  }
   if (!RUN.store) return;
   const st = RUN.store;
   if (ev.paper) {
@@ -716,7 +722,7 @@ function ingestLog(lines, reset) {
       if (/^live mode: waiting for the wallet passphrase|^mode: PAPER/.test(msg)) { start = i; break; }
     }
     LOGA.drift = new Map(); LOGA.gaps = 0;
-    ATT.pts = []; ATT.rate = 0; ATT.accounts = 0; ATT.tipsUsd = 0;
+    ATT.pts = []; ATT.rate = 0; ATT.accounts = 0; ATT.tipsUsd = 0; ATT.logUntil = 0;
     lines = lines.slice(start);
   }
   for (const line of lines) {
@@ -733,7 +739,7 @@ function ingestLog(lines, reset) {
  * and where the fresh price landed against that floor. The funnel says how many; this
  * says by how much, which is the number that decides whether anything will ever clear.
  * Backfilled from the log for the current run at start, then fed by execution events. */
-const ATT = { pts: [], rate: 0, accounts: 0, tipsUsd: 0 };
+const ATT = { pts: [], rate: 0, accounts: 0, tipsUsd: 0, logUntil: 0 };
 const ATT_KINDS = {
   loss: { name: "loss on fresh price", tone: "--coral" },
   fee: { name: "cleared price, not fee", tone: "--amber" },
@@ -775,6 +781,8 @@ function recordAttempt(c, t, tipUsd) {
 
 function ingestAttempt(msg, ts) {
   const t = ts ? Date.parse(ts + "Z") : Date.now();
+  // The backfill's last moment: live events from before it are already counted here.
+  if (t > ATT.logUntil) ATT.logUntil = t;
   recordAttempt(classifyAttempt(msg), t, 0);
 }
 

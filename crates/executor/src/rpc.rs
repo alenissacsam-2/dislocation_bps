@@ -313,6 +313,16 @@ impl Rpc {
         Ok((Hash::from_str(bh).context("unparseable blockhash")?, valid_until))
     }
 
+    /// The lamports an account of `len` bytes must hold to be rent-exempt, as the chain
+    /// charges it today.
+    ///
+    /// # Errors
+    /// If the call fails or the answer is not a number.
+    pub async fn rent_exempt_minimum(&self, len: usize) -> Result<u64> {
+        let r = self.call("getMinimumBalanceForRentExemption", json!([len])).await?;
+        r.as_u64().ok_or_else(|| anyhow!("getMinimumBalanceForRentExemption returned {r}"))
+    }
+
     /// Run the transaction against the node's current state without submitting it.
     ///
     /// `watch` names accounts whose post-execution balances should come back, which is

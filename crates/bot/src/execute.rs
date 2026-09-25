@@ -292,8 +292,13 @@ const FEE_ALLOWANCE_LAMPORTS: u64 = 100_000;
 /// `ResultWithNegativeLamports` three times before the risk gate's own breaker halted
 /// trading. The exact case is pinned in `the_live_failure_is_caught_before_it_repeats`.
 #[must_use]
-pub fn wrap_shortfall(amount_in: u64, distinct_mints: usize, balance: u64) -> Option<u64> {
-    let reserved = distinct_mints as u64 * route::TOKEN_ACCOUNT_RENT + FEE_ALLOWANCE_LAMPORTS;
+pub fn wrap_shortfall(
+    amount_in: u64,
+    distinct_mints: usize,
+    balance: u64,
+    account_rent: u64,
+) -> Option<u64> {
+    let reserved = distinct_mints as u64 * account_rent + FEE_ALLOWANCE_LAMPORTS;
     if amount_in.saturating_add(reserved) > balance {
         Some(reserved)
     } else {
@@ -518,6 +523,11 @@ pub struct Trader {
     /// When the last Jito send went, so the next waits out the block engine's
     /// one-a-second limit here rather than being answered with a 429 there.
     last_jito_send: Option<std::time::Instant>,
+    /// What opening one token account deposits, as the chain charges it. Starts at
+    /// [`route::TOKEN_ACCOUNT_RENT`] and is replaced at startup by the live figure:
+    /// rent fell from 2,039,280 to 1,488,440 lamports for 165 bytes, and a constant
+    /// that overstates it by 37% shrinks every trade the wrap reservation sizes.
+    account_rent: u64,
 }
 
 impl Trader {
@@ -535,7 +545,36 @@ impl Trader {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            account_rent: route::TOKEN_ACCOUNT_RENT,
         }
+    }
+
+    /// Use the chain's current rent for a token account. Zero keeps the constant.
+    pub fn set_account_rent(&mut self, lamports: u64) {
+        if lamports > 0 {
+            self.account_rent = lamports;
+        }
+    }
+
+    /// What one token account deposits, as this trader currently prices it.
+    #[must_use]
+    pub fn account_rent(&self) -> u64 {
+        self.account_rent
+    }
+
+    /// Ask the chain what a token account deposits now and use that.
+    ///
+    /// Priced at 200 bytes rather than the classic 165: a Token-2022 account carries
+    /// its extensions in the same account, and a reservation a little high only trims
+    /// a trade, where one too low lets a wrap leave nothing for the rent it needs.
+    ///
+    /// # Errors
+    /// If the chain cannot be reached; the previous figure then stands.
+    pub async fn learn_account_rent(&mut self) -> Result<u64> {
+        const TOKEN_ACCOUNT_BYTES_WITH_EXTENSIONS: usize = 200;
+        let rent = self.exec.rpc.rent_exempt_minimum(TOKEN_ACCOUNT_BYTES_WITH_EXTENSIONS).await?;
+        self.set_account_rent(rent);
+        Ok(rent)
     }
 
     /// Send [`Submit::Jito`] trades to this block engine URL instead of the default.
@@ -1112,7 +1151,7 @@ impl Trader {
                  of rent out of the same balance this trade's profit is measured in — the \
                  bot opens one itself once attempts keep asking for this mint",
                 to_pubkey(&mint),
-                route::TOKEN_ACCOUNT_RENT
+                self.account_rent
             )));
         }
 
@@ -1670,7 +1709,7 @@ impl Trader {
             // afford.
             let distinct_mints = plan.mints.iter().collect::<std::collections::HashSet<_>>().len();
             let amount_in_u64 = u64::try_from(spent).unwrap_or(u64::MAX);
-            if let Some(reserved) = wrap_shortfall(amount_in_u64, distinct_mints, bal) {
+            if let Some(reserved) = wrap_shortfall(amount_in_u64, distinct_mints, bal, self.account_rent) {
                 return Ok(Attempt::Refused(format!(
                     "wrapping {amount_in_u64} lamports would leave less than the {reserved} \
                      lamports this transaction needs for account rent and fees, against a \
@@ -1852,11 +1891,11 @@ impl Trader {
                  refusing rather than spending {} lamports of rent unasked",
                 missing.len(),
                 Self::MAX_ACCOUNTS_TO_OPEN,
-                missing.len() as u64 * route::TOKEN_ACCOUNT_RENT
+                missing.len() as u64 * self.account_rent
             );
         }
 
-        let cost = missing.len() as u64 * route::TOKEN_ACCOUNT_RENT;
+        let cost = missing.len() as u64 * self.account_rent;
         tracing::warn!(
             "opening {} token account(s) the wallet does not have yet, at {cost} lamports of \
              rent. This is a deposit, not a fee: it stays in the account and returns in full \
@@ -1957,6 +1996,24 @@ impl Trader {
             .collect()
     }
 
+    /// Whether a cycle of this shape could ever be sent by this trader, whatever its
+    /// price: the refusals in [`Trader::attempt`] that do not depend on the market.
+    ///
+    /// What the token rotation counts as demand. Counting the rest opened an account
+    /// for STONK on 2026-09-24 off 486 asks from USDC-start loops that Jito refuses
+    /// before pricing them, and closed JLP to make room.
+    #[must_use]
+    pub fn could_execute(&self, plan: &CyclePlan) -> bool {
+        let binned = plan.pools.iter().filter(|(_, d)| is_binned(*d)).count();
+        let starts_in_sol = plan.mints.first().is_some_and(|m| to_pubkey(m) == pk(programs::WSOL_MINT));
+        plan.encodable()
+            && plan.pools.iter().all(|(_, d)| can_reprice(*d))
+            && plan.pools.len() <= MAX_EXECUTABLE_HOPS
+            && (binned == 0 || plan.pools.len() <= MAX_HOPS_WITH_A_BINNED_LEG)
+            && binned <= MAX_BINNED_HOPS
+            && (!self.sends_via_jito() || (starts_in_sol && self.opts.wsol == WsolPolicy::WrapAndClose))
+    }
+
     /// The first mint of `plan` the wallet holds no account for, if the set is known.
     #[must_use]
     pub fn missing_account(&self, plan: &CyclePlan) -> Option<Pubkey32> {
@@ -2039,7 +2096,11 @@ impl Trader {
             }
             Some(false) => anyhow::bail!("closing the account reverted on chain: {signature}"),
             None => {
-                // Not known is not failed. Re-read next time rather than guess.
+                // Not known is not failed — but a close that lands after the wait would
+                // leave a mint marked held with no account behind it, and trades through
+                // it would then skip the create they need. Forget it instead: if the
+                // account survived, the next open finds it and costs nothing.
+                self.accounts_held.remove(mint);
                 tracing::warn!("{signature} (closing an account) has not confirmed yet");
                 Ok(false)
             }
@@ -2354,6 +2415,7 @@ mod tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            account_rent: route::TOKEN_ACCOUNT_RENT,
         };
         let p = plan(3);
         let data = pools_for(&p);
@@ -2387,6 +2449,7 @@ mod tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            account_rent: route::TOKEN_ACCOUNT_RENT,
         };
         let data = pools_for(&plan(3));
         let arrays = vec![[Pubkey::new_unique(); 3]; 3];
@@ -2418,6 +2481,7 @@ mod tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            account_rent: route::TOKEN_ACCOUNT_RENT,
         };
         let data = pools_for(&plan(2));
         let arrays = vec![[Pubkey::new_unique(); 3]; 2];
@@ -2755,6 +2819,7 @@ mod mainnet {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            account_rent: route::TOKEN_ACCOUNT_RENT,
         };
         let (hops, _) = t.hops_for(&plan, &pool_data, &arrays, &vec![None; plan.pools.len()], &[], 0, 0).expect("hops");
 
@@ -2882,7 +2947,7 @@ mod mainnet {
     /// on the wrap transfer, three times, until the risk gate halted trading.
     #[test]
     fn the_live_failure_is_caught_before_it_repeats() {
-        let shortfall = wrap_shortfall(128_808_539, 2, 132_746_877);
+        let shortfall = wrap_shortfall(128_808_539, 2, 132_746_877, route::TOKEN_ACCOUNT_RENT);
         assert!(shortfall.is_some(), "the sizing that failed on mainnet must now be refused");
         let reserved = shortfall.unwrap();
         assert_eq!(reserved, 2 * 2_039_280 + 100_000);
@@ -2893,7 +2958,7 @@ mod mainnet {
     #[test]
     fn a_wrap_with_real_headroom_is_not_refused() {
         // Same wallet, a size that leaves the reserve intact.
-        assert!(wrap_shortfall(100_000_000, 2, 132_746_877).is_none());
+        assert!(wrap_shortfall(100_000_000, 2, 132_746_877, route::TOKEN_ACCOUNT_RENT).is_none());
     }
 
     /// More mints touched means more rent reserved: a wallet with exactly the reserve
@@ -2901,11 +2966,11 @@ mod mainnet {
     #[test]
     fn more_distinct_mints_reserve_more() {
         let bal_for_two = 2 * 2_039_280 + 100_000;
-        assert!(wrap_shortfall(0, 1, bal_for_two).is_none(), "1 mint fits inside 2 mints' reserve");
-        assert!(wrap_shortfall(0, 2, bal_for_two).is_none(), "exactly enough is enough");
-        assert!(wrap_shortfall(0, 2, bal_for_two - 1).is_some(), "one lamport short must refuse");
+        assert!(wrap_shortfall(0, 1, bal_for_two, route::TOKEN_ACCOUNT_RENT).is_none(), "1 mint fits inside 2 mints' reserve");
+        assert!(wrap_shortfall(0, 2, bal_for_two, route::TOKEN_ACCOUNT_RENT).is_none(), "exactly enough is enough");
+        assert!(wrap_shortfall(0, 2, bal_for_two - 1, route::TOKEN_ACCOUNT_RENT).is_some(), "one lamport short must refuse");
         assert!(
-            wrap_shortfall(0, 3, bal_for_two).is_some(),
+            wrap_shortfall(0, 3, bal_for_two, route::TOKEN_ACCOUNT_RENT).is_some(),
             "3 mints must not fit 2 mints' reserve"
         );
     }
@@ -2937,6 +3002,7 @@ mod fresh_quote_tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            account_rent: route::TOKEN_ACCOUNT_RENT,
         };
 
         let mut p = tests::plan(2);
@@ -2976,6 +3042,7 @@ mod fresh_quote_tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            account_rent: route::TOKEN_ACCOUNT_RENT,
         };
         let p = tests::plan(3);
         let (hops, spent) = t
@@ -3022,6 +3089,7 @@ mod fresh_quote_tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            account_rent: route::TOKEN_ACCOUNT_RENT,
         };
         let mut p = tests::plan(2);
         let data = tests::pools_for(&p);
@@ -3072,6 +3140,7 @@ mod fresh_quote_tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            account_rent: route::TOKEN_ACCOUNT_RENT,
             };
             let _ = &t;
             let p = tests::plan(2);
@@ -3125,6 +3194,7 @@ mod fresh_quote_tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            account_rent: route::TOKEN_ACCOUNT_RENT,
         }
     }
 
@@ -3234,6 +3304,7 @@ mod fresh_quote_tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            account_rent: route::TOKEN_ACCOUNT_RENT,
         };
         let p = tests::plan(2);
         // Pools that decode but trade the wrong mints cannot be re-priced at all.
@@ -3314,6 +3385,7 @@ mod account_rent_tests {
             accounts_held: HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            account_rent: cb_executor::route::TOKEN_ACCOUNT_RENT,
         };
         t.accounts_held = mints.iter().copied().collect();
         t

@@ -287,7 +287,9 @@ pub fn build(owner: &Pubkey, hops: &[Hop], pre_balance: u64, opts: &RouteOptions
             }
         }
         for mint in seen {
-            if opts.others_exist && mint != base_mint {
+            // wSOL is never "open" between trades: `WrapAndClose` closes it every time, so
+            // a cycle that passes through SOL mid-route still has to create it.
+            if opts.others_exist && mint != base_mint && mint != wsol {
                 continue;
             }
             let p = program_of(&mint);

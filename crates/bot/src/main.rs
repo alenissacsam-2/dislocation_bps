@@ -309,6 +309,9 @@ const MAX_ACCOUNT_OPENS_PER_HOUR: usize = 6;
 /// At most this many idle accounts closed per save tick, so one tick cannot block the
 /// sweep for long.
 const MAX_ACCOUNT_CLOSES_PER_TICK: usize = 2;
+/// How long an idle account that could not be closed — it holds a balance, or the close
+/// did not confirm — is left before it is tried again.
+const KEPT_OPEN_RECHECK: Duration = Duration::from_secs(6 * 3_600);
 
 /// Record that an attempt needed each intermediate mint of `plan` that is not a base
 /// or pinned one. See `demand`.
@@ -856,6 +859,12 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
     // needs and every cycle through that mint quietly failing its profit check for the
     // rest of the session — which is precisely the failure this call exists to end.
     // Idempotent, so a retry after a send that actually succeeded finds nothing to do.
+    // Rent is a chain parameter and it has moved: 2,039,280 lamports for a token account
+    // when this was written, 1,488,440 by 2026-09-25. Read it rather than remember it.
+    match trader.learn_account_rent().await {
+        Ok(r) => tracing::info!("a token account deposits {r} lamports of rent at today's rate"),
+        Err(e) => tracing::warn!("could not read the current rent ({e:#}); using {}", trader.account_rent()),
+    }
     let mut base_mints = registry::Registry::embedded()?.base_mints;
     // The base mints are only where cycles *start*. A loop through an intermediate mint
     // the wallet has no account for cannot pass its profit check at all, because the
@@ -901,7 +910,7 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
             tracing::info!("the wallet holds an account for every mint in the book");
         }
         Ok(missing) => {
-            let cost = missing.len() as u64 * cb_executor::route::TOKEN_ACCOUNT_RENT;
+            let cost = missing.len() as u64 * trader.account_rent();
             tracing::warn!(
                 "{} of {} mints have no token account, so cycles through them are refused \
                  rather than attempted. Opening all of them would deposit {cost} lamports \
@@ -1296,6 +1305,8 @@ async fn spawn_live(
         let mut demand_timer = tokio::time::interval(DEMAND_SAVE_INTERVAL);
         let mut account_opens: std::collections::VecDeque<std::time::Instant> =
             std::collections::VecDeque::new();
+        let mut kept_open: std::collections::HashMap<cb_core::types::Pubkey32, std::time::Instant> =
+            std::collections::HashMap::new();
 
         loop {
             tokio::select! {
@@ -1326,12 +1337,15 @@ async fn spawn_live(
                     if let Some(t) = trader.as_mut() {
                         let managed = t.managed_accounts(&protected);
                         let idle = demand::idle(&demand, &managed, now_ms() / 1_000);
-                        for mint in idle.into_iter().take(MAX_ACCOUNT_CLOSES_PER_TICK) {
+                        // An account left open for a balance is not retried every tick.
+                        kept_open.retain(|_, at: &mut std::time::Instant| at.elapsed() < KEPT_OPEN_RECHECK);
+                        let due: Vec<_> = idle.into_iter().filter(|m| !kept_open.contains_key(m)).collect();
+                        for mint in due.into_iter().take(MAX_ACCOUNT_CLOSES_PER_TICK) {
                             match t.close_account(&mint).await {
                                 Ok(true) => tracing::warn!(
                                     "closed an account no attempt asked for in a day, to trade                                      its deposit instead"
                                 ),
-                                Ok(false) => {}
+                                Ok(false) => { kept_open.insert(mint, std::time::Instant::now()); }
                                 Err(e) => tracing::warn!("could not close an idle account: {e:#}"),
                             }
                         }
@@ -1701,7 +1715,9 @@ async fn spawn_live(
                                     //
                                     // Same budget as the probe it replaces, so the RPC load
                                     // does not change.
-                                    let promoted = worth_measuring && t.sends_via_jito();
+                                    let promoted = worth_measuring
+                                        && t.sends_via_jito()
+                                        && opp.plan.as_ref().is_some_and(execute::CyclePlan::encodable);
                                     if promoted {
                                         probes_this_sweep += 1;
                                     }
@@ -1719,7 +1735,9 @@ async fn spawn_live(
                                         None => {
                                             if let Some(probe_plan) = to_measure {
                                                 probes_this_sweep += 1;
-                                                note_demand(&mut demand, probe_plan, net, &protected);
+                                                if t.could_execute(probe_plan) {
+                                                    note_demand(&mut demand, probe_plan, net, &protected);
+                                                }
                                                 let started = std::time::Instant::now();
                                                 let r = t
                                                     .attempt(
@@ -1829,7 +1847,9 @@ async fn spawn_live(
                                         }
                                         Some(plan) => {
                                             attempts_this_sweep += 1;
-                                            note_demand(&mut demand, plan, net, &protected);
+                                            if t.could_execute(plan) {
+                                                note_demand(&mut demand, plan, net, &protected);
+                                            }
                                             let started = std::time::Instant::now();
                                             let r = t
                                                 .attempt(
