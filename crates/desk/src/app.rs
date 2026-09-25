@@ -84,9 +84,51 @@ pub async fn bot_status(app: tauri::State<'_, App>) -> Result<serde_json::Value,
 pub async fn bot_start(app: tauri::State<'_, App>) -> Result<(), String> {
     let runner = Arc::clone(&app.runner);
     let secret = live_passphrase(&app);
-    tauri::async_runtime::spawn_blocking(move || runner.start(secret).map_err(|e| e.to_string()))
-        .await
-        .map_err(|e| e.to_string())?
+    let paths = app.paths.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Only from a stopped bot: the ledger is never moved out from under a writer.
+        if !matches!(runner.probe(), RunState::Running | RunState::Starting)
+            && should_auto_archive(ledger_bytes(&paths.ledger()))
+        {
+            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+            // A ledger that cannot be moved is not a reason to refuse to start: the
+            // run is still recorded, only into the large file.
+            if let Err(e) = archive::archive_ledger(&paths.ledger(), &paths.archive_dir(), &stamp) {
+                eprintln!("could not archive the large ledger before starting: {e:#}");
+            }
+        }
+        runner.start(secret).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Above this, a start from the desk archives the ledger first.
+///
+/// The History view aggregates the whole ledger in one query; past a few hundred
+/// megabytes that takes over a minute and holds a read snapshot the whole time, which
+/// also stops the bot's write-ahead log from being checkpointed. On 2026-09-25 the
+/// ledger had reached 850 MB and its log 1.28 GB across runs nobody had archived, and
+/// History never loaded. The archived file stays browsable under Runs.
+pub const AUTO_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Whether a ledger of `bytes` (database and its logs together) should be archived
+/// before the next run starts into it.
+#[must_use]
+pub fn should_auto_archive(bytes: u64) -> bool {
+    bytes > AUTO_ARCHIVE_BYTES
+}
+
+/// The ledger and its write-ahead log and shared-memory file, together.
+#[must_use]
+pub fn ledger_bytes(ledger: &std::path::Path) -> u64 {
+    let size = |p: std::path::PathBuf| std::fs::metadata(p).map_or(0, |m| m.len());
+    let with = |suffix: &str| {
+        let mut s = ledger.as_os_str().to_owned();
+        s.push(suffix);
+        std::path::PathBuf::from(s)
+    };
+    size(ledger.to_path_buf()) + size(with("-wal")) + size(with("-shm"))
 }
 
 /// The passphrase to hand the bot, or `None`.
@@ -567,4 +609,25 @@ pub fn save_limits(
 #[tauri::command]
 pub fn get_root(app: tauri::State<'_, App>) -> String {
     app.paths.root.display().to_string()
+}
+
+#[cfg(test)]
+mod auto_archive_tests {
+    use super::*;
+
+    #[test]
+    fn the_ledger_is_measured_with_its_logs_and_archived_only_when_large() {
+        let d = std::env::temp_dir().join(format!("cb-desk-archive-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let db = d.join("cryptobot.db");
+        assert_eq!(ledger_bytes(&db), 0, "no ledger yet is zero, not an error");
+        std::fs::write(&db, vec![0u8; 1000]).unwrap();
+        std::fs::write(d.join("cryptobot.db-wal"), vec![0u8; 500]).unwrap();
+        std::fs::write(d.join("cryptobot.db-shm"), vec![0u8; 20]).unwrap();
+        assert_eq!(ledger_bytes(&db), 1520);
+        assert!(!should_auto_archive(1520));
+        assert!(!should_auto_archive(AUTO_ARCHIVE_BYTES));
+        assert!(should_auto_archive(AUTO_ARCHIVE_BYTES + 1));
+        let _ = std::fs::remove_dir_all(d);
+    }
 }
