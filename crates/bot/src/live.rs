@@ -919,8 +919,36 @@ impl LiveMarket {
     /// back different from what the feed had, which is a direct measurement of how
     /// much the WebSocket is missing rather than an assumption about it.
     pub async fn reconcile(&mut self) -> Result<ReconcileReport> {
-        let addresses: Vec<String> =
-            self.watches.keys().map(|k| bs58::encode(k).into_string()).collect();
+        self.reread(None).await
+    }
+
+    /// Re-read these pools now, with their vaults and bin arrays, instead of waiting for
+    /// the next reconcile.
+    ///
+    /// For after an attempt has shown the feed's copy of a pool to be wrong. On
+    /// 2026-09-24 one Meteora DLMM pool's dropped update left it priced about 50 bps
+    /// off for minutes, and every cycle through it was detected, fetched and refused in
+    /// turn — the same phantom, re-attempted under a different partner venue each sweep
+    /// until the reconcile timer came round.
+    ///
+    /// # Errors
+    /// If the chain cannot be reached; the store is then left as it was.
+    pub async fn refresh(&mut self, pools: &[Pubkey32]) -> Result<ReconcileReport> {
+        let only: std::collections::HashSet<Pubkey32> = pools.iter().copied().collect();
+        self.reread(Some(&only)).await
+    }
+
+    async fn reread(
+        &mut self,
+        only: Option<&std::collections::HashSet<Pubkey32>>,
+    ) -> Result<ReconcileReport> {
+        let wanted = |pool: &Pubkey32| only.is_none_or(|set| set.contains(pool));
+        let addresses: Vec<String> = self
+            .watches
+            .keys()
+            .filter(|k| wanted(k))
+            .map(|k| bs58::encode(k).into_string())
+            .collect();
         if addresses.is_empty() {
             return Ok(ReconcileReport::default());
         }
@@ -929,8 +957,12 @@ impl LiveMarket {
 
         // Vault balances first, so a constant-product pool is rebuilt from a coherent
         // set rather than a fresh pool account against last week's vault.
-        let vault_b58: Vec<String> =
-            self.vault_index.keys().map(|k| bs58::encode(k).into_string()).collect();
+        let vault_b58: Vec<String> = self
+            .vault_index
+            .iter()
+            .filter(|(_, (pool, _))| wanted(pool))
+            .map(|(k, _)| bs58::encode(k).into_string())
+            .collect();
         if !vault_b58.is_empty() {
             let (vaults, _) =
                 get_multiple_accounts(&self.client, &self.rpc_http, &vault_b58).await?;
@@ -949,8 +981,12 @@ impl LiveMarket {
         // Bin arrays next, for the same reason and with the same ordering: a binned pool
         // must be rebuilt from a coherent set rather than from a fresh pool account
         // against bins read minutes ago.
-        let bin_b58: Vec<String> =
-            self.bin_index.keys().map(|k| bs58::encode(k).into_string()).collect();
+        let bin_b58: Vec<String> = self
+            .bin_index
+            .iter()
+            .filter(|(_, (pool, _))| wanted(pool))
+            .map(|(k, _)| bs58::encode(k).into_string())
+            .collect();
         if !bin_b58.is_empty() {
             let (arrays, _) =
                 get_multiple_accounts(&self.client, &self.rpc_http, &bin_b58).await?;

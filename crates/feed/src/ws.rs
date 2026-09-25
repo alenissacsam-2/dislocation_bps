@@ -48,8 +48,9 @@ fn now_ms() -> u64 {
 pub struct FeedStats {
     pub updates: AtomicU64,
     pub reconnects: AtomicU64,
-    /// Updates dropped because the consumer channel was full. Every one of these is
-    /// an opportunity we could not even evaluate.
+    /// Updates superseded while the consumer was busy: a newer update for the same
+    /// account arrived before the older one could be delivered. The newest state of
+    /// every account is always delivered; only the intermediate one is skipped.
     pub dropped: AtomicU64,
     pub last_slot: AtomicU64,
     pub last_update_ms: AtomicU64,
@@ -132,6 +133,9 @@ async fn run_once(
     // subscription id, so without this table we cannot tell which account changed.
     let mut pending: std::collections::HashMap<u64, Pubkey32> = std::collections::HashMap::new();
     let mut subs: std::collections::HashMap<u64, Pubkey32> = std::collections::HashMap::new();
+    // Updates the consumer had no room for, newest per account. See `deliver`.
+    let mut backlog: std::collections::HashMap<Pubkey32, AccountUpdate> =
+        std::collections::HashMap::new();
 
     stats.subscribed.store(0, Ordering::Relaxed);
     stats.subscribe_errors.store(0, Ordering::Relaxed);
@@ -272,9 +276,44 @@ async fn run_once(
         stats.last_update_ms.store(now_ms(), Ordering::Relaxed);
 
         let update = AccountUpdate { pubkey, data, slot, received_ms: now_ms() };
-        // try_send, never send: blocking here would apply backpressure all the way
-        // back to the socket and turn a slow consumer into a stalled feed.
-        if tx.try_send(update).is_err() {
+        deliver(tx, &mut backlog, update, stats);
+    }
+}
+
+/// Hand `update` to the consumer without ever blocking the socket, and without losing
+/// the latest state of any account.
+///
+/// try_send, never send: blocking here would apply backpressure all the way back to the
+/// socket and turn a slow consumer into a stalled feed. But throwing the update away
+/// when the channel is full, as this used to, lost the *newest* state of that account
+/// until it happened to change again — and a quiet pool or a Meteora bin array can go
+/// minutes without changing. 1,247 were lost that way in one 10-hour run, and a single
+/// stale DLMM pool was then detected, fetched and refused through cycle after cycle.
+///
+/// So a full channel parks the update in `backlog`, keyed by account, where a newer one
+/// replaces it. The backlog is flushed, oldest-first by nothing but map order, before
+/// each new update is offered, so the consumer catches up with the latest state of
+/// everything the moment it has room.
+fn deliver(
+    tx: &mpsc::Sender<AccountUpdate>,
+    backlog: &mut std::collections::HashMap<Pubkey32, AccountUpdate>,
+    update: AccountUpdate,
+    stats: &FeedStats,
+) {
+    if !backlog.is_empty() {
+        let keys: Vec<Pubkey32> = backlog.keys().copied().collect();
+        for k in keys {
+            let Some(parked) = backlog.remove(&k) else { continue };
+            if let Err(mpsc::error::TrySendError::Full(back)) = tx.try_send(parked) {
+                backlog.insert(k, back);
+                break;
+            }
+        }
+    }
+    let key = update.pubkey;
+    let result = if backlog.is_empty() { tx.try_send(update) } else { Err(mpsc::error::TrySendError::Full(update)) };
+    if let Err(mpsc::error::TrySendError::Full(update)) = result {
+        if backlog.insert(key, update).is_some() {
             stats.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -368,6 +407,26 @@ mod tests {
     fn stats_start_at_zero() {
         let s = FeedStats::default();
         assert_eq!(s.snapshot(), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn a_busy_consumer_still_receives_the_newest_state_of_every_account() {
+        let (tx, mut rx) = mpsc::channel::<AccountUpdate>(1);
+        let stats = FeedStats::default();
+        let mut backlog = std::collections::HashMap::new();
+        let up = |k: u8, slot: u64| AccountUpdate { pubkey: [k; 32], data: vec![k], slot, received_ms: 0 };
+
+        deliver(&tx, &mut backlog, up(1, 10), &stats); // fills the channel
+        deliver(&tx, &mut backlog, up(1, 11), &stats); // parked
+        deliver(&tx, &mut backlog, up(1, 12), &stats); // supersedes 11
+        assert_eq!(stats.dropped.load(Ordering::Relaxed), 1, "only the intermediate state is skipped");
+        assert_eq!(rx.try_recv().unwrap().slot, 10);
+
+        // The consumer has room again: the next update first delivers the parked one.
+        deliver(&tx, &mut backlog, up(2, 13), &stats);
+        assert_eq!(rx.try_recv().unwrap().slot, 12, "the newest state of account 1 arrives");
+        deliver(&tx, &mut backlog, up(3, 14), &stats);
+        assert_eq!(rx.try_recv().unwrap().pubkey, [2; 32], "account 2 was parked, not lost");
     }
 
     #[test]

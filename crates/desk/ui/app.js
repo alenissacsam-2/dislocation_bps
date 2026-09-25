@@ -626,7 +626,9 @@ function paintFunnel() {
   el.style.gridTemplateColumns = `repeat(${stages.length}, minmax(0, 1fr))`;
   el.innerHTML = stages.map((s, i) => {
     const n = st.counts[s.key] || 0;
-    const h = n ? 14 + Math.sqrt(n / max) * 86 : 0;
+    // The level stays in the lower half; the count and name sit above it and never
+    // share a pixel with the surface line.
+    const h = n ? 8 + Math.sqrt(n / max) * 44 : 0;
     const d = topDrop(s.key);
     const lost = i > 0 ? (st.counts[stages[i - 1].key] || 0) - n : 0;
     const fault = d && st.causes[d.name]?.fault;
@@ -823,7 +825,9 @@ function drawAttempts() {
   const t0 = Math.min(...ATT.pts.map((q) => q.t));
   const t1 = Math.max(Date.now(), t0 + 60_000);
   const ys = ATT.pts.filter((q) => Number.isFinite(q.bps)).map((q) => q.bps).sort((a, b) => a - b);
-  const lo = Math.min(-2, ys.length ? ys[Math.floor(ys.length * 0.05)] * 1.15 : -10);
+  // The 10th percentile, so a handful of deep misses does not flatten the band where
+  // almost every attempt lands; anything below is pinned to the bottom edge.
+  const lo = Math.min(-2, ys.length ? ys[Math.floor(ys.length * 0.1)] * 1.2 : -10);
   const hi = 3;
   const X = (t) => pad.l + ((w - pad.l - pad.r) * (t - t0)) / (t1 - t0);
   const Y = (v) => h - pad.b - ((clamp(v, lo, hi) - lo) / (hi - lo)) * (h - pad.t - pad.b);
@@ -836,7 +840,7 @@ function drawAttempts() {
   g.strokeStyle = css("--teal"); g.globalAlpha = 0.55; g.setLineDash([4, 4]); g.lineWidth = 1;
   g.beginPath(); g.moveTo(pad.l, Y(0)); g.lineTo(w - pad.r, Y(0)); g.stroke();
   g.setLineDash([]); g.globalAlpha = 1;
-  label(g, "floor", w - pad.r, Y(0) - 8, "right", css("--teal"));
+  label(g, "floor", pad.l + 4, Y(0) - 8, "left", css("--teal"));
 
   // Where a point has no measured distance, it sits just under the floor (refused for
   // something other than price) or above it (sent), so its outcome still reads.
@@ -934,7 +938,9 @@ function paintHealth() {
   const e = S.live || {};
   const c = (name, v, bad, muted) => `<span class="${bad ? "bad" : muted ? "muted" : ""}">${name}<b>${v}</b></span>`;
   $("counters").innerHTML = [
-    c("dropped", int(e.dropped ?? NaN), (e.dropped || 0) > 0),
+    // Intermediate states skipped while the sweep was busy; the newest state of every
+    // account is always delivered, so this is load, not loss.
+    c("superseded", int(e.dropped ?? NaN), false),
     c("reconnects", int(e.reconnects ?? NaN), (e.reconnects || 0) > 0),
     c("stalls", int(e.stalls ?? NaN), (e.stalls || 0) > 0),
     c("subscribe errors", int(e.subscribeErrors ?? NaN), (e.subscribeErrors || 0) > 0),

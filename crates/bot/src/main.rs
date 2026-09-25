@@ -1859,6 +1859,21 @@ async fn spawn_live(
                                                     execute::Intent::Trade,
                                                 )
                                                 .await;
+                                            // A loss on the fresh read means the feed's copy of at
+                                            // least one of these pools is behind the chain. Re-read
+                                            // them now, so the next sweep does not detect the same
+                                            // phantom through a different partner venue.
+                                            if let Ok(cb_executor::Attempt::Refused(why)) = &r {
+                                                if why.contains("guarantees only")
+                                                    || why.contains("the floor would let through")
+                                                {
+                                                    let ids: Vec<_> =
+                                                        plan.pools.iter().map(|(p, _)| *p).collect();
+                                                    if let Err(e) = market.refresh(&ids).await {
+                                                        tracing::debug!("could not re-read a stale cycle: {e:#}");
+                                                    }
+                                                }
+                                            }
                                             if matches!(r, Ok(cb_executor::Attempt::Refused(_))) {
                                                 rotate_for(
                                                     t,

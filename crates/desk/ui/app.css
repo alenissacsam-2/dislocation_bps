@@ -183,7 +183,7 @@ button { font: inherit; color: inherit; }
 .key-hot:hover:not(:disabled) { background: color-mix(in srgb, var(--coral) 88%, white); }
 .key-danger { color: var(--coral); }
 .key-danger:hover:not(:disabled) { color: color-mix(in srgb, var(--coral) 70%, white); }
-:root[data-theme="light"] .key-go { color: #fff; }
+:root[data-theme="light"] .key-go:not(:disabled) { color: #fff; }
 
 .link-key {
   display: flex; align-items: center; gap: 8px; margin-top: 12px; width: 100%;
@@ -321,14 +321,16 @@ nav button.on .ic { color: var(--amber); }
 
 .funnel { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 8px; align-items: stretch; }
 .chamber { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.chamber .well { position: relative; height: 112px; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; padding: 10px 10px 9px; }
+.chamber .well { position: relative; height: 112px; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-start; padding: 11px 10px 9px; }
 .chamber .fillbar {
   position: absolute; left: 6px; right: 6px; bottom: 6px; height: 0; border-radius: 10px;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--amber) 32%, transparent), var(--amber-soft));
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--amber) 55%, transparent);
+  /* A liquid level, not a slab: a quiet body and a crisp surface line, so the count and
+   * label written over it keep their contrast at any fill. */
+  background: linear-gradient(180deg, color-mix(in srgb, var(--amber) 16%, transparent), color-mix(in srgb, var(--amber) 7%, transparent));
+  box-shadow: inset 0 2px 0 color-mix(in srgb, var(--amber) 80%, transparent);
   transition: height 0.7s var(--ease);
 }
-.chamber.landed .fillbar { background: linear-gradient(180deg, color-mix(in srgb, var(--teal) 40%, transparent), var(--teal-soft)); box-shadow: inset 0 1px 0 color-mix(in srgb, var(--teal) 60%, transparent); }
+.chamber.landed .fillbar { background: linear-gradient(180deg, color-mix(in srgb, var(--teal) 18%, transparent), color-mix(in srgb, var(--teal) 8%, transparent)); box-shadow: inset 0 2px 0 color-mix(in srgb, var(--teal) 85%, transparent); }
 .chamber .count { position: relative; font: 500 22px/1 var(--mono); font-variant-numeric: tabular-nums; }
 .chamber .name { position: relative; font-size: 12px; color: var(--ink-2); margin-top: 5px; line-height: 1.25; }
 .chamber.zero .count { color: var(--ink-3); }
@@ -353,7 +355,7 @@ nav button.on .ic { color: var(--amber); }
 /* ── drift ────────────────────────────────────────────────────────────── */
 
 .drift { display: grid; gap: 12px; }
-.drift-row { display: grid; grid-template-columns: 116px minmax(0, 1fr) 64px; gap: 10px; align-items: center; }
+.drift-row { display: grid; grid-template-columns: 148px minmax(0, 1fr) 60px; gap: 10px; align-items: center; }
 .drift-row .venue { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .drift-row .venue small { display: block; font-size: 11.5px; color: var(--ink-3); }
 .drift-row canvas { width: 100%; height: 30px; display: block; }
