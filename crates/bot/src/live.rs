@@ -1431,6 +1431,40 @@ impl LiveMarket {
         Some(whole * 10f64.powi(-i32::from(self.registry.decimals(mint))))
     }
 
+    /// Stop watching `pool`: its watch, the routing of its auxiliary accounts, its state
+    /// and its registry entry. Returns the accounts the feed should unsubscribe from.
+    pub fn remove_pool(&mut self, pool: &Pubkey32) -> Vec<Pubkey32> {
+        if self.watches.remove(pool).is_none() {
+            return Vec::new();
+        }
+        let mut gone = vec![*pool];
+        self.vault_index.retain(|k, v| {
+            let keep = v.0 != *pool;
+            if !keep {
+                gone.push(*k);
+            }
+            keep
+        });
+        self.bin_index.retain(|k, v| {
+            let keep = v.0 != *pool;
+            if !keep {
+                gone.push(*k);
+            }
+            keep
+        });
+        self.oracle_index.retain(|k, v| {
+            let keep = *v != *pool;
+            if !keep {
+                gone.push(*k);
+            }
+            keep
+        });
+        self.store.remove(&PoolId(*pool));
+        self.registry.pools.retain(|p| p.address != *pool);
+        self.subscriptions.retain(|k| !gone.contains(k));
+        gone
+    }
+
     /// How many pools this market watches.
     #[must_use]
     pub fn watch_count(&self) -> usize {
@@ -1728,6 +1762,33 @@ mod tests {
 
     fn mint(s: &str) -> Pubkey32 {
         pk(s).unwrap()
+    }
+
+    /// Two discovered pools merged in, one let go again: the one let go leaves the
+    /// watch set, the store and the subscriptions, with its vaults; the other stays.
+    #[test]
+    fn a_discovered_pool_merges_in_and_can_be_let_go_with_its_accounts() {
+        let mut m = market_with(Vec::new());
+        let mut found = market_with(vec![sol_usdc(1, 5_569_625_019_338_410_820, 400), sol_usdc(2, 5_569_625_019_338_410_820, 400)]);
+        for id in [1u8, 2] {
+            found.watches.insert([id; 32], Watch { label: format!("p{id}"), dex: Dex::OrcaWhirlpool, venue: Venue::Whirlpool, slot: 1 });
+            found.vault_index.insert([id + 100; 32], ([id; 32], true));
+        }
+        found.subscriptions = vec![[1; 32], [2; 32], [101; 32], [102; 32]];
+        let (subscribe, added) = m.absorb(found);
+        assert_eq!(added.len(), 2);
+        assert_eq!(subscribe.len(), 4, "both pools and both vaults");
+        assert_eq!(m.watch_count(), 2);
+        assert!(m.store.get(&PoolId([1; 32])).is_some());
+
+        let gone = m.remove_pool(&[1; 32]);
+        assert_eq!(gone.len(), 2, "the pool and its vault: {gone:?}");
+        assert!(gone.contains(&[1; 32]) && gone.contains(&[101; 32]));
+        assert_eq!(m.watch_count(), 1);
+        assert!(m.store.get(&PoolId([1; 32])).is_none());
+        assert!(!m.subscriptions.contains(&[101; 32]));
+        assert!(m.store.get(&PoolId([2; 32])).is_some(), "the other stays");
+        assert!(m.remove_pool(&[1; 32]).is_empty(), "letting go twice is a no-op");
     }
 
     /// Real Orca SOL/USDC state: 758.6e12 liquidity at tick -23953, spacing 4.

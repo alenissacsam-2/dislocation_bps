@@ -1609,7 +1609,10 @@ async fn spawn_live(
     if cfg.discovery {
         spawn_discovery(cfg.rpc_http_url.clone(), market.registry.clone(), found_tx);
     }
-    let mut discovery_full_said = false;
+    // Discovered pools, oldest first: the ones to let go of when new ones arrive at the
+    // cap. Pools rotate within hours, so the oldest discovery is the likeliest cold.
+    let mut discovered: std::collections::VecDeque<cb_core::types::Pubkey32> =
+        std::collections::VecDeque::new();
 
     // What the scanner last saw, for the status heartbeat to report. A plain mutex is
     // fine: nothing holds it across an await.
@@ -1855,19 +1858,22 @@ async fn spawn_live(
                     }
                 }
                 Some(found) = found_rx.recv() => {
-                    if market.watch_count() >= MAX_WATCHED_POOLS {
-                        if !discovery_full_said {
-                            tracing::warn!(
-                                "discovery: watching {MAX_WATCHED_POOLS} pools, the most this run \
-                                 subscribes to; newly found pools are left out until a restart"
-                            );
-                            discovery_full_said = true;
-                        }
-                        continue;
-                    }
                     let (subscribe, added) = market.absorb(found);
+                    discovered.extend(added.iter().copied());
+                    // Over the cap, the oldest discoveries go. Never the pools the run
+                    // started with: those are the registry and the census watchlist.
+                    let mut dropped: Vec<cb_core::types::Pubkey32> = Vec::new();
+                    let mut evicted = 0usize;
+                    while market.watch_count() > MAX_WATCHED_POOLS {
+                        let Some(old) = discovered.pop_front() else { break };
+                        dropped.extend(market.remove_pool(&old));
+                        evicted += 1;
+                    }
+                    if !dropped.is_empty() {
+                        let _ = feed_ctl.send(cb_feed::ws::Watch::Drop(dropped));
+                    }
                     if !added.is_empty() {
-                        let _ = feed_ctl.send(subscribe);
+                        let _ = feed_ctl.send(cb_feed::ws::Watch::Add(subscribe));
                         if let Some(t) = trader.as_mut() {
                             t.learn_vaults(market.vault_pairs());
                             t.add_token_2022_mints(
@@ -1875,9 +1881,11 @@ async fn spawn_live(
                             );
                         }
                         tracing::info!(
-                            "discovery: now watching {} pools, {} just added where arbitrage is running",
+                            "discovery: now watching {} pools, {} just added where arbitrage is \
+                             running{}",
                             market.watch_count(),
-                            added.len()
+                            added.len(),
+                            if evicted > 0 { format!(", {evicted} of the oldest found let go") } else { String::new() }
                         );
                     }
                 }

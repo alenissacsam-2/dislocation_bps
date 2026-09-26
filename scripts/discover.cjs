@@ -108,6 +108,12 @@ for (const f of [path.join(__dirname, "..", "crates", "bot", "pools.json"), path
 }
 // Accounts already looked at and found not to be a pool on a traded venue.
 const notPool = new Set();
+// When each pool was last reported. A pool is reported again once this long has
+// passed, because the bot lets go of its oldest discoveries when it is full, and a
+// pool that is busy again should come back.
+const REPORT_AGAIN_MS = 2 * 60 * 60 * 1000;
+const reported = new Map();
+const fresh = (k) => !known.has(k) || (reported.has(k) && Date.now() - reported.get(k) > REPORT_AGAIN_MS);
 
 async function once() {
   const head = await call("getSlot", [{ commitment: "confirmed" }]);
@@ -144,7 +150,7 @@ async function once() {
   const wanted = new Set();
   for (const writes of arbs) {
     const mine = writes.filter((k) => isPool.has(k) || known.has(k));
-    if (mine.length >= 2) for (const k of mine) if (!known.has(k)) wanted.add(k);
+    if (mine.length >= 2) for (const k of mine) if (fresh(k)) wanted.add(k);
   }
   if (wanted.size === 0) return;
   const keys = [...wanted];
@@ -182,7 +188,10 @@ async function once() {
       tvl_usd: 0,
       seen: block.blockTime || 0,
     }));
-  for (const p of out) known.add(p.address);
+  for (const p of out) {
+    known.add(p.address);
+    reported.set(p.address, Date.now());
+  }
   for (const m of Object.keys(mints)) knownMints.add(m);
   if (out.length) process.stdout.write(JSON.stringify({ pools: out, mints }) + "\n");
 }

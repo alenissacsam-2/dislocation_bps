@@ -82,6 +82,15 @@ pub struct WsFeed {
     pub stats: Arc<FeedStats>,
 }
 
+/// A change to the watched set while the feed runs. See [`WsFeed::spawn_controlled`].
+#[derive(Debug, Clone)]
+pub enum Watch {
+    /// Subscribe these, now and on every reconnect.
+    Add(Vec<Pubkey32>),
+    /// Unsubscribe these, and leave them out of every reconnect.
+    Drop(Vec<Pubkey32>),
+}
+
 impl WsFeed {
     #[must_use]
     pub fn new(url: impl Into<String>) -> Self {
@@ -98,15 +107,15 @@ impl WsFeed {
         self.spawn_controlled(accounts).0
     }
 
-    /// [`WsFeed::spawn`], plus a sender that adds accounts to the watched set while the
-    /// feed runs: each is subscribed on the live connection at once and on every
-    /// reconnect after.
+    /// [`WsFeed::spawn`], plus a sender that changes the watched set while the feed
+    /// runs: an added account is subscribed on the live connection at once and on every
+    /// reconnect after; a dropped one is unsubscribed and left out.
     pub fn spawn_controlled(
         &self,
         accounts: Vec<Pubkey32>,
-    ) -> (mpsc::Receiver<AccountUpdate>, mpsc::UnboundedSender<Vec<Pubkey32>>) {
+    ) -> (mpsc::Receiver<AccountUpdate>, mpsc::UnboundedSender<Watch>) {
         let (tx, rx) = mpsc::channel::<AccountUpdate>(4096);
-        let (add_tx, mut add_rx) = mpsc::unbounded_channel::<Vec<Pubkey32>>();
+        let (add_tx, mut add_rx) = mpsc::unbounded_channel::<Watch>();
         let url = self.url.clone();
         let stats = Arc::clone(&self.stats);
 
@@ -153,7 +162,7 @@ where
 async fn run_once(
     url: &str,
     accounts: &mut Vec<Pubkey32>,
-    added: &mut mpsc::UnboundedReceiver<Vec<Pubkey32>>,
+    added: &mut mpsc::UnboundedReceiver<Watch>,
     tx: &mpsc::Sender<AccountUpdate>,
     stats: &FeedStats,
 ) -> Result<()> {
@@ -195,16 +204,39 @@ async fn run_once(
     loop {
         let read = tokio::select! {
             r = tokio::time::timeout(READ_TIMEOUT, socket.next()) => r,
-            more = added.recv() => {
-                // Accounts added while running: subscribed here, and kept for every
-                // reconnect after. A closed sender just means nobody will add more.
-                for acct in more.unwrap_or_default() {
-                    if accounts.contains(&acct) {
-                        continue;
+            change = added.recv() => {
+                // Accounts added while running are subscribed here and kept for every
+                // reconnect after; dropped ones are unsubscribed and forgotten. A closed
+                // sender just means nobody will change the set again.
+                match change {
+                    Some(Watch::Add(more)) => {
+                        for acct in more {
+                            if accounts.contains(&acct) {
+                                continue;
+                            }
+                            subscribe(&mut socket, next_id, &acct, &mut pending).await?;
+                            next_id += 1;
+                            accounts.push(acct);
+                        }
                     }
-                    subscribe(&mut socket, next_id, &acct, &mut pending).await?;
-                    next_id += 1;
-                    accounts.push(acct);
+                    Some(Watch::Drop(gone)) => {
+                        accounts.retain(|a| !gone.contains(a));
+                        let ids: Vec<u64> =
+                            subs.iter().filter(|(_, pk)| gone.contains(pk)).map(|(id, _)| *id).collect();
+                        for id in ids {
+                            subs.remove(&id);
+                            let req = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": next_id,
+                                "method": "accountUnsubscribe",
+                                "params": [id]
+                            });
+                            next_id += 1;
+                            socket.send(Message::Text(req.to_string().into())).await?;
+                            stats.subscribed.fetch_sub(1, Ordering::Relaxed);
+                        }
+                    }
+                    None => {}
                 }
                 continue;
             }
