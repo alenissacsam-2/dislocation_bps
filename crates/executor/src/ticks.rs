@@ -176,7 +176,10 @@ pub async fn resolve(
         bail!("no candidate tick arrays for tick {tick_current} at spacing {tick_spacing}");
     }
     let keys: Vec<Pubkey> = cands.iter().map(|(_, k)| *k).collect();
-    let fetched = rpc.accounts_full(&keys).await?;
+    // The same read a trade re-prices with: the primary endpoint at `processed`. This
+    // runs between a detection and a send, and the rotating `confirmed` read it used
+    // before went to a fallback about 140 ms further away two times in three.
+    let fetched = rpc.accounts_latest(&keys).await?;
 
     let live: Vec<(i32, Pubkey)> = cands
         .iter()
