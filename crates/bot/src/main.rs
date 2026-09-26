@@ -886,6 +886,18 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
         Ok(r) => tracing::info!("a token account deposits {r} lamports of rent at today's rate"),
         Err(e) => tracing::warn!("could not read the current rent ({e:#}); using {}", trader.account_rent()),
     }
+    // Once per start, before any trade: can this path land a bundle at all? See
+    // `Trader::jito_probe`.
+    match trader.jito_probe().await {
+        Ok(Some(true)) => tracing::warn!(
+            "Jito self-test LANDED: the send path works, so a trade bundle that is not              included lost its race or its floor, not its way"
+        ),
+        Ok(Some(false)) => tracing::error!(
+            "Jito self-test was NOT included within 30 s: a bundle with no floor and no race              did not land, so the send path itself is failing (region, tip, or bundle format)"
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("Jito self-test could not be sent: {e:#}"),
+    }
     // The lookup table from earlier runs, if one was built. See `cb_executor::alt`.
     if let Some(key) = read_lookup_path() {
         match trader.load_lookup(key).await {

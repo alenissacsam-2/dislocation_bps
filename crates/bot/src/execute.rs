@@ -2115,7 +2115,7 @@ impl Trader {
                 Some(true) => return Ok(Some(signature)),
                 Some(false) => anyhow::bail!("{what} reverted on chain: {signature}"),
                 None if round < ROUNDS => tracing::warn!(
-                    "{signature} ({what}) has not been included; re-sending against a fresh                      blockhash ({round} of {ROUNDS})"
+                    "{signature} ({what}) has not been included; re-sending against a fresh blockhash ({round} of {ROUNDS})"
                 ),
                 None => {}
             }
@@ -2321,6 +2321,42 @@ impl Trader {
                 None
             }
         }
+    }
+
+    /// Prove the Jito path can land anything at all: one bundle holding nothing but the
+    /// minimum tip.
+    ///
+    /// # Why
+    ///
+    /// By 2026-09-26 about sixty trade bundles had gone out and none was included, and
+    /// the block engine's own status call answered `Invalid` for every one, so nothing
+    /// said whether they lost their races or never reached a leader at all. A tip-only
+    /// bundle has no floor to miss and no race to lose: if it is not included, the
+    /// sending path itself is broken and no trade could ever have landed.
+    ///
+    /// Costs the minimum tip and the base fee (6,000 lamports) when it lands; nothing
+    /// when it does not. Returns whether it landed, or `None` when this trader does not
+    /// send through Jito.
+    ///
+    /// # Errors
+    /// If the blockhash cannot be read or the block engine refuses the transaction.
+    pub async fn jito_probe(&mut self) -> Result<Option<bool>> {
+        if !self.sends_via_jito() || self.opts.dry_run {
+            return Ok(None);
+        }
+        let (blockhash, _) = self.exec.rpc.latest_blockhash().await?;
+        let seed = u64::from_le_bytes(blockhash.to_bytes()[..8].try_into().expect("a hash is 32 bytes"));
+        let tip = cb_executor::jito::tip_account(seed);
+        let ixs = [tx::transfer_lamports(&self.owner, &tip, cb_executor::jito::MIN_TIP_LAMPORTS)];
+        let assembled = tx::assemble(&self.exec.wallet, &ixs, blockhash)?;
+        let receipt = self.exec.rpc.send_jito(&self.jito_url, &assembled.tx_base64).await?;
+        self.last_jito_send = Some(std::time::Instant::now());
+        tracing::info!(
+            "Jito self-test: sent a tip-only bundle {} (bundle {}); waiting up to 30 s for it",
+            receipt.signature,
+            receipt.bundle_id.as_deref().unwrap_or("unnamed")
+        );
+        Ok(Some(self.confirm(&receipt.signature, 15).await == Some(true)))
     }
 
     /// Keep the connections a trade needs open between trades. See
