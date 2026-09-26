@@ -105,7 +105,7 @@ async function accounts(keys, slice) {
     if (!acc) return;
     const v = VENUE[acc.owner];
     const d = Buffer.from(acc.data[0], "base64");
-    pools.set(k, { dex: v.dex, mint_a: b58(d.subarray(v.a, v.a + 32)), mint_b: b58(d.subarray(v.b, v.b + 32)), n: 0 });
+    pools.set(k, { dex: v.dex, mint_a: b58(d.subarray(v.a, v.a + 32)), mint_b: b58(d.subarray(v.b, v.b + 32)), n: 0, sol: 0 });
   });
 
   // Count only arbitrages the bot could have finished.
@@ -117,14 +117,26 @@ async function accounts(keys, slice) {
     // pool (a prop AMM, say) still makes the cycle unfinishable here.
     if (r.venues.split("+").some((v) => v.startsWith("?"))) continue;
     usable++;
-    for (const k of mine) pools.get(k).n++;
+    const net = r.asset === "SOL" ? Math.max(0, Number(r.net)) / 1e9 : 0;
+    for (const k of mine) {
+      pools.get(k).n++;
+      pools.get(k).sol += net;
+    }
   }
   const embedded = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "crates", "bot", "pools.json"), "utf8"));
   const known = new Set(embedded.pools.map((p) => p.address));
-  const chosen = [...pools.entries()]
-    .filter(([k, p]) => p.n > 0 && !known.has(k))
-    .sort((x, y) => y[1].n - x[1].n)
-    .slice(0, MAX);
+  // Most slots by how often arbitrage came through a pool; a quarter by how much it
+  // paid. Counting alone never picks a pool behind one large arbitrage, and on
+  // 2026-09-27 the largest arbitrage a home bot could have reached (0.0068 SOL, on
+  // state 24+ slots old) ran through two pools neither list had chosen.
+  const eligible = [...pools.entries()].filter(([k, p]) => p.n > 0 && !known.has(k));
+  const byCount = [...eligible].sort((x, y) => y[1].n - x[1].n).slice(0, MAX - Math.floor(MAX / 4));
+  const taken = new Set(byCount.map(([k]) => k));
+  const byValue = eligible
+    .filter(([k, p]) => !taken.has(k) && p.sol > 0)
+    .sort((x, y) => y[1].sol - x[1].sol)
+    .slice(0, MAX - byCount.length);
+  const chosen = [...byCount, ...byValue];
 
   // Mints: decimals and program from the mint account, symbol from Token-2022 metadata
   // or the DAS index, and an address prefix when neither has one.
