@@ -23,7 +23,7 @@
 
 use anyhow::{Context, Result};
 use cb_core::types::{Dex, PoolId, PoolState, Pubkey32};
-use cb_dex::{meteora_damm_v2, meteora_dlmm, orca_whirlpool, raydium_clmm, raydium_cpmm, raydium_v4};
+use cb_dex::{meteora_damm_v2, meteora_dlmm, orca_whirlpool, pumpswap, raydium_clmm, raydium_cpmm, raydium_v4};
 use cb_executor::encode::{to_pubkey, to_raw};
 use cb_executor::pda::meteora_bin_array;
 use cb_feed::AccountUpdate;
@@ -31,6 +31,7 @@ use cb_scanner::multi::{survey_and_find, SurveyedCycle};
 use cb_scanner::store::PoolStore;
 use cb_server::{Event, EventBus, RouteRow};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::registry::{pk, Registry};
@@ -128,6 +129,20 @@ enum Venue {
         /// Each held bin array and the slot it arrived at.
         arrays: HashMap<i64, (u64, meteora_dlmm::BinArray)>,
     },
+    /// PumpSwap. Vaults like v4; a fee that moves with the coin's market cap, so it is
+    /// recomputed from the fee program's tiers every time a reserve moves. See
+    /// `cb_dex::pumpswap`.
+    PumpSwap {
+        pool: Box<pumpswap::PumpPool>,
+        base_amount: Option<u64>,
+        quote_amount: Option<u64>,
+        /// The base mint's supply, read at start; with the reserves it is the market cap.
+        supply: u64,
+        /// Whether pump.fun's migration created the pool, which picks tiered fees.
+        pump: bool,
+        /// The fee program's tiers, shared by every PumpSwap pool. `None` until read.
+        fees: Option<Arc<pumpswap::FeeConfig>>,
+    },
     /// Raydium's newer constant-product program. Vaults like v4, fee like CLMM.
     RaydiumCpmm {
         pool: Box<raydium_cpmm::CpmmPool>,
@@ -183,6 +198,12 @@ impl Watch {
                 )
                 .ok()
             }
+            Venue::PumpSwap { pool, base_amount, quote_amount, supply, pump, fees } => {
+                let (base, quote) = ((*base_amount)?, (*quote_amount)?);
+                let cap = pumpswap::market_cap(*supply, base, pool.effective_quote(quote));
+                let bps = fees.as_ref()?.fees(*pump, cap, false).total_bps();
+                pumpswap::to_pool_state(addr, pool, base, quote, bps, self.slot).ok()
+            }
             _ => None,
         }
     }
@@ -195,6 +216,9 @@ impl Watch {
             }
             Venue::RaydiumCpmm { vault_0_amount, vault_1_amount, .. } => {
                 *(if first { vault_0_amount } else { vault_1_amount }) = Some(amount);
+            }
+            Venue::PumpSwap { base_amount, quote_amount, .. } => {
+                *(if first { base_amount } else { quote_amount }) = Some(amount);
             }
             _ => {}
         }
@@ -380,6 +404,8 @@ impl LiveMarket {
         let mut clmm_pending: Vec<(Pubkey32, Pubkey32, Vec<u8>)> = Vec::new(); // pool, config, data
         let mut cpmm_config_b58: Vec<String> = Vec::new();
         let mut cpmm_pending: Vec<(Pubkey32, Pubkey32)> = Vec::new(); // pool, config
+        let mut pump_pending: Vec<(Pubkey32, Pubkey32)> = Vec::new(); // pool, base mint
+        let wsol_raw = pk("So11111111111111111111111111111111111111112")?;
         let store = PoolStore::new();
         let mut failures: Vec<String> = Vec::new();
 
@@ -514,7 +540,47 @@ impl LiveMarket {
                     }
                     Err(e) => failures.push(format!("{}: {e:#}", entry.label)),
                 },
-                Dex::PumpSwap => failures.push(format!("{}: pumpswap not wired live", entry.label)),
+                Dex::PumpSwap => match pumpswap::decode_pool(data) {
+                    // Refused until their fee splits have been checked against the
+                    // program the way ordinary pools were.
+                    Ok(p) if p.is_mayhem_mode || p.is_cashback_coin => failures.push(format!(
+                        "{}: a mayhem-mode or cashback PumpSwap pool, whose fees have not been \
+                         verified",
+                        entry.label
+                    )),
+                    Ok(p) if cb_executor::venue::pumpswap::is_pump_pool(&p) && p.quote_mint != wsol_raw => {
+                        failures.push(format!(
+                            "{}: a pump pool quoted in something other than SOL, whose \
+                             stable-coin fee tiers have not been verified",
+                            entry.label
+                        ));
+                    }
+                    Ok(p) => {
+                        let pump = cb_executor::venue::pumpswap::is_pump_pool(&p);
+                        vault_index.insert(p.base_vault, (addr, true));
+                        vault_index.insert(p.quote_vault, (addr, false));
+                        vault_b58.push(bs58::encode(p.base_vault).into_string());
+                        vault_b58.push(bs58::encode(p.quote_vault).into_string());
+                        pump_pending.push((addr, p.base_mint));
+                        watches.insert(
+                            addr,
+                            Watch {
+                                label: entry.label.clone(),
+                                dex: entry.dex,
+                                venue: Venue::PumpSwap {
+                                    pool: Box::new(p),
+                                    base_amount: None,
+                                    quote_amount: None,
+                                    supply: 0,
+                                    pump,
+                                    fees: None,
+                                },
+                                slot: boot_slot,
+                            },
+                        );
+                    }
+                    Err(e) => failures.push(format!("{}: {e:#}", entry.label)),
+                },
             }
         }
 
@@ -585,6 +651,41 @@ impl LiveMarket {
                         let label = watches.get(&addr).map_or_else(String::new, |w| w.label.clone());
                         watches.remove(&addr);
                         failures.push(format!("{label}: cpmm fee config unresolved"));
+                    }
+                }
+            }
+        }
+
+        // PumpSwap's fee tiers, shared, and each coin's supply, which with the reserves
+        // is the market cap that picks a tier.
+        if !pump_pending.is_empty() {
+            let mut keys = vec![bs58::encode(cb_executor::venue::pumpswap::fee_config()).into_string()];
+            keys.extend(pump_pending.iter().map(|(_, mint)| bs58::encode(mint).into_string()));
+            let (got, _) = get_multiple_accounts(&client, rpc_http, &keys).await?;
+            let cfg = got
+                .first()
+                .and_then(Option::as_ref)
+                .and_then(|d| pumpswap::decode_fee_config(d).ok())
+                .map(Arc::new);
+            for ((addr, _), mint) in pump_pending.iter().zip(got.iter().skip(1)) {
+                let supply = mint
+                    .as_ref()
+                    .and_then(|d| d.get(36..44))
+                    .and_then(|b| b.try_into().ok())
+                    .map(u64::from_le_bytes);
+                match (cfg.clone(), supply) {
+                    (Some(c), Some(n)) => {
+                        if let Some(Venue::PumpSwap { supply, fees, .. }) =
+                            watches.get_mut(addr).map(|w| &mut w.venue)
+                        {
+                            *supply = n;
+                            *fees = Some(c);
+                        }
+                    }
+                    _ => {
+                        let label = watches.get(addr).map_or_else(String::new, |w| w.label.clone());
+                        watches.remove(addr);
+                        failures.push(format!("{label}: pumpswap fee config or coin supply unreadable"));
                     }
                 }
             }
@@ -711,6 +812,11 @@ impl LiveMarket {
                     // Same reasoning: the accrued-fee counters live in this account and
                     // are subtracted from the vault balances to get the real reserve.
                     **pool = raydium_cpmm::decode(&u.data).ok()?;
+                    self.watches.get(&u.pubkey)?.vault_state(u.pubkey)?
+                }
+                Venue::PumpSwap { pool, .. } => {
+                    // The virtual quote reserve lives in this account.
+                    **pool = pumpswap::decode_pool(&u.data).ok()?;
                     self.watches.get(&u.pubkey)?.vault_state(u.pubkey)?
                 }
             }
@@ -1075,6 +1181,10 @@ impl LiveMarket {
             }
             Venue::RaydiumCpmm { pool, .. } => {
                 **pool = raydium_cpmm::decode(data).ok()?;
+                self.watches.get(&addr)?.vault_state(addr)
+            }
+            Venue::PumpSwap { pool, .. } => {
+                **pool = pumpswap::decode_pool(data).ok()?;
                 self.watches.get(&addr)?.vault_state(addr)
             }
         }

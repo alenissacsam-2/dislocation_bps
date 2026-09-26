@@ -886,6 +886,18 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
         Ok(r) => tracing::info!("a token account deposits {r} lamports of rent at today's rate"),
         Err(e) => tracing::warn!("could not read the current rent ({e:#}); using {}", trader.account_rent()),
     }
+    // A PumpSwap hop needs the program's fee recipients, and a purchase needs the
+    // wallet's volume accumulator to exist already. Only when the universe has one.
+    if registry::Registry::load()?.pools.iter().any(|p| p.dex == cb_core::types::Dex::PumpSwap) {
+        if let Err(e) = trader.load_pump_fees().await {
+            tracing::warn!("could not read PumpSwap's fee recipients ({e:#}); PumpSwap hops will be refused");
+        }
+        match trader.ensure_pump_volume_accumulator().await {
+            Ok(true) => tracing::warn!("created the wallet's PumpSwap volume accumulator (rent, returned if closed)"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("could not create the PumpSwap volume accumulator ({e:#}); PumpSwap purchases will fail their floors"),
+        }
+    }
     // Once per start, before any trade: can this path land a bundle at all? See
     // `Trader::jito_probe`.
     match trader.jito_probe().await {

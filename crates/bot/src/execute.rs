@@ -110,7 +110,10 @@ pub const KEEP_WARM_EVERY: std::time::Duration = std::time::Duration::from_secs(
 /// plan the router accepts and the encoder then refuses at the last moment.
 #[must_use]
 pub const fn has_encoder(dex: Dex) -> bool {
-    matches!(dex, Dex::OrcaWhirlpool | Dex::RaydiumClmm | Dex::RaydiumAmmV4 | Dex::MeteoraDlmm)
+    matches!(
+        dex,
+        Dex::OrcaWhirlpool | Dex::RaydiumClmm | Dex::RaydiumAmmV4 | Dex::MeteoraDlmm | Dex::PumpSwap
+    )
 }
 
 /// Whether a venue prices in ticks, and so needs tick arrays resolved before a swap
@@ -153,7 +156,10 @@ pub const fn is_binned(dex: Dex) -> bool {
 /// 13 times in one 10-hour run, before the working path could be reached.
 #[must_use]
 pub const fn can_reprice(dex: Dex) -> bool {
-    matches!(dex, Dex::OrcaWhirlpool | Dex::RaydiumClmm | Dex::MeteoraDlmm | Dex::RaydiumAmmV4)
+    matches!(
+        dex,
+        Dex::OrcaWhirlpool | Dex::RaydiumClmm | Dex::MeteoraDlmm | Dex::RaydiumAmmV4 | Dex::PumpSwap
+    )
 }
 
 impl CyclePlan {
@@ -465,6 +471,7 @@ fn program_for(dex: Dex) -> Pubkey {
         Dex::OrcaWhirlpool => pk(cb_dex::orca_whirlpool::PROGRAM_ID),
         Dex::RaydiumAmmV4 => pk(cb_dex::raydium_v4::PROGRAM_ID),
         Dex::MeteoraDlmm => pk(cb_dex::meteora_dlmm::PROGRAM_ID),
+        Dex::PumpSwap => pk(cb_dex::pumpswap::PROGRAM_ID),
         _ => pk(cb_dex::raydium_clmm::PROGRAM_ID),
     }
 }
@@ -476,6 +483,7 @@ fn mint_a_of(dex: Dex, data: &[u8]) -> Result<Pubkey32> {
         Dex::RaydiumClmm => Ok(cb_dex::raydium_clmm::decode(data)?.mint_0),
         Dex::RaydiumAmmV4 => Ok(cb_dex::raydium_v4::decode_amm_info(data)?.base_mint),
         Dex::MeteoraDlmm => Ok(cb_dex::meteora_dlmm::decode(data)?.token_x_mint),
+        Dex::PumpSwap => Ok(cb_dex::pumpswap::decode_pool(data)?.base_mint),
         other => bail!("{} is not encodable", other.name()),
     }
 }
@@ -822,6 +830,15 @@ impl Trader {
             // number here that certainly is stale.
             Dex::MeteoraDlmm => {
                 cb_dex::meteora_dlmm::to_pool_state(address, data, bins, 0).ok()?
+            }
+            // Vault-backed like v4, and the virtual quote reserve is in the pool account
+            // read beside them. The fee is the plan's: the tier the market cap had at
+            // detection, which only changes when the cap crosses a tier boundary.
+            Dex::PumpSwap => {
+                let (base, quote) = vaults?;
+                let pool = cb_dex::pumpswap::decode_pool(data).ok()?;
+                cb_dex::pumpswap::to_pool_state(address, &pool, base, quote, u64::from(fee_ppm) / 100, 0)
+                    .ok()?
             }
             _ => return None,
         };
@@ -1421,11 +1438,17 @@ impl Trader {
                     }
                 }
                 None => {
-                    if let Ok(info) = cb_dex::raydium_v4::decode_amm_info(&pool_data[i]) {
-                        self.vaults_seen.insert(
-                            *pool_raw,
-                            [to_pubkey(&info.base_vault), to_pubkey(&info.quote_vault)],
-                        );
+                    let learned = match dex {
+                        Dex::RaydiumAmmV4 => cb_dex::raydium_v4::decode_amm_info(&pool_data[i])
+                            .ok()
+                            .map(|info| [to_pubkey(&info.base_vault), to_pubkey(&info.quote_vault)]),
+                        Dex::PumpSwap => cb_dex::pumpswap::decode_pool(&pool_data[i])
+                            .ok()
+                            .map(|p| [to_pubkey(&p.base_vault), to_pubkey(&p.quote_vault)]),
+                        _ => None,
+                    };
+                    if let Some(v) = learned {
+                        self.vaults_seen.insert(*pool_raw, v);
                         unlearned = Some(to_pubkey(pool_raw));
                     }
                 }
@@ -2327,6 +2350,47 @@ impl Trader {
         }
     }
 
+    /// Read PumpSwap's fee recipients from its `GlobalConfig`, so a PumpSwap hop can be
+    /// encoded. The first of each list; the program accepts any of the eight.
+    ///
+    /// # Errors
+    /// If the config cannot be read or decoded.
+    pub async fn load_pump_fees(&mut self) -> Result<()> {
+        let data = self
+            .exec
+            .rpc
+            .accounts(&[pk(cb_dex::pumpswap::GLOBAL_CONFIG)])
+            .await?
+            .pop()
+            .flatten()
+            .context("PumpSwap's GlobalConfig does not exist")?;
+        let g = cb_dex::pumpswap::decode_global_config(&data)?;
+        self.pump_fees = Some(cb_executor::venue::pumpswap::PumpFeeRecipients {
+            protocol: to_pubkey(&g.protocol_fee_recipients[0]),
+            buyback: to_pubkey(&g.buyback_fee_recipients[0]),
+        });
+        Ok(())
+    }
+
+    /// Create the wallet's PumpSwap volume accumulator if it does not exist.
+    ///
+    /// `buy_exact_quote_in` names it and creates it on first use at the payer's cost.
+    /// Inside a trade that rent would come out of the balance the profit is measured
+    /// in, and the floor would refuse the trade every time, so it is made here, once,
+    /// as setup. Its rent comes back if it is ever closed. Returns whether one was made.
+    ///
+    /// # Errors
+    /// If it cannot be read, or the setup transaction fails.
+    pub async fn ensure_pump_volume_accumulator(&self) -> Result<bool> {
+        let key = cb_executor::venue::pumpswap::user_volume_accumulator(&self.owner);
+        if self.exec.rpc.accounts(&[key]).await?.pop().flatten().is_some() {
+            return Ok(false);
+        }
+        let ix = cb_executor::venue::pumpswap::init_user_volume_accumulator(&self.owner);
+        self.send_setup(&[ix], "creating the PumpSwap volume accumulator").await?;
+        Ok(true)
+    }
+
     /// Prove the Jito path can land anything at all: one bundle holding nothing but the
     /// minimum tip.
     ///
@@ -2492,6 +2556,11 @@ fn input_is_token_a(dex: Dex, data: &[u8], mint: &Pubkey32) -> Result<bool> {
         Dex::MeteoraDlmm => {
             let p = cb_dex::meteora_dlmm::decode(data)?;
             (p.token_x_mint, p.token_y_mint)
+        }
+        // PumpSwap's base is token A: spending it is a sale, the encoder's `input_is_a`.
+        Dex::PumpSwap => {
+            let p = cb_dex::pumpswap::decode_pool(data)?;
+            (p.base_mint, p.quote_mint)
         }
         other => bail!("{} is not encodable", other.name()),
     };
@@ -2761,10 +2830,10 @@ mod tests {
     /// move together, and nothing else makes them.
     #[test]
     fn every_venue_the_router_will_plan_is_one_the_encoder_accepts() {
-        for dex in [Dex::OrcaWhirlpool, Dex::RaydiumClmm, Dex::RaydiumAmmV4] {
+        for dex in [Dex::OrcaWhirlpool, Dex::RaydiumClmm, Dex::RaydiumAmmV4, Dex::PumpSwap] {
             assert!(has_encoder(dex), "{} is planned but cannot be built", dex.name());
         }
-        for dex in [Dex::RaydiumCpmm, Dex::MeteoraDammV2, Dex::PumpSwap] {
+        for dex in [Dex::RaydiumCpmm, Dex::MeteoraDammV2] {
             assert!(!has_encoder(dex), "{} has an encoder now; say so here", dex.name());
         }
         // Only the two tick venues go near the tick-array resolver.
