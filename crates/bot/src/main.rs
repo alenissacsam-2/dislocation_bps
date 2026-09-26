@@ -984,6 +984,85 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
 }
 
 
+/// A trade that has been sent and whose fate the chain has not told us yet.
+///
+/// # Why this exists
+///
+/// The send path used to wait for the answer in line — three status reads two seconds
+/// apart, then a status call to the block engine — which stopped the whole loop for
+/// five seconds or more after every send: no feed updates applied, no sweeps, no
+/// attempts, at exactly the moment the market was moving. Now the send is recorded as
+/// awaiting an answer, the loop carries on, and a one-second timer asks once per
+/// pending send until it lands, reverts, or has plainly not been included.
+struct PendingSend {
+    sig: String,
+    sent_at: std::time::Instant,
+    /// The ledger row written when it was sent, updated with the outcome.
+    row: Option<i64>,
+    via_jito: bool,
+}
+
+/// Ask once about every pending send old enough to have an answer and log the outcome
+/// in the words the desk classifies. Returns `(ledger row, taken, reason, net USD)` for
+/// each one settled, for the caller to write: the ledger is not `Sync`, so it is not
+/// held across the awaits here.
+async fn settle_pending(
+    t: &mut execute::Trader,
+    pending: &mut Vec<PendingSend>,
+    sol_price: f64,
+) -> Vec<(i64, bool, String, f64)> {
+    /// A block and a bit: asking sooner mostly hears "not yet".
+    const FIRST_LOOK: Duration = Duration::from_secs(2);
+    /// A bundle is valid for a few slots; after this it is not coming.
+    const GIVE_UP: Duration = Duration::from_secs(8);
+    let mut keep = Vec::new();
+    let mut settled = Vec::new();
+    for p in std::mem::take(pending) {
+        if p.sent_at.elapsed() < FIRST_LOOK {
+            keep.push(p);
+            continue;
+        }
+        let sig = &p.sig;
+        let (taken, reason, net) = match t.confirm(sig, 1).await {
+            Some(true) => {
+                tracing::error!("LANDED {sig} — the transaction confirmed on chain");
+                (true, "submitted and landed".to_string(), 0.0)
+            }
+            Some(false) => {
+                // A revert pays the whole fee and returns nothing; the daily budget has
+                // to see it.
+                let cost_usd = t.submission_cost_lamports() as f64 / 1e9 * sol_price;
+                t.settle(-cost_usd);
+                tracing::warn!(
+                    "{sig} landed and reverted — the floor was not met by the time it was \
+                     included; this cost ${cost_usd:.6} and returned nothing"
+                );
+                (true, "submitted, landed, reverted".to_string(), -cost_usd)
+            }
+            None if p.sent_at.elapsed() < GIVE_UP => {
+                keep.push(p);
+                continue;
+            }
+            None if p.via_jito => {
+                tracing::warn!(
+                    "{sig} was not included — a Jito bundle that misses is dropped and costs \
+                     nothing"
+                );
+                (false, "sent to Jito; not included, cost nothing".to_string(), 0.0)
+            }
+            None => {
+                tracing::warn!("{sig} has not confirmed yet — not the same as failed; check it in an explorer");
+                (false, "submitted; not yet confirmed".to_string(), 0.0)
+            }
+        };
+        if let Some(row) = p.row {
+            settled.push((row, taken, reason, net));
+        }
+    }
+    *pending = keep;
+    settled
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Reading the measurement should not require starting a feed, a socket, or a
@@ -1378,6 +1457,9 @@ async fn spawn_live(
         // Keeps the RPC and Jito connections a trade uses open, so a send does not
         // start with a handshake. See `Trader::keep_warm`.
         let mut warm_timer = tokio::time::interval(execute::KEEP_WARM_EVERY);
+        // Sends whose fate is not known yet, and the timer that asks. See `PendingSend`.
+        let mut pending_sends: Vec<PendingSend> = Vec::new();
+        let mut confirm_timer = tokio::time::interval(Duration::from_secs(1));
         let mut drift = (0usize, 0usize);
         // Both are edge-triggered: logged when they change, not every sweep. A warning
         // that fires five times a second is a warning nobody reads.
@@ -1450,6 +1532,19 @@ async fn spawn_live(
                 _ = warm_timer.tick() => {
                     if let Some(t) = trader.as_mut() {
                         t.keep_warm().await;
+                    }
+                }
+                _ = confirm_timer.tick(), if !pending_sends.is_empty() => {
+                    if let Some(t) = trader.as_mut() {
+                        let sol_price = market.sol_price_usd().unwrap_or(0.0);
+                        let outcomes = settle_pending(t, &mut pending_sends, sol_price).await;
+                        if let Some(l) = ledger.as_ref() {
+                            for (row, taken, reason, net) in outcomes {
+                                if let Err(e) = l.update_fill_outcome(row, taken, &reason, net) {
+                                    tracing::warn!("could not record a send's outcome: {e}");
+                                }
+                            }
+                        }
                     }
                 }
                 _ = reconcile_timer.tick() => {
@@ -1691,6 +1786,7 @@ async fn spawn_live(
                         let mut signature: Option<String> = None;
                         let mut latency_ms: u64 = 0;
                         let mut outcome_reason = skipped.clone();
+                        let mut pending_new: Option<PendingSend> = None;
 
                         if skipped.is_none() {
                             match trader.as_mut() {
@@ -2027,98 +2123,23 @@ async fn spawn_live(
                                                     // same slot invalidates the first.
                                                     submitted_this_sweep = true;
                                                     tracing::error!("submitted {sig}");
-                                                    landed = true;
                                                     signature = Some(sig.clone());
-                                                    // Then ask what became of it, rather than
-                                                    // leaving the log's last word on the most
-                                                    // important event this run can produce as
-                                                    // "asked". At ERROR so it stands out in a
-                                                    // file that is otherwise all refusals: this
-                                                    // is the line the whole exercise is for.
-                                                    outcome_reason = Some(match t.confirm(&sig, 3).await {
-                                                        Some(true) => {
-                                                            tracing::error!(
-                                                                "LANDED {sig} — the transaction \
-                                                                 confirmed on chain"
-                                                            );
-                                                            "submitted and landed".into()
-                                                        }
-                                                        Some(false) => {
-                                                            // Price it, and tell the risk gate.
-                                                            // A revert pays the whole fee and
-                                                            // returns nothing, and until now
-                                                            // that loss was booked at zero —
-                                                            // leaving `max_daily_loss_usd`
-                                                            // measuring a figure nothing wrote.
-                                                            let cost_usd = t
-                                                                .submission_cost_lamports()
-                                                                as f64
-                                                                / 1e9
-                                                                * sol_price;
-                                                            t.settle(-cost_usd);
-                                                            realised = -cost_usd;
-                                                            tracing::warn!(
-                                                                "{sig} landed and reverted — the \
-                                                                 floor was not met by the time it \
-                                                                 was included; this cost \
-                                                                 ${cost_usd:.6} and returned \
-                                                                 nothing"
-                                                            );
-                                                            "submitted, landed, reverted".into()
-                                                        }
-                                                        None if t.sends_via_jito() => {
-                                                            // A bundle is included whole or
-                                                            // not at all, and one that is not
-                                                            // is dropped: nothing was paid, and
-                                                            // nothing was taken either.
-                                                            landed = false;
-                                                            // Why it missed decides what to fix:
-                                                            // a floor already gone wants faster
-                                                            // pricing, a valid bundle left
-                                                            // pending wants a bigger tip.
-                                                            let status = match bundle_id.as_deref() {
-                                                                Some(id) => t.bundle_status(id).await,
-                                                                None => None,
-                                                            };
-                                                            let why = match status.as_deref() {
-                                                                Some("Failed") => {
-                                                                    "the block engine's own simulation \
-                                                                     failed it: the floor was already \
-                                                                     gone when it arrived"
-                                                                }
-                                                                Some("Pending") => {
-                                                                    "it was still valid but no Jito \
-                                                                     leader took it: outbid, or no Jito \
-                                                                     leader in its window"
-                                                                }
-                                                                Some("Invalid") => {
-                                                                    "the block engine no longer knows \
-                                                                     the bundle"
-                                                                }
-                                                                Some(_) => "see the block engine's status",
-                                                                None => "the block engine gave no status",
-                                                            };
-                                                            let status =
-                                                                status.unwrap_or_else(|| "unknown".into());
-                                                            tracing::warn!(
-                                                                "{sig} was not included (bundle \
-                                                                 status {status}: {why}) — a Jito \
-                                                                 bundle that misses is dropped and \
-                                                                 costs nothing"
-                                                            );
-                                                            format!(
-                                                                "sent to Jito; not included \
-                                                                 ({status}), cost nothing"
-                                                            )
-                                                        }
-                                                        None => {
-                                                            tracing::warn!(
-                                                                "{sig} has not confirmed yet — not \
-                                                                 the same as failed; check it in an \
-                                                                 explorer"
-                                                            );
-                                                            "submitted; not yet confirmed".into()
-                                                        }
+                                                    // What became of it is asked by the
+                                                    // confirm timer, off this loop: waiting
+                                                    // here left the bot blind to the market
+                                                    // for five seconds after every send. See
+                                                    // `PendingSend`.
+                                                    let _ = bundle_id;
+                                                    outcome_reason = Some(if t.sends_via_jito() {
+                                                        "sent to Jito; awaiting inclusion".to_string()
+                                                    } else {
+                                                        "submitted; awaiting confirmation".to_string()
+                                                    });
+                                                    pending_new = Some(PendingSend {
+                                                        sig: sig.clone(),
+                                                        sent_at: std::time::Instant::now(),
+                                                        row: None,
+                                                        via_jito: t.sends_via_jito(),
                                                     });
                                                 }
                                                 Ok(cb_executor::Attempt::SimulationRejected {
@@ -2313,9 +2334,17 @@ async fn spawn_live(
                                 // recorded as "not measured" rather than as speed.
                                 latency_ms: (latency_ms > 0).then_some(latency_ms),
                             };
-                            if let Err(e) = l.record_fill(&rec) {
-                                tracing::warn!("could not record fill: {e}");
+                            match l.record_fill(&rec) {
+                                Ok(id) => {
+                                    if let Some(p) = pending_new.as_mut() {
+                                        p.row = Some(id);
+                                    }
+                                }
+                                Err(e) => tracing::warn!("could not record fill: {e}"),
                             }
+                        }
+                        if let Some(p) = pending_new.take() {
+                            pending_sends.push(p);
                         }
 
                         bus.publish(Event::Opportunity {

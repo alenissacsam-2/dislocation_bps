@@ -490,7 +490,7 @@ const RULES = [
   [/submitted and landed/, "landed", "Landed"],
   [/landed, reverted/, "landed", "Landed and reverted", true],
   [/not included/, "landed", "Not included — cost nothing"],
-  [/not yet confirmed/, "landed", "Sent; confirmation pending"],
+  [/not yet confirmed|awaiting (inclusion|confirmation)/, "landed", "Sent; confirmation pending"],
   [/^rpc error|^unexpected/, "built", "Error while attempting", true],
 ];
 

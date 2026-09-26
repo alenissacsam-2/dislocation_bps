@@ -163,6 +163,21 @@ impl Ledger {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Record what became of a submitted trade once the chain has answered.
+    ///
+    /// A send is written when it goes out, before anyone knows whether it landed, so the
+    /// outcome arrives later and updates the same row rather than adding a second one.
+    ///
+    /// # Errors
+    /// If the update fails.
+    pub fn update_fill_outcome(&self, id: i64, taken: bool, reason: &str, net_usd: f64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE paper_fills SET taken = ?1, skipped_reason = ?2, net_usd = ?3 WHERE id = ?4",
+            rusqlite::params![i64::from(taken), reason, net_usd, id],
+        )?;
+        Ok(())
+    }
+
     /// Everything the run has learned so far, in one struct.
     ///
     /// Reads inside a deferred transaction so every figure describes the same instant.

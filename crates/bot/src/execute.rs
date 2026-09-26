@@ -2341,29 +2341,6 @@ impl Trader {
         None
     }
 
-    /// What the block engine did with a bundle this sent, in its own words (`Failed`,
-    /// `Pending`, `Landed`, `Invalid`), or `None` if it could not be asked.
-    ///
-    /// The status request counts against the same one-a-second allowance as a send, so
-    /// it waits out the gap and then restarts it.
-    pub async fn bundle_status(&mut self, bundle_id: &str) -> Option<String> {
-        let gap = std::time::Duration::from_millis(cb_executor::jito::MIN_SEND_GAP_MS);
-        if let Some(at) = self.last_jito_send {
-            if let Some(wait) = gap.checked_sub(at.elapsed()) {
-                tokio::time::sleep(wait).await;
-            }
-        }
-        let r = self.exec.rpc.jito_bundle_status(&self.jito_url, bundle_id).await;
-        self.last_jito_send = Some(std::time::Instant::now());
-        match r {
-            Ok(status) => status,
-            Err(e) => {
-                tracing::debug!("could not read the status of bundle {bundle_id}: {e:#}");
-                None
-            }
-        }
-    }
-
     /// Read PumpSwap's fee recipients from its `GlobalConfig`, so a PumpSwap hop can be
     /// encoded. The first of each list; the program accepts any of the eight.
     ///
