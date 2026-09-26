@@ -95,14 +95,26 @@ impl WsFeed {
     /// loop that cannot keep up should say so, not accumulate a backlog of stale
     /// prices it will act on far too late.
     pub fn spawn(&self, accounts: Vec<Pubkey32>) -> mpsc::Receiver<AccountUpdate> {
+        self.spawn_controlled(accounts).0
+    }
+
+    /// [`WsFeed::spawn`], plus a sender that adds accounts to the watched set while the
+    /// feed runs: each is subscribed on the live connection at once and on every
+    /// reconnect after.
+    pub fn spawn_controlled(
+        &self,
+        accounts: Vec<Pubkey32>,
+    ) -> (mpsc::Receiver<AccountUpdate>, mpsc::UnboundedSender<Vec<Pubkey32>>) {
         let (tx, rx) = mpsc::channel::<AccountUpdate>(4096);
+        let (add_tx, mut add_rx) = mpsc::unbounded_channel::<Vec<Pubkey32>>();
         let url = self.url.clone();
         let stats = Arc::clone(&self.stats);
 
         tokio::spawn(async move {
+            let mut accounts = accounts;
             let mut backoff_ms = 500u64;
             loop {
-                match run_once(&url, &accounts, &tx, &stats).await {
+                match run_once(&url, &mut accounts, &mut add_rx, &tx, &stats).await {
                     Ok(()) => tracing::warn!("feed stream ended cleanly; reconnecting"),
                     Err(e) => tracing::warn!("feed error: {e:#}; reconnecting"),
                 }
@@ -112,13 +124,36 @@ impl WsFeed {
             }
         });
 
-        rx
+        (rx, add_tx)
     }
+}
+
+/// Send one `accountSubscribe` and remember which request it was.
+async fn subscribe<S>(
+    socket: &mut S,
+    id: u64,
+    acct: &Pubkey32,
+    pending: &mut std::collections::HashMap<u64, Pubkey32>,
+) -> Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
+{
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "accountSubscribe",
+        "params": [bs58::encode(acct).into_string(), {"encoding": "base64", "commitment": "processed"}]
+    });
+    socket.send(Message::Text(req.to_string().into())).await?;
+    pending.insert(id, *acct);
+    Ok(())
 }
 
 async fn run_once(
     url: &str,
-    accounts: &[Pubkey32],
+    accounts: &mut Vec<Pubkey32>,
+    added: &mut mpsc::UnboundedReceiver<Vec<Pubkey32>>,
     tx: &mpsc::Sender<AccountUpdate>,
     stats: &FeedStats,
 ) -> Result<()> {
@@ -141,19 +176,12 @@ async fn run_once(
     stats.subscribe_errors.store(0, Ordering::Relaxed);
 
     for (i, acct) in accounts.iter().enumerate() {
-        let id = i as u64 + 1;
-        let req = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "accountSubscribe",
-            "params": [bs58::encode(acct).into_string(), {"encoding": "base64", "commitment": "processed"}]
-        });
-        socket.send(Message::Text(req.to_string().into())).await?;
-        pending.insert(id, *acct);
+        subscribe(&mut socket, i as u64 + 1, acct, &mut pending).await?;
         if (i + 1) % SUBSCRIBE_BATCH == 0 {
             tokio::time::sleep(SUBSCRIBE_PAUSE).await;
         }
     }
+    let mut next_id = accounts.len() as u64 + 1;
 
     // A silently-dead socket is the dangerous failure mode: the peer stops sending but
     // never closes, so `next()` blocks forever and the reconnect loop never runs. The
@@ -165,7 +193,23 @@ async fn run_once(
     let mut last_data = std::time::Instant::now();
 
     loop {
-        let next = match tokio::time::timeout(READ_TIMEOUT, socket.next()).await {
+        let read = tokio::select! {
+            r = tokio::time::timeout(READ_TIMEOUT, socket.next()) => r,
+            more = added.recv() => {
+                // Accounts added while running: subscribed here, and kept for every
+                // reconnect after. A closed sender just means nobody will add more.
+                for acct in more.unwrap_or_default() {
+                    if accounts.contains(&acct) {
+                        continue;
+                    }
+                    subscribe(&mut socket, next_id, &acct, &mut pending).await?;
+                    next_id += 1;
+                    accounts.push(acct);
+                }
+                continue;
+            }
+        };
+        let next = match read {
             Ok(Some(m)) => m,
             Ok(None) => return Ok(()), // stream ended cleanly
             Err(_elapsed) => {

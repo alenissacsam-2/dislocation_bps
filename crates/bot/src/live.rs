@@ -1431,6 +1431,60 @@ impl LiveMarket {
         Some(whole * 10f64.powi(-i32::from(self.registry.decimals(mint))))
     }
 
+    /// How many pools this market watches.
+    #[must_use]
+    pub fn watch_count(&self) -> usize {
+        self.watches.len()
+    }
+
+    /// Take in the pools another market bootstrapped: their watches, the routing of
+    /// their auxiliary accounts, their current states and their registry entries.
+    /// Pools this market already watches are left as they are.
+    ///
+    /// Returns the accounts the feed must now subscribe to, and the pools added. The
+    /// other market was bootstrapped exactly as this one was, so everything that makes
+    /// a pool safe to price — the Token-2022 screen, the fee configs, the oracles —
+    /// has already run on what comes in.
+    pub fn absorb(&mut self, other: LiveMarket) -> (Vec<Pubkey32>, Vec<Pubkey32>) {
+        let LiveMarket { registry, watches, vault_index, bin_index, oracle_index, store, .. } = other;
+        let fresh: Vec<Pubkey32> = watches.keys().filter(|k| !self.watches.contains_key(*k)).copied().collect();
+        let is_fresh = |k: &Pubkey32| fresh.contains(k);
+        let mut subscribe: Vec<Pubkey32> = fresh.clone();
+        for (k, v) in vault_index {
+            if is_fresh(&v.0) {
+                subscribe.push(k);
+                self.vault_index.insert(k, v);
+            }
+        }
+        for (k, v) in bin_index {
+            if is_fresh(&v.0) {
+                subscribe.push(k);
+                self.bin_index.insert(k, v);
+            }
+        }
+        for (k, pool) in oracle_index {
+            if is_fresh(&pool) {
+                subscribe.push(k);
+                self.oracle_index.insert(k, pool);
+            }
+        }
+        for (k, w) in watches {
+            if is_fresh(&k) {
+                if let Some(state) = store.get(&PoolId(k)) {
+                    self.store.upsert(state);
+                }
+                self.watches.insert(k, w);
+            }
+        }
+        let pools = registry.pools.into_iter().filter(|p| is_fresh(&p.address)).collect();
+        self.registry.merge(Registry { base_mints: Vec::new(), mints: registry.mints, pools });
+        subscribe.retain(|k| !self.subscriptions.contains(k));
+        subscribe.sort_unstable();
+        subscribe.dedup();
+        self.subscriptions.extend(subscribe.iter().copied());
+        (subscribe, fresh)
+    }
+
     /// Every vault-backed pool with its two vaults, in the order the executor prices
     /// them: base then quote for Raydium v4 and PumpSwap, token 0 then 1 for CP-Swap.
     ///

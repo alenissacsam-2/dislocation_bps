@@ -156,6 +156,15 @@ impl Registry {
         Self::parse_with(json, true)
     }
 
+    /// Parse pools to add to a registry already loaded, in the same format as
+    /// `watchlist.json`: no base mints required. What `scripts/discover.cjs` prints.
+    ///
+    /// # Errors
+    /// If the JSON does not parse or holds no pools.
+    pub fn parse_extra(json: &str) -> Result<Self> {
+        Self::parse_with(json, false)
+    }
+
     fn parse_with(json: &str, require_base: bool) -> Result<Self> {
         let raw: RawRegistry = serde_json::from_str(json).context("registry is not valid json")?;
 

@@ -980,6 +980,80 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
 }
 
 
+/// The most pools a run watches, discovered ones included. Each costs one to five
+/// feed subscriptions and adds cycles to every sweep; this keeps the subscription count
+/// near a thousand and the sweep near 40 ms.
+const MAX_WATCHED_POOLS: usize = 400;
+
+/// Run `scripts/discover.cjs` for the life of the process, and bootstrap each batch of
+/// pools it reports into a market of their own, sent to the main loop to be merged.
+///
+/// Bootstrapping here rather than in the loop keeps its round trips — pool accounts,
+/// vaults, fee configs, oracles, the Token-2022 screen — off the path trades take. The
+/// batch is bootstrapped with every mint known so far, so the mint screens see all of
+/// them. A missing `node`, or a script that dies, costs only the discovery: the pools
+/// the run started with are watched as before.
+fn spawn_discovery(
+    rpc_http: String,
+    known: registry::Registry,
+    out: tokio::sync::mpsc::Sender<live::LiveMarket>,
+) {
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let child = tokio::process::Command::new("node")
+            .arg("scripts/discover.cjs")
+            .env("CRYPTOBOT_RPC_HTTP_URL", &rpc_http)
+            // Held open and never written: the script exits when it closes, which is
+            // how it learns this process is gone however this process ended.
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn();
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("pool discovery could not start ({e}); watching the start-up pools only");
+                return;
+            }
+        };
+        if let Some(err) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut lines = tokio::io::BufReader::new(err).lines();
+                while let Ok(Some(l)) = lines.next_line().await {
+                    tracing::debug!("discover.cjs: {}", cb_core::redact::redact_urls_in(&l));
+                }
+            });
+        }
+        let _keep_open = child.stdin.take();
+        let Some(stdout) = child.stdout.take() else { return };
+        tracing::info!("pool discovery running: following live arbitrage to the pools it uses");
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let mut mints = known.mints;
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(found) = registry::Registry::parse_extra(&line) else { continue };
+            for (k, m) in found.mints {
+                mints.entry(k).or_insert(m);
+            }
+            let batch = registry::Registry {
+                base_mints: known.base_mints.clone(),
+                mints: mints.clone(),
+                pools: found.pools,
+            };
+            match live::LiveMarket::bootstrap(&rpc_http, batch).await {
+                Ok(m) => {
+                    if out.send(m).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => tracing::debug!("discovered pools did not bootstrap: {e:#}"),
+            }
+        }
+        tracing::warn!("pool discovery stopped; the pools found so far stay watched");
+        let _ = child.kill().await;
+    });
+}
+
 /// A trade that has been sent and whose fate the chain has not told us yet.
 ///
 /// # Why this exists
@@ -1142,6 +1216,35 @@ async fn main() -> anyhow::Result<()> {
         println!("{} of {asked} pools priceable", market.store_len());
         return Ok(());
     }
+    // `cb-bot --discover [seconds]`: bootstrap as `--pools` does, run pool discovery for a
+    // while, merge what it finds, and time a sweep of the grown graph. No feed, no wallet.
+    if args.iter().any(|a| a == "--discover") {
+        tracing_subscriber::fmt().with_ansi(false).with_target(false).init();
+        let cfg = Config::load("config.toml")?;
+        let secs: u64 = args
+            .iter()
+            .position(|a| a == "--discover")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(90);
+        let mut market = live::LiveMarket::bootstrap(&cfg.rpc_http_url, registry::Registry::load()?).await?;
+        let (found_tx, mut found_rx) = tokio::sync::mpsc::channel::<live::LiveMarket>(4);
+        spawn_discovery(cfg.rpc_http_url.clone(), market.registry.clone(), found_tx);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        while let Ok(Some(found)) = tokio::time::timeout_at(deadline, found_rx.recv()).await {
+            let (subscribe, added) = market.absorb(found);
+            println!(
+                "absorbed {} pools ({} new subscriptions); now {} pools, {} priceable",
+                added.len(),
+                subscribe.len(),
+                market.watch_count(),
+                market.store_len()
+            );
+        }
+        let s = market.sweep(cfg.tradable_usd(), cfg.tradeable_depth_usd(), cfg.max_hops);
+        println!("sweep of the grown graph: {} cycles in {} us", s.evaluated, s.duration_us);
+        return Ok(());
+    }
     // `cb-bot --bench-sweep`: bootstrap as `--pools` does, then time the full-graph sweep
     // the main loop runs, on today's real pools. No feed, no wallet.
     if args.iter().any(|a| a == "--bench-sweep") {
@@ -1220,6 +1323,7 @@ async fn main() -> anyhow::Result<()> {
             // path, and paying rent is not something a run with no config should decide.
             extra_token_mints: Vec::new(),
             token_account_slots: 0,
+            discovery: false,
             capital_usd: 100.0,
             fee_buffer_usd: 0.20,
             min_trade_usd: 10.0,
@@ -1399,7 +1503,14 @@ async fn spawn_live(
 
     let feed = WsFeed::new(cfg.rpc_ws_url.clone());
     let stats = std::sync::Arc::clone(&feed.stats);
-    let mut rx = feed.spawn(market.subscriptions.clone());
+    let (mut rx, feed_ctl) = feed.spawn_controlled(market.subscriptions.clone());
+    // Pools arbitrage is running through now, bootstrapped off the main loop and
+    // merged into it. See `spawn_discovery`.
+    let (found_tx, mut found_rx) = tokio::sync::mpsc::channel::<live::LiveMarket>(4);
+    if cfg.discovery {
+        spawn_discovery(cfg.rpc_http_url.clone(), market.registry.clone(), found_tx);
+    }
+    let mut discovery_full_said = false;
 
     // What the scanner last saw, for the status heartbeat to report. A plain mutex is
     // fine: nothing holds it across an await.
@@ -1634,6 +1745,33 @@ async fn spawn_live(
                             tracing::error!("feed channel closed — no further updates");
                             break;
                         }
+                    }
+                }
+                Some(found) = found_rx.recv() => {
+                    if market.watch_count() >= MAX_WATCHED_POOLS {
+                        if !discovery_full_said {
+                            tracing::warn!(
+                                "discovery: watching {MAX_WATCHED_POOLS} pools, the most this run \
+                                 subscribes to; newly found pools are left out until a restart"
+                            );
+                            discovery_full_said = true;
+                        }
+                        continue;
+                    }
+                    let (subscribe, added) = market.absorb(found);
+                    if !added.is_empty() {
+                        let _ = feed_ctl.send(subscribe);
+                        if let Some(t) = trader.as_mut() {
+                            t.learn_vaults(market.vault_pairs());
+                            t.add_token_2022_mints(
+                                market.registry.mints.iter().filter(|(_, m)| m.token_2022).map(|(k, _)| *k),
+                            );
+                        }
+                        tracing::info!(
+                            "discovery: now watching {} pools, {} just added where arbitrage is running",
+                            market.watch_count(),
+                            added.len()
+                        );
                     }
                 }
                 _ = usd_timer.tick() => market.rebuild_usd_index(),

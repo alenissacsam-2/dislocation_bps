@@ -777,6 +777,11 @@ impl Trader {
     /// Separate from `new` so the executor does not have to know what a registry is,
     /// and so a caller that never learns keeps the old behaviour exactly: every mint
     /// classic, every swap the v1 instruction.
+    /// Add to the Token-2022 mints, for pools found while running.
+    pub fn add_token_2022_mints(&mut self, mints: impl IntoIterator<Item = Pubkey32>) {
+        self.token_2022_mints.extend(mints);
+    }
+
     pub fn set_token_2022_mints(&mut self, mints: impl IntoIterator<Item = Pubkey32>) {
         self.token_2022_mints = mints.into_iter().collect();
     }

@@ -13,6 +13,10 @@ const fn default_token_account_slots() -> usize {
     6
 }
 
+const fn default_discovery() -> bool {
+    true
+}
+
 fn default_rpc_http() -> String {
     "https://api.mainnet-beta.solana.com".to_string()
 }
@@ -191,6 +195,13 @@ pub struct Config {
     /// rotation off.
     #[serde(default = "default_token_account_slots")]
     pub token_account_slots: usize,
+
+    /// Follow live arbitrage to the pools it runs through and watch those too, while
+    /// running (`scripts/discover.cjs`, which needs `node` on the PATH). A watchlist
+    /// read at start stops describing the market within hours; off, the bot watches
+    /// only the pools it started with.
+    #[serde(default = "default_discovery")]
+    pub discovery: bool,
 
     /// Simulate every trade and submit none.
     ///
@@ -376,6 +387,7 @@ mod tests {
             jito_simulate_first: true,
             extra_token_mints: Vec::new(),
             token_account_slots: default_token_account_slots(),
+            discovery: default_discovery(),
             dry_run: true,
             max_position_usd: 25.0,
             max_daily_loss_usd: 5.0,
