@@ -22,6 +22,15 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// writes into a socket the far end has already dropped.
 const POOL_IDLE: Duration = Duration::from_secs(3);
 
+/// The same, for the two hosts on a trade's critical path: the primary RPC and the
+/// Jito block engine. Both were measured on 2026-09-26 to keep an idle connection for
+/// at least 60 s, and both cost far more to reach cold than warm from this machine
+/// (Helius 225 ms against 60; Jito Frankfurt about 770 against 215). At 3 s every Jito
+/// send, seconds or minutes after the last, opened a new TCP and TLS session first:
+/// 640 to 1,035 ms from the fresh re-price to the send. [`Rpc::keep_warm`] keeps
+/// traffic on both well inside this window.
+const WARM_POOL_IDLE: Duration = Duration::from_secs(45);
+
 pub struct Rpc {
     /// Endpoints in preference order. Reads fail over down this list; sends never do.
     endpoints: Vec<String>,
@@ -29,6 +38,8 @@ pub struct Rpc {
     /// retried first on every subsequent call.
     cursor: std::sync::atomic::AtomicUsize,
     http: reqwest::Client,
+    /// For the primary endpoint and Jito only; see [`WARM_POOL_IDLE`].
+    http_warm: reqwest::Client,
 }
 
 /// What a simulation said would happen.
@@ -172,6 +183,12 @@ impl Rpc {
                 // submits the same trade twice.
                 .pool_idle_timeout(POOL_IDLE)
                 .build()?,
+            http_warm: reqwest::Client::builder()
+                .timeout(TIMEOUT)
+                .pool_idle_timeout(WARM_POOL_IDLE)
+                .tcp_keepalive(Duration::from_secs(15))
+                .tcp_nodelay(true)
+                .build()?,
         })
     }
 
@@ -196,7 +213,8 @@ impl Rpc {
 
         let mut backoff = Duration::from_millis(400);
         for attempt in 0..=Self::RATE_LIMIT_RETRIES {
-            let resp = match self.http.post(url).json(&body).send().await {
+            let client = if url == self.endpoints[0] { &self.http_warm } else { &self.http };
+            let resp = match client.post(url).json(&body).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     // Not `.with_context(...)?`. reqwest embeds the destination URL —
@@ -481,7 +499,7 @@ impl Rpc {
             "method": "sendTransaction",
             "params": [tx_base64, {"encoding": "base64"}],
         });
-        let resp = match self.http.post(url).json(&body).send().await {
+        let resp = match self.http_warm.post(url).json(&body).send().await {
             Ok(r) => r,
             Err(e) => bail!(
                 "Jito sendTransaction failed: {}",
@@ -508,6 +526,37 @@ impl Rpc {
         Ok(JitoReceipt { signature, bundle_id })
     }
 
+    /// Touch the primary RPC and, given one, the Jito block engine, so the next trade
+    /// finds both connections open. See [`WARM_POOL_IDLE`].
+    ///
+    /// `getSlot` and `getTipAccounts` are the cheapest calls each serves. The Jito one
+    /// counts against its one-a-second allowance, so the caller spaces it like a send.
+    ///
+    /// # Errors
+    /// If either request fails.
+    pub async fn keep_warm(&self, jito_url: Option<&str>) -> Result<()> {
+        // The body is read to the end so the connection goes back to the pool.
+        let touch = |url: String, body: Value| async move {
+            let r = self.http_warm.post(&url).json(&body).send().await?;
+            r.bytes().await.map(|_| ())
+        };
+        let redact = |e: reqwest::Error| {
+            anyhow!("keep-warm request failed: {}", cb_core::redact::redact_urls_in(&e.to_string()))
+        };
+        let primary =
+            touch(self.endpoints[0].clone(), json!({"jsonrpc": "2.0", "id": 1, "method": "getSlot"}));
+        match jito_url {
+            Some(u) => {
+                let tips = json!({"jsonrpc": "2.0", "id": 1, "method": "getTipAccounts", "params": []});
+                let (a, b) = tokio::join!(primary, touch(crate::jito::api_url(u, "getTipAccounts"), tips));
+                a.map_err(redact)?;
+                b.map_err(redact)?;
+            }
+            None => primary.await.map_err(redact)?,
+        }
+        Ok(())
+    }
+
     /// What the block engine did with a bundle sent in the last five minutes.
     ///
     /// # Why
@@ -531,7 +580,7 @@ impl Rpc {
             "params": [[bundle_id]],
         });
         let endpoint = crate::jito::api_url(url, "getInflightBundleStatuses");
-        let resp = match self.http.post(&endpoint).json(&body).send().await {
+        let resp = match self.http_warm.post(&endpoint).json(&body).send().await {
             Ok(r) => r,
             Err(e) => bail!(
                 "Jito getInflightBundleStatuses failed: {}",

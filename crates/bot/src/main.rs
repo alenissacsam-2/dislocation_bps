@@ -1338,6 +1338,9 @@ async fn spawn_live(
         // index every sweep would be work spent on a number that has not changed.
         let mut usd_timer = tokio::time::interval(USD_REFRESH);
         let mut reconcile_timer = tokio::time::interval(RECONCILE_INTERVAL);
+        // Keeps the RPC and Jito connections a trade uses open, so a send does not
+        // start with a handshake. See `Trader::keep_warm`.
+        let mut warm_timer = tokio::time::interval(execute::KEEP_WARM_EVERY);
         let mut drift = (0usize, 0usize);
         // Both are edge-triggered: logged when they change, not every sweep. A warning
         // that fires five times a second is a warning nobody reads.
@@ -1407,6 +1410,11 @@ async fn spawn_live(
                     }
                 }
                 _ = usd_timer.tick() => market.rebuild_usd_index(),
+                _ = warm_timer.tick() => {
+                    if let Some(t) = trader.as_mut() {
+                        t.keep_warm().await;
+                    }
+                }
                 _ = reconcile_timer.tick() => {
                     // Blocks the other branches for a second or so. That is fine: the
                     // update channel is bounded at 4096 and buffers far more than a

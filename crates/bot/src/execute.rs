@@ -98,6 +98,10 @@ pub struct CyclePlan {
     pub fee_ppm: Vec<u32>,
 }
 
+/// How often [`Trader::keep_warm`] runs: well inside the 45 s the warm pool keeps an idle
+/// connection, and the 60 s both hosts were measured to.
+pub const KEEP_WARM_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Whether [`cb_executor::venue::build_swap`] can encode a swap on this venue.
 ///
 /// One definition rather than a `matches!` repeated at each of the places that need to
@@ -2306,6 +2310,31 @@ impl Trader {
                 tracing::debug!("could not read the status of bundle {bundle_id}: {e:#}");
                 None
             }
+        }
+    }
+
+    /// Keep the connections a trade needs open between trades. See
+    /// [`cb_executor::rpc::Rpc::keep_warm`].
+    ///
+    /// Skips Jito when a send went out recently, since that already kept it warm and
+    /// the ping would only spend the one-a-second allowance; otherwise it waits out
+    /// the gap like a send and restarts it.
+    pub async fn keep_warm(&mut self) {
+        let jito = self.sends_via_jito() && !self.opts.dry_run;
+        let gap = std::time::Duration::from_millis(cb_executor::jito::MIN_SEND_GAP_MS);
+        let recent = self.last_jito_send.is_some_and(|at| at.elapsed() < KEEP_WARM_EVERY);
+        let ping_jito = jito && !recent;
+        if ping_jito {
+            if let Some(wait) = self.last_jito_send.and_then(|at| gap.checked_sub(at.elapsed())) {
+                tokio::time::sleep(wait).await;
+            }
+        }
+        let url = ping_jito.then_some(self.jito_url.as_str());
+        if let Err(e) = self.exec.rpc.keep_warm(url).await {
+            tracing::debug!("{e:#}");
+        }
+        if ping_jito {
+            self.last_jito_send = Some(std::time::Instant::now());
         }
     }
 
