@@ -2661,9 +2661,7 @@ impl Trader {
             }
         }
         let urls: &[String] = if ping_jito { &self.jito_urls } else { &[] };
-        if let Err(e) = self.exec.rpc.keep_warm(urls).await {
-            tracing::debug!("{e:#}");
-        }
+        self.exec.rpc.keep_warm(urls);
         if ping_jito {
             self.last_jito_send = Some(std::time::Instant::now());
         }

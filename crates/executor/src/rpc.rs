@@ -547,35 +547,26 @@ impl Rpc {
     /// count against each region's one-a-second allowance, so the caller spaces them
     /// like a send.
     ///
-    /// # Errors
-    /// If the primary RPC cannot be reached. A block engine that does not answer is
-    /// only logged: one region down must not read as the whole path failing.
-    pub async fn keep_warm(&self, jito_urls: &[String]) -> Result<()> {
-        // The body is read to the end so the connection goes back to the pool.
-        async fn touch(client: reqwest::Client, url: String, body: Value) -> reqwest::Result<()> {
-            let r = client.post(&url).json(&body).send().await?;
-            r.bytes().await.map(|_| ())
+    /// Returns at once: the requests run detached, since nothing waits on their answers
+    /// and the caller is the trading loop. Awaiting eight regions, the farthest two
+    /// seconds away on a cold connection, held that loop still every twenty seconds.
+    /// A request that fails is logged at debug and costs only its warmth.
+    pub fn keep_warm(&self, jito_urls: &[String]) {
+        async fn touch(client: reqwest::Client, url: String, body: Value) {
+            let r = async { client.post(&url).json(&body).send().await?.bytes().await }.await;
+            if let Err(e) = r {
+                tracing::debug!("keep-warm request failed: {}", cb_core::redact::redact_urls_in(&e.to_string()));
+            }
         }
-        let redact = |e: reqwest::Error| {
-            anyhow!("keep-warm request failed: {}", cb_core::redact::redact_urls_in(&e.to_string()))
-        };
         let tips = json!({"jsonrpc": "2.0", "id": 1, "method": "getTipAccounts", "params": []});
-        let mut regions = tokio::task::JoinSet::new();
         for u in jito_urls {
-            regions.spawn(touch(self.http_warm.clone(), crate::jito::api_url(u, "getTipAccounts"), tips.clone()));
+            tokio::spawn(touch(self.http_warm.clone(), crate::jito::api_url(u, "getTipAccounts"), tips.clone()));
         }
-        let primary = touch(
+        tokio::spawn(touch(
             self.http_warm.clone(),
             self.endpoints[0].clone(),
             json!({"jsonrpc": "2.0", "id": 1, "method": "getSlot"}),
-        )
-        .await;
-        while let Some(r) = regions.join_next().await {
-            if let Ok(Err(e)) = r {
-                tracing::debug!("{:#}", redact(e));
-            }
-        }
-        primary.map_err(redact)
+        ));
     }
 
     /// What the block engine did with a bundle sent in the last five minutes.
