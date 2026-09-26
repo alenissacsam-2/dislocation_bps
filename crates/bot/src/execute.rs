@@ -1156,6 +1156,7 @@ impl Trader {
         expected_net_usd: f64,
         intent: Intent,
     ) -> Result<Attempt> {
+        let attempt_started = std::time::Instant::now();
         // Cheapest and most fatal first, same principle as the gate itself: a halted
         // run used to still pay for a full account fetch, tick-array resolution, and
         // a blockhash — several RPC round trips — only to be refused at the very last
@@ -1369,6 +1370,15 @@ impl Trader {
 
         let (fetched, (blockhash, _)) =
             tokio::try_join!(rpc.accounts_latest(&keys), rpc.latest_blockhash())?;
+        {
+            let bytes: usize = fetched.iter().flatten().map(|a| a.data.len()).sum();
+            tracing::info!(
+                "re-price read: {} accounts, {} KiB, {} ms",
+                keys.len(),
+                bytes / 1024,
+                attempt_started.elapsed().as_millis()
+            );
+        }
         let mut pool_data = Vec::with_capacity(n);
         for (key, acc) in keys.iter().zip(fetched.iter()).take(n) {
             let Some(a) = acc.as_ref() else {

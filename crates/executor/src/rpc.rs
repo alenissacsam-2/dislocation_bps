@@ -705,9 +705,17 @@ impl Rpc {
             return Ok(Vec::new());
         }
         let addresses: Vec<String> = keys.iter().map(ToString::to_string).collect();
-        let params = json!([addresses, {"encoding": "base64", "commitment": commitment}]);
         // `processed` is only ever asked for on a trade's re-price; see [`Rpc::call_primary`].
-        let r = if commitment == "processed" {
+        //
+        // That read is also compressed. It carries every tick and bin array a trade
+        // might name, ten-odd kilobytes each and mostly zeros, and its time on the wire
+        // is part of the gap between a detection and a send. Measured from this machine
+        // on 2026-09-26: 18 KB of base64 took about 105 ms, the same accounts as
+        // base64+zstd (7 KB) about 65.
+        let hot = commitment == "processed";
+        let encoding = if hot { "base64+zstd" } else { "base64" };
+        let params = json!([addresses, {"encoding": encoding, "commitment": commitment}]);
+        let r = if hot {
             self.call_primary("getMultipleAccounts", params).await?
         } else {
             self.call("getMultipleAccounts", params).await?
@@ -721,11 +729,12 @@ impl Rpc {
                 if a.is_null() {
                     return None;
                 }
-                let data = a["data"]
-                    .as_array()
-                    .and_then(|d| d.first())
-                    .and_then(Value::as_str)
-                    .and_then(base64_decode)?;
+                let field = a["data"].as_array()?;
+                let raw = field.first().and_then(Value::as_str).and_then(base64_decode)?;
+                let data = match field.get(1).and_then(Value::as_str) {
+                    Some("base64+zstd") => zstd_decode(&raw)?,
+                    _ => raw,
+                };
                 let owner = a["owner"].as_str().and_then(|o| Pubkey::from_str(o).ok())?;
                 Some(Account { owner, data, lamports: a["lamports"].as_u64().unwrap_or(0) })
             })
@@ -862,6 +871,15 @@ fn token_amount_of(account: &Value) -> Option<u64> {
 }
 
 /// Minimal base64, so the crate does not take a dependency for two call sites.
+/// Decompress one account's data as sent under `base64+zstd`.
+fn zstd_decode(compressed: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed).ok()?;
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut rev = [255u8; 256];

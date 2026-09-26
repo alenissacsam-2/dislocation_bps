@@ -19,3 +19,4 @@ reqwest = { workspace = true }
 bs58 = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+ruzstd = "0.9"
