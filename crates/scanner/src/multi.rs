@@ -299,6 +299,35 @@ pub fn survey_from_base(
     out
 }
 
+/// [`survey_from_base`] and [`find_from_base`] in one pass: every cycle from
+/// `base_mint` priced for its marginal edge, and the profitable ones sized against
+/// `max_in`, from a single enumeration.
+///
+/// The live sweep used to call both, enumerating every cycle twice per base mint on
+/// every sweep; with lollipops in the graph a sweep reached 140 ms of a 200 ms interval,
+/// and every millisecond of it is a millisecond later that a price change is seen.
+#[must_use]
+pub fn survey_and_find(
+    snap: &Snapshot,
+    base_mint: &Pubkey32,
+    max_hops: usize,
+    max_in: u128,
+) -> (Vec<SurveyedCycle>, Vec<PricedCycle>) {
+    let cycles = enumerate_from_base(snap, base_mint, max_hops);
+    let mut found: Vec<PricedCycle> = if max_in == 0 {
+        Vec::new()
+    } else {
+        cycles.iter().filter_map(|c| price(c, max_in)).collect()
+    };
+    found.sort_by_key(|c| std::cmp::Reverse(c.profit));
+    let mut surveyed: Vec<SurveyedCycle> = cycles
+        .into_iter()
+        .filter_map(|c| marginal_edge_bps(&c.legs).map(|edge_bps| SurveyedCycle { cycle: c, edge_bps }))
+        .collect();
+    surveyed.sort_by(|a, b| b.edge_bps.total_cmp(&a.edge_bps));
+    (surveyed, found)
+}
+
 /// Profitable cycles from `base_mint`, sized against `max_in`. Sorted by profit.
 #[must_use]
 pub fn find_from_base(
@@ -487,6 +516,19 @@ mod tests {
     /// Two pools quoting one token against USDC disagree. From SOL the only way to reach
     /// that is in through one SOL/USDC pool and out through another — a loop that visits
     /// USDC twice, which the simple-cycle search never emits.
+    #[test]
+    fn one_pass_finds_exactly_what_the_two_passes_did() {
+        let (snap, _) = triangle();
+        let (surveyed, found) = survey_and_find(&snap, &SOL, 3, 10_000);
+        let a: Vec<_> = survey_from_base(&snap, &SOL, 3).into_iter().map(|c| (c.cycle, c.edge_bps.to_bits())).collect();
+        let b: Vec<_> = surveyed.into_iter().map(|c| (c.cycle, c.edge_bps.to_bits())).collect();
+        assert_eq!(a, b);
+        let x: Vec<_> = find_from_base(&snap, &SOL, 3, 10_000).into_iter().map(|p| (p.cycle, p.profit)).collect();
+        let y: Vec<_> = found.into_iter().map(|p| (p.cycle, p.profit)).collect();
+        assert_eq!(x, y);
+        assert!(!y.is_empty(), "the triangle is profitable");
+    }
+
     #[test]
     fn a_round_trip_behind_a_hub_is_reachable_from_sol_without_holding_the_hub() {
         let stonk = [9u8; 32];

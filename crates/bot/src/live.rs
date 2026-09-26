@@ -27,7 +27,7 @@ use cb_dex::{meteora_damm_v2, meteora_dlmm, orca_whirlpool, raydium_clmm, raydiu
 use cb_executor::encode::{to_pubkey, to_raw};
 use cb_executor::pda::meteora_bin_array;
 use cb_feed::AccountUpdate;
-use cb_scanner::multi::{find_from_base, survey_from_base};
+use cb_scanner::multi::{survey_and_find, SurveyedCycle};
 use cb_scanner::store::PoolStore;
 use cb_server::{Event, EventBus, RouteRow};
 use std::collections::HashMap;
@@ -769,7 +769,12 @@ impl LiveMarket {
         let started = Instant::now();
         // Pools we have not heard from in a while are dropped rather than quoted.
         let (snap, stale_excluded) = self.store.snapshot_fresh(MAX_STALE_LAG_SLOTS);
-        let mut rows: Vec<EdgeRow> = Vec::new();
+        // Every surveyed cycle, by base mint, with the two numbers the leaderboard sorts
+        // and filters on. Labels are strings built per cycle, and only the handful of
+        // rows actually shown need them — building them for every cycle every sweep was
+        // most of a sweep's allocations.
+        let mut surveyed: Vec<(f64, Vec<SurveyedCycle>)> = Vec::new();
+        let mut light: Vec<(usize, usize, f64, f64)> = Vec::new(); // base, cycle, edge, depth
         let mut opportunities: Vec<LiveOpportunity> = Vec::new();
         let mut evaluated: u64 = 0;
 
@@ -779,30 +784,20 @@ impl LiveMarket {
                 continue;
             }
             let max_in = (tradable_usd / usd_per_unit) as u128;
-
-            for sc in survey_from_base(&snap, base, max_hops) {
+            let (cycles, found) = survey_and_find(&snap, base, max_hops, max_in);
+            let b = surveyed.len();
+            for (i, sc) in cycles.iter().enumerate() {
                 evaluated += 1;
-                rows.push(EdgeRow {
-                    route: self.route_label(&sc.cycle.mints),
-                    venues: self.venue_label(&sc.cycle.pools),
-                    hops: sc.cycle.hops(),
-                    edge_bps: sc.edge_bps,
-                    dislocation_bps: sc.dislocation_bps(),
-                    fee_bps: sc.cycle.fee_bps(),
-                    // The bottleneck across every leg, in dollars — not the entry
-                    // pool's own reserve, which is almost never the binding one. A
-                    // constant-product leg is unbounded in principle and so is capped
-                    // at its input reserve; infinite liquidity is not a thing.
-                    depth_usd: cb_core::path::cycle_depth_base(&sc.cycle.legs) as f64
-                        * usd_per_unit,
-                    slot: sc.cycle.slot(&snap),
-                });
+                // The bottleneck across every leg, in dollars — not the entry pool's own
+                // reserve, which is almost never the binding one. A constant-product leg
+                // is unbounded in principle and so is capped at its input reserve;
+                // infinite liquidity is not a thing.
+                let depth_usd = cb_core::path::cycle_depth_base(&sc.cycle.legs) as f64 * usd_per_unit;
+                light.push((b, i, sc.edge_bps, depth_usd));
             }
+            surveyed.push((usd_per_unit, cycles));
 
-            if max_in == 0 {
-                continue;
-            }
-            for p in find_from_base(&snap, base, max_hops, max_in) {
+            for p in found {
                 // Priced here, while the legs are the ones that produced the detection.
                 // Re-deriving it later from the recorded USD figures would be a guess:
                 // the curve's shape lives in the legs, not in its optimum.
@@ -870,24 +865,33 @@ impl LiveMarket {
 
         // Counted before truncation: the old count was capped by the size of the
         // leaderboard, so a market with fifty clearing cycles reported twelve.
-        let clearing = rows
+        let clearing = light
             .iter()
-            .filter(|r| r.edge_bps > 0.0 && r.depth_usd >= min_depth_usd)
+            .filter(|(_, _, edge, depth)| *edge > 0.0 && *depth >= min_depth_usd)
             .count() as u64;
 
-        rows.sort_by(|a, b| b.edge_bps.total_cmp(&a.edge_bps));
-        let best = rows.first().cloned();
-        let tradeable = rows.iter().find(|r| r.depth_usd >= min_depth_usd).cloned();
+        light.sort_by(|a, b| b.2.total_cmp(&a.2));
+        let row = |&(b, i, edge_bps, depth_usd): &(usize, usize, f64, f64)| {
+            let sc = &surveyed[b].1[i];
+            EdgeRow {
+                route: self.route_label(&sc.cycle.mints),
+                venues: self.venue_label(&sc.cycle.pools),
+                hops: sc.cycle.hops(),
+                edge_bps,
+                dislocation_bps: sc.dislocation_bps(),
+                fee_bps: sc.cycle.fee_bps(),
+                depth_usd,
+                slot: sc.cycle.slot(&snap),
+            }
+        };
+        let best = light.first().map(row);
+        let tradeable = light.iter().find(|l| l.3 >= min_depth_usd).map(row);
 
         // Keep the head of both groups. The board shows what can be traded above what
         // is only a rate, and neither group can truncate the other out of existence.
         let mut kept: Vec<EdgeRow> = Vec::with_capacity(LEADERBOARD_ROWS * 2);
-        kept.extend(
-            rows.iter().filter(|r| r.depth_usd >= min_depth_usd).take(LEADERBOARD_ROWS).cloned(),
-        );
-        kept.extend(
-            rows.iter().filter(|r| r.depth_usd < min_depth_usd).take(LEADERBOARD_ROWS).cloned(),
-        );
+        kept.extend(light.iter().filter(|l| l.3 >= min_depth_usd).take(LEADERBOARD_ROWS).map(row));
+        kept.extend(light.iter().filter(|l| l.3 < min_depth_usd).take(LEADERBOARD_ROWS).map(row));
 
         opportunities.sort_by(|a, b| b.gross_profit_usd.total_cmp(&a.gross_profit_usd));
 
