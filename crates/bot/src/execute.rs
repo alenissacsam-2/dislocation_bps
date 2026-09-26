@@ -87,7 +87,8 @@ pub struct CyclePlan {
     /// **Detection-time.** Kept for the record and for comparison, but no longer what
     /// the floors are built from — see [`Trader::hops_for`].
     pub leg_out: Vec<u128>,
-    /// Each pool's fee tier, in parts per million.
+    /// Each pool's fee tier, in parts per million. For a Raydium CLMM pool this is the
+    /// config fee alone: its dynamic fee is re-read with the pool at execution.
     ///
     /// Carried from detection because it is pool *configuration*, not pool *price*: it
     /// lives in a separate config account that a swap does not touch, so unlike a
@@ -791,7 +792,10 @@ impl Trader {
         let state = match dex {
             Dex::OrcaWhirlpool => cb_dex::orca_whirlpool::to_pool_state(address, data, 0).ok()?,
             Dex::RaydiumClmm => {
-                cb_dex::raydium_clmm::to_pool_state(address, data, fee_ppm, 0).ok()?
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                cb_dex::raydium_clmm::to_pool_state(address, data, fee_ppm, 0, now).ok()?
             }
             // The pool account holds the fee, the mints and the uncollected protocol
             // fees; the price lives entirely in two SPL token accounts it points at.

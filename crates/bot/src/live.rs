@@ -540,7 +540,7 @@ impl LiveMarket {
                 failures.push(format!("{}: fee config unresolved", bs58::encode(addr).into_string()));
                 continue;
             };
-            match raydium_clmm::to_pool_state(addr, &data, fee, boot_slot) {
+            match raydium_clmm::to_pool_state(addr, &data, fee, boot_slot, now_ms() / 1_000) {
                 Ok(ps) => {
                     store.upsert(ps);
                     if let Some(w) = watches.get_mut(&addr) {
@@ -678,7 +678,14 @@ impl LiveMarket {
                     meteora_damm_v2::to_pool_state(u.pubkey, &u.data, u.slot).ok()?
                 }
                 Venue::RaydiumClmm { trade_fee_ppm } => {
-                    raydium_clmm::to_pool_state(u.pubkey, &u.data, *trade_fee_ppm, u.slot).ok()?
+                    raydium_clmm::to_pool_state(
+                        u.pubkey,
+                        &u.data,
+                        *trade_fee_ppm,
+                        u.slot,
+                        now_ms() / 1_000,
+                    )
+                    .ok()?
                 }
                 Venue::MeteoraDlmm { pair, pair_slot, .. } => {
                     // The active bin lives in this account and decides which of the
@@ -828,12 +835,21 @@ impl LiveMarket {
                         .collect::<Option<Vec<_>>>()?;
                     // Configuration, not price: carried so execution can re-price a
                     // concentrated leg against fresh state without a round trip for a
-                    // number a swap cannot change. See `CyclePlan::fee_ppm`.
+                    // number a swap cannot change. See `CyclePlan::fee_ppm`. A Raydium
+                    // CLMM pool's store fee includes its dynamic part, which does
+                    // change, so its config fee is carried instead and the dynamic part
+                    // is read again from the fresh account.
                     let fee_ppm: Vec<u32> = p
                         .cycle
                         .pools
                         .iter()
-                        .map(|id| snap.get(id).map(|st| st.fee_ppm))
+                        .map(|id| {
+                            let st = snap.get(id)?;
+                            Some(match self.watches.get(&id.0).map(|w| &w.venue) {
+                                Some(Venue::RaydiumClmm { trade_fee_ppm }) => *trade_fee_ppm,
+                                _ => st.fee_ppm,
+                            })
+                        })
                         .collect::<Option<Vec<_>>>()?;
                     Some(crate::execute::CyclePlan {
                         pools,
@@ -1040,7 +1056,7 @@ impl LiveMarket {
             Venue::Whirlpool => orca_whirlpool::to_pool_state(addr, data, slot).ok(),
             Venue::MeteoraDammV2 => meteora_damm_v2::to_pool_state(addr, data, slot).ok(),
             Venue::RaydiumClmm { trade_fee_ppm } => {
-                raydium_clmm::to_pool_state(addr, data, *trade_fee_ppm, slot).ok()
+                raydium_clmm::to_pool_state(addr, data, *trade_fee_ppm, slot, now_ms() / 1_000).ok()
             }
             Venue::MeteoraDlmm { pair, pair_slot, .. } => {
                 **pair = meteora_dlmm::decode(data).ok()?;

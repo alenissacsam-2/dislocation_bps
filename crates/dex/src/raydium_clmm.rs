@@ -14,6 +14,15 @@
 //! but they must be read from *chain*, not assumed, because assuming a fee is
 //! assuming the one number this whole exercise turns on.
 //!
+//! # Except when it partly is
+//!
+//! Some pools add a *dynamic* fee on top of the config's, grown by recent price
+//! movement and decayed by time, and that part lives in the pool account (see
+//! [`dynamic_fee_ppm`]). On 2026-09-26 one SOL/VIDAx pool carried 36 ppm of it: the
+//! bot quoted every swap through that pool 0.36 bps high, built a per-hop floor the
+//! program could never meet, and had 433 simulations fail on that pool and 13 Jito
+//! bundles dropped before the cause was measured. One SOL/DKNG pool carried 5,098 ppm.
+//!
 //! Having both venues matters beyond redundancy: Raydium and Orca each run a 4 bp
 //! SOL/USDC pool. A two-hop cycle between them costs 8 bp of fees total, which is the
 //! cheapest closed loop available on Solana for that pair and roughly a tenth of what
@@ -52,6 +61,27 @@ const OFF_TICK_SPACING: usize = 235;
 const OFF_LIQUIDITY: usize = 237;
 const OFF_SQRT_PRICE: usize = 253;
 const OFF_TICK_CURRENT: usize = 269;
+
+// The pool's `DynamicFeeInfo`. Read off live accounts on 2026-09-26 and checked
+// against the program: a SOL/VIDAx swap simulated 0.36 bps short of the config-fee
+// quote, which is exactly what these fields give, and on every pool that has them the
+// accumulator exceeds its reference by 10,000 per tick-spacing step moved.
+const OFF_DYN_FILTER_PERIOD: usize = 1096; // u16, seconds
+const OFF_DYN_DECAY_PERIOD: usize = 1098; // u16, seconds
+const OFF_DYN_REDUCTION: usize = 1100; // u16, of 10,000
+const OFF_DYN_CONTROL: usize = 1102; // u32; zero means no dynamic fee
+const OFF_DYN_MAX_VOLATILITY: usize = 1106; // u32
+const OFF_DYN_INDEX_REFERENCE: usize = 1110; // i32, a tick-spacing index
+const OFF_DYN_VOLATILITY_REFERENCE: usize = 1114; // u32
+const OFF_DYN_VOLATILITY: usize = 1118; // u32, as of the last swap
+const OFF_DYN_LAST_UPDATE: usize = 1122; // u64, unix seconds
+/// The accumulator grows by this much per tick-spacing step the price has moved.
+const VOLATILITY_STEP: u64 = 10_000;
+/// `(volatility x tick_spacing)^2 x control` divided by this is the fee in ppm.
+const DYNAMIC_FEE_DENOMINATOR: u128 = 10_000_000_000_000;
+/// Taken off the time since the pool last traded before decaying anything, so a local
+/// clock running ahead of the chain's cannot make the fee look lower than it is.
+const CLOCK_MARGIN_SECS: u64 = 5;
 
 // Verified byte offsets into AmmConfig.
 const OFF_CFG_TRADE_FEE_RATE: usize = 47;
@@ -158,19 +188,76 @@ pub fn decode_trade_fee_ppm(data: &[u8]) -> Result<u32> {
     Ok(fee)
 }
 
+/// The dynamic part of a pool's fee, in ppm, for a swap made at `now_unix` that stays
+/// inside the current tick-spacing step.
+///
+/// Zero for a pool without one. Otherwise this follows the program's update at the
+/// start of a swap: once `filter_period` has passed since the last trade the reference
+/// resets to here and the volatility decays by `reduction` (to nothing after
+/// `decay_period`); the volatility is then the reference plus 10,000 per step the price
+/// sits from the reference step, capped, and the fee is
+/// `(volatility x tick_spacing)^2 x control / 10^13`, rounded up.
+///
+/// Every approximation here errs high, because a quote must be a floor: time is counted
+/// short by [`CLOCK_MARGIN_SECS`], and a later swap can only have decayed it further.
+#[must_use]
+pub fn dynamic_fee_ppm(data: &[u8], tick_current: i32, tick_spacing: u16, now_unix: u64) -> u32 {
+    if data.len() < OFF_DYN_LAST_UPDATE + 8 || tick_spacing == 0 {
+        return 0;
+    }
+    let control = u32_at(data, OFF_DYN_CONTROL);
+    if control == 0 {
+        return 0;
+    }
+    let filter = u64::from(u16_at(data, OFF_DYN_FILTER_PERIOD));
+    let decay = u64::from(u16_at(data, OFF_DYN_DECAY_PERIOD));
+    let reduction = u64::from(u16_at(data, OFF_DYN_REDUCTION));
+    let max_volatility = u64::from(u32_at(data, OFF_DYN_MAX_VOLATILITY));
+    let last = u64::from_le_bytes(
+        data[OFF_DYN_LAST_UPDATE..OFF_DYN_LAST_UPDATE + 8].try_into().expect("8 bytes"),
+    );
+    let index = tick_current.div_euclid(i32::from(tick_spacing));
+    let elapsed = now_unix.saturating_sub(last).saturating_sub(CLOCK_MARGIN_SECS);
+    let (index_reference, reference) = if elapsed >= filter {
+        let decayed = if elapsed < decay {
+            u64::from(u32_at(data, OFF_DYN_VOLATILITY)) * reduction / 10_000
+        } else {
+            0
+        };
+        (index, decayed)
+    } else {
+        (i32_at(data, OFF_DYN_INDEX_REFERENCE), u64::from(u32_at(data, OFF_DYN_VOLATILITY_REFERENCE)))
+    };
+    let steps = u64::from(index_reference.abs_diff(index));
+    let volatility = reference.saturating_add(steps.saturating_mul(VOLATILITY_STEP)).min(max_volatility);
+    let scaled = u128::from(volatility) * u128::from(tick_spacing);
+    let fee = (scaled * scaled * u128::from(control)).div_ceil(DYNAMIC_FEE_DENOMINATOR);
+    u32::try_from(fee).unwrap_or(u32::MAX)
+}
+
 /// Combine the pool account with the fee from its config into a [`PoolState`].
 ///
-/// The fee is a parameter rather than something fetched here, so this stays a pure
-/// function and the caller is forced to have actually resolved the config.
+/// `trade_fee_ppm` is the config's fee; the pool's own dynamic fee, if it has one, is
+/// read from `data` and added (see [`dynamic_fee_ppm`]), so `PoolState::fee_ppm` is
+/// the whole fee a swap made at `now_unix` pays. The config fee is a parameter rather
+/// than something fetched here, so this stays a pure function and the caller is forced
+/// to have actually resolved the config.
 pub fn to_pool_state(
     address: Pubkey32,
     data: &[u8],
     trade_fee_ppm: u32,
     slot: u64,
+    now_unix: u64,
 ) -> Result<PoolState> {
     let p = decode(data)?;
     ensure!(p.liquidity > 0, "clmm pool has no liquidity at the current price");
     ensure!(trade_fee_ppm < 1_000_000, "clmm trade fee {trade_fee_ppm}ppm is not a fee");
+    let dynamic = dynamic_fee_ppm(data, p.tick_current, p.tick_spacing, now_unix);
+    let fee_ppm = trade_fee_ppm.saturating_add(dynamic);
+    ensure!(
+        fee_ppm < 1_000_000,
+        "clmm fee {trade_fee_ppm}ppm plus {dynamic}ppm dynamic is not a fee"
+    );
 
     ensure!(
         clmm::price_belongs_to_tick(p.sqrt_price_x64, p.tick_current, p.tick_spacing),
@@ -197,7 +284,7 @@ pub fn to_pool_state(
             sqrt_lo_x64,
             sqrt_hi_x64,
         },
-        fee_ppm: trade_fee_ppm,
+        fee_ppm,
         slot,
     })
 }
@@ -257,7 +344,7 @@ mod tests {
 
     #[test]
     fn pool_state_prices_sol_at_about_ninety_one_dollars() {
-        let p = to_pool_state([9u8; 32], &sol_usdc(), 400, 77).unwrap();
+        let p = to_pool_state([9u8; 32], &sol_usdc(), 400, 77, 0).unwrap();
         assert_eq!(p.dex, Dex::RaydiumClmm);
         assert_eq!(p.fee_ppm, 400);
         assert_eq!(p.slot, 77);
@@ -275,7 +362,7 @@ mod tests {
     /// instead. Any future sizing that ignores `max_in` will silently over-quote.
     #[test]
     fn the_tightest_tick_holds_far_more_than_our_capital_and_far_less_than_a_flash_loan() {
-        let p = to_pool_state([9u8; 32], &sol_usdc(), 400, 1).unwrap();
+        let p = to_pool_state([9u8; 32], &sol_usdc(), 400, 1, 0).unwrap();
         let sol_in = p.leg_for_input(&[1u8; 32]).expect("must quote SOL in");
 
         let five_dollars_of_sol = 55_000_000u128; // 0.055 SOL at ~$91
@@ -295,20 +382,20 @@ mod tests {
     #[test]
     fn a_pool_with_no_liquidity_is_not_a_pool() {
         let d = account(1, 0, 5_572_826_470_351_845_177, -23941, (9, 6), (1, 2));
-        assert!(to_pool_state([9u8; 32], &d, 400, 1).is_err());
+        assert!(to_pool_state([9u8; 32], &d, 400, 1, 0).is_err());
     }
 
     #[test]
     fn price_inconsistent_with_its_own_tick_is_rejected() {
         let d = account(1, 1_000_000_000, 5_572_826_470_351_845_177, 0, (9, 6), (1, 2));
-        let err = to_pool_state([9u8; 32], &d, 400, 1).unwrap_err().to_string();
+        let err = to_pool_state([9u8; 32], &d, 400, 1, 0).unwrap_err().to_string();
         assert!(err.contains("does not belong to tick"), "unexpected error: {err}");
     }
 
     #[test]
     fn a_hundred_percent_fee_is_rejected_rather_than_underflowing_gamma() {
         assert!(decode_trade_fee_ppm(&config(1_000_000)).is_err());
-        assert!(to_pool_state([9u8; 32], &sol_usdc(), 1_000_000, 1).is_err());
+        assert!(to_pool_state([9u8; 32], &sol_usdc(), 1_000_000, 1, 0).is_err());
     }
 
     #[test]
@@ -377,5 +464,62 @@ mod tests {
             assert_eq!(before.tick_current, after.tick_current, "{name} overlaps tick");
             assert_eq!(before.amm_config, after.amm_config, "{name} overlaps amm_config");
         }
+    }
+
+    /// The SOL/VIDAx pool's `DynamicFeeInfo` as read on 2026-09-26, last traded at `at`.
+    fn with_dynamic_fee(mut d: Vec<u8>, index_reference: i32, volatility: u32, at: u64) -> Vec<u8> {
+        d[OFF_DYN_FILTER_PERIOD..OFF_DYN_FILTER_PERIOD + 2].copy_from_slice(&60u16.to_le_bytes());
+        d[OFF_DYN_DECAY_PERIOD..OFF_DYN_DECAY_PERIOD + 2].copy_from_slice(&600u16.to_le_bytes());
+        d[OFF_DYN_REDUCTION..OFF_DYN_REDUCTION + 2].copy_from_slice(&5_000u16.to_le_bytes());
+        d[OFF_DYN_CONTROL..OFF_DYN_CONTROL + 4].copy_from_slice(&15_000u32.to_le_bytes());
+        d[OFF_DYN_MAX_VOLATILITY..OFF_DYN_MAX_VOLATILITY + 4].copy_from_slice(&150_000u32.to_le_bytes());
+        d[OFF_DYN_INDEX_REFERENCE..OFF_DYN_INDEX_REFERENCE + 4]
+            .copy_from_slice(&index_reference.to_le_bytes());
+        d[OFF_DYN_VOLATILITY_REFERENCE..OFF_DYN_VOLATILITY_REFERENCE + 4]
+            .copy_from_slice(&volatility.to_le_bytes());
+        d[OFF_DYN_VOLATILITY..OFF_DYN_VOLATILITY + 4].copy_from_slice(&volatility.to_le_bytes());
+        d[OFF_DYN_LAST_UPDATE..OFF_DYN_LAST_UPDATE + 8].copy_from_slice(&at.to_le_bytes());
+        d
+    }
+
+    const AT: u64 = 1_790_387_462;
+
+    #[test]
+    fn a_dynamic_fee_matches_what_the_program_charged() {
+        // Tick 19213 at spacing 60 is step 320, the pool's own reference: no movement,
+        // so the fee is the stored volatility's. A simulated swap paid 36.09 ppm less
+        // than the config fee's quote; (2579 x 60)^2 x 15000 / 10^13 = 35.92, rounded up.
+        let d = with_dynamic_fee(account(60, 1, 1, 19_213, (9, 8), (1, 2)), 320, 2_579, AT);
+        assert_eq!(dynamic_fee_ppm(&d, 19_213, 60, AT + 10), 36);
+    }
+
+    #[test]
+    fn a_dynamic_fee_decays_with_time_and_grows_with_movement() {
+        let d = with_dynamic_fee(account(60, 1, 1, 19_213, (9, 8), (1, 2)), 320, 2_579, AT);
+        // Past the filter period the reference halves: (1289 x 60)^2 x 15000 / 10^13.
+        assert_eq!(dynamic_fee_ppm(&d, 19_213, 60, AT + 100), 9);
+        // Past the decay period nothing is left.
+        assert_eq!(dynamic_fee_ppm(&d, 19_213, 60, AT + 700), 0);
+        // Inside the clock margin of the filter period it has not decayed yet.
+        assert_eq!(dynamic_fee_ppm(&d, 19_213, 60, AT + 62), 36);
+        // Two steps from the reference inside the filter period: 2579 + 20000.
+        let moved = with_dynamic_fee(account(60, 1, 1, 19_213, (9, 8), (1, 2)), 318, 2_579, AT);
+        assert_eq!(dynamic_fee_ppm(&moved, 19_213, 60, AT + 10), 2_753);
+    }
+
+    #[test]
+    fn a_pool_without_a_dynamic_fee_pays_its_config_fee() {
+        assert_eq!(dynamic_fee_ppm(&sol_usdc(), -23_941, 1, AT), 0);
+        let p = to_pool_state([9u8; 32], &sol_usdc(), 400, 1, AT).unwrap();
+        assert_eq!(p.fee_ppm, 400);
+    }
+
+    #[test]
+    fn the_pool_state_fee_includes_the_dynamic_part() {
+        let base = sol_usdc();
+        let d = with_dynamic_fee(base, -23_941, 30_000, AT);
+        let p = to_pool_state([9u8; 32], &d, 400, 1, AT + 10).unwrap();
+        // (30000 x 1)^2 x 15000 / 10^13 = 1.35, rounded up.
+        assert_eq!(p.fee_ppm, 402);
     }
 }
