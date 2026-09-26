@@ -275,8 +275,26 @@ impl Rpc {
     /// A read, rotating across the configured endpoints and failing over within one
     /// call if the one it started on does not answer.
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        self.call_from(self.next_start(), method, params).await
+    }
+
+    /// A read on a trade's critical path: the first configured endpoint, and the others
+    /// only if it fails.
+    ///
+    /// # Why not rotate these too
+    ///
+    /// Rotation spreads rate limits, and it spread latency with them. Measured from this
+    /// machine on 2026-09-26: the primary (the feed's own provider) answered in about
+    /// 60 ms, the two fallbacks in about 200 ms each. Two of every three re-price reads
+    /// therefore took three times as long as they had to, between a detection and a
+    /// send whose price is decided by exactly that gap, and read state from a node the
+    /// feed was not watching. A median attempt spent 546 ms before it could refuse.
+    async fn call_primary(&self, method: &str, params: Value) -> Result<Value> {
+        self.call_from(0, method, params).await
+    }
+
+    async fn call_from(&self, start: usize, method: &str, params: Value) -> Result<Value> {
         let n = self.endpoint_count();
-        let start = self.next_start();
         let mut last: Option<anyhow::Error> = None;
 
         for step in 0..n {
@@ -304,7 +322,7 @@ impl Rpc {
     /// If the call fails or the returned blockhash is not parseable.
     pub async fn latest_blockhash(&self) -> Result<(Hash, u64)> {
         let r = self
-            .call("getLatestBlockhash", json!([{"commitment": "confirmed"}]))
+            .call_primary("getLatestBlockhash", json!([{"commitment": "confirmed"}]))
             .await?;
         let bh = r["value"]["blockhash"]
             .as_str()
@@ -638,12 +656,13 @@ impl Rpc {
             return Ok(Vec::new());
         }
         let addresses: Vec<String> = keys.iter().map(ToString::to_string).collect();
-        let r = self
-            .call(
-                "getMultipleAccounts",
-                json!([addresses, {"encoding": "base64", "commitment": commitment}]),
-            )
-            .await?;
+        let params = json!([addresses, {"encoding": "base64", "commitment": commitment}]);
+        // `processed` is only ever asked for on a trade's re-price; see [`Rpc::call_primary`].
+        let r = if commitment == "processed" {
+            self.call_primary("getMultipleAccounts", params).await?
+        } else {
+            self.call("getMultipleAccounts", params).await?
+        };
         let arr = r["value"]
             .as_array()
             .ok_or_else(|| anyhow!("getMultipleAccounts returned no account array"))?;
