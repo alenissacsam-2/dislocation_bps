@@ -69,3 +69,6 @@ _retired/
 token-demand.json
 token-demand.json.tmp
 lookup-table.json
+
+# Pools the on-chain census found (scripts/watchlist.cjs); regenerated between runs.
+watchlist.json

@@ -668,6 +668,12 @@ impl LiveMarket {
         Ok(market)
     }
 
+    /// How many pools currently price.
+    #[must_use]
+    pub fn store_len(&self) -> usize {
+        self.store.len()
+    }
+
     /// Apply one account update. Returns the pool whose state changed, if any.
     pub fn apply(&mut self, u: &AccountUpdate, bus: &EventBus) -> Option<PoolState> {
         let state = if let Some(w) = self.watches.get_mut(&u.pubkey) {

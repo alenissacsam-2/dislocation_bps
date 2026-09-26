@@ -848,7 +848,7 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
     // no swap changes a mint's owner, and getting it wrong derives the wrong
     // associated account rather than raising anything.
     {
-        let reg = registry::Registry::embedded()?;
+        let reg = registry::Registry::load()?;
         let t22: Vec<_> =
             reg.mints.iter().filter(|(_, m)| m.token_2022).map(|(k, _)| *k).collect();
         if !t22.is_empty() {
@@ -890,10 +890,12 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
     // `Trader::jito_probe`.
     match trader.jito_probe().await {
         Ok(Some(true)) => tracing::warn!(
-            "Jito self-test LANDED: the send path works, so a trade bundle that is not              included lost its race or its floor, not its way"
+            "Jito self-test LANDED: the send path works, so a trade bundle that is not \
+             included lost its race or its floor, not its way"
         ),
         Ok(Some(false)) => tracing::error!(
-            "Jito self-test was NOT included within 30 s: a bundle with no floor and no race              did not land, so the send path itself is failing (region, tip, or bundle format)"
+            "Jito self-test was NOT included within 30 s: a bundle with no floor and no race \
+             did not land, so the send path itself is failing (region, tip, or bundle format)"
         ),
         Ok(None) => {}
         Err(e) => tracing::warn!("Jito self-test could not be sent: {e:#}"),
@@ -905,7 +907,7 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
             Err(e) => tracing::warn!("could not load lookup table {key} ({e:#}); a new one will be built if needed"),
         }
     }
-    let mut base_mints = registry::Registry::embedded()?.base_mints;
+    let mut base_mints = registry::Registry::load()?.base_mints;
     // The base mints are only where cycles *start*. A loop through an intermediate mint
     // the wallet has no account for cannot pass its profit check at all, because the
     // rent it would have to pay inside the trade is two hundred times the gain — so the
@@ -944,7 +946,7 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
     // be a deliberate spend of 1.68% of this wallet each — but to know, so a cycle
     // through a mint we cannot hold is refused in one line instead of two round trips
     // and an unexplained balance shortfall.
-    let all_mints: Vec<_> = registry::Registry::embedded()?.mints.keys().copied().collect();
+    let all_mints: Vec<_> = registry::Registry::load()?.mints.keys().copied().collect();
     match trader.learn_token_accounts(&all_mints).await {
         Ok(missing) if missing.is_empty() => {
             tracing::info!("the wallet holds an account for every mint in the book");
@@ -978,6 +980,17 @@ async fn main() -> anyhow::Result<()> {
     if args.iter().any(|a| a == "--verify") {
         let cfg = Config::load("config.toml")?;
         return verify(&cfg).await;
+    }
+    // `cb-bot --pools`: bootstrap the registry and the census watchlist from chain,
+    // report which pools would be dropped and why, and exit. No feed, no wallet.
+    if args.iter().any(|a| a == "--pools") {
+        tracing_subscriber::fmt().with_ansi(false).with_target(false).init();
+        let cfg = Config::load("config.toml")?;
+        let registry = registry::Registry::load()?;
+        let asked = registry.pools.len();
+        let market = live::LiveMarket::bootstrap(&cfg.rpc_http_url, registry).await?;
+        println!("{} of {asked} pools priceable", market.store_len());
+        return Ok(());
     }
     if args.iter().any(|a| a == "--report") {
         let path = args.iter().position(|a| a == "--report").and_then(|i| args.get(i + 1));
@@ -1156,7 +1169,7 @@ async fn spawn_live(
     cfg: &Config,
     trader: Option<execute::Trader>,
 ) -> anyhow::Result<()> {
-    let registry = registry::Registry::embedded()?;
+    let registry = registry::Registry::load()?;
 
     // Report the universe before any data arrives, so the run's headline constraint
     // is on the record even if the feed never connects.
@@ -1295,7 +1308,7 @@ async fn spawn_live(
     // Accounts the rotation in `demand` must never close: where every cycle starts and
     // ends, and whatever the operator pinned by name.
     let mut protected: std::collections::HashSet<cb_core::types::Pubkey32> =
-        registry::Registry::embedded()?.base_mints.into_iter().collect();
+        registry::Registry::load()?.base_mints.into_iter().collect();
     for m in &cfg.extra_token_mints {
         if let Ok(k) = registry::pk(m) {
             protected.insert(k);
@@ -1901,7 +1914,9 @@ async fn spawn_live(
                                                  loop entered from SOL is not held by this"
                                                     .to_string()
                                             } else if unsendable && blocked_by.is_none() {
-                                                "not attempted — this shape cannot be sent: under Jito only a                                                  cycle that starts and ends in SOL has its fee guaranteed on                                                  chain, and a binned pool leaves room for two hops"
+                                                "not attempted — this shape cannot be sent: under Jito only a \
+                                                 cycle that starts and ends in SOL has its fee guaranteed on \
+                                                 chain, and a binned pool leaves room for two hops"
                                                     .to_string()
                                             } else if let Some(dex) = blocked_by {
                                                 // Its own message. Pooled with the
@@ -2869,7 +2884,7 @@ const VERIFY_PACE: Duration = Duration::from_millis(1200);
 /// the error was in the input, not the arithmetic. Only an outside opinion could catch
 /// it, so now there is one, on demand.
 async fn verify(cfg: &Config) -> anyhow::Result<()> {
-    let registry = registry::Registry::embedded()?;
+    let registry = registry::Registry::load()?;
     println!("cryptobot — decoder audit against an independent router\n");
     println!("  reading {} pools from chain...", registry.pools.len());
 

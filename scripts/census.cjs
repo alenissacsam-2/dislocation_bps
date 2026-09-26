@@ -195,7 +195,18 @@ function deltas(tx, payer, keys) {
   const add = (mint, v) => (out[mint] = (out[mint] || 0n) + v);
   for (const b of m.preTokenBalances || []) if (b.owner === payer) add(b.mint, -BigInt(b.uiTokenAmount.amount));
   for (const b of m.postTokenBalances || []) if (b.owner === payer) add(b.mint, BigInt(b.uiTokenAmount.amount));
-  const lam = BigInt(m.postBalances[0]) - BigInt(m.preBalances[0]);
+  let lam = BigInt(m.postBalances[0]) - BigInt(m.preBalances[0]);
+  // Rent coming home is not profit. A token account of the payer that existed before
+  // and is closed here hands its rent back, which the first census read as a
+  // 1,488,440-lamport "arbitrage". Wrapped SOL inside it is already counted below.
+  for (const b of m.preTokenBalances || []) {
+    if (b.owner !== payer) continue;
+    const i = b.accountIndex;
+    if (BigInt(m.postBalances[i]) !== 0n) continue;
+    let rent = BigInt(m.preBalances[i]);
+    if (b.mint === WSOL) rent -= BigInt(b.uiTokenAmount.amount);
+    lam -= rent;
+  }
   add("SOL", lam + (out[WSOL] || 0n));
   delete out[WSOL];
   // Tips leave the payer as lamports; measured on the receiving side.
@@ -265,6 +276,9 @@ function classify(tx) {
           arbs.push({
             slot: s, sig: tx.transaction.signatures[0], venues: a.venues.sort().join("+"), asset: a.asset, gross: a.gross,
             net: a.asset === "SOL" ? a.gross - a.fee - a.tip : null,
+            // Every account it wrote but did not sign for: its pools, vaults and arrays.
+            // scripts/watchlist.cjs resolves which of them are pools.
+            writes: a.keys.filter((k) => k.writable && !k.signer && !TIP_ACCOUNTS.has(k.key) && !NOT_STATE.has(k.key)).map((k) => k.key),
             fee: a.fee, tip: a.tip, payer: a.payer,
             watched: a.keys.some((k) => registry.has(k.key)),
             age: youngest === null ? `>${s - start}` : s - youngest,

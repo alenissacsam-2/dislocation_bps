@@ -5,6 +5,11 @@
 //! what an experiment *was*, so a measurement written to the ledger can always be
 //! traced back to the exact universe that produced it, by way of the commit.
 //!
+//! One exception, and it only adds: [`Registry::load`] merges `watchlist.json` from the
+//! working directory, which `scripts/watchlist.cjs` writes from the on-chain census.
+//! Long-tail pools where arbitrage actually lands come and go in days, so that list is
+//! regenerated between runs rather than committed, and its size is logged at start.
+//!
 //! Nothing in here is authoritative about money. Symbols and decimals are for display
 //! and USD conversion; `fee_ppm` and `tvl_usd` are for ordering. Every fee and every
 //! reserve used in a quote is decoded from the chain at run time.
@@ -19,6 +24,7 @@ const EMBEDDED: &str = include_str!("../pools.json");
 
 #[derive(Debug, Clone, Deserialize)]
 struct RawRegistry {
+    #[serde(default)]
     base_mints: Vec<String>,
     mints: HashMap<String, RawMint>,
     pools: Vec<RawPool>,
@@ -98,13 +104,59 @@ fn parse_dex(s: &str) -> Result<Dex> {
     })
 }
 
+/// Where `scripts/watchlist.cjs` writes the pools the on-chain census found.
+pub const WATCHLIST_PATH: &str = "watchlist.json";
+
 impl Registry {
     /// Parse the embedded registry.
     pub fn embedded() -> Result<Self> {
         Self::parse(EMBEDDED)
     }
 
+    /// The embedded registry plus the census watchlist, if one has been generated.
+    ///
+    /// A malformed watchlist is reported and ignored: it can only ever add pools, and a
+    /// bad one must not stop a run that would otherwise have started.
+    pub fn load() -> Result<Self> {
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        let mut reg = Self::embedded()?;
+        let Ok(json) = std::fs::read_to_string(WATCHLIST_PATH) else { return Ok(reg) };
+        match Self::parse_with(&json, false) {
+            Ok(extra) => {
+                let (pools, mints) = reg.merge(extra);
+                REPORTED.call_once(|| {
+                    tracing::info!(
+                        "{WATCHLIST_PATH}: {pools} pools and {mints} mints added from the \
+                         on-chain census"
+                    );
+                });
+            }
+            Err(e) => REPORTED.call_once(|| tracing::warn!("ignoring {WATCHLIST_PATH}: {e:#}")),
+        }
+        Ok(reg)
+    }
+
+    /// Add `other`'s mints and pools that this registry does not already have. Never
+    /// replaces an entry and never touches the base mints. Returns what was added.
+    pub fn merge(&mut self, other: Self) -> (usize, usize) {
+        let mut mints = 0;
+        for (k, m) in other.mints {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.mints.entry(k) {
+                e.insert(m);
+                mints += 1;
+            }
+        }
+        let known: std::collections::HashSet<Pubkey32> = self.pools.iter().map(|p| p.address).collect();
+        let before = self.pools.len();
+        self.pools.extend(other.pools.into_iter().filter(|p| !known.contains(&p.address)));
+        (self.pools.len() - before, mints)
+    }
+
     pub fn parse(json: &str) -> Result<Self> {
+        Self::parse_with(json, true)
+    }
+
+    fn parse_with(json: &str, require_base: bool) -> Result<Self> {
         let raw: RawRegistry = serde_json::from_str(json).context("registry is not valid json")?;
 
         let mut mints = HashMap::with_capacity(raw.mints.len());
@@ -146,7 +198,7 @@ impl Registry {
         let base_mints = raw.base_mints.iter().map(|s| pk(s)).collect::<Result<Vec<_>>>()?;
 
         anyhow::ensure!(!pools.is_empty(), "registry has no pools");
-        anyhow::ensure!(!base_mints.is_empty(), "registry has no base mints");
+        anyhow::ensure!(!require_base || !base_mints.is_empty(), "registry has no base mints");
         Ok(Self { base_mints, mints, pools })
     }
 
@@ -338,6 +390,28 @@ mod tests {
         let r = Registry::embedded().unwrap();
         assert_eq!(r.symbol(&[7u8; 32]).len(), 4);
         assert_eq!(r.decimals(&[7u8; 32]), 9);
+    }
+
+    #[test]
+    fn a_watchlist_only_adds() {
+        let mut r = Registry::embedded().unwrap();
+        let known = r.pools[0].clone();
+        let sol = bs58::encode(r.base_mints[0]).into_string();
+        let overlay = format!(
+            r#"{{"mints":{{"So11111111111111111111111111111111111111112":{{"symbol":"X","decimals":9}},
+                "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R":{{"symbol":"R2","decimals":6}}}},
+               "pools":[{{"address":"{}","dex":"raydium_clmm","label":"dup","mint_a":"{sol}","mint_b":"{sol}","fee_ppm":1,"tvl_usd":0}},
+                        {{"address":"11111111111111111111111111111112","dex":"meteora_dlmm","label":"new","mint_a":"{sol}","mint_b":"4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R","fee_ppm":0,"tvl_usd":0}}]}}"#,
+            bs58::encode(known.address).into_string()
+        );
+        let extra = Registry::parse_with(&overlay, false).expect("a watchlist needs no base mints");
+        let before = r.pools.len();
+        let (pools, _) = r.merge(extra);
+        assert_eq!(pools, 1, "the duplicate pool is skipped, the new one added");
+        assert_eq!(r.pools.len(), before + 1);
+        assert_eq!(r.symbol(&r.base_mints[0]), Registry::embedded().unwrap().symbol(&r.base_mints[0]),
+            "an existing mint is never renamed");
+        assert!(Registry::parse(&overlay).is_err(), "the embedded registry still needs base mints");
     }
 
     #[test]

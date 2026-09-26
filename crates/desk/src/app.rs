@@ -483,7 +483,8 @@ pub async fn set_dry_run(
         let mode = config::read_mode(&app.paths.config()).map_err(|e| e.to_string())?;
         if mode.effective != "live" {
             return Err(
-                "Mode is Demo, so nothing would be submitted anyway. Arm Live first —                  then this switch is the one that matters."
+                "Mode is Demo, so nothing would be submitted anyway. Arm Live first — \
+                 then this switch is the one that matters."
                     .into(),
             );
         }
