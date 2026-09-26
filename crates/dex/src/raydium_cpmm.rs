@@ -26,8 +26,18 @@
 //!
 //! **Token-2022.** Unlike v4, this program accepts Token-2022 mints, which can carry
 //! transfer fees and transfer hooks that skim a swap invisibly to constant-product
-//! arithmetic. The pool account records each mint's token program, so we check it and
-//! decline rather than trusting the registry to have filtered correctly.
+//! arithmetic. The pool account records each mint's token program but not the mint's
+//! extensions, so a Token-2022 side is decoded and reported here, and the caller that
+//! holds the mint account decides (`cb_dex::token2022::transfer_costs`). Any program
+//! other than the two token programs is refused outright. Refusing Token-2022 wholesale
+//! cost the most active CP-Swap pools on 2026-09-26: tokenised equities whose mints
+//! carry metadata, a permanent delegate and a pause switch, but no fee and no hook.
+//!
+//! **The creator fee.** Pools launched through Raydium's launchpad charge a second fee
+//! beside the trade fee, at the rate their config names (0.05% to 1.5% on every config
+//! read on 2026-09-26), when `enable_creator_fee` is set. It comes off the input, or off
+//! the output when the pool takes it only in the token being received. Ignoring it
+//! overstates every quote through such a pool by up to 150 bps.
 //!
 //! **The status byte.** A pool can have swaps disabled while still holding liquidity
 //! and looking perfectly quotable. Routing through one produces a cycle that cannot
@@ -37,7 +47,7 @@
 //! `Q2sPHPdUWFMg7M7wwrQKLrn619cAucfRsmhVJffodSp` on 2026-08-21.
 
 use anyhow::{ensure, Result};
-use cb_core::types::{Dex, PoolId, PoolState, Pubkey32};
+use cb_core::types::{Dex, PoolId, PoolMath, PoolState, Pubkey32};
 
 pub const PROGRAM_ID: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 
@@ -47,8 +57,10 @@ pub const POOL_LEN: usize = 637;
 /// this is a floor rather than an equality.
 pub const CONFIG_MIN_LEN: usize = 44;
 
-/// The classic SPL Token program. Anything else may skim transfers.
+/// The classic SPL Token program.
 pub const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+/// Token-2022, whose mints may carry extensions the caller must screen.
+pub const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 // Verified byte offsets into the pool account.
 const OFF_AMM_CONFIG: usize = 8;
@@ -69,14 +81,20 @@ const OFF_FUND_FEES_1: usize = 365;
 // and six bytes of padding, then a **third** pair of fee buckets. These landed in what
 // used to be reserved padding, so a decoder written against the older layout reads
 // them as zero and silently overstates the reserve. See the module docs.
+const OFF_CREATOR_FEE_ON: usize = 389;
+const OFF_ENABLE_CREATOR_FEE: usize = 390;
 const OFF_CREATOR_FEES_0: usize = 397;
+/// The pool's observation account, which a swap writes its price history to.
+const OFF_OBSERVATION: usize = 296;
 const OFF_CREATOR_FEES_1: usize = 405;
 
 /// Bit in `status` that disables swapping. Set means the pool will reject a trade.
 const STATUS_SWAP_DISABLED: u8 = 1 << 2;
 
-// Verified byte offsets into AmmConfig.
+// Verified byte offsets into AmmConfig: bump, disable_create_pool, index, then the
+// trade, protocol and fund rates, the pool-creation fee, two owners, and the creator rate.
 const OFF_CFG_TRADE_FEE_RATE: usize = 12;
+const OFF_CFG_CREATOR_FEE_RATE: usize = 108;
 
 fn u64_at(d: &[u8], o: usize) -> u64 {
     let mut b = [0u8; 8];
@@ -108,6 +126,15 @@ pub struct CpmmPool {
     pub fund_fees_1: u64,
     pub creator_fees_0: u64,
     pub creator_fees_1: u64,
+    /// The account a swap records the price in; every swap names it.
+    pub observation: Pubkey32,
+    /// Whether this pool charges a creator fee on swaps, on top of the trade fee.
+    pub enable_creator_fee: bool,
+    /// Which side that fee comes from: 0 both, 1 only token 0, 2 only token 1.
+    pub creator_fee_on: u8,
+    /// Whether each mint is owned by Token-2022 rather than the classic program.
+    pub token_2022_0: bool,
+    pub token_2022_1: bool,
 }
 
 impl CpmmPool {
@@ -137,14 +164,15 @@ pub fn decode(data: &[u8]) -> Result<CpmmPool> {
         "cpmm pool has swaps disabled (status {status:#04x}) — it would quote and then revert"
     );
 
-    let spl = bs58_expect(SPL_TOKEN_PROGRAM);
+    let (spl, t22) = (bs58_expect(SPL_TOKEN_PROGRAM), bs58_expect(TOKEN_2022_PROGRAM));
     let prog_0 = pubkey_at(data, OFF_PROGRAM_0);
     let prog_1 = pubkey_at(data, OFF_PROGRAM_1);
     ensure!(
-        prog_0 == spl && prog_1 == spl,
-        "cpmm pool holds a non-classic token mint — a transfer fee or hook could skim \
-         the swap in a way constant-product arithmetic cannot see"
+        [prog_0, prog_1].iter().all(|p| *p == spl || *p == t22),
+        "cpmm pool names a token program that is neither SPL Token nor Token-2022"
     );
+    let creator_fee_on = data[OFF_CREATOR_FEE_ON];
+    ensure!(creator_fee_on <= 2, "cpmm pool has creator_fee_on {creator_fee_on}, which no version defines");
 
     let decimals_0 = data[OFF_DECIMALS_0];
     let decimals_1 = data[OFF_DECIMALS_1];
@@ -167,7 +195,25 @@ pub fn decode(data: &[u8]) -> Result<CpmmPool> {
         fund_fees_1: u64_at(data, OFF_FUND_FEES_1),
         creator_fees_0: u64_at(data, OFF_CREATOR_FEES_0),
         creator_fees_1: u64_at(data, OFF_CREATOR_FEES_1),
+        observation: pubkey_at(data, OFF_OBSERVATION),
+        enable_creator_fee: data[OFF_ENABLE_CREATOR_FEE] != 0,
+        creator_fee_on,
+        token_2022_0: prog_0 == t22,
+        token_2022_1: prog_1 == t22,
     })
+}
+
+/// Read the creator fee rate, in parts per million, out of an `AmmConfig` account. It
+/// applies only to a pool with `enable_creator_fee` set; see [`to_pool_state`].
+pub fn decode_creator_fee_ppm(data: &[u8]) -> Result<u32> {
+    ensure!(
+        data.len() >= OFF_CFG_CREATOR_FEE_RATE + 8,
+        "raydium cpmm config too short for a creator rate: {} bytes",
+        data.len()
+    );
+    let fee = u64_at(data, OFF_CFG_CREATOR_FEE_RATE);
+    ensure!(fee < 1_000_000, "cpmm creator fee {fee}ppm is not a fee");
+    Ok(fee as u32)
 }
 
 /// Read the trade fee, in parts per million, out of an `AmmConfig` account.
@@ -182,7 +228,12 @@ pub fn decode_trade_fee_ppm(data: &[u8]) -> Result<u32> {
     Ok(fee as u32)
 }
 
-/// Combine the pool account, its two vault balances, and its fee into a [`PoolState`].
+/// Combine the pool account, its two vault balances, and its config's two fee rates
+/// into a [`PoolState`].
+///
+/// `creator_fee_ppm` is the config's creator rate, charged only when the pool has
+/// `enable_creator_fee` set, and then from the side `creator_fee_on` names — see
+/// [`PoolMath::ConstantProductExtraFee`].
 ///
 /// Errors if a vault holds less than the fees recorded against it, which means the
 /// three accounts were read at inconsistent slots and must not be quoted on.
@@ -192,9 +243,11 @@ pub fn to_pool_state(
     vault_0_amount: u64,
     vault_1_amount: u64,
     trade_fee_ppm: u32,
+    creator_fee_ppm: u32,
     slot: u64,
 ) -> Result<PoolState> {
     ensure!(trade_fee_ppm < 1_000_000, "cpmm trade fee {trade_fee_ppm}ppm is not a fee");
+    ensure!(creator_fee_ppm < 1_000_000, "cpmm creator fee {creator_fee_ppm}ppm is not a fee");
 
     let r0 = vault_0_amount
         .checked_sub(pool.owed_0())
@@ -204,7 +257,7 @@ pub fn to_pool_state(
         .ok_or_else(|| anyhow::anyhow!("vault 1 below fees owed — torn read across slots"))?;
     ensure!(r0 > 0 && r1 > 0, "cpmm pool has an empty side after fees");
 
-    Ok(PoolState::constant_product(
+    let mut state = PoolState::constant_product(
         PoolId(address),
         Dex::RaydiumCpmm,
         pool.mint_0,
@@ -213,7 +266,24 @@ pub fn to_pool_state(
         u128::from(r1),
         trade_fee_ppm,
         slot,
-    ))
+    );
+    if pool.enable_creator_fee && creator_fee_ppm > 0 {
+        // Token 0 is A. Only-token-0 takes it from the input spending A and from the
+        // output spending B; only-token-1 the reverse; both-tokens always the input.
+        let (a_to_b_out, b_to_a_out) = match pool.creator_fee_on {
+            1 => (false, true),
+            2 => (true, false),
+            _ => (false, false),
+        };
+        state.math = PoolMath::ConstantProductExtraFee {
+            reserve_a: u128::from(r0),
+            reserve_b: u128::from(r1),
+            extra_fee_ppm: creator_fee_ppm,
+            extra_on_output_a_to_b: a_to_b_out,
+            extra_on_output_b_to_a: b_to_a_out,
+        };
+    }
+    Ok(state)
 }
 
 /// Decode a base58 constant known to be valid. Panics only on a typo in this file.
@@ -292,7 +362,7 @@ mod tests {
     fn reserves_exclude_all_three_fee_buckets() {
         let p = decode(&live()).unwrap();
         let (v0, v1) = (10_000_000_000u64, 20_000_000_000u64);
-        let ps = to_pool_state([9u8; 32], &p, v0, v1, 2500, 42).unwrap();
+        let ps = to_pool_state([9u8; 32], &p, v0, v1, 2500, 0, 42).unwrap();
 
         assert_eq!(ps.reserve_a(), u128::from(v0 - 72_586 - 32_273_478 - 6_888_081_160));
         assert_eq!(ps.reserve_b(), u128::from(v1 - 112_411_388 - 356_658_004));
@@ -312,7 +382,7 @@ mod tests {
     fn the_price_matches_what_an_independent_router_quotes() {
         let p = decode(&live()).unwrap();
         let (vault_0, vault_1) = (1_326_162_157_059u64, 10_353_978_949_932u64);
-        let ps = to_pool_state([9u8; 32], &p, vault_0, vault_1, 2500, 1).unwrap();
+        let ps = to_pool_state([9u8; 32], &p, vault_0, vault_1, 2500, 0, 1).unwrap();
 
         let price = ps.spot_price().expect("pool must price");
         assert!((price - 7.848).abs() < 0.002, "priced at {price}, but it trades at 7.848");
@@ -328,7 +398,7 @@ mod tests {
     #[test]
     fn a_vault_below_its_own_fees_is_a_torn_read_not_a_pool() {
         let p = decode(&live()).unwrap();
-        let err = to_pool_state([9u8; 32], &p, 1, 20_000_000_000, 2500, 1).unwrap_err().to_string();
+        let err = to_pool_state([9u8; 32], &p, 1, 20_000_000_000, 2500, 0, 1).unwrap_err().to_string();
         assert!(err.contains("torn read"), "unexpected error: {err}");
     }
 
@@ -344,13 +414,86 @@ mod tests {
         assert!(decode(&account(0b11, bs58_expect(SPL_TOKEN_PROGRAM), (9, 6), [0; 6])).is_ok());
     }
 
-    /// This program, unlike Raydium v4, accepts Token-2022 mints. Those can carry a
-    /// transfer fee that constant-product arithmetic cannot see.
+    /// This program, unlike Raydium v4, accepts Token-2022 mints. The pool cannot say
+    /// whether one charges for transfers, so it is decoded and flagged for the caller
+    /// that holds the mint; any other owning program is refused here.
     #[test]
-    fn token_2022_mints_are_refused() {
-        let t22 = bs58_expect("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
-        let err = decode(&account(0, t22, (9, 6), [0; 6])).unwrap_err().to_string();
-        assert!(err.contains("non-classic token mint"), "unexpected error: {err}");
+    fn token_2022_mints_are_flagged_and_other_programs_refused() {
+        let t22 = bs58_expect(TOKEN_2022_PROGRAM);
+        let p = decode(&account(0, t22, (9, 6), [0; 6])).unwrap();
+        assert!(p.token_2022_0 && p.token_2022_1);
+        let classic = decode(&live()).unwrap();
+        assert!(!classic.token_2022_0 && !classic.token_2022_1);
+        let err = decode(&account(0, [5u8; 32], (9, 6), [0; 6])).unwrap_err().to_string();
+        assert!(err.contains("neither SPL Token nor Token-2022"), "unexpected error: {err}");
+    }
+
+    fn with_creator_fee(on: u8) -> CpmmPool {
+        let mut d = live();
+        d[OFF_ENABLE_CREATOR_FEE] = 1;
+        d[OFF_CREATOR_FEE_ON] = on;
+        decode(&d).unwrap()
+    }
+
+    /// The creator fee comes off the input when the pool takes it in both tokens, and
+    /// then it simply adds to the trade fee.
+    #[test]
+    fn a_creator_fee_on_both_tokens_adds_to_the_input_fee() {
+        let (v0, v1) = (1_000_000_000_000u64, 2_000_000_000_000u64);
+        let base = to_pool_state([9u8; 32], &decode(&live()).unwrap(), v0, v1, 2500, 10_000, 1).unwrap();
+        let both = to_pool_state([9u8; 32], &with_creator_fee(0), v0, v1, 2500, 10_000, 1).unwrap();
+        let x = 1_000_000_000u128;
+        let plain = base.leg_for_input(&[1u8; 32]).unwrap().quote(x).unwrap();
+        let charged = both.leg_for_input(&[1u8; 32]).unwrap().quote(x).unwrap();
+        // 1% more fee on the input is very nearly 1% less out.
+        let loss_bps = (1.0 - charged as f64 / plain as f64) * 1e4;
+        assert!((100.0..101.0).contains(&loss_bps), "lost {loss_bps} bps");
+        let back = both.leg_for_input(&[2u8; 32]).unwrap().quote(x).unwrap();
+        let back_plain = base.leg_for_input(&[2u8; 32]).unwrap().quote(x).unwrap();
+        assert!(back < back_plain, "both directions pay it");
+    }
+
+    /// Taken only in token 0, the fee comes off the input spending token 0 and off the
+    /// output buying it — and the output version is the smaller quote, never the larger.
+    #[test]
+    fn a_creator_fee_on_one_token_follows_that_token() {
+        let (v0, v1) = (1_000_000_000_000u64, 2_000_000_000_000u64);
+        let only0 = to_pool_state([9u8; 32], &with_creator_fee(1), v0, v1, 2500, 10_000, 1).unwrap();
+        let only1 = to_pool_state([9u8; 32], &with_creator_fee(2), v0, v1, 2500, 10_000, 1).unwrap();
+        assert!(matches!(
+            only0.math,
+            PoolMath::ConstantProductExtraFee { extra_on_output_a_to_b: false, extra_on_output_b_to_a: true, .. }
+        ));
+        assert!(matches!(
+            only1.math,
+            PoolMath::ConstantProductExtraFee { extra_on_output_a_to_b: true, extra_on_output_b_to_a: false, .. }
+        ));
+        // The exact program arithmetic, spending token 1 into a token-0-only pool: the
+        // trade fee off the input, then the creator fee off what the curve pays.
+        let x = 5_000_000_000u128;
+        let (r_in, r_out) = (u128::from(v1 - 112_411_388 - 356_658_004), u128::from(v0 - 72_586 - 32_273_478 - 6_888_081_160));
+        let less = x - (x * 2500).div_ceil(1_000_000);
+        let swapped = r_out * less / (r_in + less);
+        let program = swapped - (swapped * 10_000).div_ceil(1_000_000);
+        let quoted = only0.leg_for_input(&[2u8; 32]).unwrap().quote(x).unwrap();
+        assert!(quoted <= program, "quoted {quoted} above the program's {program}");
+        assert!(program - quoted < program / 50_000, "but within 0.2 bps: {quoted} vs {program}");
+    }
+
+    #[test]
+    fn a_disabled_creator_fee_costs_nothing_whatever_the_config_says() {
+        let p = decode(&live()).unwrap();
+        assert!(!p.enable_creator_fee);
+        let s = to_pool_state([9u8; 32], &p, 10_000_000_000, 20_000_000_000, 2500, 10_000, 1).unwrap();
+        assert!(matches!(s.math, PoolMath::ConstantProduct { .. }));
+    }
+
+    #[test]
+    fn the_config_yields_its_creator_rate() {
+        let mut d = config(2500);
+        d[OFF_CFG_CREATOR_FEE_RATE..OFF_CFG_CREATOR_FEE_RATE + 8].copy_from_slice(&10_000u64.to_le_bytes());
+        assert_eq!(decode_creator_fee_ppm(&d).unwrap(), 10_000);
+        assert!(decode_creator_fee_ppm(&d[..100]).is_err());
     }
 
     /// Raydium's two constant-product programs have different layouts and different
@@ -367,6 +510,7 @@ mod tests {
     fn a_hundred_percent_fee_is_rejected_rather_than_underflowing_gamma() {
         assert!(decode_trade_fee_ppm(&config(1_000_000)).is_err());
         let p = decode(&live()).unwrap();
-        assert!(to_pool_state([9u8; 32], &p, 10_000_000_000, 20_000_000_000, 1_000_000, 1).is_err());
+        assert!(to_pool_state([9u8; 32], &p, 10_000_000_000, 20_000_000_000, 1_000_000, 0, 1).is_err());
+        assert!(to_pool_state([9u8; 32], &p, 10_000_000_000, 20_000_000_000, 2500, 1_000_000, 1).is_err());
     }
 }

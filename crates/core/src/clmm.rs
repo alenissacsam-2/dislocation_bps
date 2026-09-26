@@ -385,7 +385,9 @@ mod tests {
                     // production path stays in integers over virtual reserves.
                     let l = liquidity as f64;
                     let sp = sqrt_price as f64 / Q64 as f64;
-                    let net = amount as f64 * (1_000_000.0 - f64::from(fee)) / 1_000_000.0;
+                    // The fee is a whole number of units, rounded up, as the programs
+                    // take it: what reaches the curve is floor(amount · γ).
+                    let net = (amount * (1_000_000 - u128::from(fee)) / 1_000_000) as f64;
                     let direct = if a_to_b {
                         // out = Δx·L·P / (L + Δx·√P)
                         net * l * sp * sp / (l + net * sp)

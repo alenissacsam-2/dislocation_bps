@@ -98,6 +98,14 @@ pub fn cp_swap_out(amount_in: u128, reserve_in: u128, reserve_out: u128, fee_ppm
     // This is the same overflow that once made `optimal_input` return None for the
     // entire live market, one function further down the call chain.
     let in_after_fee = u256(amount_in).checked_mul(u256(gamma_num))?;
+    // Whole units only. Every program here takes its fee as a whole number of base units
+    // rounded up, and swaps the whole units left: floor(amount · γ), not amount · γ. The
+    // fraction a continuous γ keeps is never swapped, and it is worth up to one unit of
+    // input — reserve_out / reserve_in units of output. Measured on a Token-2022 CP-Swap
+    // pool on 2026-09-26, where a token unit was worth 25 lamports: every quote selling
+    // the token was 23 lamports over what the program paid. Rounding here can only
+    // lower a quote, so it is right for every venue this quotes.
+    let in_after_fee = (in_after_fee / u256(PPM_DENOM)) * u256(PPM_DENOM);
 
     // out = (in·γ · reserve_out) / (reserve_in·PPM + in·γ)
     let numerator = in_after_fee.checked_mul(u256(reserve_out))?;

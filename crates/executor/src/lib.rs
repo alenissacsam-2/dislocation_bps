@@ -135,8 +135,10 @@ pub enum SendVia {
     /// Jito's block engine as a bundle of one. A miss is dropped and costs nothing; see
     /// [`rpc::Rpc::send_jito`].
     Jito {
-        /// The block engine's `/api/v1/transactions` URL, with `bundleOnly=true`.
-        url: String,
+        /// Every block engine's `/api/v1/transactions` URL, with `bundleOnly=true`,
+        /// the configured one first. The same bytes go to all of them; see
+        /// [`jito::REGIONS`].
+        urls: Vec<String>,
         /// Run our own simulation first.
         ///
         /// With revert protection a failing trade is free, so the simulation no longer
@@ -208,8 +210,8 @@ impl Plan {
 
         let (signature, bundle_id) = match via {
             SendVia::Rpc => (rpc.send(&self.tx_base64, true).await?, None),
-            SendVia::Jito { url, .. } => {
-                let r = rpc.send_jito(url, &self.tx_base64).await?;
+            SendVia::Jito { urls, .. } => {
+                let r = rpc.send_jito_all(urls, &self.tx_base64).await?;
                 (r.signature, r.bundle_id)
             }
         };

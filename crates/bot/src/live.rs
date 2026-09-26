@@ -147,6 +147,8 @@ enum Venue {
     RaydiumCpmm {
         pool: Box<raydium_cpmm::CpmmPool>,
         trade_fee_ppm: u32,
+        /// The config's creator rate; charged only if the pool enables it.
+        creator_fee_ppm: u32,
         vault_0_amount: Option<u64>,
         vault_1_amount: Option<u64>,
     },
@@ -187,13 +189,14 @@ impl Watch {
                 raydium_v4::to_pool_state(addr, info, (*base_amount)?, (*quote_amount)?, self.slot)
                     .ok()
             }
-            Venue::RaydiumCpmm { pool, trade_fee_ppm, vault_0_amount, vault_1_amount } => {
+            Venue::RaydiumCpmm { pool, trade_fee_ppm, creator_fee_ppm, vault_0_amount, vault_1_amount } => {
                 raydium_cpmm::to_pool_state(
                     addr,
                     pool,
                     (*vault_0_amount)?,
                     (*vault_1_amount)?,
                     *trade_fee_ppm,
+                    *creator_fee_ppm,
                     self.slot,
                 )
                 .ok()
@@ -488,6 +491,19 @@ impl LiveMarket {
                     Err(e) => failures.push(format!("{}: {e:#}", entry.label)),
                 },
                 Dex::RaydiumCpmm => match raydium_cpmm::decode(data) {
+                    // The pool names each mint's token program. A Token-2022 side the
+                    // registry calls classic would derive the wrong token account and
+                    // skip the transfer-cost screen below, so the two must agree.
+                    Ok(p)
+                        if [(p.mint_0, p.token_2022_0), (p.mint_1, p.token_2022_1)].iter().any(
+                            |(m, t22)| registry.mints.get(m).is_some_and(|i| i.token_2022 != *t22),
+                        ) =>
+                    {
+                        failures.push(format!(
+                            "{}: the registry and the pool disagree about which token program owns a mint",
+                            entry.label
+                        ));
+                    }
                     Ok(p) => {
                         vault_index.insert(p.vault_0, (addr, true));
                         vault_index.insert(p.vault_1, (addr, false));
@@ -504,6 +520,7 @@ impl LiveMarket {
                                     pool: Box::new(p),
                                     // Filled in once the config resolves.
                                     trade_fee_ppm: u32::MAX,
+                                    creator_fee_ppm: 0,
                                     vault_0_amount: None,
                                     vault_1_amount: None,
                                 },
@@ -628,23 +645,26 @@ impl LiveMarket {
         cpmm_config_b58.dedup();
         if !cpmm_config_b58.is_empty() {
             let (configs, _) = get_multiple_accounts(&client, rpc_http, &cpmm_config_b58).await?;
-            let mut fee_by_config: HashMap<Pubkey32, u32> = HashMap::new();
+            let mut fee_by_config: HashMap<Pubkey32, (u32, u32)> = HashMap::new();
             for (b58, data) in cpmm_config_b58.iter().zip(configs.iter()) {
                 let Some(data) = data else { continue };
-                match raydium_cpmm::decode_trade_fee_ppm(data) {
-                    Ok(fee) => {
-                        fee_by_config.insert(pk(b58)?, fee);
+                let fees = raydium_cpmm::decode_trade_fee_ppm(data)
+                    .and_then(|t| Ok((t, raydium_cpmm::decode_creator_fee_ppm(data)?)));
+                match fees {
+                    Ok(fees) => {
+                        fee_by_config.insert(pk(b58)?, fees);
                     }
                     Err(e) => failures.push(format!("cpmm config {b58}: {e:#}")),
                 }
             }
             for (addr, config) in cpmm_pending {
                 match fee_by_config.get(&config) {
-                    Some(&fee) => {
-                        if let Some(Venue::RaydiumCpmm { trade_fee_ppm, .. }) =
+                    Some(&(trade, creator)) => {
+                        if let Some(Venue::RaydiumCpmm { trade_fee_ppm, creator_fee_ppm, .. }) =
                             watches.get_mut(&addr).map(|w| &mut w.venue)
                         {
-                            *trade_fee_ppm = fee;
+                            *trade_fee_ppm = trade;
+                            *creator_fee_ppm = creator;
                         }
                     }
                     None => {
@@ -691,7 +711,7 @@ impl LiveMarket {
                     // A self-contained pool was priced the moment it decoded.
                     store.remove(&PoolId(p.address));
                     failures.push(format!(
-                        "{}: a Token-2022 mint here charges a transfer fee or runs a transfer hook",
+                        "{}: a Token-2022 mint here charges a transfer fee, runs a transfer hook, freezes new accounts or is paused",
                         p.label
                     ));
                 }
@@ -1005,12 +1025,24 @@ impl LiveMarket {
                             })
                         })
                         .collect::<Option<Vec<_>>>()?;
+                    // A CP-Swap pool's creator rate, which its PoolState folds into
+                    // the curve rather than into `fee_ppm`. See `CyclePlan::extra_fee_ppm`.
+                    let extra_fee_ppm: Vec<u32> = p
+                        .cycle
+                        .pools
+                        .iter()
+                        .map(|id| match self.watches.get(&id.0).map(|w| &w.venue) {
+                            Some(Venue::RaydiumCpmm { creator_fee_ppm, .. }) => *creator_fee_ppm,
+                            _ => 0,
+                        })
+                        .collect();
                     Some(crate::execute::CyclePlan {
                         pools,
                         mints: p.cycle.mints.clone(),
                         amount_in: p.capped_in,
                         leg_out,
                         fee_ppm,
+                        extra_fee_ppm,
                     })
                 })();
 
@@ -1300,6 +1332,24 @@ impl LiveMarket {
     pub fn usd_per_base_unit(&self, mint: &Pubkey32) -> Option<f64> {
         let whole = *self.usd.get(mint)?;
         Some(whole * 10f64.powi(-i32::from(self.registry.decimals(mint))))
+    }
+
+    /// Every vault-backed pool with its two vaults, in the order the executor prices
+    /// them: base then quote for Raydium v4 and PumpSwap, token 0 then 1 for CP-Swap.
+    ///
+    /// Handed to the trader at start, so the first attempt on each of these pools can
+    /// price it from its vaults instead of being spent learning where they are.
+    #[must_use]
+    pub fn vault_pairs(&self) -> Vec<(Pubkey32, [Pubkey32; 2])> {
+        self.watches
+            .iter()
+            .filter_map(|(addr, w)| match &w.venue {
+                Venue::RaydiumV4 { info, .. } => Some((*addr, [info.base_vault, info.quote_vault])),
+                Venue::PumpSwap { pool, .. } => Some((*addr, [pool.base_vault, pool.quote_vault])),
+                Venue::RaydiumCpmm { pool, .. } => Some((*addr, [pool.vault_0, pool.vault_1])),
+                _ => None,
+            })
+            .collect()
     }
 
     /// SOL price in USD, derived from live pools like every other token.

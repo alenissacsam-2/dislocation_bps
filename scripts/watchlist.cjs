@@ -41,6 +41,7 @@ const VENUE = {
   "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8": { dex: "raydium_v4", size: (n) => n === 752, a: 400, b: 432 },
   cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG: { dex: "meteora_damm_v2", size: (n) => n === 1112, a: 168, b: 200 },
   pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA: { dex: "pumpswap", size: (n) => n >= 200 && n <= 400, a: 43, b: 75 },
+  CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C: { dex: "raydium_cpmm", size: (n) => n === 637, a: 168, b: 200 },
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

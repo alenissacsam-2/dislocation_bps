@@ -54,6 +54,9 @@ pub struct Simulation {
     /// Post-execution SPL token amounts, for those requested accounts that are token
     /// accounts. `None` where the account is not one, or did not exist.
     pub post_token_amounts: Vec<Option<u64>>,
+    /// Post-execution data of each requested account, `None` where it did not exist.
+    /// What a verification harness decodes a pool from after an earlier leg moved it.
+    pub post_data: Vec<Option<Vec<u8>>>,
 }
 
 impl Simulation {
@@ -405,10 +408,14 @@ impl Rpc {
 
         let mut post_lamports = Vec::new();
         let mut post_token_amounts = Vec::new();
+        let mut post_data = Vec::new();
         if let Some(accs) = v["accounts"].as_array() {
             for a in accs {
                 post_lamports.push(a["lamports"].as_u64().unwrap_or(0));
                 post_token_amounts.push(token_amount_of(a));
+                post_data.push(
+                    a["data"].as_array().and_then(|d| d.first()).and_then(Value::as_str).and_then(base64_decode),
+                );
             }
         }
 
@@ -418,6 +425,7 @@ impl Rpc {
             units_consumed: v["unitsConsumed"].as_u64(),
             post_lamports,
             post_token_amounts,
+            post_data,
         })
     }
 
@@ -493,68 +501,81 @@ impl Rpc {
     /// # Errors
     /// If the request fails or the block engine refuses the transaction.
     pub async fn send_jito(&self, url: &str, tx_base64: &str) -> Result<JitoReceipt> {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendTransaction",
-            "params": [tx_base64, {"encoding": "base64"}],
-        });
-        let resp = match self.http_warm.post(url).json(&body).send().await {
-            Ok(r) => r,
-            Err(e) => bail!(
-                "Jito sendTransaction failed: {}",
-                cb_core::redact::redact_urls_in(&e.to_string())
-            ),
-        };
-        let status = resp.status();
-        let bundle_id = resp
-            .headers()
-            .get("x-bundle-id")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        let text = resp.text().await.unwrap_or_default();
-        let parsed: Value = serde_json::from_str(&text).map_err(|_| {
-            anyhow!("Jito answered {status} rather than JSON ({} bytes)", text.len())
-        })?;
-        if let Some(e) = parsed.get("error") {
-            bail!("Jito refused the transaction ({status}): {e}");
-        }
-        let signature = parsed["result"]
-            .as_str()
-            .map(String::from)
-            .ok_or_else(|| anyhow!("Jito sendTransaction did not return a signature"))?;
-        Ok(JitoReceipt { signature, bundle_id })
+        post_jito(&self.http_warm, url, &jito_send_body(tx_base64)).await
     }
 
-    /// Touch the primary RPC and, given one, the Jito block engine, so the next trade
-    /// finds both connections open. See [`WARM_POOL_IDLE`].
+    /// [`Rpc::send_jito`] to every URL in `urls` at once, answering with the first
+    /// block engine to accept it. See [`crate::jito::REGIONS`] for why.
     ///
-    /// `getSlot` and `getTipAccounts` are the cheapest calls each serves. The Jito one
-    /// counts against its one-a-second allowance, so the caller spaces it like a send.
+    /// The same signed bytes go to each, so however many regions forward it, the
+    /// transaction is included at most once and pays at most once. The requests still
+    /// in flight when the first answer arrives are left to finish on their own; a
+    /// region that refuses is only reported if every region does.
     ///
     /// # Errors
-    /// If either request fails.
-    pub async fn keep_warm(&self, jito_url: Option<&str>) -> Result<()> {
+    /// If every block engine refuses the transaction or cannot be reached.
+    pub async fn send_jito_all(&self, urls: &[String], tx_base64: &str) -> Result<JitoReceipt> {
+        match urls {
+            [] => bail!("no block engine to send to"),
+            [one] => return self.send_jito(one, tx_base64).await,
+            _ => {}
+        }
+        let body = jito_send_body(tx_base64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(urls.len());
+        for url in urls {
+            let (client, body, url, tx) = (self.http_warm.clone(), body.clone(), url.clone(), tx.clone());
+            tokio::spawn(async move {
+                let r = post_jito(&client, &url, &body).await;
+                let _ = tx.send(r).await;
+            });
+        }
+        drop(tx);
+        let mut refusals = Vec::new();
+        while let Some(r) = rx.recv().await {
+            match r {
+                Ok(receipt) => return Ok(receipt),
+                Err(e) => refusals.push(format!("{e:#}")),
+            }
+        }
+        bail!("every block engine refused the transaction: {}", refusals.join(" | "))
+    }
+
+    /// Touch the primary RPC and every Jito block engine given, so the next trade finds
+    /// all the connections it will use open. See [`WARM_POOL_IDLE`].
+    ///
+    /// `getSlot` and `getTipAccounts` are the cheapest calls each serves. The Jito ones
+    /// count against each region's one-a-second allowance, so the caller spaces them
+    /// like a send.
+    ///
+    /// # Errors
+    /// If the primary RPC cannot be reached. A block engine that does not answer is
+    /// only logged: one region down must not read as the whole path failing.
+    pub async fn keep_warm(&self, jito_urls: &[String]) -> Result<()> {
         // The body is read to the end so the connection goes back to the pool.
-        let touch = |url: String, body: Value| async move {
-            let r = self.http_warm.post(&url).json(&body).send().await?;
+        async fn touch(client: reqwest::Client, url: String, body: Value) -> reqwest::Result<()> {
+            let r = client.post(&url).json(&body).send().await?;
             r.bytes().await.map(|_| ())
-        };
+        }
         let redact = |e: reqwest::Error| {
             anyhow!("keep-warm request failed: {}", cb_core::redact::redact_urls_in(&e.to_string()))
         };
-        let primary =
-            touch(self.endpoints[0].clone(), json!({"jsonrpc": "2.0", "id": 1, "method": "getSlot"}));
-        match jito_url {
-            Some(u) => {
-                let tips = json!({"jsonrpc": "2.0", "id": 1, "method": "getTipAccounts", "params": []});
-                let (a, b) = tokio::join!(primary, touch(crate::jito::api_url(u, "getTipAccounts"), tips));
-                a.map_err(redact)?;
-                b.map_err(redact)?;
-            }
-            None => primary.await.map_err(redact)?,
+        let tips = json!({"jsonrpc": "2.0", "id": 1, "method": "getTipAccounts", "params": []});
+        let mut regions = tokio::task::JoinSet::new();
+        for u in jito_urls {
+            regions.spawn(touch(self.http_warm.clone(), crate::jito::api_url(u, "getTipAccounts"), tips.clone()));
         }
-        Ok(())
+        let primary = touch(
+            self.http_warm.clone(),
+            self.endpoints[0].clone(),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "getSlot"}),
+        )
+        .await;
+        while let Some(r) = regions.join_next().await {
+            if let Ok(Err(e)) = r {
+                tracing::debug!("{:#}", redact(e));
+            }
+        }
+        primary.map_err(redact)
     }
 
     /// What the block engine did with a bundle sent in the last five minutes.
@@ -838,6 +859,45 @@ pub struct JitoReceipt {
     pub bundle_id: Option<String>,
 }
 
+/// The `sendTransaction` request a block engine takes, for one base64 transaction.
+fn jito_send_body(tx_base64: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [tx_base64, {"encoding": "base64"}],
+    })
+}
+
+/// One `sendTransaction` to one block engine. See [`Rpc::send_jito`].
+async fn post_jito(client: &reqwest::Client, url: &str, body: &Value) -> Result<JitoReceipt> {
+    let resp = match client.post(url).json(body).send().await {
+        Ok(r) => r,
+        Err(e) => bail!(
+            "Jito sendTransaction failed: {}",
+            cb_core::redact::redact_urls_in(&e.to_string())
+        ),
+    };
+    let status = resp.status();
+    let bundle_id = resp
+        .headers()
+        .get("x-bundle-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let text = resp.text().await.unwrap_or_default();
+    let parsed: Value = serde_json::from_str(&text).map_err(|_| {
+        anyhow!("Jito answered {status} rather than JSON ({} bytes)", text.len())
+    })?;
+    if let Some(e) = parsed.get("error") {
+        bail!("Jito refused the transaction ({status}): {e}");
+    }
+    let signature = parsed["result"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| anyhow!("Jito sendTransaction did not return a signature"))?;
+    Ok(JitoReceipt { signature, bundle_id })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SignatureStatus {
     pub confirmations: Option<u64>,
@@ -1115,6 +1175,7 @@ mod error_context_tests {
             units_consumed: None,
             post_lamports: Vec::new(),
             post_token_amounts: Vec::new(),
+            post_data: Vec::new(),
         }
     }
 

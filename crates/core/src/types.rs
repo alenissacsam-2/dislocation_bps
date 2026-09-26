@@ -164,6 +164,27 @@ pub enum PoolMath {
         /// base mint and B the quote mint).
         quote_is_b: bool,
     },
+    /// Constant product with a second fee beside the pool's `fee_ppm`, taken from the
+    /// input in one direction and from the output in the other — or from the input in
+    /// both. Raydium CP-Swap's creator fee prices this way: the trade fee always comes
+    /// off the input, and the creator fee off whichever side the pool names
+    /// (`creator_fee_on`: both tokens means the input, one token means that token,
+    /// whether it is being spent or received).
+    ///
+    /// Off the input, the two fees simply add. Off the output, it is the same curve over
+    /// an output reserve scaled by `1 - extra`, as for [`PoolMath::QuoteSideFee`]. Both
+    /// fees are shaded by [`QUOTE_SIDE_FEE_MARGIN_PPM`] against us, because the program
+    /// rounds each one up separately.
+    ConstantProductExtraFee {
+        reserve_a: u128,
+        reserve_b: u128,
+        /// The second fee, in ppm of whichever side it is taken from.
+        extra_fee_ppm: u32,
+        /// Spending A pays the second fee out of the output.
+        extra_on_output_a_to_b: bool,
+        /// Spending B pays the second fee out of the output.
+        extra_on_output_b_to_a: bool,
+    },
     Bounded {
         /// Output per unit of input when spending token A, Q64. Zero when that
         /// direction cannot be filled at all.
@@ -268,6 +289,34 @@ impl PoolState {
                     Some(Leg::cp(r_in, r_out, u32::try_from(on_input).ok()?))
                 }
             }
+            PoolMath::ConstantProductExtraFee {
+                reserve_a,
+                reserve_b,
+                extra_fee_ppm,
+                extra_on_output_a_to_b,
+                extra_on_output_b_to_a,
+            } => {
+                let (r_in, r_out) =
+                    if a_to_b { (reserve_a, reserve_b) } else { (reserve_b, reserve_a) };
+                if r_in == 0 || r_out == 0 {
+                    return None;
+                }
+                let trade = u128::from(self.fee_ppm) + QUOTE_SIDE_FEE_MARGIN_PPM;
+                let extra = u128::from(extra_fee_ppm) + QUOTE_SIDE_FEE_MARGIN_PPM;
+                let on_output = if a_to_b { extra_on_output_a_to_b } else { extra_on_output_b_to_a };
+                if on_output {
+                    if trade >= 1_000_000 || extra >= 1_000_000 {
+                        return None;
+                    }
+                    Some(Leg::cp(r_in, r_out * (1_000_000 - extra) / 1_000_000, u32::try_from(trade).ok()?))
+                } else {
+                    let both = trade + extra;
+                    if both >= 1_000_000 {
+                        return None;
+                    }
+                    Some(Leg::cp(r_in, r_out, u32::try_from(both).ok()?))
+                }
+            }
             PoolMath::Bounded { rate_a_x64, max_in_a, rate_b_x64, max_in_b } => {
                 let (rate, max_in) =
                     if a_to_b { (rate_a_x64, max_in_a) } else { (rate_b_x64, max_in_b) };
@@ -356,9 +405,9 @@ impl PoolState {
     #[must_use]
     pub fn reserve_a(&self) -> u128 {
         match self.math {
-            PoolMath::ConstantProduct { reserve_a, .. } | PoolMath::QuoteSideFee { reserve_a, .. } => {
-                reserve_a
-            }
+            PoolMath::ConstantProduct { reserve_a, .. }
+            | PoolMath::QuoteSideFee { reserve_a, .. }
+            | PoolMath::ConstantProductExtraFee { reserve_a, .. } => reserve_a,
             // Deliberately the *real* depth and not the flat reserve the quote is
             // built from: that number is an arithmetic device chosen to be enormous,
             // and reporting it as a reserve would put a fictional depth on the
@@ -376,9 +425,9 @@ impl PoolState {
     #[must_use]
     pub fn reserve_b(&self) -> u128 {
         match self.math {
-            PoolMath::ConstantProduct { reserve_b, .. } | PoolMath::QuoteSideFee { reserve_b, .. } => {
-                reserve_b
-            }
+            PoolMath::ConstantProduct { reserve_b, .. }
+            | PoolMath::QuoteSideFee { reserve_b, .. }
+            | PoolMath::ConstantProductExtraFee { reserve_b, .. } => reserve_b,
             PoolMath::Bounded { max_in_b, .. } => max_in_b,
             PoolMath::Concentrated { liquidity, sqrt_price_x64, .. }
             | PoolMath::ConcentratedFeeSide { liquidity, sqrt_price_x64, .. } => {

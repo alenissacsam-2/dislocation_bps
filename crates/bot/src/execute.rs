@@ -96,11 +96,27 @@ pub struct CyclePlan {
     /// Re-pricing a Raydium CLMM leg needs it and re-fetching it would be a round trip
     /// spent on a number that cannot have changed.
     pub fee_ppm: Vec<u32>,
+    /// Each pool's second fee rate, in ppm, where its venue has one: a Raydium CP-Swap
+    /// config's creator rate, charged only when the pool enables it (read fresh from
+    /// the pool at execution). Zero elsewhere, and for any hop past the end.
+    pub extra_fee_ppm: Vec<u32>,
 }
 
 /// How often [`Trader::keep_warm`] runs: well inside the 45 s the warm pool keeps an idle
 /// connection, and the 60 s both hosts were measured to.
 pub const KEEP_WARM_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The tips a run of landing probes tries, lowest first, stopping at the first that
+/// lands. See [`Trader::jito_probe`].
+///
+/// From the block engine's minimum up by threes, to past the 50th percentile of what
+/// landed bundles were paying on 2026-09-26 (8,607 lamports; the 75th was 70,364). The
+/// most a run can cost is one landing: the base fee plus the tip that landed.
+pub const PROBE_TIPS: [u64; 4] = [1_000, 3_000, 9_000, 27_000];
+
+/// How often the probes run again when nothing sent has landed in the meantime, so a
+/// send path that breaks mid-run is noticed within this long.
+pub const PROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
 /// Whether [`cb_executor::venue::build_swap`] can encode a swap on this venue.
 ///
@@ -118,6 +134,7 @@ pub const fn has_encoder(dex: Dex) -> bool {
             | Dex::MeteoraDlmm
             | Dex::PumpSwap
             | Dex::MeteoraDammV2
+            | Dex::RaydiumCpmm
     )
 }
 
@@ -169,6 +186,7 @@ pub const fn can_reprice(dex: Dex) -> bool {
             | Dex::RaydiumAmmV4
             | Dex::PumpSwap
             | Dex::MeteoraDammV2
+            | Dex::RaydiumCpmm
     )
 }
 
@@ -445,6 +463,16 @@ pub fn cap_tip(wanted: u64, room: u128) -> u64 {
 /// below it.
 const MAX_BID_SHARE_PERCENT: u128 = 25;
 
+/// The share of a trade's fresh gross offered as its Jito tip.
+///
+/// Half, where the priority bid above is held to a quarter. The quarter protects a
+/// transaction that pays its fee whether or not it wins; a tip is paid only by a bundle
+/// that lands, and the last floor guarantees the base fee and the tip on chain, so a
+/// larger tip can shrink a win but cannot make a loss. Searchers competing for the same
+/// dislocation commonly tip half to nine tenths of it, and at a quarter not one of this
+/// bot's bundles had landed by 2026-09-26.
+const JITO_TIP_SHARE_PERCENT: u128 = 50;
+
 /// What the priority bid will cost, in lamports.
 ///
 /// Solana charges the bid against the compute limit the transaction *requests*, not the
@@ -483,7 +511,8 @@ fn program_for(dex: Dex) -> Pubkey {
         Dex::MeteoraDlmm => pk(cb_dex::meteora_dlmm::PROGRAM_ID),
         Dex::PumpSwap => pk(cb_dex::pumpswap::PROGRAM_ID),
         Dex::MeteoraDammV2 => pk(cb_dex::meteora_damm_v2::PROGRAM_ID),
-        _ => pk(cb_dex::raydium_clmm::PROGRAM_ID),
+        Dex::RaydiumCpmm => pk(cb_dex::raydium_cpmm::PROGRAM_ID),
+        Dex::RaydiumClmm => pk(cb_dex::raydium_clmm::PROGRAM_ID),
     }
 }
 
@@ -496,7 +525,7 @@ fn mint_a_of(dex: Dex, data: &[u8]) -> Result<Pubkey32> {
         Dex::MeteoraDlmm => Ok(cb_dex::meteora_dlmm::decode(data)?.token_x_mint),
         Dex::PumpSwap => Ok(cb_dex::pumpswap::decode_pool(data)?.base_mint),
         Dex::MeteoraDammV2 => Ok(cb_dex::meteora_damm_v2::decode_layout(data)?.mint_a),
-        other => bail!("{} is not encodable", other.name()),
+        Dex::RaydiumCpmm => Ok(cb_dex::raydium_cpmm::decode(data)?.mint_0),
     }
 }
 
@@ -546,8 +575,15 @@ pub struct Trader {
     /// Empty means never measured, which is deliberately not the same as "the wallet
     /// holds nothing": an unmeasured set refuses nothing and the old behaviour stands.
     accounts_held: std::collections::HashSet<Pubkey32>,
-    /// Where [`Submit::Jito`] sends. The block engine's default unless configured.
-    jito_url: String,
+    /// Where [`Submit::Jito`] sends: the configured block engine first, then every
+    /// other region, all at once. See [`cb_executor::jito::REGIONS`].
+    jito_urls: Vec<String>,
+    /// The tip the last landing probe landed with, this run. A floor under every trade's
+    /// tip: a trade bundle is no easier to land than a tip-only one. See
+    /// [`Trader::jito_probe`].
+    landing_tip: Option<u64>,
+    /// When anything this trader sent — a trade or a probe — was last seen on chain.
+    last_landed: Option<std::time::Instant>,
     /// When the last Jito send went, so the next waits out the block engine's
     /// one-a-second limit here rather than being answered with a 429 there.
     last_jito_send: Option<std::time::Instant>,
@@ -601,7 +637,9 @@ impl Trader {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
-            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            jito_urls: cb_executor::jito::fanout_urls(cb_executor::jito::DEFAULT_URL),
+            landing_tip: None,
+            last_landed: None,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -639,14 +677,21 @@ impl Trader {
         Ok(rent)
     }
 
-    /// Send [`Submit::Jito`] trades to this block engine URL instead of the default.
+    /// Send [`Submit::Jito`] trades to this block engine URL, and to every other region
+    /// of the same block engine, instead of the default.
     ///
     /// An empty string keeps the default, so a config that leaves the key blank cannot
     /// point trades at nothing.
     pub fn set_jito_url(&mut self, url: &str) {
         if !url.trim().is_empty() {
-            self.jito_url = url.trim().to_string();
+            self.jito_urls = cb_executor::jito::fanout_urls(url);
         }
+    }
+
+    /// How many block engines each Jito send goes to.
+    #[must_use]
+    pub fn jito_regions(&self) -> usize {
+        self.jito_urls.len()
     }
 
     /// The Jito tip a trade grossing `gross` lamports will pay if it lands; zero off Jito.
@@ -666,8 +711,12 @@ impl Trader {
             return 0;
         };
         let min = cb_executor::jito::MIN_TIP_LAMPORTS;
-        let share = gross.saturating_mul(MAX_BID_SHARE_PERCENT) / 100;
-        u64::try_from(share).unwrap_or(u64::MAX).clamp(min, tip_max_lamports.max(min))
+        let max = tip_max_lamports.max(min);
+        // Nothing under what a tip-only bundle has been seen to need this run: a trade
+        // bundle competes for the same leader and is no easier to land.
+        let floor = self.landing_tip.unwrap_or(min).clamp(min, max);
+        let share = gross.saturating_mul(JITO_TIP_SHARE_PERCENT) / 100;
+        u64::try_from(share).unwrap_or(u64::MAX).clamp(floor, max)
     }
 
     /// What this cycle grosses against the state just fetched, at the size the pools
@@ -808,12 +857,16 @@ impl Trader {
     /// entire point.
     /// `vaults` carries the two vault balances a constant-product venue prices from,
     /// and is `None` for a concentrated one, whose whole state is the pool account.
+    // Eight distinct facts about one hop, each a different venue's need; a struct to
+    // carry them would be built at the one call site and taken apart here.
+    #[allow(clippy::too_many_arguments)]
     fn fresh_leg(
         dex: Dex,
         address: Pubkey32,
         data: &[u8],
         input_mint: &Pubkey32,
         fee_ppm: u32,
+        extra_fee_ppm: u32,
         vaults: Option<(u64, u64)>,
         bins: &[&[u8]],
     ) -> Option<Leg> {
@@ -854,7 +907,18 @@ impl Trader {
                 cb_dex::pumpswap::to_pool_state(address, &pool, base, quote, u64::from(fee_ppm) / 100, 0)
                     .ok()?
             }
-            _ => return None,
+            // Vault-backed like v4; the uncollected fee buckets are in the pool account
+            // read beside the vaults, and whether it charges its creator fee too. The two
+            // rates are the plan's: configuration a swap does not touch. A pool that
+            // charges the creator fee with no rate carried is refused, not priced as free.
+            Dex::RaydiumCpmm => {
+                let (v0, v1) = vaults?;
+                let pool = cb_dex::raydium_cpmm::decode(data).ok()?;
+                if pool.enable_creator_fee && extra_fee_ppm == 0 {
+                    return None;
+                }
+                cb_dex::raydium_cpmm::to_pool_state(address, &pool, v0, v1, fee_ppm, extra_fee_ppm, 0).ok()?
+            }
         };
         state.leg_for_input(input_mint)
     }
@@ -950,6 +1014,7 @@ impl Trader {
                     &pool_data[i],
                     &plan.mints[i],
                     plan.fee_ppm[i],
+                    plan.extra_fee_ppm.get(i).copied().unwrap_or(0),
                     vaults.get(i).copied().flatten(),
                     &refs,
                 )
@@ -1459,6 +1524,9 @@ impl Trader {
                         Dex::PumpSwap => cb_dex::pumpswap::decode_pool(&pool_data[i])
                             .ok()
                             .map(|p| [to_pubkey(&p.base_vault), to_pubkey(&p.quote_vault)]),
+                        Dex::RaydiumCpmm => cb_dex::raydium_cpmm::decode(&pool_data[i])
+                            .ok()
+                            .map(|p| [to_pubkey(&p.vault_0), to_pubkey(&p.vault_1)]),
                         _ => None,
                     };
                     if let Some(v) = learned {
@@ -1897,7 +1965,7 @@ impl Trader {
                 let via = match self.opts.submit {
                     Submit::Rpc => cb_executor::SendVia::Rpc,
                     Submit::Jito { simulate_first, .. } => cb_executor::SendVia::Jito {
-                        url: self.jito_url.clone(),
+                        urls: self.jito_urls.clone(),
                         simulate_first,
                     },
                 };
@@ -2382,40 +2450,83 @@ impl Trader {
         Ok(true)
     }
 
-    /// Prove the Jito path can land anything at all: one bundle holding nothing but the
-    /// minimum tip.
+    /// Send a bundle that does nothing but tip `tip` lamports, to every block engine
+    /// region at once, and return its signature for the caller to follow.
     ///
     /// # Why
     ///
-    /// By 2026-09-26 about sixty trade bundles had gone out and none was included, and
-    /// the block engine's own status call answered `Invalid` for every one, so nothing
-    /// said whether they lost their races or never reached a leader at all. A tip-only
-    /// bundle has no floor to miss and no race to lose: if it is not included, the
-    /// sending path itself is broken and no trade could ever have landed.
+    /// A trade bundle that is not included says nothing on its own: its floor may have
+    /// gone, it may have lost an auction, or it may never have reached a leader at all.
+    /// A tip-only bundle has no floor and races nobody, so whether it lands isolates the
+    /// last of those — and the smallest tip that lands is the least a trade can tip and
+    /// still be carried. On 2026-09-26 the minimum tip, sent to one region, did not land
+    /// twice running, which is what made the send path the first thing to fix.
     ///
-    /// Costs the minimum tip and the base fee (6,000 lamports) when it lands; nothing
-    /// when it does not. Returns whether it landed, or `None` when this trader does not
-    /// send through Jito.
+    /// Costs the tip and the base fee (5,000 lamports) when it lands; nothing when it
+    /// does not. `None` when this trader does not send through Jito or is a dry run.
     ///
     /// # Errors
-    /// If the blockhash cannot be read or the block engine refuses the transaction.
-    pub async fn jito_probe(&mut self) -> Result<Option<bool>> {
+    /// If the blockhash cannot be read or every block engine refuses the transaction.
+    pub async fn jito_probe(&mut self, tip: u64) -> Result<Option<String>> {
         if !self.sends_via_jito() || self.opts.dry_run {
             return Ok(None);
         }
+        let gap = std::time::Duration::from_millis(cb_executor::jito::MIN_SEND_GAP_MS);
+        if let Some(wait) = self.last_jito_send.and_then(|at| gap.checked_sub(at.elapsed())) {
+            tokio::time::sleep(wait).await;
+        }
         let (blockhash, _) = self.exec.rpc.latest_blockhash().await?;
         let seed = u64::from_le_bytes(blockhash.to_bytes()[..8].try_into().expect("a hash is 32 bytes"));
-        let tip = cb_executor::jito::tip_account(seed);
-        let ixs = [tx::transfer_lamports(&self.owner, &tip, cb_executor::jito::MIN_TIP_LAMPORTS)];
+        let tip = tip.max(cb_executor::jito::MIN_TIP_LAMPORTS);
+        let ixs = [tx::transfer_lamports(&self.owner, &cb_executor::jito::tip_account(seed), tip)];
         let assembled = tx::assemble(&self.exec.wallet, &ixs, blockhash)?;
-        let receipt = self.exec.rpc.send_jito(&self.jito_url, &assembled.tx_base64).await?;
+        let sent = self.exec.rpc.send_jito_all(&self.jito_urls, &assembled.tx_base64).await;
         self.last_jito_send = Some(std::time::Instant::now());
+        let receipt = sent?;
         tracing::info!(
-            "Jito self-test: sent a tip-only bundle {} (bundle {}); waiting up to 30 s for it",
-            receipt.signature,
-            receipt.bundle_id.as_deref().unwrap_or("unnamed")
+            "Jito probe: sent a tip-only bundle of {tip} lamports to {} block engines: {}",
+            self.jito_urls.len(),
+            receipt.signature
         );
-        Ok(Some(self.confirm(&receipt.signature, 15).await == Some(true)))
+        Ok(Some(receipt.signature))
+    }
+
+    /// Record what became of a probe of `tip` lamports. A landing sets the floor every
+    /// trade's tip is held to; a miss leaves it where it was.
+    pub fn note_probe(&mut self, tip: u64, landed: bool) {
+        if landed {
+            self.landing_tip = Some(tip);
+            self.last_landed = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Where each vault-backed pool keeps its reserves, known in advance. See
+    /// `LiveMarket::vault_pairs`: without it the first attempt on every such pool is
+    /// spent learning this and refused.
+    pub fn learn_vaults(&mut self, pairs: impl IntoIterator<Item = (Pubkey32, [Pubkey32; 2])>) -> usize {
+        let mut n = 0;
+        for (pool, [a, b]) in pairs {
+            self.vaults_seen.insert(pool, [to_pubkey(&a), to_pubkey(&b)]);
+            n += 1;
+        }
+        n
+    }
+
+    /// Record that a trade landed: the path is proven without spending a probe on it.
+    pub fn note_landed(&mut self) {
+        self.last_landed = Some(std::time::Instant::now());
+    }
+
+    /// Whether anything sent has been seen on chain within `within`.
+    #[must_use]
+    pub fn landed_within(&self, within: std::time::Duration) -> bool {
+        self.last_landed.is_some_and(|at| at.elapsed() < within)
+    }
+
+    /// The tip a probe has most recently landed with, if any has this run.
+    #[must_use]
+    pub fn landing_tip(&self) -> Option<u64> {
+        self.landing_tip
     }
 
     /// Keep the connections a trade needs open between trades. See
@@ -2434,8 +2545,8 @@ impl Trader {
                 tokio::time::sleep(wait).await;
             }
         }
-        let url = ping_jito.then_some(self.jito_url.as_str());
-        if let Err(e) = self.exec.rpc.keep_warm(url).await {
+        let urls: &[String] = if ping_jito { &self.jito_urls } else { &[] };
+        if let Err(e) = self.exec.rpc.keep_warm(urls).await {
             tracing::debug!("{e:#}");
         }
         if ping_jito {
@@ -2557,7 +2668,10 @@ fn input_is_token_a(dex: Dex, data: &[u8], mint: &Pubkey32) -> Result<bool> {
             let p = cb_dex::meteora_damm_v2::decode_layout(data)?;
             (p.mint_a, p.mint_b)
         }
-        other => bail!("{} is not encodable", other.name()),
+        Dex::RaydiumCpmm => {
+            let p = cb_dex::raydium_cpmm::decode(data)?;
+            (p.mint_0, p.mint_1)
+        }
     };
     if *mint == a {
         Ok(true)
@@ -2615,6 +2729,7 @@ mod tests {
             amount_in: 1_000_000,
             leg_out: (0..n).map(|_| 1_010_000).collect(),
             fee_ppm: (0..n).map(|_| 3_000).collect(),
+            extra_fee_ppm: Vec::new(),
         }
     }
 
@@ -2720,7 +2835,9 @@ mod tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
-            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
+            landing_tip: None,
+            last_landed: None,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -2758,7 +2875,9 @@ mod tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
-            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
+            landing_tip: None,
+            last_landed: None,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -2794,7 +2913,9 @@ mod tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
-            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
+            landing_tip: None,
+            last_landed: None,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -2808,27 +2929,36 @@ mod tests {
         assert!(e.contains("zero"), "{e}");
     }
 
+    /// Every venue has an encoder since CP-Swap got one, so no venue blocks a plan.
     #[test]
-    fn unencodable_venues_are_named_before_anything_is_fetched() {
-        let mut p = plan(3);
-        p.pools[1].1 = Dex::RaydiumCpmm;
-        assert!(!p.encodable());
-        assert_eq!(p.blocking_venue(), Some(Dex::RaydiumCpmm));
-
-        let clean = plan(3);
-        assert!(clean.encodable());
-        assert_eq!(clean.blocking_venue(), None);
+    fn no_venue_blocks_a_plan_now_that_every_one_is_encodable() {
+        for dex in ALL_VENUES {
+            let mut p = plan(3);
+            p.pools[1].1 = dex;
+            assert!(p.encodable(), "{}", dex.name());
+            assert_eq!(p.blocking_venue(), None);
+        }
     }
+
+    const ALL_VENUES: [Dex; 7] = [
+        Dex::OrcaWhirlpool,
+        Dex::RaydiumClmm,
+        Dex::RaydiumAmmV4,
+        Dex::RaydiumCpmm,
+        Dex::MeteoraDlmm,
+        Dex::MeteoraDammV2,
+        Dex::PumpSwap,
+    ];
 
     /// This asserted the opposite until v4 got an encoder, which is the point of
     /// pinning it: the router's idea of what can be built and the encoder's have to
     /// move together, and nothing else makes them.
     #[test]
     fn every_venue_the_router_will_plan_is_one_the_encoder_accepts() {
-        for dex in [Dex::OrcaWhirlpool, Dex::RaydiumClmm, Dex::RaydiumAmmV4, Dex::PumpSwap, Dex::MeteoraDammV2] {
+        for dex in ALL_VENUES {
             assert!(has_encoder(dex), "{} is planned but cannot be built", dex.name());
+            assert!(can_reprice(dex), "{} is planned but cannot be re-priced", dex.name());
         }
-        assert!(!has_encoder(Dex::RaydiumCpmm), "CP-Swap has an encoder now; say so here");
         // Only the two tick venues go near the tick-array resolver.
         assert!(is_concentrated(Dex::OrcaWhirlpool) && is_concentrated(Dex::RaydiumClmm));
         assert!(!is_concentrated(Dex::RaydiumAmmV4), "v4 is constant-product, it has no ticks");
@@ -2989,6 +3119,7 @@ mod mainnet {
             leg_out: vec![90_000, 1_010_000],
             // Orca 0.3% and Raydium CLMM 0.25%, the tiers these two pools actually run.
             fee_ppm: vec![3_000, 2_500],
+            extra_fee_ppm: Vec::new(),
         };
 
         // Real USD figures: a zero size is refused by the gate before anything is
@@ -3101,6 +3232,7 @@ mod mainnet {
             amount_in: 2_000_000,
             leg_out: vec![180_000, 2_010_000],
             fee_ppm: vec![3_000, 2_500],
+            extra_fee_ppm: Vec::new(),
         };
 
         // Resolve tick arrays the way the executor does.
@@ -3134,7 +3266,9 @@ mod mainnet {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
-            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
+            landing_tip: None,
+            last_landed: None,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -3322,7 +3456,9 @@ mod fresh_quote_tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
-            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
+            landing_tip: None,
+            last_landed: None,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -3366,7 +3502,9 @@ mod fresh_quote_tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
-            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
+            landing_tip: None,
+            last_landed: None,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -3394,7 +3532,7 @@ mod fresh_quote_tests {
     /// would quietly reappear.
     #[test]
     fn a_venue_without_an_encoder_cannot_be_re_priced() {
-        assert!(Trader::fresh_leg(Dex::RaydiumAmmV4, [7u8; 32], &[0u8; 300], &[1u8; 32], 2_500, None, &[])
+        assert!(Trader::fresh_leg(Dex::RaydiumAmmV4, [7u8; 32], &[0u8; 300], &[1u8; 32], 2_500, 0, None, &[])
             .is_none());
     }
 
@@ -3417,7 +3555,9 @@ mod fresh_quote_tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
-            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
+            landing_tip: None,
+            last_landed: None,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -3472,7 +3612,9 @@ mod fresh_quote_tests {
                 vaults_seen: HashMap::new(),
                 token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
-            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
+            landing_tip: None,
+            last_landed: None,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -3530,7 +3672,9 @@ mod fresh_quote_tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
-            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
+            landing_tip: None,
+            last_landed: None,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -3599,17 +3743,28 @@ mod fresh_quote_tests {
         assert!(e.contains("loses its own fee"), "unexpected refusal: {e}");
     }
 
-    /// A quarter of the prize, never under the block engine's minimum, never over the
-    /// configured ceiling — and nothing at all off Jito.
+    /// Half the prize, never under the block engine's minimum or what a probe has
+    /// needed to land, never over the configured ceiling — and nothing at all off Jito.
     #[test]
-    fn the_tip_is_a_quarter_of_the_prize_between_the_minimum_and_the_ceiling() {
-        let t = jito_trader(20_000);
+    fn the_tip_is_half_the_prize_between_the_landing_floor_and_the_ceiling() {
+        let mut t = jito_trader(20_000);
         let min = cb_executor::jito::MIN_TIP_LAMPORTS;
 
         assert_eq!(t.tip_for(400), min, "a small prize still pays the minimum");
-        assert_eq!(t.tip_for(40_000), 10_000, "a quarter of 40,000");
+        assert_eq!(t.tip_for(20_000), 10_000, "half of 20,000");
         assert_eq!(t.tip_for(4_000_000), 20_000, "capped at the ceiling");
         assert_eq!(t.tip_for(0), min, "a cycle grossing nothing still tips the minimum");
+
+        // A probe that needed 9,000 to land raises every smaller tip to it.
+        t.note_probe(9_000, true);
+        assert_eq!(t.tip_for(400), 9_000);
+        assert_eq!(t.tip_for(30_000), 15_000, "a bigger share is still the share");
+        // But never past the ceiling, even if a probe needed more.
+        t.note_probe(27_000, true);
+        assert_eq!(t.tip_for(400), 20_000);
+        // A probe that did not land moves nothing.
+        t.note_probe(1_000, false);
+        assert_eq!(t.landing_tip(), Some(27_000));
 
         let rpc = Trader { opts: TradeOptions::default(), ..jito_trader(20_000) };
         assert_eq!(rpc.tip_for(40_000), 0, "no tip when not sending through Jito");
@@ -3644,7 +3799,9 @@ mod fresh_quote_tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: std::collections::HashSet::new(),
             accounts_held: std::collections::HashSet::new(),
-            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
+            landing_tip: None,
+            last_landed: None,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -3729,7 +3886,9 @@ mod account_rent_tests {
             vaults_seen: HashMap::new(),
             token_2022_mints: HashSet::new(),
             accounts_held: HashSet::new(),
-            jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
+            jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
+            landing_tip: None,
+            last_landed: None,
             last_jito_send: None,
             pump_fees: None,
             account_rent: cb_executor::route::TOKEN_ACCOUNT_RENT,
@@ -3859,6 +4018,7 @@ mod meteora_dlmm_tests {
             &pool,
             &pair.token_x_mint,
             0,
+            0,
             None,
             &[&array],
         )
@@ -3873,6 +4033,7 @@ mod meteora_dlmm_tests {
                 pool_key(),
                 &pool,
                 &pair.token_x_mint,
+                0,
                 0,
                 None,
                 &[]
@@ -3896,6 +4057,7 @@ mod meteora_dlmm_tests {
             &pool,
             &pair.token_x_mint,
             absurd,
+            0,
             None,
             &[&array],
         )

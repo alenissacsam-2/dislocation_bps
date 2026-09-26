@@ -39,10 +39,11 @@ pub mod meteora_dlmm;
 pub mod orca;
 pub mod pumpswap;
 pub mod raydium;
+pub mod raydium_cpmm;
 pub mod raydium_v4;
 
 use crate::encode::pk;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use cb_core::types::Dex;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
@@ -119,7 +120,7 @@ pub fn price_limit(sqrt_price_x64: u128, price_falling: bool, min: u128, max: u1
 /// vaults belonging to a state the quote never saw.
 ///
 /// # Errors
-/// If the venue is not one of the two implemented, or the account does not decode.
+/// If the account does not decode as a pool of that venue.
 pub fn build_swap(
     dex: Dex,
     ctx: &SwapContext,
@@ -133,10 +134,7 @@ pub fn build_swap(
         Dex::MeteoraDlmm => meteora_dlmm::swap(ctx, pool_data),
         Dex::PumpSwap => pumpswap::swap(ctx, pool_data, extra.pump),
         Dex::MeteoraDammV2 => meteora_damm_v2::swap(ctx, pool_data),
-        other => bail!(
-            "{} swaps are not encoded — see crates/executor/src/venue/mod.rs for why",
-            other.name()
-        ),
+        Dex::RaydiumCpmm => raydium_cpmm::swap(ctx, pool_data),
     }
 }
 
@@ -194,8 +192,11 @@ mod tests {
         assert!(price_limit(u128::MAX, false, MIN, MAX) < MAX);
     }
 
+    /// Every venue has an encoder now, so the match above is exhaustive and the
+    /// compiler holds it that way. What is left to pin is that none of them encodes
+    /// something from an account that cannot be its pool.
     #[test]
-    fn unimplemented_venues_refuse_by_name_rather_than_encoding_something() {
+    fn an_account_too_short_to_be_a_pool_is_refused_on_every_venue() {
         let ctx = SwapContext {
             owner: Pubkey::new_unique(),
             pool: Pubkey::new_unique(),
@@ -209,9 +210,18 @@ mod tests {
             tick_arrays: [Pubkey::new_unique(); crate::pda::TICK_ARRAYS_PER_SWAP],
         };
         let extra = VenueExtra::default();
-        // PumpSwap and DAMM v2 have encoders now; CP-Swap is the one venue left without.
-        let dex = Dex::RaydiumCpmm;
-        let e = build_swap(dex, &ctx, &[0u8; 2000], &extra).unwrap_err().to_string();
-        assert!(e.contains(dex.name()), "refusal for {dex:?} does not name it: {e}");
+        for dex in [
+            Dex::OrcaWhirlpool,
+            Dex::RaydiumClmm,
+            Dex::RaydiumAmmV4,
+            Dex::RaydiumCpmm,
+            Dex::MeteoraDlmm,
+            Dex::MeteoraDammV2,
+            Dex::PumpSwap,
+        ] {
+            assert!(build_swap(dex, &ctx, &[0u8; 10], &extra).is_err(), "{} encoded ten bytes", dex.name());
+        }
+        // And a CP-Swap account naming no token program at all is not a pool either.
+        assert!(build_swap(Dex::RaydiumCpmm, &ctx, &[0u8; 2000], &extra).is_err());
     }
 }

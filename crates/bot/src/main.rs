@@ -828,9 +828,11 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
     trader.set_jito_url(&cfg.jito_url);
     match opts.submit {
         execute::Submit::Jito { tip_max_lamports, simulate_first } => tracing::info!(
-            "trades go to Jito as bundles of one: a missed floor is dropped and costs \
-             nothing, and every floor guarantees the base fee and the tip on chain — tip a \
-             quarter of the gross, {} to {tip_max_lamports} lamports; {}",
+            "trades go to Jito as bundles of one, sent to {} block engine regions at once: a \
+             missed floor is dropped and costs nothing, and every floor guarantees the base \
+             fee and the tip on chain — tip half the gross, {} to {tip_max_lamports} \
+             lamports, and never under what a landing probe needed; {}",
+            trader.jito_regions(),
             cb_executor::jito::MIN_TIP_LAMPORTS,
             if simulate_first {
                 "each is still simulated first"
@@ -897,20 +899,6 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
             Ok(false) => {}
             Err(e) => tracing::warn!("could not create the PumpSwap volume accumulator ({e:#}); PumpSwap purchases will fail their floors"),
         }
-    }
-    // Once per start, before any trade: can this path land a bundle at all? See
-    // `Trader::jito_probe`.
-    match trader.jito_probe().await {
-        Ok(Some(true)) => tracing::warn!(
-            "Jito self-test LANDED: the send path works, so a trade bundle that is not \
-             included lost its race or its floor, not its way"
-        ),
-        Ok(Some(false)) => tracing::error!(
-            "Jito self-test was NOT included within 30 s: a bundle with no floor and no race \
-             did not land, so the send path itself is failing (region, tip, or bundle format)"
-        ),
-        Ok(None) => {}
-        Err(e) => tracing::warn!("Jito self-test could not be sent: {e:#}"),
     }
     // The lookup table from earlier runs, if one was built. See `cb_executor::alt`.
     if let Some(key) = read_lookup_path() {
@@ -1000,6 +988,23 @@ struct PendingSend {
     /// The ledger row written when it was sent, updated with the outcome.
     row: Option<i64>,
     via_jito: bool,
+    /// `Some(tip)` for a landing probe rather than a trade. See `Trader::jito_probe`.
+    probe_tip: Option<u64>,
+}
+
+/// Send a landing probe of `tip` lamports and follow it like a trade.
+async fn send_probe(t: &mut execute::Trader, pending: &mut Vec<PendingSend>, tip: u64) {
+    match t.jito_probe(tip).await {
+        Ok(Some(sig)) => pending.push(PendingSend {
+            sig,
+            sent_at: std::time::Instant::now(),
+            row: None,
+            via_jito: true,
+            probe_tip: Some(tip),
+        }),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("Jito probe of {tip} lamports could not be sent: {e:#}"),
+    }
 }
 
 /// Ask once about every pending send old enough to have an answer and log the outcome
@@ -1013,8 +1018,9 @@ async fn settle_pending(
 ) -> Vec<(i64, bool, String, f64)> {
     /// A block and a bit: asking sooner mostly hears "not yet".
     const FIRST_LOOK: Duration = Duration::from_secs(2);
-    /// A bundle is valid for a few slots; after this it is not coming.
-    const GIVE_UP: Duration = Duration::from_secs(8);
+    /// Long enough for a bundle sent to every region to meet a leader connected to
+    /// one of them; after this it is not coming.
+    const GIVE_UP: Duration = Duration::from_secs(20);
     let mut keep = Vec::new();
     let mut settled = Vec::new();
     for p in std::mem::take(pending) {
@@ -1023,8 +1029,40 @@ async fn settle_pending(
             continue;
         }
         let sig = &p.sig;
+        if let Some(tip) = p.probe_tip {
+            match t.confirm(sig, 1).await {
+                Some(landed) => {
+                    t.note_probe(tip, true);
+                    tracing::warn!(
+                        "Jito probe LANDED with a {tip} lamport tip ({}): the send path works, \
+                         and no trade will tip less than this",
+                        if landed { "executed cleanly" } else { "included but failed, which a transfer should not" }
+                    );
+                }
+                None if p.sent_at.elapsed() < GIVE_UP => keep.push(p),
+                None => {
+                    t.note_probe(tip, false);
+                    match execute::PROBE_TIPS.iter().find(|&&next| next > tip) {
+                        Some(&next) => {
+                            tracing::warn!(
+                                "Jito probe of {tip} lamports was not included in {} s; trying {next}",
+                                GIVE_UP.as_secs()
+                            );
+                            send_probe(t, &mut keep, next).await;
+                        }
+                        None => tracing::error!(
+                            "no Jito probe landed, up to a {tip} lamport tip sent to every \
+                             region: bundles from here are not reaching leaders at all, so no \
+                             trade can land until that is found"
+                        ),
+                    }
+                }
+            }
+            continue;
+        }
         let (taken, reason, net) = match t.confirm(sig, 1).await {
             Some(true) => {
+                t.note_landed();
                 tracing::error!("LANDED {sig} — the transaction confirmed on chain");
                 (true, "submitted and landed".to_string(), 0.0)
             }
@@ -1046,7 +1084,11 @@ async fn settle_pending(
             None if p.via_jito => {
                 tracing::warn!(
                     "{sig} was not included — a Jito bundle that misses is dropped and costs \
-                     nothing"
+                     nothing ({})",
+                    match t.landing_tip() {
+                        Some(tip) => format!("probes land at {tip} lamports, so it reached leaders and lost its floor or its race"),
+                        None => "no probe has landed yet this run, so it may not have reached a leader".to_string(),
+                    }
                 );
                 (false, "sent to Jito; not included, cost nothing".to_string(), 0.0)
             }
@@ -1412,6 +1454,10 @@ async fn spawn_live(
         // exactly one place trades are decided. `None` in paper mode, and then no code
         // below can reach a signature no matter what the rest of the loop does.
         let mut trader = trader;
+        if let Some(t) = trader.as_mut() {
+            let n = t.learn_vaults(market.vault_pairs());
+            tracing::info!("the trader knows where {n} vault-backed pools keep their reserves");
+        }
         let mut next_id: u64 = 1;
         // A cycle whose execution attempt was refused very recently, keyed by the
         // identity of the loop rather than by which mint it was entered at — the same
@@ -1460,6 +1506,9 @@ async fn spawn_live(
         // Sends whose fate is not known yet, and the timer that asks. See `PendingSend`.
         let mut pending_sends: Vec<PendingSend> = Vec::new();
         let mut confirm_timer = tokio::time::interval(Duration::from_secs(1));
+        // Landing probes: the first tick is immediate, so a run starts by finding out
+        // whether its bundles can land at all. See `Trader::jito_probe`.
+        let mut probe_timer = tokio::time::interval(execute::PROBE_EVERY);
         let mut drift = (0usize, 0usize);
         // Both are edge-triggered: logged when they change, not every sweep. A warning
         // that fires five times a second is a warning nobody reads.
@@ -1532,6 +1581,14 @@ async fn spawn_live(
                 _ = warm_timer.tick() => {
                     if let Some(t) = trader.as_mut() {
                         t.keep_warm().await;
+                    }
+                }
+                _ = probe_timer.tick() => {
+                    if let Some(t) = trader.as_mut() {
+                        let probing = pending_sends.iter().any(|p| p.probe_tip.is_some());
+                        if !probing && !t.landed_within(execute::PROBE_EVERY) {
+                            send_probe(t, &mut pending_sends, execute::PROBE_TIPS[0]).await;
+                        }
                     }
                 }
                 _ = confirm_timer.tick(), if !pending_sends.is_empty() => {
@@ -2140,6 +2197,7 @@ async fn spawn_live(
                                                         sent_at: std::time::Instant::now(),
                                                         row: None,
                                                         via_jito: t.sends_via_jito(),
+                                                        probe_tip: None,
                                                     });
                                                 }
                                                 Ok(cb_executor::Attempt::SimulationRejected {

@@ -59,9 +59,77 @@ pub fn api_url(send_url: &str, method: &str) -> String {
     format!("{base}/api/v1/{method}")
 }
 
+/// Every block engine region Jito runs, by the host prefix each is served under.
+///
+/// # Why a trade goes to all of them
+///
+/// A validator takes its bundles from the one block engine it is connected to, usually
+/// the region nearest it. A bundle sent only to Singapore therefore waits for a leader
+/// connected to Singapore, and most stake is in Europe and North America. On
+/// 2026-09-26 two tip-only bundles — no floor, no race, the minimum tip — were sent to
+/// Singapore alone and neither landed in 30 s, after fifteen trade bundles had gone
+/// the same way. The same signed transaction sent to every region reaches whichever
+/// leader comes next, and cannot land twice: a signature is included at most once.
+pub const REGIONS: [&str; 8] = ["singapore", "tokyo", "frankfurt", "amsterdam", "london", "dublin", "ny", "slc"];
+
+/// The domain every regional block engine is a subdomain of.
+const REGIONAL_DOMAIN: &str = "mainnet.block-engine.jito.wtf";
+
+/// `send_url` on every region's host, `send_url` itself first.
+///
+/// A URL that is not on one of Jito's own block engine hosts comes back alone: a
+/// custom relay has no regions to fan out across.
+#[must_use]
+pub fn fanout_urls(send_url: &str) -> Vec<String> {
+    let url = send_url.trim();
+    let mut out = vec![url.to_string()];
+    let Some(scheme_end) = url.find("://") else { return out };
+    let rest = &url[scheme_end + 3..];
+    let (host, path) = rest.find('/').map_or((rest, ""), |i| (&rest[..i], &rest[i..]));
+    if host != REGIONAL_DOMAIN && !host.ends_with(&format!(".{REGIONAL_DOMAIN}")) {
+        return out;
+    }
+    for region in REGIONS {
+        let u = format!("https://{region}.{REGIONAL_DOMAIN}{path}");
+        if !out.contains(&u) {
+            out.push(u);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_regional_url_fans_out_to_every_region_itself_first() {
+        let sg = "https://singapore.mainnet.block-engine.jito.wtf/api/v1/transactions?bundleOnly=true";
+        let urls = fanout_urls(sg);
+        assert_eq!(urls[0], sg, "the configured region stays the first to be asked");
+        assert_eq!(urls.len(), REGIONS.len(), "singapore is not sent to twice");
+        for r in REGIONS {
+            assert!(urls.iter().any(|u| u.starts_with(&format!("https://{r}.mainnet"))), "{r} missing");
+        }
+        assert!(urls.iter().all(|u| u.ends_with("/api/v1/transactions?bundleOnly=true")), "{urls:?}");
+    }
+
+    #[test]
+    fn the_global_url_keeps_itself_and_adds_every_region() {
+        let urls = fanout_urls(DEFAULT_URL);
+        assert_eq!(urls[0], DEFAULT_URL);
+        assert_eq!(urls.len(), REGIONS.len() + 1);
+    }
+
+    #[test]
+    fn a_url_that_is_not_jitos_is_not_fanned_out() {
+        assert_eq!(fanout_urls("https://relay.example.com/api/v1/transactions"), vec![
+            "https://relay.example.com/api/v1/transactions".to_string()
+        ]);
+        assert_eq!(fanout_urls("not a url"), vec!["not a url".to_string()]);
+        // A look-alike host is not Jito's.
+        assert_eq!(fanout_urls("https://evilmainnet.block-engine.jito.wtf.example/x").len(), 1);
+    }
 
     #[test]
     fn every_tip_account_is_a_valid_distinct_key() {

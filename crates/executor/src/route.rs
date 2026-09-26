@@ -36,7 +36,7 @@ use crate::encode::{pk, programs, to_pubkey};
 use crate::pda::associated_token_address;
 use crate::tx;
 use crate::venue::{build_swap, SwapContext, VenueExtra};
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, ensure, Context, Result};
 use cb_core::types::Dex;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
@@ -316,7 +316,10 @@ pub fn build(owner: &Pubkey, hops: &[Hop], pre_balance: u64, opts: &RouteOptions
             output_token_program: h.output_token_program,
             tick_arrays: h.tick_arrays,
         };
-        ixs.push(build_swap(h.dex, &ctx, &h.pool_data, &opts.venue)?);
+        ixs.push(
+            build_swap(h.dex, &ctx, &h.pool_data, &opts.venue)
+                .with_context(|| format!("a {} hop could not be encoded", h.dex.name()))?,
+        );
     }
 
     let (profit, min_post_balance) = if wrapping {
@@ -603,9 +606,10 @@ mod tests {
         );
     }
 
-    /// A venue with no encoder must stop the route rather than being skipped.
+    /// A hop that cannot be encoded must stop the route rather than being skipped, and
+    /// say which venue it was.
     #[test]
-    fn a_cycle_through_an_unencodable_venue_refuses() {
+    fn a_cycle_through_a_hop_that_cannot_be_encoded_refuses_and_names_it() {
         let owner = Pubkey::new_unique();
         let mut hops = cycle(3);
         hops[1].dex = Dex::RaydiumCpmm;

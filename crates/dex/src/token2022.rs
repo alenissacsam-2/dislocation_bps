@@ -12,6 +12,12 @@
 //! the older and newer fee (`epoch u64, maximum_fee u64, basis_points u16` each).
 //! `TransferHook` is type 14; its value is an authority and a program id, zero when
 //! unset.
+//!
+//! Two more stop a swap outright rather than skimming it, and are screened for the same
+//! reason — a pool that can only revert still shows a price, and chasing it wastes every
+//! attempt: `DefaultAccountState` (type 6) set to frozen makes the token account a swap
+//! opens unusable, and `Pausable` (type 26; an authority, then a paused flag) with the
+//! flag set refuses every transfer. Tokenised equities carry both extensions, unset.
 
 use anyhow::{ensure, Result};
 
@@ -19,7 +25,11 @@ const BASE_MINT_LEN: usize = 82;
 const ACCOUNT_TYPE_OFFSET: usize = 165;
 const TLV_START: usize = 166;
 const TRANSFER_FEE_CONFIG: u16 = 1;
+const DEFAULT_ACCOUNT_STATE: u16 = 6;
 const TRANSFER_HOOK: u16 = 14;
+const PAUSABLE: u16 = 26;
+/// `AccountState::Frozen` in a `DefaultAccountState` extension.
+const FROZEN: u8 = 2;
 
 /// A mint's transfer costs: the larger of its two scheduled fees in basis points, and
 /// whether a transfer hook program is set.
@@ -27,13 +37,18 @@ const TRANSFER_HOOK: u16 = 14;
 pub struct TransferCosts {
     pub fee_bps: u16,
     pub hook: bool,
+    /// New token accounts start frozen, so the one a swap opens cannot receive.
+    pub frozen_by_default: bool,
+    /// Transfers are paused by the mint's authority.
+    pub paused: bool,
 }
 
 impl TransferCosts {
-    /// Whether a transfer of this mint delivers exactly what was sent.
+    /// Whether a transfer of this mint, into an account a swap opens, delivers exactly
+    /// what was sent.
     #[must_use]
     pub fn is_free(&self) -> bool {
-        self.fee_bps == 0 && !self.hook
+        self.fee_bps == 0 && !self.hook && !self.frozen_by_default && !self.paused
     }
 }
 
@@ -65,6 +80,8 @@ pub fn transfer_costs(data: &[u8]) -> Result<TransferCosts> {
                 out.fee_bps = older.max(newer);
             }
             TRANSFER_HOOK if len >= 64 => out.hook = value[32..64].iter().any(|&b| b != 0),
+            DEFAULT_ACCOUNT_STATE if len >= 1 => out.frozen_by_default = value[0] == FROZEN,
+            PAUSABLE if len >= 33 => out.paused = value[32] != 0,
             _ => {}
         }
         o += len;
@@ -111,6 +128,19 @@ mod tests {
         assert!(transfer_costs(&mint_with(&[(TRANSFER_HOOK, set)])).unwrap().hook);
         let unset = vec![7u8; 32].into_iter().chain(vec![0u8; 32]).collect();
         assert!(!transfer_costs(&mint_with(&[(TRANSFER_HOOK, unset)])).unwrap().hook);
+    }
+
+    #[test]
+    fn a_frozen_default_or_a_pause_blocks_and_their_unset_forms_do_not() {
+        assert!(transfer_costs(&mint_with(&[(DEFAULT_ACCOUNT_STATE, vec![FROZEN])])).unwrap().frozen_by_default);
+        assert!(transfer_costs(&mint_with(&[(DEFAULT_ACCOUNT_STATE, vec![1])])).unwrap().is_free());
+        let mut paused = vec![3u8; 32];
+        paused.push(1);
+        assert!(transfer_costs(&mint_with(&[(PAUSABLE, paused)])).unwrap().paused);
+        let mut running = vec![3u8; 32];
+        running.push(0);
+        let c = transfer_costs(&mint_with(&[(PAUSABLE, running), (DEFAULT_ACCOUNT_STATE, vec![1])])).unwrap();
+        assert!(c.is_free(), "a tokenised equity as it trades: pausable, not paused");
     }
 
     #[test]

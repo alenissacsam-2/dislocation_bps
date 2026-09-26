@@ -45,6 +45,15 @@ pub const MIN_ASKS_TO_OPEN: u32 = 2;
 /// base fees each time for no change in reach.
 pub const REPLACE_MARGIN: f64 = 1.5;
 
+/// How much more a new mint must be worth than the weakest held one to take its slot
+/// on value alone, however few times it has been asked for.
+///
+/// Asks count attempts, not money. On 2026-09-26 a mint asked for three times with
+/// $0.39 expected between them could not displace a held one asked for 23 times with
+/// $0.0165, because it had not been asked for *more often*. Ten times the value is past
+/// any doubt about which account is worth the deposit.
+pub const DOMINANT_VALUE_MARGIN: f64 = 10.0;
+
 /// The least a mint's asks must have expected between them, in USD, before an account
 /// is opened for it: about the two base fees that opening and later closing cost.
 ///
@@ -203,8 +212,9 @@ pub fn on_missing(
         sa.usd.total_cmp(&sb.usd).then(sa.asks.cmp(&sb.asks)).then(a.cmp(b))
     })?;
     let floor = score_of(weakest);
-    (want.usd > floor.usd * REPLACE_MARGIN && want.asks > floor.asks)
-        .then_some(Move::Replace { open: *wanted, close: *weakest })
+    let clearly_better = want.usd > floor.usd * REPLACE_MARGIN && want.asks > floor.asks;
+    let far_more_valuable = want.usd > floor.usd * DOMINANT_VALUE_MARGIN;
+    (clearly_better || far_more_valuable).then_some(Move::Replace { open: *wanted, close: *weakest })
 }
 
 /// Accounts nothing has asked for in a whole watched day. Their deposit is capital the
@@ -267,6 +277,29 @@ mod tests {
             on_missing(&d, &set(&[2, 3]), 2, &m(9)),
             Some(Move::Replace { open: m(9), close: m(3) })
         );
+    }
+
+    #[test]
+    fn a_mint_worth_ten_times_the_weakest_takes_its_slot_with_fewer_asks() {
+        let mut d = Demand::new(0);
+        for t in 0..23 {
+            d.record(t, &m(2), 0.000_7);
+        }
+        d.record(30, &m(9), 0.13);
+        d.record(31, &m(9), 0.13);
+        assert_eq!(
+            on_missing(&d, &set(&[2]), 1, &m(9)),
+            Some(Move::Replace { open: m(9), close: m(2) }),
+            "2 asks at $0.26 against 23 at $0.016"
+        );
+        // Merely more valuable, and asked for less, is still not enough.
+        let mut e = Demand::new(0);
+        for t in 0..23 {
+            e.record(t, &m(2), 0.01);
+        }
+        e.record(30, &m(9), 0.2);
+        e.record(31, &m(9), 0.2);
+        assert_eq!(on_missing(&e, &set(&[2]), 1, &m(9)), None, "$0.40 against $0.23 is under ten times");
     }
 
     #[test]
