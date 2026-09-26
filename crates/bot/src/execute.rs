@@ -531,6 +531,9 @@ pub struct Trader {
     /// When the last Jito send went, so the next waits out the block engine's
     /// one-a-second limit here rather than being answered with a 429 there.
     last_jito_send: Option<std::time::Instant>,
+    /// PumpSwap's fee recipients, read from its GlobalConfig at start. `None` until
+    /// read, and a PumpSwap hop is refused while it is.
+    pump_fees: Option<cb_executor::venue::pumpswap::PumpFeeRecipients>,
     /// What opening one token account deposits, as the chain charges it. Starts at
     /// [`route::TOKEN_ACCOUNT_RENT`] and is replaced at startup by the live figure:
     /// rent fell from 2,039,280 to 1,488,440 lamports for 165 bytes, and a constant
@@ -580,6 +583,7 @@ impl Trader {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
             lookup: None,
             lookup_pending: Vec::new(),
@@ -1806,7 +1810,7 @@ impl Trader {
             wsol: self.opts.wsol,
             create_token_accounts: self.opts.create_token_accounts,
             others_exist: !self.accounts_held.is_empty(),
-            venue: VenueExtra { token_program, bitmap_policy: BitmapPolicy::Auto },
+            venue: VenueExtra { token_program, bitmap_policy: BitmapPolicy::Auto, pump: self.pump_fees },
             min_gain: u64::try_from(required_gain).unwrap_or(u64::MAX),
             // Any of the eight accounts will do; spreading by the blockhash keeps
             // successive tips off one write lock without a random-number generator.
@@ -2654,6 +2658,7 @@ mod tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
             lookup: None,
             lookup_pending: Vec::new(),
@@ -2691,6 +2696,7 @@ mod tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
             lookup: None,
             lookup_pending: Vec::new(),
@@ -2726,6 +2732,7 @@ mod tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
             lookup: None,
             lookup_pending: Vec::new(),
@@ -3067,6 +3074,7 @@ mod mainnet {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
             lookup: None,
             lookup_pending: Vec::new(),
@@ -3083,6 +3091,7 @@ mod mainnet {
             venue: VenueExtra {
                 token_program: pk(programs::SPL_TOKEN),
                 bitmap_policy: BitmapPolicy::Include,
+                pump: None,
             },
             min_gain: 0,
             tip: None,
@@ -3253,6 +3262,7 @@ mod fresh_quote_tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
             lookup: None,
             lookup_pending: Vec::new(),
@@ -3296,6 +3306,7 @@ mod fresh_quote_tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
             lookup: None,
             lookup_pending: Vec::new(),
@@ -3346,6 +3357,7 @@ mod fresh_quote_tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
             lookup: None,
             lookup_pending: Vec::new(),
@@ -3400,6 +3412,7 @@ mod fresh_quote_tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
             lookup: None,
             lookup_pending: Vec::new(),
@@ -3457,6 +3470,7 @@ mod fresh_quote_tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
             lookup: None,
             lookup_pending: Vec::new(),
@@ -3570,6 +3584,7 @@ mod fresh_quote_tests {
             accounts_held: std::collections::HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
             lookup: None,
             lookup_pending: Vec::new(),
@@ -3654,6 +3669,7 @@ mod account_rent_tests {
             accounts_held: HashSet::new(),
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
+            pump_fees: None,
             account_rent: cb_executor::route::TOKEN_ACCOUNT_RENT,
             lookup: None,
             lookup_pending: Vec::new(),

@@ -406,6 +406,7 @@ mod tests {
             venue: VenueExtra {
                 token_program: pk(programs::SPL_TOKEN),
                 bitmap_policy: BitmapPolicy::Include,
+                pump: None,
             },
             ..Default::default()
         }
@@ -746,7 +747,7 @@ mod raydium_packet {
             wsol: WsolPolicy::WrapAndClose,
             create_token_accounts: true,
             others_exist,
-            venue: crate::venue::VenueExtra { token_program: classic, bitmap_policy: policy },
+            venue: crate::venue::VenueExtra { token_program: classic, bitmap_policy: policy, pump: None },
             min_gain: 6_000,
             tip: Some((crate::jito::tip_account(0), 1_000)),
         };
@@ -827,7 +828,7 @@ mod lollipop_packet {
             wsol: WsolPolicy::WrapAndClose,
             create_token_accounts: true,
             others_exist: true,
-            venue: crate::venue::VenueExtra { token_program: classic, bitmap_policy: BitmapPolicy::Auto },
+            venue: crate::venue::VenueExtra { token_program: classic, bitmap_policy: BitmapPolicy::Auto, pump: None },
             min_gain: 6_000,
             tip: Some((crate::jito::tip_account(0), 1_000)),
             ..RouteOptions::default()
@@ -893,7 +894,7 @@ mod lookup_packet {
             wsol: WsolPolicy::WrapAndClose,
             create_token_accounts: true,
             others_exist: true,
-            venue: crate::venue::VenueExtra { token_program: classic, bitmap_policy: BitmapPolicy::Auto },
+            venue: crate::venue::VenueExtra { token_program: classic, bitmap_policy: BitmapPolicy::Auto, pump: None },
             min_gain: 6_000,
             tip: Some((crate::jito::tip_account(0), 1_000)),
             ..RouteOptions::default()

@@ -121,6 +121,30 @@ pub enum PoolMath {
     /// through them is flat to a rounding error across the whole permitted range, so the
     /// quote lands a hair **under** the constant-sum truth — the only direction an
     /// approximation of a fill is allowed to err in.
+    /// Constant product whose fee is taken on the quote side in both directions: out of
+    /// what a sale of the base token receives, and out of what a purchase spends.
+    /// PumpSwap prices this way.
+    ///
+    /// The pool's `fee_ppm` is the whole fee. [`PoolState::leg_for_input`] turns each
+    /// direction into an ordinary constant-product leg, exactly:
+    ///
+    /// - **Selling the base token**, the fee comes off the output, and a curve whose
+    ///   output is scaled by `1 - f` is the same curve over an output reserve scaled by
+    ///   `1 - f` with no fee at all.
+    /// - **Buying with the quote token**, `spend / (1 + f)` reaches the curve and the
+    ///   rest is fee, which is a fee of `f / (1 + f)` on input.
+    ///
+    /// Both are shaded by [`QUOTE_SIDE_FEE_MARGIN_PPM`] against us, because the program
+    /// rounds each of its fee shares separately and up.
+    QuoteSideFee {
+        /// Real balance of token A.
+        reserve_a: u128,
+        /// Real balance of token B.
+        reserve_b: u128,
+        /// Whether token B is the quote token (it is for every PumpSwap pool: A is the
+        /// base mint and B the quote mint).
+        quote_is_b: bool,
+    },
     Bounded {
         /// Output per unit of input when spending token A, Q64. Zero when that
         /// direction cannot be filled at all.
@@ -133,6 +157,11 @@ pub enum PoolMath {
         max_in_b: u128,
     },
 }
+
+/// Extra fee assumed on a [`PoolMath::QuoteSideFee`] leg, in ppm, to cover the program
+/// rounding each fee share up separately: a handful of base units on any output, which
+/// two ppm covers for every output above a few million base units.
+pub const QUOTE_SIDE_FEE_MARGIN_PPM: u128 = 2;
 
 /// A decoded pool at a point in time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +231,24 @@ impl PoolState {
                 }
                 Some(Leg::cp(r_in, r_out, self.fee_ppm))
             }
+            PoolMath::QuoteSideFee { reserve_a, reserve_b, quote_is_b } => {
+                let (r_in, r_out) =
+                    if a_to_b { (reserve_a, reserve_b) } else { (reserve_b, reserve_a) };
+                if r_in == 0 || r_out == 0 {
+                    return None;
+                }
+                let f = u128::from(self.fee_ppm) + QUOTE_SIDE_FEE_MARGIN_PPM;
+                if f >= 1_000_000 {
+                    return None;
+                }
+                // Spending A while the quote is B (or B while it is A) is a sale.
+                if a_to_b == quote_is_b {
+                    Some(Leg::cp(r_in, r_out * (1_000_000 - f) / 1_000_000, 0))
+                } else {
+                    let on_input = (f * 1_000_000).div_ceil(1_000_000 + f);
+                    Some(Leg::cp(r_in, r_out, u32::try_from(on_input).ok()?))
+                }
+            }
             PoolMath::Bounded { rate_a_x64, max_in_a, rate_b_x64, max_in_b } => {
                 let (rate, max_in) =
                     if a_to_b { (rate_a_x64, max_in_a) } else { (rate_b_x64, max_in_b) };
@@ -255,7 +302,9 @@ impl PoolState {
     #[must_use]
     pub fn reserve_a(&self) -> u128 {
         match self.math {
-            PoolMath::ConstantProduct { reserve_a, .. } => reserve_a,
+            PoolMath::ConstantProduct { reserve_a, .. } | PoolMath::QuoteSideFee { reserve_a, .. } => {
+                reserve_a
+            }
             // Deliberately the *real* depth and not the flat reserve the quote is
             // built from: that number is an arithmetic device chosen to be enormous,
             // and reporting it as a reserve would put a fictional depth on the
@@ -272,7 +321,9 @@ impl PoolState {
     #[must_use]
     pub fn reserve_b(&self) -> u128 {
         match self.math {
-            PoolMath::ConstantProduct { reserve_b, .. } => reserve_b,
+            PoolMath::ConstantProduct { reserve_b, .. } | PoolMath::QuoteSideFee { reserve_b, .. } => {
+                reserve_b
+            }
             PoolMath::Bounded { max_in_b, .. } => max_in_b,
             PoolMath::Concentrated { liquidity, sqrt_price_x64, .. } => {
                 clmm::virtual_reserves_for_input(liquidity, sqrt_price_x64, false)

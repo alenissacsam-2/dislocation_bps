@@ -339,7 +339,7 @@ mod tests {
                 assert_eq!(sqrt_lo_x64, Q64);
                 assert_eq!(sqrt_hi_x64, 4 * Q64, "a 4x price move, not a tick");
             }
-            PoolMath::ConstantProduct { .. } | PoolMath::Bounded { .. } => {
+            PoolMath::ConstantProduct { .. } | PoolMath::Bounded { .. } | PoolMath::QuoteSideFee { .. } => {
                 panic!("damm v2 is concentrated")
             }
         }

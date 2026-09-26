@@ -83,7 +83,7 @@ async fn swap(rpc: &Rpc, owner: Pubkey, pool: &Pool, input_is_a: bool, amount: u
         output_token_program: pool.programs[o],
         tick_arrays: chosen.arrays,
     };
-    let extra = VenueExtra { token_program: pool.programs[i], bitmap_policy: BitmapPolicy::Auto };
+    let extra = VenueExtra { token_program: pool.programs[i], bitmap_policy: BitmapPolicy::Auto, pump: None };
     venue::build_swap(Dex::RaydiumClmm, &ctx, &pool.data, &extra)
 }
 

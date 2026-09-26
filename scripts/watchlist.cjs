@@ -27,6 +27,8 @@ const flag = (name, dflt) => {
   return i >= 0 ? args.splice(i, 2)[1] : dflt;
 };
 const MAX = +flag("--max", 60);
+// Report only: print what would be chosen without writing watchlist.json.
+const DRY = args.includes("--dry") && args.splice(args.indexOf("--dry"), 1);
 const ALLOWED = new Set(flag("--venues", "orca_whirlpool,raydium_clmm,raydium_v4,meteora_dlmm").split(","));
 const files = args;
 
@@ -158,9 +160,9 @@ async function accounts(keys, slice) {
       mint_a: p.mint_a, mint_b: p.mint_b, fee_ppm: 0, tvl_usd: 0, next_block_arbs: p.n,
     })),
   };
-  fs.writeFileSync("watchlist.json", JSON.stringify(out, null, 1));
+  if (!DRY) fs.writeFileSync("watchlist.json", JSON.stringify(out, null, 1));
   console.log(`next-block arbitrages ${nextBlock.length}, finishable on ${[...ALLOWED].join(", ")}: ${usable}`);
   console.log(`pools behind them ${pools.size}; new and chosen ${chosen.length}; new mints ${Object.keys(mints).length}`);
   for (const p of out.pools.slice(0, 20)) console.log(String(p.next_block_arbs).padStart(3), p.dex.padEnd(15), p.label.padEnd(18), p.address);
-  console.log("wrote watchlist.json");
+  console.log(DRY ? "dry run: watchlist.json not written" : "wrote watchlist.json");
 })();

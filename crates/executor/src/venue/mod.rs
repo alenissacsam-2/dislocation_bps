@@ -36,6 +36,7 @@
 
 pub mod meteora_dlmm;
 pub mod orca;
+pub mod pumpswap;
 pub mod raydium;
 pub mod raydium_v4;
 
@@ -129,6 +130,7 @@ pub fn build_swap(
         Dex::RaydiumClmm => raydium::swap(ctx, pool_data, extra.token_program, extra.bitmap_policy),
         Dex::RaydiumAmmV4 => raydium_v4::swap(ctx, pool_data),
         Dex::MeteoraDlmm => meteora_dlmm::swap(ctx, pool_data),
+        Dex::PumpSwap => pumpswap::swap(ctx, pool_data, extra.pump),
         other => bail!(
             "{} swaps are not encoded — see crates/executor/src/venue/mod.rs for why",
             other.name()
@@ -145,6 +147,8 @@ pub struct VenueExtra {
     /// Whether Raydium's swap is given the tick-array bitmap extension. See
     /// [`raydium::BitmapPolicy`] — this is settled by simulation, not by assertion.
     pub bitmap_policy: raydium::BitmapPolicy,
+    /// PumpSwap's fee recipients, read from its `GlobalConfig`. `None` refuses PumpSwap.
+    pub pump: Option<pumpswap::PumpFeeRecipients>,
 }
 
 impl Default for VenueExtra {
@@ -154,6 +158,7 @@ impl Default for VenueExtra {
             // Raydium's own SDK passes it, so it is the better of the two guesses —
             // and it is only a guess until `--verify-encode` has run against a pool.
             bitmap_policy: raydium::BitmapPolicy::Include,
+            pump: None,
         }
     }
 }

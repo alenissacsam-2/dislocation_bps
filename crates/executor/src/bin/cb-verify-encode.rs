@@ -431,7 +431,7 @@ async fn check_pool(
 
     for policy in policies {
         let extra =
-            VenueExtra { token_program, bitmap_policy: policy.unwrap_or(BitmapPolicy::Include) };
+            VenueExtra { token_program, bitmap_policy: policy.unwrap_or(BitmapPolicy::Include), pump: None };
         let name = match policy {
             Some(BitmapPolicy::Include) => "swap(bitmap)",
             Some(BitmapPolicy::Omit) => "swap(no bitmap)",
