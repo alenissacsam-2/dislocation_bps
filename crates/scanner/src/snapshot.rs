@@ -8,7 +8,13 @@
 //! Taking one snapshot per pass fixes both. The scan cost becomes O(pools) per pass
 //! instead of O(pools) per graph step, and every cycle in a pass is priced against
 //! one coherent picture of the market.
+//!
+//! Each pool's two legs are built here too, once. A pool sits in hundreds of the
+//! fourteen thousand cycles a pass walks, and building its leg — virtual reserves and
+//! tick capacity for a concentrated pool — at every step of every path was half of a
+//! 54 ms sweep on 2026-09-27.
 
+use cb_core::path::Leg;
 use cb_core::types::{PoolId, PoolState, Pubkey32};
 use std::collections::HashMap;
 
@@ -18,6 +24,8 @@ pub struct Snapshot {
     pools: Vec<PoolState>,
     by_mint: HashMap<Pubkey32, Vec<usize>>,
     by_id: HashMap<PoolId, usize>,
+    /// Each pool's leg spending its token A, then its token B.
+    legs: Vec<[Option<Leg>; 2]>,
 }
 
 impl Snapshot {
@@ -30,7 +38,22 @@ impl Snapshot {
             by_mint.entry(p.mint_b).or_default().push(i);
             by_id.insert(p.id, i);
         }
-        Self { pools, by_mint, by_id }
+        let legs = pools.iter().map(|p| [p.leg_for_input(&p.mint_a), p.leg_for_input(&p.mint_b)]).collect();
+        Self { pools, by_mint, by_id, legs }
+    }
+
+    /// The leg spending `input` through the pool at `index`, as
+    /// [`PoolState::leg_for_input`] would build it, built once per snapshot.
+    #[must_use]
+    pub fn leg(&self, index: usize, input: &Pubkey32) -> Option<Leg> {
+        let p = &self.pools[index];
+        if *input == p.mint_a {
+            self.legs[index][0]
+        } else if *input == p.mint_b {
+            self.legs[index][1]
+        } else {
+            None
+        }
     }
 
     /// Every pool that trades `mint`, in either position.

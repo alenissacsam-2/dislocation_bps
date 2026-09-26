@@ -192,7 +192,7 @@ pub fn enumerate_from_base(snap: &Snapshot, base_mint: &Pubkey32, max_hops: usiz
     for &i in snap.pools_trading(base_mint) {
         let first = snap.at(i);
         let Some(mid) = first.other_mint(base_mint) else { continue };
-        let Some(leg) = first.leg_for_input(base_mint) else { continue };
+        let Some(leg) = snap.leg(i, base_mint) else { continue };
         let mut path =
             Path { pools: vec![first.id], mints: vec![*base_mint, mid], legs: vec![leg] };
         collect(snap, base_mint, &mut path, max_hops, &mut found);
@@ -262,10 +262,10 @@ fn lollipops(snap: &Snapshot, base_mint: &Pubkey32, out: &mut Vec<Cycle>) {
                             continue;
                         }
                         let legs = [
-                            enter.leg_for_input(base_mint),
-                            out_leg.leg_for_input(&hub),
-                            back.leg_for_input(&x),
-                            exit.leg_for_input(&hub),
+                            snap.leg(e, base_mint),
+                            snap.leg(j, &hub),
+                            snap.leg(k, &x),
+                            snap.leg(r, &hub),
                         ];
                         if legs.iter().any(Option::is_none) {
                             continue;
@@ -415,7 +415,7 @@ fn collect(
         if next_mint != *base_mint && path.mints.contains(&next_mint) {
             continue;
         }
-        let Some(leg) = next.leg_for_input(&current) else { continue };
+        let Some(leg) = snap.leg(i, &current) else { continue };
         path.pools.push(next.id);
         path.mints.push(next_mint);
         path.legs.push(leg);
@@ -468,6 +468,13 @@ impl Path {
 }
 
 fn price(cycle: &Cycle, max_in: u128) -> Option<PricedCycle> {
+    // A float first, the exact rational only near break-even. The exact check reduces
+    // by a u128 gcd per leg, and ran for every one of fourteen thousand cycles a pass
+    // when almost all are tens of basis points under water; f64 is good to 1e-15 per
+    // step, so a cycle it puts a whole basis point under is under.
+    if marginal_edge_bps(&cycle.legs).is_none_or(|e| e < -1.0) {
+        return None;
+    }
     if !is_profitable(&cycle.legs) {
         return None;
     }

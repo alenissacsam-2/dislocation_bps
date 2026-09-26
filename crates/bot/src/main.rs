@@ -30,10 +30,18 @@ const SLOT_MS: u64 = 200;
 /// what made Windows Firewall prompt on first launch.
 const LISTEN: &str = "127.0.0.1:8787";
 
-/// How often the whole cycle graph is re-priced. Two sweeps per slot: fast enough
-/// that a measurement is never more than half a block stale, slow enough that the
-/// scan cost stays invisible.
-const SWEEP_INTERVAL: Duration = Duration::from_millis(200);
+/// How often the whole cycle graph is re-priced. Four sweeps per slot.
+///
+/// Every detection waits half of this on average before anything can happen, so it is
+/// latency on every trade. It was 200 ms while a sweep took 54 ms; with the snapshot
+/// building each pool's legs once and a float screen ahead of the exact profit check,
+/// a sweep of the same 14,000 cycles takes 20 ms (`cb-bot --bench-sweep`, 2026-09-27),
+/// so the wait halves for a fifth of the loop's time.
+const SWEEP_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Sweeps per leaderboard update sent to the window: five a second, as before the
+/// sweep interval halved. The window renders every one it receives.
+const PUBLISH_EVERY_N_SWEEPS: u32 = 2;
 
 /// How often token valuations are rebuilt from pool state. Only used for sizing, and
 /// a token's dollar value does not move meaningfully inside ten seconds.
@@ -428,11 +436,11 @@ fn mode_label(cfg: &Config) -> &'static str {
     }
 }
 
-/// One sweep in this many is written to the ledger. Sweeps run at 5 Hz and the
+/// One sweep in this many is written to the ledger. Sweeps run at 10 Hz and the
 /// market does not change meaningfully between two of them, so sampling at 1 Hz
 /// keeps a day of running to ~86k rows while losing nothing a mean or a histogram
 /// would notice.
-const LEDGER_EVERY_N_SWEEPS: u32 = 5;
+const LEDGER_EVERY_N_SWEEPS: u32 = 10;
 
 /// How often every watched account is re-read over HTTP and folded back in.
 ///
@@ -1045,7 +1053,7 @@ async fn settle_pending(
                     match execute::PROBE_TIPS.iter().find(|&&next| next > tip) {
                         Some(&next) => {
                             tracing::warn!(
-                                "Jito probe of {tip} lamports was not included in {} s; trying {next}",
+                                "Jito probe of {tip} lamports did not land in {} s; trying {next}",
                                 GIVE_UP.as_secs()
                             );
                             send_probe(t, &mut keep, next).await;
@@ -1132,6 +1140,48 @@ async fn main() -> anyhow::Result<()> {
         let asked = registry.pools.len();
         let market = live::LiveMarket::bootstrap(&cfg.rpc_http_url, registry).await?;
         println!("{} of {asked} pools priceable", market.store_len());
+        return Ok(());
+    }
+    // `cb-bot --bench-sweep`: bootstrap as `--pools` does, then time the full-graph sweep
+    // the main loop runs, on today's real pools. No feed, no wallet.
+    if args.iter().any(|a| a == "--bench-sweep") {
+        tracing_subscriber::fmt().with_ansi(false).with_target(false).init();
+        let cfg = Config::load("config.toml")?;
+        let market = live::LiveMarket::bootstrap(&cfg.rpc_http_url, registry::Registry::load()?).await?;
+        let (tradable, depth, hops) = (cfg.tradable_usd(), cfg.tradeable_depth_usd(), cfg.max_hops);
+        let mut times: Vec<u64> = Vec::new();
+        let mut evaluated = 0;
+        for _ in 0..40 {
+            let s = market.sweep(tradable, depth, hops);
+            times.push(s.duration_us);
+            evaluated = s.evaluated;
+        }
+        times.sort_unstable();
+        println!(
+            "{evaluated} cycles a sweep: p50 {} us, p90 {} us, fastest {} us",
+            times[times.len() / 2],
+            times[times.len() * 9 / 10],
+            times[0]
+        );
+        // Where it goes: the snapshot, the graph walk alone, and the walk with pricing.
+        let t = std::time::Instant::now();
+        let (snap, _) = market.store.snapshot_fresh(live::MAX_STALE_LAG_SLOTS);
+        let snap_us = t.elapsed().as_micros();
+        let t = std::time::Instant::now();
+        let mut walked = 0;
+        for base in &market.registry.base_mints {
+            walked += cb_scanner::multi::enumerate_from_base(&snap, base, hops).len();
+        }
+        let walk_us = t.elapsed().as_micros();
+        let t = std::time::Instant::now();
+        for base in &market.registry.base_mints {
+            let _ = cb_scanner::multi::survey_and_find(&snap, base, hops, u128::MAX / 4);
+        }
+        let survey_us = t.elapsed().as_micros();
+        println!(
+            "snapshot {snap_us} us; walk {walk_us} us for {walked} cycles over {} bases; walk+price {survey_us} us",
+            market.registry.base_mints.len()
+        );
         return Ok(());
     }
     if args.iter().any(|a| a == "--report") {
@@ -1734,7 +1784,7 @@ async fn spawn_live(
                         }
                     }
 
-                    if !sweep.rows.is_empty() {
+                    if !sweep.rows.is_empty() && sweep_n % PUBLISH_EVERY_N_SWEEPS == 0 {
                         bus.publish(Event::Routes {
                             rows: sweep.rows.iter().map(RouteRow::from).collect(),
                             tradeable_min_usd: sweep.tradeable_min_usd,
