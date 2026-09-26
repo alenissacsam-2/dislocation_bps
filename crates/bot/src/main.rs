@@ -1705,10 +1705,18 @@ async fn spawn_live(
                                         });
                                     // Everything that disqualifies a candidate for
                                     // reasons that have nothing to do with its fee.
+                                    // A shape this trader can never send, whatever its price —
+                                    // a USDC-start cycle under Jito, a venue it cannot re-price.
+                                    // Refused inside the attempt too, but only after it had taken
+                                    // one of the sweep's few attempt slots: 363 times in one run,
+                                    // each crowding out a cycle that could have been sent.
+                                    let unsendable =
+                                        opp.plan.as_ref().is_some_and(|pl| !t.could_execute(pl));
                                     let barred = submitted_this_sweep
                                         || attempts_this_sweep >= MAX_ATTEMPTS_PER_SWEEP
                                         || on_cooldown
-                                        || unfundable_entry;
+                                        || unfundable_entry
+                                        || unsendable;
                                     // The two filters that reject a candidate by making a
                                     // claim about what would have happened to it, rather
                                     // than by observing something that already has. Both
@@ -1855,6 +1863,9 @@ async fn spawn_live(
                                                 "not attempted — the wallet cannot start a \
                                                  trade in this cycle's entry mint; the same \
                                                  loop entered from SOL is not held by this"
+                                                    .to_string()
+                                            } else if unsendable && blocked_by.is_none() {
+                                                "not attempted — this shape cannot be sent: under Jito only a                                                  cycle that starts and ends in SOL has its fee guaranteed on                                                  chain, and a binned pool leaves room for two hops"
                                                     .to_string()
                                             } else if let Some(dex) = blocked_by {
                                                 // Its own message. Pooled with the

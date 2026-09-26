@@ -2135,7 +2135,8 @@ impl Trader {
         let starts_in_sol = plan.mints.first().is_some_and(|m| to_pubkey(m) == pk(programs::WSOL_MINT));
         plan.encodable()
             && plan.pools.iter().all(|(_, d)| can_reprice(*d))
-            && plan.pools.len() <= MAX_EXECUTABLE_HOPS
+            // A lollipop is four hops and fits once its accounts are in the lookup table.
+            && (plan.pools.len() <= MAX_EXECUTABLE_HOPS || plan.is_lollipop())
             && (binned == 0 || plan.pools.len() <= MAX_HOPS_WITH_A_BINNED_LEG)
             && binned <= MAX_BINNED_HOPS
             && (!self.sends_via_jito() || (starts_in_sol && self.opts.wsol == WsolPolicy::WrapAndClose))
