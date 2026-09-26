@@ -1219,7 +1219,7 @@ impl Trader {
         // of the 1,232 bytes a packet allows. Refused here rather than after four
         // accounts fetches and a blockhash — see [`MAX_HOPS_WITH_A_BINNED_LEG`].
         let binned = plan.pools.iter().filter(|(_, d)| is_binned(*d)).count();
-        if binned > 0 && plan.pools.len() > MAX_HOPS_WITH_A_BINNED_LEG {
+        if binned > 0 && plan.pools.len() > self.max_hops_with_a_binned_leg() {
             return Ok(Attempt::Refused(format!(
                 "{} hops will not fit in one transaction beside a {} leg, which needs \
                  nineteen accounts of the {} bytes a packet holds — this shape needs an \
@@ -2137,9 +2137,18 @@ impl Trader {
             && plan.pools.iter().all(|(_, d)| can_reprice(*d))
             // A lollipop is four hops and fits once its accounts are in the lookup table.
             && (plan.pools.len() <= MAX_EXECUTABLE_HOPS || plan.is_lollipop())
-            && (binned == 0 || plan.pools.len() <= MAX_HOPS_WITH_A_BINNED_LEG)
+            && (binned == 0 || plan.pools.len() <= self.max_hops_with_a_binned_leg())
             && binned <= MAX_BINNED_HOPS
             && (!self.sends_via_jito() || (starts_in_sol && self.opts.wsol == WsolPolicy::WrapAndClose))
+    }
+
+    /// How many hops a cycle with a binned leg may have. Two without a lookup table,
+    /// where a DLMM's nineteen accounts leave no room for a third hop; three with one,
+    /// where the accounts cost a byte each and the cycle is refused at assembly only if
+    /// it still does not fit — after which the table grows to take it.
+    #[must_use]
+    pub fn max_hops_with_a_binned_leg(&self) -> usize {
+        if self.lookup.is_some() { MAX_EXECUTABLE_HOPS } else { MAX_HOPS_WITH_A_BINNED_LEG }
     }
 
     /// The first mint of `plan` the wallet holds no account for, if the set is known.
