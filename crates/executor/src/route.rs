@@ -130,6 +130,9 @@ pub struct RouteOptions {
     /// A wrong `true` does not lose money: the swap into a missing account fails, and a
     /// failed bundle is dropped.
     pub others_exist: bool,
+    /// One mint whose account does not exist yet and is created in this transaction
+    /// even when `others_exist` says the rest do: a trade opening the account it needs.
+    pub create_also: Option<Pubkey>,
     pub venue: VenueExtra,
     /// How much more than its input the last hop must guarantee, beyond the one base
     /// unit invariant 2 already demands.
@@ -157,6 +160,7 @@ impl Default for RouteOptions {
             wsol: WsolPolicy::default(),
             create_token_accounts: false,
             others_exist: false,
+            create_also: None,
             venue: VenueExtra::default(),
             min_gain: 0,
             tip: None,
@@ -289,7 +293,7 @@ pub fn build(owner: &Pubkey, hops: &[Hop], pre_balance: u64, opts: &RouteOptions
         for mint in seen {
             // wSOL is never "open" between trades: `WrapAndClose` closes it every time, so
             // a cycle that passes through SOL mid-route still has to create it.
-            if opts.others_exist && mint != base_mint && mint != wsol {
+            if opts.others_exist && mint != base_mint && mint != wsol && opts.create_also != Some(mint) {
                 continue;
             }
             let p = program_of(&mint);
@@ -582,6 +586,20 @@ mod tests {
         assert_eq!(r.instructions.len(), 7);
     }
 
+    /// With the rest known to exist, only the base and the one mint a trade is opening
+    /// for itself get a create.
+    #[test]
+    fn a_trade_opening_its_own_account_creates_that_one_and_the_base() {
+        let owner = Pubkey::new_unique();
+        let hops = cycle(3);
+        let known = RouteOptions { create_token_accounts: true, others_exist: true, ..opts() };
+        let r = build(&owner, &hops, 0, &known).unwrap();
+        assert_eq!(r.instructions.len(), 5, "compute + the base's create + 3 swaps");
+        let opening = RouteOptions { create_also: Some(hops[1].input_mint), ..known };
+        let r = build(&owner, &hops, 0, &opening).unwrap();
+        assert_eq!(r.instructions.len(), 6, "and the one being opened");
+    }
+
     /// The measurement `tx.rs` defers to. A real cycle shares the signer, the token
     /// program and the token accounts across legs, so it fits further than the
     /// no-sharing bound suggests — and this records exactly how far.
@@ -751,6 +769,7 @@ mod raydium_packet {
             wsol: WsolPolicy::WrapAndClose,
             create_token_accounts: true,
             others_exist,
+            create_also: None,
             venue: crate::venue::VenueExtra { token_program: classic, bitmap_policy: policy, pump: None },
             min_gain: 6_000,
             tip: Some((crate::jito::tip_account(0), 1_000)),
@@ -832,6 +851,7 @@ mod lollipop_packet {
             wsol: WsolPolicy::WrapAndClose,
             create_token_accounts: true,
             others_exist: true,
+            create_also: None,
             venue: crate::venue::VenueExtra { token_program: classic, bitmap_policy: BitmapPolicy::Auto, pump: None },
             min_gain: 6_000,
             tip: Some((crate::jito::tip_account(0), 1_000)),
@@ -898,6 +918,7 @@ mod lookup_packet {
             wsol: WsolPolicy::WrapAndClose,
             create_token_accounts: true,
             others_exist: true,
+            create_also: None,
             venue: crate::venue::VenueExtra { token_program: classic, bitmap_policy: BitmapPolicy::Auto, pump: None },
             min_gain: 6_000,
             tip: Some((crate::jito::tip_account(0), 1_000)),

@@ -478,6 +478,19 @@ const MAX_BID_SHARE_PERCENT: u128 = 25;
 /// bot's bundles had landed by 2026-09-26.
 const JITO_TIP_SHARE_PERCENT: u128 = 50;
 
+/// The least a cycle through a mint the wallet holds no account for must gross, at
+/// detection and in lamports, for a Jito trade to open that account itself.
+///
+/// The account's rent is a deposit, not a cost, and the last floor guarantees the fee
+/// and the tip whatever the rent: a trade that opens its own account either lands
+/// profitable, holding a new refundable account, or is dropped. What the account does
+/// cost is a base fee later to close it; this keeps that to a quarter of the gross.
+const OPEN_IN_TRADE_MIN_GROSS: u128 = 20_000;
+
+/// The most accounts trades may open for themselves in one run, bounding the deposit
+/// they can lock up: eight is about 0.013 SOL at 2026-09 rent, a tenth of this wallet.
+const MAX_OPENS_IN_TRADES: usize = 8;
+
 /// What the priority bid will cost, in lamports.
 ///
 /// Solana charges the bid against the compute limit the transaction *requests*, not the
@@ -589,6 +602,11 @@ pub struct Trader {
     landing_tip: Option<u64>,
     /// When anything this trader sent — a trade or a probe — was last seen on chain.
     last_landed: Option<std::time::Instant>,
+    /// Accounts sent trades are opening for themselves, by signature, until the chain
+    /// says whether they landed. See [`OPEN_IN_TRADE_MIN_GROSS`].
+    opening_in_trade: HashMap<String, Pubkey32>,
+    /// How many accounts landed trades have opened this run.
+    opened_in_trades: usize,
     /// When the last Jito send went, so the next waits out the block engine's
     /// one-a-second limit here rather than being answered with a 429 there.
     last_jito_send: Option<std::time::Instant>,
@@ -645,6 +663,8 @@ impl Trader {
             jito_urls: cb_executor::jito::fanout_urls(cb_executor::jito::DEFAULT_URL),
             landing_tip: None,
             last_landed: None,
+            opening_in_trade: HashMap::new(),
+            opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -1310,16 +1330,20 @@ impl Trader {
         // A cycle whose intermediate mint the wallet has no account for cannot clear
         // its own profit check, because creating that account costs rent out of the
         // very balance the profit is measured in. Said here, once, for nothing, rather
-        // than discovered two round trips later as an unexplained balance shortfall.
-        if let Some(mint) = self.mint_without_an_account(plan) {
-            return Ok(Attempt::Refused(format!(
+        // than discovered two round trips later as an unexplained balance shortfall —
+        // unless it goes through Jito, whose floor is checked on chain and is blind to
+        // the rent, and the prize is worth an account: then the trade opens it.
+        let open_in_trade = match self.mint_without_an_account(plan) {
+            None => None,
+            Some(mint) if self.may_open_in_trade(plan) => Some(mint),
+            Some(mint) => return Ok(Attempt::Refused(format!(
                 "the wallet holds no token account for {}, and opening one costs {} lamports \
                  of rent out of the same balance this trade's profit is measured in — the \
                  bot opens one itself once attempts keep asking for this mint",
                 to_pubkey(&mint),
                 self.account_rent
-            )));
-        }
+            ))),
+        };
 
         if let Some(dex) = plan.blocking_venue() {
             return Ok(Attempt::Refused(format!("{} has no encoder", dex.name())));
@@ -1960,6 +1984,7 @@ impl Trader {
             wsol: self.opts.wsol,
             create_token_accounts: self.opts.create_token_accounts,
             others_exist: !self.accounts_held.is_empty(),
+            create_also: open_in_trade.map(|m| to_pubkey(&m)),
             venue: VenueExtra { token_program, bitmap_policy: BitmapPolicy::Auto, pump: self.pump_fees },
             min_gain: u64::try_from(required_gain).unwrap_or(u64::MAX),
             // Any of the eight accounts will do; spreading by the blockhash keeps
@@ -2019,6 +2044,9 @@ impl Trader {
                 // that errored may still have been received, and was a request either way.
                 if jito && matches!(r, Ok(Attempt::Submitted { .. }) | Err(_)) {
                     self.last_jito_send = Some(std::time::Instant::now());
+                }
+                if let (Ok(Attempt::Submitted { signature, .. }), Some(mint)) = (&r, open_in_trade) {
+                    self.opening_in_trade.insert(signature.clone(), mint);
                 }
                 r
             }
@@ -2557,6 +2585,31 @@ impl Trader {
         n
     }
 
+    /// Whether a cycle whose one missing account this trade would open for itself may
+    /// go ahead. See [`OPEN_IN_TRADE_MIN_GROSS`].
+    fn may_open_in_trade(&self, plan: &CyclePlan) -> bool {
+        let missing: std::collections::HashSet<&Pubkey32> =
+            plan.mints.iter().filter(|m| !self.accounts_held.contains(*m)).collect();
+        let gross = plan.leg_out.last().copied().unwrap_or(0).saturating_sub(plan.amount_in);
+        self.sends_via_jito()
+            && !self.opts.dry_run
+            && missing.len() == 1
+            && self.opened_in_trades + self.opening_in_trade.len() < MAX_OPENS_IN_TRADES
+            && gross >= OPEN_IN_TRADE_MIN_GROSS
+    }
+
+    /// Settle an account a sent trade was opening for itself: held from now on if the
+    /// trade landed cleanly, forgotten if it did not. Returns the mint when it is new.
+    pub fn settle_open(&mut self, signature: &str, landed_cleanly: bool) -> Option<Pubkey32> {
+        let mint = self.opening_in_trade.remove(signature)?;
+        if !landed_cleanly {
+            return None;
+        }
+        self.accounts_held.insert(mint);
+        self.opened_in_trades += 1;
+        Some(mint)
+    }
+
     /// Record that a trade landed: the path is proven without spending a probe on it.
     pub fn note_landed(&mut self) {
         self.last_landed = Some(std::time::Instant::now());
@@ -2883,6 +2936,8 @@ mod tests {
             jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
             landing_tip: None,
             last_landed: None,
+            opening_in_trade: HashMap::new(),
+            opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -2923,6 +2978,8 @@ mod tests {
             jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
             landing_tip: None,
             last_landed: None,
+            opening_in_trade: HashMap::new(),
+            opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -2961,6 +3018,8 @@ mod tests {
             jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
             landing_tip: None,
             last_landed: None,
+            opening_in_trade: HashMap::new(),
+            opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -3314,6 +3373,8 @@ mod mainnet {
             jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
             landing_tip: None,
             last_landed: None,
+            opening_in_trade: HashMap::new(),
+            opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -3329,6 +3390,7 @@ mod mainnet {
             wsol: WsolPolicy::WrapAndClose,
             create_token_accounts: true,
             others_exist: false,
+            create_also: None,
             venue: VenueExtra {
                 token_program: pk(programs::SPL_TOKEN),
                 bitmap_policy: BitmapPolicy::Include,
@@ -3504,6 +3566,8 @@ mod fresh_quote_tests {
             jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
             landing_tip: None,
             last_landed: None,
+            opening_in_trade: HashMap::new(),
+            opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -3550,6 +3614,8 @@ mod fresh_quote_tests {
             jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
             landing_tip: None,
             last_landed: None,
+            opening_in_trade: HashMap::new(),
+            opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -3603,6 +3669,8 @@ mod fresh_quote_tests {
             jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
             landing_tip: None,
             last_landed: None,
+            opening_in_trade: HashMap::new(),
+            opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -3660,6 +3728,8 @@ mod fresh_quote_tests {
             jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
             landing_tip: None,
             last_landed: None,
+            opening_in_trade: HashMap::new(),
+            opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -3720,6 +3790,8 @@ mod fresh_quote_tests {
             jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
             landing_tip: None,
             last_landed: None,
+            opening_in_trade: HashMap::new(),
+            opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -3727,6 +3799,45 @@ mod fresh_quote_tests {
             lookup_pending: Vec::new(),
             oversize: None,
         }
+    }
+
+    /// A Jito trade may open the one account its cycle is missing when the prize is
+    /// worth it, and the account counts as held only once the trade has landed.
+    #[test]
+    fn a_trade_may_open_its_one_missing_account_and_holds_it_only_once_landed() {
+        let mut t = jito_trader(20_000);
+        t.opts.dry_run = false;
+        let mut p = tests::plan(2);
+        // Hold every mint but the intermediate one.
+        t.accounts_held.insert(p.mints[0]);
+        let missing = p.mints[1];
+        p.amount_in = 1_000_000;
+        p.leg_out = vec![5_000, 1_000_000 + OPEN_IN_TRADE_MIN_GROSS];
+        assert!(t.may_open_in_trade(&p));
+        // A smaller prize does not justify the account.
+        let mut small = p.clone();
+        small.leg_out[1] = 1_000_000 + OPEN_IN_TRADE_MIN_GROSS - 1;
+        assert!(!t.may_open_in_trade(&small));
+        // Nor does a cycle missing two accounts.
+        let mut two = tests::plan(3);
+        two.leg_out = vec![1, 1, two.amount_in + OPEN_IN_TRADE_MIN_GROSS];
+        t.accounts_held.insert(two.mints[0]);
+        assert!(!t.may_open_in_trade(&two));
+        // Off Jito the balance check would see the rent, so never.
+        let rpc = Trader { opts: TradeOptions::default(), ..jito_trader(20_000) };
+        assert!(!rpc.may_open_in_trade(&p));
+
+        t.opening_in_trade.insert("sig-a".into(), missing);
+        assert_eq!(t.settle_open("sig-a", false), None, "a bundle that missed opened nothing");
+        assert!(!t.accounts_held.contains(&missing));
+        t.opening_in_trade.insert("sig-b".into(), missing);
+        assert_eq!(t.settle_open("sig-b", true), Some(missing));
+        assert!(t.accounts_held.contains(&missing));
+        assert_eq!(t.settle_open("sig-b", true), None, "settled once");
+        // And the run-wide cap holds.
+        t.opened_in_trades = MAX_OPENS_IN_TRADES;
+        t.accounts_held.remove(&missing);
+        assert!(!t.may_open_in_trade(&p));
     }
 
     /// Through Jito the last floor carries the cost of landing, so the chain itself
@@ -3847,6 +3958,8 @@ mod fresh_quote_tests {
             jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
             landing_tip: None,
             last_landed: None,
+            opening_in_trade: HashMap::new(),
+            opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
@@ -3934,6 +4047,8 @@ mod account_rent_tests {
             jito_urls: vec![cb_executor::jito::DEFAULT_URL.to_string()],
             landing_tip: None,
             last_landed: None,
+            opening_in_trade: HashMap::new(),
+            opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
             account_rent: cb_executor::route::TOKEN_ACCOUNT_RENT,
@@ -4237,6 +4352,7 @@ mod meteora_dlmm_tests {
             wsol: WsolPolicy::WrapAndClose,
             create_token_accounts: true,
             others_exist: false,
+            create_also: None,
             venue: VenueExtra::default(),
             min_gain: 0,
             tip: None,

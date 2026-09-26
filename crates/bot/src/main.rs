@@ -1064,9 +1064,17 @@ async fn settle_pending(
             Some(true) => {
                 t.note_landed();
                 tracing::error!("LANDED {sig} — the transaction confirmed on chain");
+                if let Some(mint) = t.settle_open(sig, true) {
+                    tracing::warn!(
+                        "that trade opened a token account for {} on its way; the deposit \
+                         comes back when the account is closed",
+                        bs58::encode(mint).into_string()
+                    );
+                }
                 (true, "submitted and landed".to_string(), 0.0)
             }
             Some(false) => {
+                t.settle_open(sig, false);
                 // A revert pays the whole fee and returns nothing; the daily budget has
                 // to see it.
                 let cost_usd = t.submission_cost_lamports() as f64 / 1e9 * sol_price;
@@ -1082,6 +1090,7 @@ async fn settle_pending(
                 continue;
             }
             None if p.via_jito => {
+                t.settle_open(sig, false);
                 tracing::warn!(
                     "{sig} was not included — a Jito bundle that misses is dropped and costs \
                      nothing ({})",
