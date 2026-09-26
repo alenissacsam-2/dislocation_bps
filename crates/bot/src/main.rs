@@ -1072,6 +1072,81 @@ struct PendingSend {
     via_jito: bool,
     /// `Some(tip)` for a landing probe rather than a trade. See `Trader::jito_probe`.
     probe_tip: Option<u64>,
+    /// The trade's pools and the feed's slot when it went, for `post_mortem`.
+    pools: Vec<cb_core::types::Pubkey32>,
+    sent_slot: u64,
+}
+
+/// How many slots after a missed send `post_mortem` looks for someone else's trade.
+const POST_MORTEM_SLOTS: u64 = 20;
+
+/// Say what became of the market a Jito trade was sent into, when it was not included:
+/// the next transaction to write any of its pools after it went, how many slots later,
+/// and what that transaction tipped. Run detached; it is two or three reads per miss.
+///
+/// # Why
+///
+/// "Not included" alone cannot tell a bundle that lost its race — someone else traded
+/// the same pools a slot later, tipping more — from one that never reached a leader, or
+/// whose floor was gone by the time it was reached. The first is a matter of tip or
+/// speed; the others are not, and a landing probe answers only the second.
+async fn post_mortem(rpc_url: String, ours: String, pools: Vec<cb_core::types::Pubkey32>, sent_slot: u64) {
+    let Ok(rpc) = cb_executor::rpc::Rpc::new(rpc_url) else { return };
+    let mut next: Option<(String, u64, cb_core::types::Pubkey32)> = None;
+    // Whether every pool's history was read back past the send: only then does finding
+    // nobody mean there was nobody.
+    let mut read_back = true;
+    for pool in &pools {
+        let key = solana_sdk::pubkey::Pubkey::new_from_array(*pool);
+        // Newest first, so page back until the send slot is behind us: a busy pool
+        // writes hundreds of times between the send and this look.
+        let mut before: Option<String> = None;
+        let mut reached = false;
+        for _page in 0..10 {
+            let Ok(sigs) = rpc.signatures_for_address(&key, 1_000, before.as_deref()).await else { break };
+            let full_page = sigs.len() == 1_000;
+            let Some((last_sig, last_slot, _)) = sigs.last().cloned() else {
+                reached = true;
+                break;
+            };
+            for (sig, slot, ok) in sigs {
+                // Strictly after: the feed's slot at send time is one our own bundle could
+                // not have landed in, and what traded in it came before the send.
+                let in_window = slot > sent_slot && slot <= sent_slot + POST_MORTEM_SLOTS;
+                if ok && in_window && sig != ours && next.as_ref().is_none_or(|n| slot < n.1) {
+                    next = Some((sig, slot, *pool));
+                }
+            }
+            if last_slot < sent_slot || !full_page {
+                reached = true;
+                break;
+            }
+            before = Some(last_sig);
+        }
+        read_back &= reached;
+    }
+    match next {
+        None if !read_back => tracing::info!(
+            "post-mortem {ours}: no trade on its pools found after it went, but a pool's history              could not be read back that far"
+        ),
+        None => tracing::info!(
+            "post-mortem {ours}: nobody traded its pools in the {POST_MORTEM_SLOTS} slots after it \
+             went, so it was not beaten to them — it missed its leader, or its floor"
+        ),
+        Some((sig, slot, pool)) => {
+            let paid = match rpc.tip_of(&sig).await {
+                Ok(Some((payer, tip, fee))) => {
+                    format!(", paid by {}… with a {tip} lamport tip and a {fee} lamport fee", payer.get(..6).unwrap_or(""))
+                }
+                _ => String::new(),
+            };
+            tracing::info!(
+                "post-mortem {ours}: pool {} was next written {} slots after it went, by {sig}{paid}",
+                bs58::encode(pool).into_string(),
+                slot - sent_slot
+            );
+        }
+    }
 }
 
 /// Send a landing probe of `tip` lamports and follow it like a trade.
@@ -1083,6 +1158,8 @@ async fn send_probe(t: &mut execute::Trader, pending: &mut Vec<PendingSend>, tip
             row: None,
             via_jito: true,
             probe_tip: Some(tip),
+            pools: Vec::new(),
+            sent_slot: 0,
         }),
         Ok(None) => {}
         Err(e) => tracing::warn!("Jito probe of {tip} lamports could not be sent: {e:#}"),
@@ -1097,6 +1174,7 @@ async fn settle_pending(
     t: &mut execute::Trader,
     pending: &mut Vec<PendingSend>,
     sol_price: f64,
+    rpc_url: &str,
 ) -> Vec<(i64, bool, String, f64)> {
     /// A block and a bit: asking sooner mostly hears "not yet".
     const FIRST_LOOK: Duration = Duration::from_secs(2);
@@ -1180,6 +1258,9 @@ async fn settle_pending(
             }
             None if p.via_jito => {
                 t.settle_open(sig, false);
+                if !p.pools.is_empty() && p.sent_slot > 0 {
+                    tokio::spawn(post_mortem(rpc_url.to_string(), sig.clone(), p.pools.clone(), p.sent_slot));
+                }
                 tracing::warn!(
                     "{sig} was not included — a Jito bundle that misses is dropped and costs \
                      nothing ({})",
@@ -1250,6 +1331,17 @@ async fn main() -> anyhow::Result<()> {
         }
         let s = market.sweep(cfg.tradable_usd(), cfg.tradeable_depth_usd(), cfg.max_hops);
         println!("sweep of the grown graph: {} cycles in {} us", s.evaluated, s.duration_us);
+        return Ok(());
+    }
+    // `cb-bot --post-mortem <signature> <slot> <pool>...`: what `post_mortem` says about a
+    // send that was not included, run by hand on one from an earlier run. Reads only.
+    if let Some(i) = args.iter().position(|a| a == "--post-mortem") {
+        tracing_subscriber::fmt().with_ansi(false).with_target(false).init();
+        let cfg = Config::load("config.toml")?;
+        let sig = args.get(i + 1).cloned().unwrap_or_default();
+        let slot: u64 = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let pools = args.iter().skip(i + 3).map(|p| registry::pk(p)).collect::<anyhow::Result<Vec<_>>>()?;
+        post_mortem(cfg.rpc_http_url.clone(), sig, pools, slot).await;
         return Ok(());
     }
     // `cb-bot --bench-sweep`: bootstrap as `--pools` does, then time the full-graph sweep
@@ -1625,6 +1717,7 @@ async fn spawn_live(
         }
     }
     let token_slots = cfg.token_account_slots;
+    let rpc_url_for_loop = cfg.rpc_http_url.clone();
 
     tokio::spawn(async move {
         // Owned by the sweep task, because the risk gate is per-run state and there is
@@ -1688,6 +1781,8 @@ async fn spawn_live(
         // Sends whose fate is not known yet, and the timer that asks. See `PendingSend`.
         let mut pending_sends: Vec<PendingSend> = Vec::new();
         let mut confirm_timer = tokio::time::interval(Duration::from_secs(1));
+        // Where a missed send's post-mortem reads from. See `post_mortem`.
+        let post_mortem_rpc = rpc_url_for_loop.clone();
         // Landing probes: the first tick is immediate, so a run starts by finding out
         // whether its bundles can land at all. See `Trader::jito_probe`.
         let mut probe_timer = tokio::time::interval(execute::PROBE_EVERY);
@@ -1803,7 +1898,7 @@ async fn spawn_live(
                 _ = confirm_timer.tick(), if !pending_sends.is_empty() => {
                     if let Some(t) = trader.as_mut() {
                         let sol_price = market.sol_price_usd().unwrap_or(0.0);
-                        let outcomes = settle_pending(t, &mut pending_sends, sol_price).await;
+                        let outcomes = settle_pending(t, &mut pending_sends, sol_price, &post_mortem_rpc).await;
                         if let Some(l) = ledger.as_ref() {
                             for (row, taken, reason, net) in outcomes {
                                 if let Err(e) = l.update_fill_outcome(row, taken, &reason, net) {
@@ -2407,6 +2502,8 @@ async fn spawn_live(
                                                         row: None,
                                                         via_jito: t.sends_via_jito(),
                                                         probe_tip: None,
+                                                        pools: plan.pools.iter().map(|(k, _)| *k).collect(),
+                                                        sent_slot: stats.last_slot.load(Ordering::Relaxed),
                                                     });
                                                 }
                                                 Ok(cb_executor::Attempt::SimulationRejected {

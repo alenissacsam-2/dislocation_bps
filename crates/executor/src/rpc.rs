@@ -622,6 +622,71 @@ impl Rpc {
         Ok(self.signature_statuses(&[sig.to_string()]).await?.pop().flatten())
     }
 
+    /// Signatures that wrote `address`, newest first — those older than `before` if it is
+    /// given — as `(signature, slot, succeeded)`.
+    ///
+    /// # Errors
+    /// If the call fails.
+    pub async fn signatures_for_address(
+        &self,
+        address: &Pubkey,
+        limit: usize,
+        before: Option<&str>,
+    ) -> Result<Vec<(String, u64, bool)>> {
+        let mut opts = json!({"limit": limit, "commitment": "confirmed"});
+        if let Some(b) = before {
+            opts["before"] = json!(b);
+        }
+        let r = self.call("getSignaturesForAddress", json!([address.to_string(), opts])).await?;
+        Ok(r.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| {
+                        Some((v["signature"].as_str()?.to_string(), v["slot"].as_u64()?, v["err"].is_null()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// A landed transaction's fee payer, what it paid Jito's tip accounts and its fee,
+    /// in lamports. `None` if the node does not have it.
+    ///
+    /// # Errors
+    /// If the call fails.
+    pub async fn tip_of(&self, signature: &str) -> Result<Option<(String, u64, u64)>> {
+        let r = self
+            .call(
+                "getTransaction",
+                json!([signature, {"encoding": "json", "maxSupportedTransactionVersion": 1, "commitment": "confirmed"}]),
+            )
+            .await?;
+        if r.is_null() {
+            return Ok(None);
+        }
+        let mut keys: Vec<String> = r["transaction"]["message"]["accountKeys"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|k| k.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        for part in ["writable", "readonly"] {
+            if let Some(a) = r["meta"]["loadedAddresses"][part].as_array() {
+                keys.extend(a.iter().filter_map(|k| k.as_str().map(String::from)));
+            }
+        }
+        let balances = |f: &str| -> Vec<u64> {
+            r["meta"][f].as_array().map(|a| a.iter().map(|v| v.as_u64().unwrap_or(0)).collect()).unwrap_or_default()
+        };
+        let (pre, post) = (balances("preBalances"), balances("postBalances"));
+        let tip = keys
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| crate::jito::TIP_ACCOUNTS.contains(&k.as_str()))
+            .map(|(i, _)| post.get(i).copied().unwrap_or(0).saturating_sub(pre.get(i).copied().unwrap_or(0)))
+            .sum();
+        let fee = r["meta"]["fee"].as_u64().unwrap_or(0);
+        Ok(keys.first().map(|payer| (payer.clone(), tip, fee)))
+    }
+
     /// [`Rpc::signature_status`] for several signatures in one round trip, in order.
     ///
     /// # Errors
