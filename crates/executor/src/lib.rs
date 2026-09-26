@@ -54,7 +54,10 @@ pub enum Attempt {
     /// Simulated, and the simulation said this would not profit.
     SimulationRejected { reason: String, observed_net_usd: Option<f64> },
     /// Submitted. A signature is not yet a profit.
-    Submitted { signature: String, expected_net_usd: f64 },
+    ///
+    /// `bundle_id` is Jito's name for the bundle, when it went that way and the block
+    /// engine gave one; see [`rpc::Rpc::jito_bundle_status`].
+    Submitted { signature: String, expected_net_usd: f64, bundle_id: Option<String> },
     /// Simulated deliberately and never submitted, to find out what would have
     /// happened. See [`Plan::probe`].
     Probed(Probe),
@@ -203,11 +206,14 @@ impl Plan {
             ));
         }
 
-        let signature = match via {
-            SendVia::Rpc => rpc.send(&self.tx_base64, true).await?,
-            SendVia::Jito { url, .. } => rpc.send_jito(url, &self.tx_base64).await?,
+        let (signature, bundle_id) = match via {
+            SendVia::Rpc => (rpc.send(&self.tx_base64, true).await?, None),
+            SendVia::Jito { url, .. } => {
+                let r = rpc.send_jito(url, &self.tx_base64).await?;
+                (r.signature, r.bundle_id)
+            }
         };
-        Ok(Attempt::Submitted { signature, expected_net_usd: self.expected_net_usd })
+        Ok(Attempt::Submitted { signature, expected_net_usd: self.expected_net_usd, bundle_id })
     }
 
     /// The simulation half of [`Plan::execute`]: `Some` is the rejection to return,

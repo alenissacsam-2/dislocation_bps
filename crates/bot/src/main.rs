@@ -1959,6 +1959,7 @@ async fn spawn_live(
                                             match r {
                                                 Ok(cb_executor::Attempt::Submitted {
                                                     signature: sig,
+                                                    bundle_id,
                                                     ..
                                                 }) => {
                                                     // Submitted is not confirmed. The signature
@@ -2024,13 +2025,44 @@ async fn spawn_live(
                                                             // is dropped: nothing was paid, and
                                                             // nothing was taken either.
                                                             landed = false;
+                                                            // Why it missed decides what to fix:
+                                                            // a floor already gone wants faster
+                                                            // pricing, a valid bundle left
+                                                            // pending wants a bigger tip.
+                                                            let status = match bundle_id.as_deref() {
+                                                                Some(id) => t.bundle_status(id).await,
+                                                                None => None,
+                                                            };
+                                                            let why = match status.as_deref() {
+                                                                Some("Failed") => {
+                                                                    "the block engine's own simulation \
+                                                                     failed it: the floor was already \
+                                                                     gone when it arrived"
+                                                                }
+                                                                Some("Pending") => {
+                                                                    "it was still valid but no Jito \
+                                                                     leader took it: outbid, or no Jito \
+                                                                     leader in its window"
+                                                                }
+                                                                Some("Invalid") => {
+                                                                    "the block engine no longer knows \
+                                                                     the bundle"
+                                                                }
+                                                                Some(_) => "see the block engine's status",
+                                                                None => "the block engine gave no status",
+                                                            };
+                                                            let status =
+                                                                status.unwrap_or_else(|| "unknown".into());
                                                             tracing::warn!(
-                                                                "{sig} was not included — a Jito \
+                                                                "{sig} was not included (bundle \
+                                                                 status {status}: {why}) — a Jito \
                                                                  bundle that misses is dropped and \
                                                                  costs nothing"
                                                             );
-                                                            "sent to Jito; not included, cost \
-                                                             nothing".into()
+                                                            format!(
+                                                                "sent to Jito; not included \
+                                                                 ({status}), cost nothing"
+                                                            )
                                                         }
                                                         None => {
                                                             tracing::warn!(

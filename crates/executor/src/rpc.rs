@@ -451,9 +451,12 @@ impl Rpc {
     /// should be read, not retried. The key-bearing URL never appears in an error: the
     /// block engine takes none, and every message is passed through the redactor anyway.
     ///
+    /// The block engine names the bundle it made in an `x-bundle-id` header. That id,
+    /// not the signature, is what [`Rpc::jito_bundle_status`] can say anything about.
+    ///
     /// # Errors
     /// If the request fails or the block engine refuses the transaction.
-    pub async fn send_jito(&self, url: &str, tx_base64: &str) -> Result<String> {
+    pub async fn send_jito(&self, url: &str, tx_base64: &str) -> Result<JitoReceipt> {
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -468,6 +471,11 @@ impl Rpc {
             ),
         };
         let status = resp.status();
+        let bundle_id = resp
+            .headers()
+            .get("x-bundle-id")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
         let text = resp.text().await.unwrap_or_default();
         let parsed: Value = serde_json::from_str(&text).map_err(|_| {
             anyhow!("Jito answered {status} rather than JSON ({} bytes)", text.len())
@@ -475,10 +483,56 @@ impl Rpc {
         if let Some(e) = parsed.get("error") {
             bail!("Jito refused the transaction ({status}): {e}");
         }
-        parsed["result"]
+        let signature = parsed["result"]
             .as_str()
             .map(String::from)
-            .ok_or_else(|| anyhow!("Jito sendTransaction did not return a signature"))
+            .ok_or_else(|| anyhow!("Jito sendTransaction did not return a signature"))?;
+        Ok(JitoReceipt { signature, bundle_id })
+    }
+
+    /// What the block engine did with a bundle sent in the last five minutes.
+    ///
+    /// # Why
+    ///
+    /// A bundle that is not included leaves no trace on chain, so "not included" alone
+    /// cannot tell a trade whose floor was already gone (the block engine's own
+    /// simulation failed it: `Failed`) from one that was valid and lost the auction or
+    /// never reached a Jito leader (`Pending` until it expires). Those call for opposite
+    /// fixes — faster pricing for the first, a bigger tip for the second — and on
+    /// 2026-09-26 the bot had sent 20 bundles with no way to tell which it was facing.
+    ///
+    /// `Ok(None)` means the block engine did not answer with a status.
+    ///
+    /// # Errors
+    /// If the request fails or the answer is not JSON.
+    pub async fn jito_bundle_status(&self, url: &str, bundle_id: &str) -> Result<Option<String>> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getInflightBundleStatuses",
+            "params": [[bundle_id]],
+        });
+        let endpoint = crate::jito::api_url(url, "getInflightBundleStatuses");
+        let resp = match self.http.post(&endpoint).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => bail!(
+                "Jito getInflightBundleStatuses failed: {}",
+                cb_core::redact::redact_urls_in(&e.to_string())
+            ),
+        };
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let parsed: Value = serde_json::from_str(&text).map_err(|_| {
+            anyhow!("Jito answered {status} rather than JSON ({} bytes)", text.len())
+        })?;
+        if let Some(e) = parsed.get("error") {
+            bail!("Jito refused the status request ({status}): {e}");
+        }
+        Ok(parsed["result"]["value"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|v| v["status"].as_str())
+            .map(String::from))
     }
 
     /// `Ok(None)` means the node has not seen it yet, which is not the same as failure.
@@ -697,6 +751,14 @@ pub struct Account {
     pub owner: Pubkey,
     pub data: Vec<u8>,
     pub lamports: u64,
+}
+
+/// What the block engine handed back for one send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JitoReceipt {
+    pub signature: String,
+    /// From the `x-bundle-id` header; `None` if the block engine sent none.
+    pub bundle_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -49,6 +49,16 @@ pub fn tip_account(seed: u64) -> Pubkey {
     Pubkey::from_str(TIP_ACCOUNTS[i]).expect("tip accounts are valid keys")
 }
 
+/// Another block engine method on the same host as `send_url`.
+///
+/// `send_url` is the configured `.../api/v1/transactions?bundleOnly=true`; every other
+/// method lives beside it under `/api/v1/`, with no query string.
+#[must_use]
+pub fn api_url(send_url: &str, method: &str) -> String {
+    let base = send_url.find("/api/v1/").map_or(send_url.trim_end_matches('/'), |i| &send_url[..i]);
+    format!("{base}/api/v1/{method}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,5 +77,17 @@ mod tests {
     fn the_default_url_asks_for_revert_protection() {
         assert!(DEFAULT_URL.starts_with("https://"));
         assert!(DEFAULT_URL.contains("bundleOnly=true"));
+    }
+
+    #[test]
+    fn other_methods_are_found_beside_the_send_url() {
+        assert_eq!(
+            api_url(DEFAULT_URL, "getInflightBundleStatuses"),
+            format!("{}/api/v1/getInflightBundleStatuses", &DEFAULT_URL[..DEFAULT_URL.find("/api/v1/").unwrap()])
+        );
+        assert_eq!(
+            api_url("https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/transactions?bundleOnly=true", "bundles"),
+            "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles"
+        );
     }
 }
