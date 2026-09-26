@@ -1092,10 +1092,26 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         (Mode::Live, false) => {
+            // Said the way the run is actually configured: "simulated first" was true
+            // until jito_simulate_first could be turned off, and a line that overstates
+            // the safety net is the one line here that must not.
+            let checked = match cfg.submit_via {
+                SubmitVia::Rpc => {
+                    "every one is simulated first and abandoned unless the simulated balance \
+                     clears the profit floor"
+                }
+                SubmitVia::Jito if cfg.jito_simulate_first => {
+                    "every one is simulated first, then sent to Jito with its profit floor \
+                     guaranteed on chain"
+                }
+                SubmitVia::Jito => {
+                    "each goes to Jito unsimulated, with its profit floor guaranteed on chain; \
+                     a bundle that misses it is dropped"
+                }
+            };
             tracing::error!(
-                "mode: LIVE, dry_run = false — transactions will be SUBMITTED. Every one \
-                 is simulated first and abandoned unless the simulated balance clears the \
-                 profit floor, but money can move from here"
+                "mode: LIVE, dry_run = false — transactions will be SUBMITTED: {checked}. \
+                 Money can move from here"
             );
         }
     }
