@@ -300,6 +300,27 @@ const LEDGER_PATH: &str = "cryptobot.db";
 /// Where the rolling record of which mints attempts needed is kept, so a restart does
 /// not forget a day of it. See `demand`.
 const DEMAND_PATH: &str = "token-demand.json";
+/// Where the address of this wallet's lookup table is remembered between runs.
+const LOOKUP_PATH: &str = "lookup-table.json";
+/// The most addresses the lookup table may grow to. At today's rent each costs about
+/// 160,000 lamports of refundable deposit, so this bounds it near 0.02 SOL.
+const LOOKUP_TABLE_CAP: usize = 120;
+/// At most this many table extensions in any hour; each is a setup transaction that
+/// holds the sweep while it confirms.
+const MAX_LOOKUP_GROWS_PER_HOUR: usize = 6;
+
+fn read_lookup_path() -> Option<solana_sdk::pubkey::Pubkey> {
+    let text = std::fs::read_to_string(LOOKUP_PATH).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v["address"].as_str()?.parse().ok()
+}
+
+fn write_lookup_path(key: &solana_sdk::pubkey::Pubkey) {
+    let body = serde_json::json!({ "address": key.to_string() }).to_string();
+    if let Err(e) = std::fs::write(LOOKUP_PATH, body) {
+        tracing::warn!("could not record lookup table {key} in {LOOKUP_PATH}: {e}");
+    }
+}
 /// How often that record is saved, and idle accounts are looked for.
 const DEMAND_SAVE_INTERVAL: Duration = Duration::from_secs(300);
 /// At most this many accounts opened mid-run in any hour. Each is a refundable deposit
@@ -865,6 +886,13 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
         Ok(r) => tracing::info!("a token account deposits {r} lamports of rent at today's rate"),
         Err(e) => tracing::warn!("could not read the current rent ({e:#}); using {}", trader.account_rent()),
     }
+    // The lookup table from earlier runs, if one was built. See `cb_executor::alt`.
+    if let Some(key) = read_lookup_path() {
+        match trader.load_lookup(key).await {
+            Ok(n) => tracing::info!("using lookup table {key}: {n} addresses"),
+            Err(e) => tracing::warn!("could not load lookup table {key} ({e:#}); a new one will be built if needed"),
+        }
+    }
     let mut base_mints = registry::Registry::embedded()?.base_mints;
     // The base mints are only where cycles *start*. A loop through an intermediate mint
     // the wallet has no account for cannot pass its profit check at all, because the
@@ -1307,6 +1335,8 @@ async fn spawn_live(
             std::collections::VecDeque::new();
         let mut kept_open: std::collections::HashMap<cb_core::types::Pubkey32, std::time::Instant> =
             std::collections::HashMap::new();
+        let mut lookup_grows: std::collections::VecDeque<std::time::Instant> =
+            std::collections::VecDeque::new();
 
         loop {
             tokio::select! {
@@ -1871,6 +1901,19 @@ async fn spawn_live(
                                                         plan.pools.iter().map(|(p, _)| *p).collect();
                                                     if let Err(e) = market.refresh(&ids).await {
                                                         tracing::debug!("could not re-read a stale cycle: {e:#}");
+                                                    }
+                                                }
+                                            }
+                                            // Cleared its floor and did not fit a packet: put what it
+                                            // names into the lookup table, so the next attempt fits.
+                                            if let Some(wanted) = t.take_oversize() {
+                                                lookup_grows.retain(|at| at.elapsed() < Duration::from_secs(3_600));
+                                                if lookup_grows.len() < MAX_LOOKUP_GROWS_PER_HOUR && !wanted.is_empty() {
+                                                    lookup_grows.push_back(std::time::Instant::now());
+                                                    match t.grow_lookup(wanted, LOOKUP_TABLE_CAP).await {
+                                                        Ok(Some(key)) => write_lookup_path(&key),
+                                                        Ok(None) => {}
+                                                        Err(e) => tracing::warn!("could not grow the lookup table: {e:#}"),
                                                     }
                                                 }
                                             }

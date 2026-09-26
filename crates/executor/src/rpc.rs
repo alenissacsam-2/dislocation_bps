@@ -313,6 +313,16 @@ impl Rpc {
         Ok((Hash::from_str(bh).context("unparseable blockhash")?, valid_until))
     }
 
+    /// The current slot at `confirmed`. What a lookup table is seeded from: the chain
+    /// only accepts a slot it still remembers.
+    ///
+    /// # Errors
+    /// If the call fails or the answer is not a number.
+    pub async fn slot(&self) -> Result<u64> {
+        let r = self.call("getSlot", json!([{"commitment": "confirmed"}])).await?;
+        r.as_u64().ok_or_else(|| anyhow!("getSlot returned {r}"))
+    }
+
     /// The lamports an account of `len` bytes must hold to be rent-exempt, as the chain
     /// charges it today.
     ///

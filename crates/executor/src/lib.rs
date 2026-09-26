@@ -28,6 +28,7 @@
 //! encoder therefore still costs nothing, and a right one cannot land at a loss — the
 //! programs enforce the floor whatever our arithmetic says. It is off by default.
 
+pub mod alt;
 pub mod encode;
 pub mod jito;
 pub mod pda;

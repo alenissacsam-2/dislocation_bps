@@ -49,6 +49,8 @@ use cb_executor::route::{self, Hop, RouteOptions, WsolPolicy};
 use cb_executor::venue::raydium::BitmapPolicy;
 use cb_executor::venue::VenueExtra;
 use cb_executor::{ticks, tx, Attempt, Executor, Plan};
+use solana_sdk::instruction::Instruction;
+use solana_sdk::message::AddressLookupTableAccount;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 
@@ -529,7 +531,34 @@ pub struct Trader {
     /// rent fell from 2,039,280 to 1,488,440 lamports for 165 bytes, and a constant
     /// that overstates it by 37% shrinks every trade the wrap reservation sizes.
     account_rent: u64,
+    /// The lookup table trades are compiled against, as far as it is usable now.
+    lookup: Option<AddressLookupTableAccount>,
+    /// Addresses appended to the table but not usable until the slot after they were
+    /// added; promoted into `lookup` once [`LOOKUP_WARMUP`] has passed.
+    lookup_pending: Vec<(std::time::Instant, Vec<Pubkey>)>,
+    /// What the last trade refused for size would have needed from the table.
+    oversize: Option<Vec<Pubkey>>,
 }
+
+/// Move addresses whose warm-up has passed into the usable table. A free function so it
+/// can run while an attempt holds the trader's RPC client borrowed.
+fn promote_lookup(
+    lookup: &mut Option<AddressLookupTableAccount>,
+    pending: &mut Vec<(std::time::Instant, Vec<Pubkey>)>,
+) {
+    let Some(table) = lookup.as_mut() else { return };
+    let (ready, waiting): (Vec<_>, Vec<_>) =
+        std::mem::take(pending).into_iter().partition(|(at, _)| at.elapsed() >= LOOKUP_WARMUP);
+    for (_, addrs) in ready {
+        table.addresses.extend(addrs);
+    }
+    *pending = waiting;
+}
+
+/// How long after an extend its addresses are treated as usable. The program makes
+/// them available from the slot after the extending transaction's; one confirmed
+/// round trip plus this is comfortably past it.
+pub const LOOKUP_WARMUP: std::time::Duration = std::time::Duration::from_millis(1_500);
 
 impl Trader {
     #[must_use]
@@ -547,6 +576,9 @@ impl Trader {
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
+            lookup: None,
+            lookup_pending: Vec::new(),
+            oversize: None,
         }
     }
 
@@ -1774,9 +1806,24 @@ impl Trader {
             Err(e) => return Ok(Attempt::Refused(e.to_string())),
         };
 
-        let assembled = match tx::assemble(&self.exec.wallet, &built.instructions, blockhash) {
+        promote_lookup(&mut self.lookup, &mut self.lookup_pending);
+        let tables: Vec<AddressLookupTableAccount> = self.lookup.iter().cloned().collect();
+        let assembled = match tx::assemble_with(&self.exec.wallet, &built.instructions, blockhash, &tables) {
             Ok(a) => a,
-            Err(e) => return Ok(Attempt::Refused(e.to_string())),
+            Err(e) => {
+                // Cleared its floor and did not fit: remember what the table would need,
+                // so the caller can add it and the next attempt at this cycle fits.
+                if e.to_string().contains("byte limit") {
+                    let held: Vec<Pubkey> =
+                        self.lookup.as_ref().map(|t| t.addresses.clone()).unwrap_or_default();
+                    let mut held = held;
+                    for (_, p) in &self.lookup_pending {
+                        held.extend(p.iter().copied());
+                    }
+                    self.oversize = Some(cb_executor::alt::candidates(&built.instructions, &held));
+                }
+                return Ok(Attempt::Refused(e.to_string()));
+            }
         };
 
         let plan_to_run = Plan {
@@ -1913,71 +1960,150 @@ impl Trader {
             ixs.push(tx::create_ata_idempotent(&self.owner, ata, &self.owner, mint, program));
         }
 
-        // Sent until it actually lands, unlike a trade.
-        //
-        // `Rpc::send` asks the node for three rebroadcasts of the same signed bytes
-        // and then stops, because a stale arbitrage is worthless and chasing one is
-        // worse than dropping it. This is the opposite case. There is no race, nothing
-        // here goes stale but the blockhash, and the transaction only has to arrive —
-        // so three rebroadcasts of one blockhash is not enough on its own.
-        //
-        // Reusing the fire-and-forget path cost a whole run. The first send returned a
-        // signature, the account was reported open, and the transaction was never
-        // included — `getSignatureStatuses` with full history search had never heard of
-        // it, and the wallet's newest transaction was still nine days old. Every
-        // SOL↔USDT cycle stayed blocked behind a wall the log said had come down. A
-        // signature is a receipt for having asked.
-        //
-        // So: re-sign against a fresh blockhash each round, and believe nothing until
-        // the chain confirms it.
+        let what = format!("opening {} token account(s)", missing.len());
+        let sent = self.send_setup(&ixs, &what).await?;
+        if let Some(signature) = &sent {
+            tracing::warn!("opened {} token account(s), confirmed on chain: {signature}", missing.len());
+        }
+        Ok(sent)
+    }
+
+    /// Use the lookup table at `key`, reading its addresses from the chain.
+    ///
+    /// # Errors
+    /// If the chain cannot be reached or the account is not a lookup table.
+    pub async fn load_lookup(&mut self, key: Pubkey) -> Result<usize> {
+        let got = self.exec.rpc.accounts_full(std::slice::from_ref(&key)).await?;
+        let acc = got
+            .into_iter()
+            .next()
+            .flatten()
+            .with_context(|| format!("lookup table {key} does not exist"))?;
+        anyhow::ensure!(
+            acc.owner == pk(cb_executor::alt::PROGRAM_ID),
+            "{key} is not a lookup table"
+        );
+        let table = cb_executor::alt::parse(key, &acc.data)?;
+        let n = table.addresses.len();
+        self.lookup = Some(table);
+        Ok(n)
+    }
+
+    /// The addresses the last trade refused for size would have needed, once.
+    pub fn take_oversize(&mut self) -> Option<Vec<Pubkey>> {
+        self.oversize.take()
+    }
+
+    /// How many addresses the table holds, usable or warming up.
+    #[must_use]
+    pub fn lookup_len(&self) -> usize {
+        self.lookup.as_ref().map_or(0, |t| t.addresses.len())
+            + self.lookup_pending.iter().map(|(_, a)| a.len()).sum::<usize>()
+    }
+
+    /// Add `addresses` to this trader's lookup table, creating the table first if there
+    /// is none. Returns the table's address when it was just created, so the caller can
+    /// remember it across restarts.
+    ///
+    /// The table grows only from trades that cleared their floor and did not fit, so
+    /// the rent it holds — refundable when the table is closed — is spent on cycles
+    /// that have shown they can clear, and never past `cap` addresses.
+    ///
+    /// # Errors
+    /// If the chain cannot be reached or a setup transaction does not land.
+    pub async fn grow_lookup(&mut self, addresses: Vec<Pubkey>, cap: usize) -> Result<Option<Pubkey>> {
+        let room = cap.min(cb_executor::alt::MAX_ADDRESSES).saturating_sub(self.lookup_len());
+        let adding: Vec<Pubkey> = addresses.into_iter().take(room).collect();
+        if adding.is_empty() {
+            return Ok(None);
+        }
+        let mut created = None;
+        let table = match &self.lookup {
+            Some(t) => t.key,
+            None => {
+                let slot = self.exec.rpc.slot().await?;
+                let (ix, key) = cb_executor::alt::create(&self.owner, &self.owner, slot);
+                if self.send_setup(&[ix], "creating a lookup table").await?.is_none() {
+                    return Ok(None);
+                }
+                tracing::warn!("created lookup table {key}");
+                self.lookup = Some(AddressLookupTableAccount { key, addresses: Vec::new() });
+                created = Some(key);
+                key
+            }
+        };
+        for chunk in adding.chunks(cb_executor::alt::EXTEND_CHUNK) {
+            let ix = cb_executor::alt::extend(&table, &self.owner, &self.owner, chunk)?;
+            let what = format!("adding {} addresses to lookup table {table}", chunk.len());
+            if self.send_setup(&[ix], &what).await?.is_none() {
+                return Ok(created);
+            }
+            self.lookup_pending.push((std::time::Instant::now(), chunk.to_vec()));
+        }
+        tracing::warn!(
+            "lookup table {table} now holds {} addresses; cycles that did not fit a packet can",
+            self.lookup_len()
+        );
+        Ok(created)
+    }
+
+    /// Send a one-off setup transaction — opening accounts, building a lookup table —
+    /// and wait until the chain has it. `None` in a dry run, which simulates and stops.
+    ///
+    /// Sent until it actually lands, unlike a trade.
+    ///
+    /// `Rpc::send` asks the node for three rebroadcasts of the same signed bytes
+    /// and then stops, because a stale arbitrage is worthless and chasing one is
+    /// worse than dropping it. This is the opposite case. There is no race, nothing
+    /// here goes stale but the blockhash, and the transaction only has to arrive —
+    /// so three rebroadcasts of one blockhash is not enough on its own.
+    ///
+    /// Reusing the fire-and-forget path cost a whole run. The first send returned a
+    /// signature, the account was reported open, and the transaction was never
+    /// included — `getSignatureStatuses` with full history search had never heard of
+    /// it, and the wallet's newest transaction was still nine days old. A signature
+    /// is a receipt for having asked.
+    ///
+    /// So: re-sign against a fresh blockhash each round, and believe nothing until
+    /// the chain confirms it.
+    ///
+    /// # Errors
+    /// If it does not simulate cleanly, reverts, or is never included.
+    async fn send_setup(&self, ixs: &[Instruction], what: &str) -> Result<Option<String>> {
         const ROUNDS: u32 = 4;
         let mut last_signature = None;
         for round in 1..=ROUNDS {
             let (blockhash, _) = self.exec.rpc.latest_blockhash().await?;
-            let assembled = tx::assemble(&self.exec.wallet, &ixs, blockhash)?;
+            let assembled = tx::assemble(&self.exec.wallet, ixs, blockhash)?;
 
             let sim = self.exec.rpc.simulate(&assembled.tx_base64, &[]).await?;
             if !sim.succeeded() {
                 let ctx = sim.error_context().unwrap_or_default();
                 anyhow::bail!(
-                    "opening the token accounts did not simulate cleanly, so nothing was \
-                     sent: {} {ctx}",
+                    "{what} did not simulate cleanly, so nothing was sent: {} {ctx}",
                     sim.err.unwrap_or_else(|| "unknown".into())
                 );
             }
             if self.opts.dry_run {
-                tracing::info!(
-                    "dry run — the token accounts simulated cleanly and were not opened"
-                );
+                tracing::info!("dry run — {what} simulated cleanly and was not sent");
                 return Ok(None);
             }
 
             let signature = self.exec.rpc.send(&assembled.tx_base64, true).await?;
             last_signature = Some(signature.clone());
             // Fifteen tries at two seconds is thirty seconds of patience, which is
-            // generous for inclusion and costs nothing: this runs once, at startup,
-            // before any sweep is waiting on it.
+            // generous for inclusion and costs nothing: setup runs rarely.
             match self.confirm(&signature, 15).await {
-                Some(true) => {
-                    tracing::warn!(
-                        "opened {} token account(s), confirmed on chain: {signature}",
-                        missing.len()
-                    );
-                    return Ok(Some(signature));
-                }
-                Some(false) => anyhow::bail!(
-                    "the transaction opening the token accounts reverted on chain: {signature}"
-                ),
+                Some(true) => return Ok(Some(signature)),
+                Some(false) => anyhow::bail!("{what} reverted on chain: {signature}"),
                 None if round < ROUNDS => tracing::warn!(
-                    "{signature} has not been included; re-sending against a fresh blockhash \
-                     ({round} of {ROUNDS})"
+                    "{signature} ({what}) has not been included; re-sending against a fresh                      blockhash ({round} of {ROUNDS})"
                 ),
                 None => {}
             }
         }
         anyhow::bail!(
-            "sent the token-account transaction {ROUNDS} times and none was included; the last \
-             was {}. Cycles through those mints stay blocked until one lands.",
+            "sent {what} {ROUNDS} times and none was included; the last was {}",
             last_signature.unwrap_or_else(|| "—".into())
         )
     }
@@ -2417,6 +2543,9 @@ mod tests {
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
+            lookup: None,
+            lookup_pending: Vec::new(),
+            oversize: None,
         };
         let p = plan(3);
         let data = pools_for(&p);
@@ -2451,6 +2580,9 @@ mod tests {
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
+            lookup: None,
+            lookup_pending: Vec::new(),
+            oversize: None,
         };
         let data = pools_for(&plan(3));
         let arrays = vec![[Pubkey::new_unique(); 3]; 3];
@@ -2483,6 +2615,9 @@ mod tests {
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
+            lookup: None,
+            lookup_pending: Vec::new(),
+            oversize: None,
         };
         let data = pools_for(&plan(2));
         let arrays = vec![[Pubkey::new_unique(); 3]; 2];
@@ -2821,6 +2956,9 @@ mod mainnet {
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
+            lookup: None,
+            lookup_pending: Vec::new(),
+            oversize: None,
         };
         let (hops, _) = t.hops_for(&plan, &pool_data, &arrays, &vec![None; plan.pools.len()], &[], 0, 0).expect("hops");
 
@@ -3004,6 +3142,9 @@ mod fresh_quote_tests {
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
+            lookup: None,
+            lookup_pending: Vec::new(),
+            oversize: None,
         };
 
         let mut p = tests::plan(2);
@@ -3044,6 +3185,9 @@ mod fresh_quote_tests {
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
+            lookup: None,
+            lookup_pending: Vec::new(),
+            oversize: None,
         };
         let p = tests::plan(3);
         let (hops, spent) = t
@@ -3091,6 +3235,9 @@ mod fresh_quote_tests {
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
+            lookup: None,
+            lookup_pending: Vec::new(),
+            oversize: None,
         };
         let mut p = tests::plan(2);
         let data = tests::pools_for(&p);
@@ -3142,6 +3289,9 @@ mod fresh_quote_tests {
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
+            lookup: None,
+            lookup_pending: Vec::new(),
+            oversize: None,
             };
             let _ = &t;
             let p = tests::plan(2);
@@ -3196,6 +3346,9 @@ mod fresh_quote_tests {
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
+            lookup: None,
+            lookup_pending: Vec::new(),
+            oversize: None,
         }
     }
 
@@ -3306,6 +3459,9 @@ mod fresh_quote_tests {
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
             account_rent: route::TOKEN_ACCOUNT_RENT,
+            lookup: None,
+            lookup_pending: Vec::new(),
+            oversize: None,
         };
         let p = tests::plan(2);
         // Pools that decode but trade the wrong mints cannot be re-priced at all.
@@ -3387,6 +3543,9 @@ mod account_rent_tests {
             jito_url: cb_executor::jito::DEFAULT_URL.to_string(),
             last_jito_send: None,
             account_rent: cb_executor::route::TOKEN_ACCOUNT_RENT,
+            lookup: None,
+            lookup_pending: Vec::new(),
+            oversize: None,
         };
         t.accounts_held = mints.iter().copied().collect();
         t

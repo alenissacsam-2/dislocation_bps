@@ -838,3 +838,76 @@ mod lollipop_packet {
         assert!(size > tx::PACKET_LIMIT, "{size}: if this fits, the lookup table is not needed");
     }
 }
+
+#[cfg(test)]
+mod lookup_packet {
+    use super::*;
+    use crate::venue::raydium::BitmapPolicy;
+    use solana_sdk::hash::Hash;
+    use solana_sdk::message::AddressLookupTableAccount;
+
+    fn clmm(seed: u8, a: &Pubkey, b: &Pubkey) -> Vec<u8> {
+        let mut d = vec![0u8; cb_dex::raydium_clmm::POOL_LEN];
+        d[9..41].copy_from_slice(&[seed; 32]);
+        d[73..105].copy_from_slice(&a.to_bytes());
+        d[105..137].copy_from_slice(&b.to_bytes());
+        d[137..169].copy_from_slice(&[seed.wrapping_add(1); 32]);
+        d[169..201].copy_from_slice(&[seed.wrapping_add(2); 32]);
+        d[201..233].copy_from_slice(&[seed.wrapping_add(3); 32]);
+        d[233] = 9;
+        d[234] = 6;
+        d[235..237].copy_from_slice(&1u16.to_le_bytes());
+        d[237..253].copy_from_slice(&1_000_000_000u128.to_le_bytes());
+        d[253..269].copy_from_slice(&(1u128 << 64).to_le_bytes());
+        d
+    }
+
+    /// The shape refused 363 times on 2026-09-25 after clearing its floor: three Raydium
+    /// CLMM hops through Jito. Over the packet on its own; well inside it once the
+    /// accounts it names live in a lookup table.
+    #[test]
+    fn a_three_hop_raydium_cycle_fits_once_its_accounts_are_in_a_lookup_table() {
+        let owner = Pubkey::new_unique();
+        let (wsol, x, y) = (pk(programs::WSOL_MINT), Pubkey::new_unique(), Pubkey::new_unique());
+        let (classic, t22) = (pk(programs::SPL_TOKEN), pk(programs::SPL_TOKEN_2022));
+        let arrays = || [Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique()];
+        let hop = |seed, i: Pubkey, o: Pubkey, ip, op, amt, out| Hop {
+            pool: Pubkey::new_unique(),
+            dex: Dex::RaydiumClmm,
+            pool_data: clmm(seed, &i, &o),
+            input_mint: i,
+            output_mint: o,
+            input_is_a: true,
+            input_token_program: ip,
+            output_token_program: op,
+            amount_in: amt,
+            min_amount_out: out,
+            tick_arrays: arrays(),
+        };
+        let hops = vec![
+            hop(0x10, wsol, x, classic, t22, 100_000_000, 10_000),
+            hop(0x20, x, y, t22, classic, 10_000, 20_000),
+            hop(0x30, y, wsol, classic, classic, 20_000, 100_010_000),
+        ];
+        let opts = RouteOptions {
+            wsol: WsolPolicy::WrapAndClose,
+            create_token_accounts: true,
+            others_exist: true,
+            venue: crate::venue::VenueExtra { token_program: classic, bitmap_policy: BitmapPolicy::Auto },
+            min_gain: 6_000,
+            tip: Some((crate::jito::tip_account(0), 1_000)),
+            ..RouteOptions::default()
+        };
+        let built = build(&owner, &hops, 200_000_000, &opts).expect("the route closes");
+        let plain = tx::measure(&owner, &built.instructions, Hash::default()).unwrap();
+        let table = AddressLookupTableAccount {
+            key: Pubkey::new_unique(),
+            addresses: crate::alt::candidates(&built.instructions, &[]),
+        };
+        let looked = tx::measure_with(&owner, &built.instructions, Hash::default(), std::slice::from_ref(&table)).unwrap();
+        eprintln!("three-hop Raydium: {plain} bytes plain, {looked} with a table of {}", table.addresses.len());
+        assert!(plain > tx::PACKET_LIMIT, "{plain}");
+        assert!(looked <= tx::PACKET_LIMIT, "{looked}");
+        assert!(table.addresses.len() <= crate::alt::MAX_ADDRESSES);
+    }
+}

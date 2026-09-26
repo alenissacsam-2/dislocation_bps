@@ -29,7 +29,7 @@ use anyhow::{ensure, Result};
 use cb_wallet::Wallet;
 use solana_sdk::hash::Hash;
 use solana_sdk::instruction::{AccountMeta, Instruction};
-use solana_sdk::message::{v0, VersionedMessage};
+use solana_sdk::message::{v0, AddressLookupTableAccount, VersionedMessage};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::transaction::VersionedTransaction;
@@ -162,10 +162,24 @@ pub fn assemble(
     instructions: &[Instruction],
     blockhash: Hash,
 ) -> Result<Assembled> {
+    assemble_with(wallet, instructions, blockhash, &[])
+}
+
+/// [`assemble`], naming any account held in `lookups` by its index in that table
+/// instead of by key. See [`crate::alt`].
+///
+/// # Errors
+/// As [`assemble`].
+pub fn assemble_with(
+    wallet: &Wallet,
+    instructions: &[Instruction],
+    blockhash: Hash,
+    lookups: &[AddressLookupTableAccount],
+) -> Result<Assembled> {
     ensure!(!instructions.is_empty(), "a transaction with no instructions is not a transaction");
 
     let payer = wallet.pubkey();
-    let message = v0::Message::try_compile(&payer, instructions, &[], blockhash)?;
+    let message = v0::Message::try_compile(&payer, instructions, lookups, blockhash)?;
     let account_count = message.account_keys.len();
     let versioned = VersionedMessage::V0(message);
 
@@ -238,7 +252,20 @@ pub fn compile_unsigned(
 /// # Errors
 /// If the instructions cannot be compiled.
 pub fn measure(payer: &Pubkey, instructions: &[Instruction], blockhash: Hash) -> Result<usize> {
-    let message = v0::Message::try_compile(payer, instructions, &[], blockhash)?;
+    measure_with(payer, instructions, blockhash, &[])
+}
+
+/// [`measure`] with lookup tables.
+///
+/// # Errors
+/// If the instructions cannot be compiled.
+pub fn measure_with(
+    payer: &Pubkey,
+    instructions: &[Instruction],
+    blockhash: Hash,
+    lookups: &[AddressLookupTableAccount],
+) -> Result<usize> {
+    let message = v0::Message::try_compile(payer, instructions, lookups, blockhash)?;
     let versioned = VersionedMessage::V0(message);
     let tx = VersionedTransaction {
         // A placeholder signature is the same 64 bytes as a real one.
