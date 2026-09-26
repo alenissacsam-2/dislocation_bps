@@ -87,6 +87,14 @@ pub const MAX_STALE_LAG_SLOTS: u64 = 1800;
 enum Venue {
     /// Everything needed is in the pool account, including the fee.
     Whirlpool,
+    /// An Orca pool whose oracle is initialised, which makes the program charge a
+    /// volatility surcharge on top of the static fee. Both accounts are watched and
+    /// both are kept, since either moving changes the price. See
+    /// `orca_whirlpool::to_pool_state_adaptive`.
+    WhirlpoolAdaptive {
+        pool: Vec<u8>,
+        oracle: Box<orca_whirlpool::Oracle>,
+    },
     /// Same: self-contained, and quotable across the pool's whole range rather than
     /// one tick of it.
     MeteoraDammV2,
@@ -207,6 +215,18 @@ impl Watch {
                 let bps = fees.as_ref()?.fees(*pump, cap, false).total_bps();
                 pumpswap::to_pool_state(addr, pool, base, quote, bps, self.slot).ok()
             }
+            // Priced for any block time from now on, not just now: the stored state is
+            // what the sweep reads until either account next moves, and it must not
+            // turn generous while it waits. See `Oracle::max_fee_rate`.
+            Venue::WhirlpoolAdaptive { pool, oracle } => orca_whirlpool::to_pool_state_adaptive(
+                addr,
+                pool,
+                oracle,
+                (now_ms() / 1_000).saturating_sub(ADAPTIVE_CLOCK_SLACK_SECS),
+                u64::MAX,
+                self.slot,
+            )
+            .ok(),
             _ => None,
         }
     }
@@ -378,6 +398,8 @@ pub struct LiveMarket {
     vault_index: HashMap<Pubkey32, (Pubkey32, bool)>,
     /// bin array address -> (pool address, array index)
     bin_index: HashMap<Pubkey32, (Pubkey32, i64)>,
+    /// Orca oracle address -> pool address, for the adaptive-fee pools.
+    oracle_index: HashMap<Pubkey32, Pubkey32>,
     pub store: PoolStore,
     pub subscriptions: Vec<Pubkey32>,
     /// USD per *whole* token, rebuilt from live pools rather than assumed.
@@ -387,6 +409,11 @@ pub struct LiveMarket {
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
+
+/// How far behind this machine's clock the chain's block time may run, in seconds.
+/// An adaptive fee depends on the block time a swap lands at; pricing from a little
+/// before now covers a lagging chain clock. See `Oracle::max_fee_rate`.
+pub const ADAPTIVE_CLOCK_SLACK_SECS: u64 = 10;
 
 impl LiveMarket {
     /// Fetch every pool in the registry, resolve fees and vaults, and build the
@@ -408,6 +435,8 @@ impl LiveMarket {
         let mut cpmm_config_b58: Vec<String> = Vec::new();
         let mut cpmm_pending: Vec<(Pubkey32, Pubkey32)> = Vec::new(); // pool, config
         let mut pump_pending: Vec<(Pubkey32, Pubkey32)> = Vec::new(); // pool, base mint
+        let mut orca_pending: Vec<(Pubkey32, String, Vec<u8>)> = Vec::new(); // pool, label, data
+        let mut oracle_index: HashMap<Pubkey32, Pubkey32> = HashMap::new();
         let wsol_raw = pk("So11111111111111111111111111111111111111112")?;
         let store = PoolStore::new();
         let mut failures: Vec<String> = Vec::new();
@@ -420,21 +449,8 @@ impl LiveMarket {
             let addr = entry.address;
 
             match entry.dex {
-                Dex::OrcaWhirlpool => match orca_whirlpool::to_pool_state(addr, data, boot_slot) {
-                    Ok(ps) => {
-                        store.upsert(ps);
-                        watches.insert(
-                            addr,
-                            Watch {
-                                label: entry.label.clone(),
-                                dex: entry.dex,
-                                venue: Venue::Whirlpool,
-                                slot: boot_slot,
-                            },
-                        );
-                    }
-                    Err(e) => failures.push(format!("{}: {e:#}", entry.label)),
-                },
+                // Priced once it is known whether its oracle exists: see below.
+                Dex::OrcaWhirlpool => orca_pending.push((addr, entry.label.clone(), data.clone())),
                 Dex::MeteoraDammV2 => match meteora_damm_v2::to_pool_state(addr, data, boot_slot)
                 {
                     Ok(ps) => {
@@ -639,6 +655,43 @@ impl LiveMarket {
             }
         }
 
+        // Orca pools: the program charges an adaptive fee whenever a pool's oracle is
+        // initialised, whatever the pool account says, so every pool's oracle is read
+        // and its existence decides how the pool is priced.
+        if !orca_pending.is_empty() {
+            let program = cb_executor::encode::pk(orca_whirlpool::PROGRAM_ID);
+            let keys: Vec<Pubkey32> = orca_pending
+                .iter()
+                .map(|(addr, ..)| to_raw(&cb_executor::pda::orca_oracle(&to_pubkey(addr), &program)))
+                .collect();
+            let b58: Vec<String> = keys.iter().map(|k| bs58::encode(k).into_string()).collect();
+            let (oracles, _) = get_multiple_accounts(&client, rpc_http, &b58).await?;
+            let since = (now_ms() / 1_000).saturating_sub(ADAPTIVE_CLOCK_SLACK_SECS);
+            for (((addr, label, data), key), oracle) in orca_pending.into_iter().zip(keys).zip(oracles) {
+                let oracle = oracle
+                    .as_deref()
+                    .and_then(|d| orca_whirlpool::decode_oracle(d).ok())
+                    .filter(|o| o.whirlpool == addr);
+                let (state, venue) = match oracle {
+                    Some(o) => (
+                        orca_whirlpool::to_pool_state_adaptive(addr, &data, &o, since, u64::MAX, boot_slot),
+                        Venue::WhirlpoolAdaptive { pool: data, oracle: Box::new(o) },
+                    ),
+                    None => (orca_whirlpool::to_pool_state(addr, &data, boot_slot), Venue::Whirlpool),
+                };
+                match state {
+                    Ok(ps) => {
+                        store.upsert(ps);
+                        if matches!(venue, Venue::WhirlpoolAdaptive { .. }) {
+                            oracle_index.insert(key, addr);
+                        }
+                        watches.insert(addr, Watch { label, dex: Dex::OrcaWhirlpool, venue, slot: boot_slot });
+                    }
+                    Err(e) => failures.push(format!("{label}: {e:#}")),
+                }
+            }
+        }
+
         // Resolve Raydium CP-Swap fees. A different program from CLMM with a different
         // config layout, so it needs its own round trip rather than sharing the above.
         cpmm_config_b58.sort();
@@ -806,6 +859,7 @@ impl LiveMarket {
         let mut subscriptions: Vec<Pubkey32> = watches.keys().copied().collect();
         subscriptions.extend(vault_index.keys().copied());
         subscriptions.extend(bin_index.keys().copied());
+        subscriptions.extend(oracle_index.keys().copied());
 
         let mut market = Self {
             registry,
@@ -814,6 +868,7 @@ impl LiveMarket {
             watches,
             vault_index,
             bin_index,
+            oracle_index,
             store,
             subscriptions,
             usd: HashMap::new(),
@@ -843,6 +898,10 @@ impl LiveMarket {
             w.slot = w.slot.max(u.slot);
             match &mut w.venue {
                 Venue::Whirlpool => orca_whirlpool::to_pool_state(u.pubkey, &u.data, u.slot).ok()?,
+                Venue::WhirlpoolAdaptive { pool, .. } => {
+                    pool.clone_from(&u.data);
+                    self.watches.get(&u.pubkey)?.vault_state(u.pubkey)?
+                }
                 Venue::MeteoraDammV2 => {
                     meteora_damm_v2::to_pool_state(u.pubkey, &u.data, u.slot).ok()?
                 }
@@ -894,6 +953,16 @@ impl LiveMarket {
             w.slot = w.slot.max(u.slot);
             if let Venue::MeteoraDlmm { arrays, .. } = &mut w.venue {
                 arrays.insert(ix, (u.slot, array));
+            }
+            self.watches.get(&pool)?.vault_state(pool)?
+        } else if let Some(&pool) = self.oracle_index.get(&u.pubkey) {
+            // Every swap on the pool writes its oracle: the accumulator, the reference
+            // and their timestamps all move, and with them the fee.
+            let decoded = orca_whirlpool::decode_oracle(&u.data).ok()?;
+            let w = self.watches.get_mut(&pool)?;
+            w.slot = w.slot.max(u.slot);
+            if let Venue::WhirlpoolAdaptive { oracle, .. } = &mut w.venue {
+                **oracle = decoded;
             }
             self.watches.get(&pool)?.vault_state(pool)?
         } else {
@@ -1210,6 +1279,30 @@ impl LiveMarket {
             }
         }
 
+        // Oracles too: an adaptive pool rebuilt against a stale oracle is priced at a
+        // fee from minutes ago.
+        let oracle_b58: Vec<String> = self
+            .oracle_index
+            .iter()
+            .filter(|(_, pool)| wanted(pool))
+            .map(|(k, _)| bs58::encode(k).into_string())
+            .collect();
+        if !oracle_b58.is_empty() {
+            let (oracles, _) =
+                get_multiple_accounts(&self.client, &self.rpc_http, &oracle_b58).await?;
+            for (b58, data) in oracle_b58.iter().zip(oracles.iter()) {
+                let Some(data) = data else { continue };
+                let Ok(decoded) = orca_whirlpool::decode_oracle(data) else { continue };
+                let Ok(key) = pk(b58) else { continue };
+                let Some(&pool) = self.oracle_index.get(&key) else { continue };
+                if let Some(Venue::WhirlpoolAdaptive { oracle, .. }) =
+                    self.watches.get_mut(&pool).map(|w| &mut w.venue)
+                {
+                    **oracle = decoded;
+                }
+            }
+        }
+
         let mut report = ReconcileReport { checked: addresses.len(), slot, ..Default::default() };
         for (b58, data) in addresses.iter().zip(accounts.iter()) {
             let Ok(addr) = pk(b58) else { continue };
@@ -1240,6 +1333,10 @@ impl LiveMarket {
         w.slot = w.slot.max(slot);
         match &mut w.venue {
             Venue::Whirlpool => orca_whirlpool::to_pool_state(addr, data, slot).ok(),
+            Venue::WhirlpoolAdaptive { pool, .. } => {
+                *pool = data.to_vec();
+                self.watches.get(&addr)?.vault_state(addr)
+            }
             Venue::MeteoraDammV2 => meteora_damm_v2::to_pool_state(addr, data, slot).ok(),
             Venue::RaydiumClmm { trade_fee_ppm } => {
                 raydium_clmm::to_pool_state(addr, data, *trade_fee_ppm, slot, now_ms() / 1_000).ok()
@@ -1566,6 +1663,7 @@ mod tests {
             watches: HashMap::new(),
             vault_index: HashMap::new(),
             bin_index: HashMap::new(),
+            oracle_index: HashMap::new(),
             store,
             subscriptions: Vec::new(),
             usd: HashMap::new(),

@@ -105,9 +105,6 @@ async function accounts(keys, slice) {
     if (!acc) return;
     const v = VENUE[acc.owner];
     const d = Buffer.from(acc.data[0], "base64");
-    // An adaptive-fee whirlpool keeps its surcharge in an oracle account the bot does
-    // not read yet, so the bot refuses to price it; choosing one would waste a slot.
-    if (v.dex === "orca_whirlpool" && d.readUInt16LE(43) !== d.readUInt16LE(41)) return;
     pools.set(k, { dex: v.dex, mint_a: b58(d.subarray(v.a, v.a + 32)), mint_b: b58(d.subarray(v.b, v.b + 32)), n: 0 });
   });
 

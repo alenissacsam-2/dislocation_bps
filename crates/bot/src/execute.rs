@@ -118,6 +118,11 @@ pub const PROBE_TIPS: [u64; 4] = [1_000, 3_000, 9_000, 27_000];
 /// send path that breaks mid-run is noticed within this long.
 pub const PROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
+/// How long after it is priced a trade is assumed to land, for an adaptive-fee
+/// whirlpool whose fee depends on the block time. Past this a Jito bundle has long since
+/// been dropped, so a fee that could only apply later is not one it can pay.
+const ADAPTIVE_LANDS_WITHIN_SECS: u64 = 20;
+
 /// Whether [`cb_executor::venue::build_swap`] can encode a swap on this venue.
 ///
 /// One definition rather than a `matches!` repeated at each of the places that need to
@@ -871,7 +876,26 @@ impl Trader {
         bins: &[&[u8]],
     ) -> Option<Leg> {
         let state = match dex {
-            Dex::OrcaWhirlpool => cb_dex::orca_whirlpool::to_pool_state(address, data, 0).ok()?,
+            // With its oracle, priced at the most the program could charge for a landing
+            // in the next few seconds; without one, the static fee is the whole fee.
+            Dex::OrcaWhirlpool => match bins.first() {
+                Some(oracle) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    let oracle = cb_dex::orca_whirlpool::decode_oracle(oracle).ok()?;
+                    cb_dex::orca_whirlpool::to_pool_state_adaptive(
+                        address,
+                        data,
+                        &oracle,
+                        now.saturating_sub(crate::live::ADAPTIVE_CLOCK_SLACK_SECS),
+                        now + ADAPTIVE_LANDS_WITHIN_SECS,
+                        0,
+                    )
+                    .ok()?
+                }
+                None => cb_dex::orca_whirlpool::to_pool_state(address, data, 0).ok()?,
+            },
             Dex::RaydiumClmm => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1468,6 +1492,18 @@ impl Trader {
             bin_at[i] = Some((at, indices));
         }
 
+        // Each whirlpool hop's oracle, in this same round trip. The program charges its
+        // adaptive fee whenever that account is initialised, so whether it exists is
+        // read, not assumed; for a static pool it comes back empty and costs nothing.
+        let orca_program = pk(cb_dex::orca_whirlpool::PROGRAM_ID);
+        let mut oracle_at: Vec<Option<usize>> = vec![None; n];
+        for (i, (pool_raw, dex)) in plan.pools.iter().enumerate() {
+            if *dex == Dex::OrcaWhirlpool {
+                oracle_at[i] = Some(keys.len());
+                keys.push(pda::orca_oracle(&to_pubkey(pool_raw), &orca_program));
+            }
+        }
+
         let (fetched, (blockhash, _)) =
             tokio::try_join!(rpc.accounts_latest(&keys), rpc.latest_blockhash())?;
         {
@@ -1630,6 +1666,15 @@ impl Trader {
         }
         for (pool_raw, hint) in bins_learned {
             self.bins_seen.insert(pool_raw, hint);
+        }
+        // An initialised oracle rides with its whirlpool hop the way bin arrays ride
+        // with a binned one: the one extra account that hop is priced from.
+        for (i, at) in oracle_at.iter().enumerate() {
+            if let Some(acc) = at.and_then(|k| fetched.get(k)).and_then(Option::as_ref) {
+                if acc.owner == orca_program {
+                    bins[i] = vec![acc.data.clone()];
+                }
+            }
         }
 
         // Which tick arrays actually exist, in the direction each hop will move the

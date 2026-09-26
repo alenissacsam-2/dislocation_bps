@@ -23,6 +23,21 @@
 //! Offsets verified against six live mainnet pools spanning every common tick spacing
 //! on 2026-08-21, cross-checked against the values Orca's own API reports for the same
 //! pools.
+//!
+//! # Adaptive-fee pools
+//!
+//! Some pools charge a volatility surcharge on top of their static `fee_rate`, held in a
+//! per-pool `Oracle` account (PDA `["oracle", whirlpool]`). The program applies it
+//! whenever that account is initialised; the pool's `tick_spacing_seed` holding a
+//! fee-tier index instead of the spacing is only the marker such pools are created
+//! with. The surcharge is `ceil(control · (accumulator · tick_group_size)² / 10¹³)`
+//! ppm, where the accumulator counts tick groups moved away from a reference that decays
+//! with time — so the fee a swap pays depends on the block time it lands at.
+//! [`Oracle::max_fee_rate`] prices the worst the program could charge anywhere in a
+//! window of block times, and [`to_pool_state_adaptive`] bounds the quote to the current
+//! tick group, the range over which the program holds that fee fixed. Ported from
+//! `programs/whirlpool/src/state/oracle.rs` and `manager/fee_rate_manager.rs` of
+//! orca-so/whirlpools, and checked against the program by simulation.
 
 use anyhow::{ensure, Result};
 use cb_core::clmm;
@@ -85,18 +100,15 @@ pub struct Whirlpool {
     /// against state that has already been read once.
     pub vault_a: Pubkey32,
     pub vault_b: Pubkey32,
+    /// The fee-tier index in `tick_spacing_seed` differs from the spacing: the pool was
+    /// created with an adaptive fee, and its oracle holds the rest of it.
+    pub adaptive: bool,
 }
 
 /// Decode a Whirlpool account.
 ///
-/// # Rejections
-///
-/// Rejects **adaptive-fee pools**. Orca overloads the `tick_spacing_seed` field on
-/// those to hold a fee-tier index instead of a copy of the tick spacing, and their
-/// effective fee carries a volatility surcharge held in a separate oracle account.
-/// Quoting one at its base `fee_rate` would understate the fee, which overstates
-/// profit — exactly the direction that loses money. Since the disagreement between
-/// the two fields is the documented marker, we use it and decline to decode.
+/// An adaptive-fee pool decodes, flagged [`Whirlpool::adaptive`]: building a swap needs
+/// its accounts like any other. Pricing one needs its oracle — see [`to_pool_state`].
 pub fn decode(data: &[u8]) -> Result<Whirlpool> {
     ensure!(
         data.len() >= WHIRLPOOL_LEN,
@@ -107,11 +119,6 @@ pub fn decode(data: &[u8]) -> Result<Whirlpool> {
     let tick_spacing = u16_at(data, OFF_TICK_SPACING);
     let seed = u16_at(data, OFF_TICK_SPACING_SEED);
     ensure!(tick_spacing > 0, "whirlpool with zero tick spacing");
-    ensure!(
-        seed == tick_spacing,
-        "adaptive-fee whirlpool (fee tier index {seed} != spacing {tick_spacing}): its true fee \
-         lives in an oracle account we do not read, so quoting it would understate cost"
-    );
 
     let fee_rate_ppm = u32::from(u16_at(data, OFF_FEE_RATE));
     ensure!(fee_rate_ppm < 1_000_000, "whirlpool fee rate {fee_rate_ppm}ppm is not a fee");
@@ -132,6 +139,7 @@ pub fn decode(data: &[u8]) -> Result<Whirlpool> {
         tick_current,
         vault_a: pubkey_at(data, OFF_VAULT_A),
         vault_b: pubkey_at(data, OFF_VAULT_B),
+        adaptive: seed != tick_spacing,
     })
 }
 
@@ -141,8 +149,17 @@ pub fn decode(data: &[u8]) -> Result<Whirlpool> {
 /// Returns an error when the pool has no liquidity at the current price, or when the
 /// price sits outside its own tick's bounds — both mean there is nothing quotable
 /// here, and both are normal for thin pools rather than signs of a decode error.
+///
+/// Refuses a pool marked adaptive: its static `fee_rate` is only part of what it charges,
+/// and quoting it alone would understate cost. Such a pool is priced by
+/// [`to_pool_state_adaptive`] with its oracle.
 pub fn to_pool_state(address: Pubkey32, data: &[u8], slot: u64) -> Result<PoolState> {
     let w = decode(data)?;
+    ensure!(
+        !w.adaptive,
+        "adaptive-fee whirlpool: its true fee needs its oracle account, which this price was \
+         not given, and quoting the static part alone would understate cost"
+    );
     ensure!(w.liquidity > 0, "whirlpool has no liquidity at the current price");
 
     ensure!(
@@ -171,6 +188,244 @@ pub fn to_pool_state(address: Pubkey32, data: &[u8], slot: u64) -> Result<PoolSt
             sqrt_hi_x64,
         },
         fee_ppm: w.fee_rate_ppm,
+        slot,
+    })
+}
+
+/// Serialised length of the `Oracle` account: discriminator, whirlpool, trade-enable
+/// timestamp, 34 bytes of constants, 44 of variables, 128 reserved.
+pub const ORACLE_LEN: usize = 254;
+
+const OFF_ORACLE_WHIRLPOOL: usize = 8;
+const OFF_TRADE_ENABLE: usize = 40;
+const OFF_FILTER_PERIOD: usize = 48;
+const OFF_DECAY_PERIOD: usize = 50;
+const OFF_REDUCTION_FACTOR: usize = 52;
+const OFF_CONTROL_FACTOR: usize = 54;
+const OFF_MAX_VOLATILITY: usize = 58;
+const OFF_TICK_GROUP_SIZE: usize = 62;
+const OFF_LAST_REFERENCE_UPDATE: usize = 82;
+const OFF_LAST_MAJOR_SWAP: usize = 90;
+const OFF_VOLATILITY_REFERENCE: usize = 98;
+const OFF_TICK_GROUP_REFERENCE: usize = 102;
+const OFF_VOLATILITY_ACCUMULATOR: usize = 106;
+
+/// The program's constants, as `oracle.rs` and `fee_rate_manager.rs` define them.
+const VOLATILITY_ACCUMULATOR_SCALE_FACTOR: u64 = 10_000;
+const REDUCTION_FACTOR_DENOMINATOR: u64 = 10_000;
+const ADAPTIVE_FEE_CONTROL_FACTOR_DENOMINATOR: u128 = 100_000;
+/// A reference older than this, in seconds, is reset outright.
+const MAX_REFERENCE_AGE: u64 = 3_600;
+/// No total fee exceeds 10%.
+pub const FEE_RATE_HARD_LIMIT: u32 = 100_000;
+
+fn u32_at(d: &[u8], o: usize) -> u32 {
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&d[o..o + 4]);
+    u32::from_le_bytes(b)
+}
+
+fn u64_at(d: &[u8], o: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&d[o..o + 8]);
+    u64::from_le_bytes(b)
+}
+
+/// An adaptive-fee pool's oracle: the fee's constants and its moving state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Oracle {
+    pub whirlpool: Pubkey32,
+    /// No swap is accepted before this block time.
+    pub trade_enable_timestamp: u64,
+    /// Seconds after the last reference update within which a swap leaves the reference
+    /// alone ("high frequency").
+    pub filter_period: u16,
+    /// Seconds after which the reference resets to zero instead of decaying.
+    pub decay_period: u16,
+    /// Share of the accumulator kept as the new reference, over 10,000.
+    pub reduction_factor: u16,
+    /// Scales the squared accumulator into a fee, over 100,000.
+    pub adaptive_fee_control_factor: u32,
+    pub max_volatility_accumulator: u32,
+    /// A tick group is `floor(tick / tick_group_size)`.
+    pub tick_group_size: u16,
+    pub last_reference_update_timestamp: u64,
+    pub last_major_swap_timestamp: u64,
+    pub volatility_reference: u32,
+    pub tick_group_index_reference: i32,
+    pub volatility_accumulator: u32,
+}
+
+/// Decode an `Oracle` account.
+///
+/// # Errors
+/// If it is too short, or its constants are ones the program would never have accepted
+/// — which means the bytes are not an oracle.
+pub fn decode_oracle(data: &[u8]) -> Result<Oracle> {
+    ensure!(data.len() >= ORACLE_LEN, "oracle account too short: {} bytes, need {ORACLE_LEN}", data.len());
+    let o = Oracle {
+        whirlpool: pubkey_at(data, OFF_ORACLE_WHIRLPOOL),
+        trade_enable_timestamp: u64_at(data, OFF_TRADE_ENABLE),
+        filter_period: u16_at(data, OFF_FILTER_PERIOD),
+        decay_period: u16_at(data, OFF_DECAY_PERIOD),
+        reduction_factor: u16_at(data, OFF_REDUCTION_FACTOR),
+        adaptive_fee_control_factor: u32_at(data, OFF_CONTROL_FACTOR),
+        max_volatility_accumulator: u32_at(data, OFF_MAX_VOLATILITY),
+        tick_group_size: u16_at(data, OFF_TICK_GROUP_SIZE),
+        last_reference_update_timestamp: u64_at(data, OFF_LAST_REFERENCE_UPDATE),
+        last_major_swap_timestamp: u64_at(data, OFF_LAST_MAJOR_SWAP),
+        volatility_reference: u32_at(data, OFF_VOLATILITY_REFERENCE),
+        tick_group_index_reference: i32_at(data, OFF_TICK_GROUP_REFERENCE),
+        volatility_accumulator: u32_at(data, OFF_VOLATILITY_ACCUMULATOR),
+    };
+    // The program's own validation of the constants: anything else is not an oracle.
+    ensure!(
+        o.filter_period > 0 && o.decay_period > o.filter_period,
+        "oracle periods {} / {} are not ones the program accepts",
+        o.filter_period,
+        o.decay_period
+    );
+    ensure!(
+        u64::from(o.reduction_factor) < REDUCTION_FACTOR_DENOMINATOR
+            && u128::from(o.adaptive_fee_control_factor) < ADAPTIVE_FEE_CONTROL_FACTOR_DENOMINATOR
+            && o.tick_group_size > 0
+            && u64::from(o.max_volatility_accumulator) * u64::from(o.tick_group_size) <= u64::from(u32::MAX),
+        "oracle constants are not ones the program accepts"
+    );
+    Ok(o)
+}
+
+impl Oracle {
+    /// The tick group a tick is in.
+    #[must_use]
+    pub fn tick_group(&self, tick: i32) -> i32 {
+        tick.div_euclid(i32::from(self.tick_group_size))
+    }
+
+    /// The volatility accumulator the first step of a swap starting in `tick_group` at
+    /// block time `t` is priced with: the program's `update_reference` then
+    /// `update_volatility_accumulator`, exactly. `None` where the program refuses the
+    /// swap, for a block time before the oracle's own last update.
+    #[must_use]
+    pub fn accumulator_at(&self, tick_group: i32, t: u64) -> Option<u32> {
+        let max_ts = self.last_reference_update_timestamp.max(self.last_major_swap_timestamp);
+        if t < max_ts {
+            return None;
+        }
+        let (mut reference, mut index) = (self.volatility_reference, self.tick_group_index_reference);
+        if t - self.last_reference_update_timestamp > MAX_REFERENCE_AGE {
+            reference = 0;
+            index = tick_group;
+        } else {
+            let elapsed = t - max_ts;
+            if elapsed < u64::from(self.filter_period) {
+                // A high-frequency swap: the reference stands.
+            } else if elapsed < u64::from(self.decay_period) {
+                index = tick_group;
+                reference = (u64::from(self.volatility_accumulator) * u64::from(self.reduction_factor)
+                    / REDUCTION_FACTOR_DENOMINATOR) as u32;
+            } else {
+                index = tick_group;
+                reference = 0;
+            }
+        }
+        let delta = (i64::from(index) - i64::from(tick_group)).unsigned_abs();
+        let acc = u64::from(reference).saturating_add(delta.saturating_mul(VOLATILITY_ACCUMULATOR_SCALE_FACTOR));
+        Some(acc.min(u64::from(self.max_volatility_accumulator)) as u32)
+    }
+
+    /// The surcharge, in ppm, an accumulator of `acc` adds to the static fee.
+    #[must_use]
+    pub fn adaptive_fee_rate(&self, acc: u32) -> u32 {
+        let crossed = u128::from(acc) * u128::from(self.tick_group_size);
+        let squared = crossed * crossed;
+        let denominator = ADAPTIVE_FEE_CONTROL_FACTOR_DENOMINATOR
+            * u128::from(VOLATILITY_ACCUMULATOR_SCALE_FACTOR)
+            * u128::from(VOLATILITY_ACCUMULATOR_SCALE_FACTOR);
+        let fee = (u128::from(self.adaptive_fee_control_factor) * squared).div_ceil(denominator);
+        u32::try_from(fee.min(u128::from(FEE_RATE_HARD_LIMIT))).unwrap_or(FEE_RATE_HARD_LIMIT)
+    }
+
+    /// The most the program could charge, static fee included, on the first tick group
+    /// of a swap starting at `tick_current` and landing at any block time in
+    /// `[t_lo, t_hi]`. `None` if no time in that window can swap at all.
+    ///
+    /// The accumulator is constant between the instants its branch changes — the last
+    /// update, the end of the filter and decay windows, the reference's maximum age — so
+    /// it is evaluated at the window's start and at each of those inside it, and the
+    /// largest taken. Largest, not latest: decaying can *raise* it, when the price has
+    /// come back to the reference group since the last swap.
+    #[must_use]
+    pub fn max_fee_rate(&self, static_fee_ppm: u32, tick_current: i32, t_lo: u64, t_hi: u64) -> Option<u32> {
+        let group = self.tick_group(tick_current);
+        let max_ts = self.last_reference_update_timestamp.max(self.last_major_swap_timestamp);
+        let breaks = [
+            max_ts,
+            max_ts.saturating_add(u64::from(self.filter_period)),
+            max_ts.saturating_add(u64::from(self.decay_period)),
+            self.last_reference_update_timestamp.saturating_add(MAX_REFERENCE_AGE + 1),
+        ];
+        let acc = std::iter::once(t_lo)
+            .chain(breaks.into_iter().filter(|b| (t_lo..=t_hi).contains(b)))
+            .filter_map(|t| self.accumulator_at(group, t))
+            .max()?;
+        Some(static_fee_ppm.saturating_add(self.adaptive_fee_rate(acc)).min(FEE_RATE_HARD_LIMIT))
+    }
+}
+
+/// Price an adaptive-fee pool with its oracle, for a swap landing at a block time in
+/// `[t_lo, t_hi]` (unix seconds).
+///
+/// The fee is [`Oracle::max_fee_rate`] over that window, and the quote is bounded to the
+/// current tick group rather than the tick-spacing interval: the program re-prices its
+/// fee at every group boundary it crosses, upward as it moves away from the reference,
+/// so only the first group's fee is known here. A group never spans more than the
+/// spacing interval, whose liquidity is constant.
+///
+/// # Errors
+/// If the oracle belongs to another pool, trading is not yet enabled, the pool has no
+/// liquidity, or its price and tick disagree.
+pub fn to_pool_state_adaptive(
+    address: Pubkey32,
+    data: &[u8],
+    oracle: &Oracle,
+    t_lo: u64,
+    t_hi: u64,
+    slot: u64,
+) -> Result<PoolState> {
+    let w = decode(data)?;
+    ensure!(oracle.whirlpool == address, "this oracle belongs to another whirlpool");
+    ensure!(
+        oracle.trade_enable_timestamp <= t_lo,
+        "whirlpool trading opens at {}, after this swap could land",
+        oracle.trade_enable_timestamp
+    );
+    ensure!(w.liquidity > 0, "whirlpool has no liquidity at the current price");
+    ensure!(
+        clmm::price_belongs_to_tick(w.sqrt_price_x64, w.tick_current, w.tick_spacing),
+        "sqrt price {} does not belong to tick {} at spacing {}",
+        w.sqrt_price_x64,
+        w.tick_current,
+        w.tick_spacing
+    );
+    ensure!(
+        w.tick_spacing % oracle.tick_group_size == 0,
+        "tick group size {} does not divide spacing {}",
+        oracle.tick_group_size,
+        w.tick_spacing
+    );
+    let fee_ppm = oracle
+        .max_fee_rate(w.fee_rate_ppm, w.tick_current, t_lo, t_hi)
+        .ok_or_else(|| anyhow::anyhow!("no block time in the window can swap this pool"))?;
+    let (sqrt_lo_x64, sqrt_hi_x64) = clmm::bounds(w.tick_current, oracle.tick_group_size)
+        .ok_or_else(|| anyhow::anyhow!("could not bound tick group of {}", w.tick_current))?;
+    Ok(PoolState {
+        id: PoolId(address),
+        dex: Dex::OrcaWhirlpool,
+        mint_a: w.mint_a,
+        mint_b: w.mint_b,
+        math: PoolMath::Concentrated { liquidity: w.liquidity, sqrt_price_x64: w.sqrt_price_x64, sqrt_lo_x64, sqrt_hi_x64 },
+        fee_ppm,
         slot,
     })
 }
@@ -245,13 +500,121 @@ mod tests {
     }
 
     /// The rejection that protects the money: an adaptive-fee pool's real fee is not
-    /// the one in this account.
+    /// the one in this account, so it is never priced without its oracle.
     #[test]
-    fn adaptive_fee_pools_are_refused() {
+    fn adaptive_fee_pools_decode_but_are_not_priced_without_their_oracle() {
         // Same pool, but the seed field holds a fee-tier index instead of the spacing.
         let d = account(4, 1024, 400, 758_634_162_063_829, 5_569_625_019_338_410_820, -23953, 1, 2);
-        let err = decode(&d).unwrap_err().to_string();
+        assert!(decode(&d).unwrap().adaptive, "building a swap still needs its accounts");
+        let err = to_pool_state([9u8; 32], &d, 1).unwrap_err().to_string();
         assert!(err.contains("adaptive-fee"), "unexpected error: {err}");
+        assert!(!decode(&sol_usdc()).unwrap().adaptive);
+    }
+
+    fn oracle() -> Oracle {
+        Oracle {
+            whirlpool: [9u8; 32],
+            trade_enable_timestamp: 0,
+            filter_period: 30,
+            decay_period: 600,
+            reduction_factor: 5_000,
+            adaptive_fee_control_factor: 4_000,
+            max_volatility_accumulator: 350_000,
+            tick_group_size: 4,
+            last_reference_update_timestamp: 1_000,
+            last_major_swap_timestamp: 1_000,
+            volatility_reference: 20_000,
+            tick_group_index_reference: -5_990,
+            volatility_accumulator: 60_000,
+        }
+    }
+
+    #[test]
+    fn the_oracle_layout_round_trips() {
+        let o = oracle();
+        let mut d = vec![0u8; ORACLE_LEN];
+        d[OFF_ORACLE_WHIRLPOOL..OFF_ORACLE_WHIRLPOOL + 32].copy_from_slice(&o.whirlpool);
+        d[OFF_FILTER_PERIOD..OFF_FILTER_PERIOD + 2].copy_from_slice(&o.filter_period.to_le_bytes());
+        d[OFF_DECAY_PERIOD..OFF_DECAY_PERIOD + 2].copy_from_slice(&o.decay_period.to_le_bytes());
+        d[OFF_REDUCTION_FACTOR..OFF_REDUCTION_FACTOR + 2].copy_from_slice(&o.reduction_factor.to_le_bytes());
+        d[OFF_CONTROL_FACTOR..OFF_CONTROL_FACTOR + 4].copy_from_slice(&o.adaptive_fee_control_factor.to_le_bytes());
+        d[OFF_MAX_VOLATILITY..OFF_MAX_VOLATILITY + 4].copy_from_slice(&o.max_volatility_accumulator.to_le_bytes());
+        d[OFF_TICK_GROUP_SIZE..OFF_TICK_GROUP_SIZE + 2].copy_from_slice(&o.tick_group_size.to_le_bytes());
+        d[OFF_LAST_REFERENCE_UPDATE..OFF_LAST_REFERENCE_UPDATE + 8]
+            .copy_from_slice(&o.last_reference_update_timestamp.to_le_bytes());
+        d[OFF_LAST_MAJOR_SWAP..OFF_LAST_MAJOR_SWAP + 8].copy_from_slice(&o.last_major_swap_timestamp.to_le_bytes());
+        d[OFF_VOLATILITY_REFERENCE..OFF_VOLATILITY_REFERENCE + 4]
+            .copy_from_slice(&o.volatility_reference.to_le_bytes());
+        d[OFF_TICK_GROUP_REFERENCE..OFF_TICK_GROUP_REFERENCE + 4]
+            .copy_from_slice(&o.tick_group_index_reference.to_le_bytes());
+        d[OFF_VOLATILITY_ACCUMULATOR..OFF_VOLATILITY_ACCUMULATOR + 4]
+            .copy_from_slice(&o.volatility_accumulator.to_le_bytes());
+        assert_eq!(decode_oracle(&d).unwrap(), o);
+        assert!(decode_oracle(&d[..ORACLE_LEN - 1]).is_err());
+        // Constants the program would never have accepted are not an oracle.
+        d[OFF_DECAY_PERIOD..OFF_DECAY_PERIOD + 2].copy_from_slice(&10u16.to_le_bytes());
+        assert!(decode_oracle(&d).is_err(), "decay no longer than the filter");
+    }
+
+    /// Each branch of the program's reference update, at the tick group two away from
+    /// the reference.
+    #[test]
+    fn the_accumulator_follows_every_branch_of_the_reference_update() {
+        let o = oracle();
+        let g = -5_988;
+        // Inside the filter window the reference stands: 20,000 + 2 groups.
+        assert_eq!(o.accumulator_at(g, 1_010), Some(40_000));
+        // Past it, the reference becomes half the last accumulator, centred here.
+        assert_eq!(o.accumulator_at(g, 1_100), Some(30_000));
+        // Past the decay window it resets.
+        assert_eq!(o.accumulator_at(g, 1_700), Some(0));
+        // And a block time before the last update is one the program refuses.
+        assert_eq!(o.accumulator_at(g, 999), None);
+        // Far from the reference it is capped.
+        assert_eq!(o.accumulator_at(g + 100, 1_010), Some(350_000));
+    }
+
+    /// ceil(4,000 · (40,000 · 4)² / 10¹³) = ceil(10.24) = 11 ppm, and the hard limit holds.
+    #[test]
+    fn the_surcharge_matches_the_programs_formula() {
+        let mut o = oracle();
+        assert_eq!(o.adaptive_fee_rate(40_000), 11);
+        assert_eq!(o.adaptive_fee_rate(350_000), 784, "4,000 · 1,400,000² / 10¹³");
+        assert_eq!(o.adaptive_fee_rate(0), 0);
+        assert_eq!(o.adaptive_fee_rate(1), 1, "any volatility rounds up to a ppm");
+        o.adaptive_fee_control_factor = 99_999;
+        o.tick_group_size = 64;
+        assert_eq!(o.adaptive_fee_rate(1_000_000), FEE_RATE_HARD_LIMIT);
+    }
+
+    /// Back in the reference group, the high-frequency branch charges only the old
+    /// reference while the decay branch charges half the last accumulator: the window's
+    /// worst is the later, larger one.
+    #[test]
+    fn the_worst_fee_in_a_window_can_come_from_decay() {
+        let o = oracle();
+        let tick = -5_990 * 4; // the reference group itself
+        let now_only = o.max_fee_rate(400, tick, 1_010, 1_010).unwrap();
+        assert_eq!(now_only, 400 + o.adaptive_fee_rate(20_000));
+        let spanning = o.max_fee_rate(400, tick, 1_010, 1_040).unwrap();
+        assert_eq!(spanning, 400 + o.adaptive_fee_rate(30_000), "decay starts at 1,030");
+        assert!(spanning > now_only);
+    }
+
+    #[test]
+    fn an_adaptive_pool_is_bounded_to_its_tick_group_and_pays_the_surcharge() {
+        let mut o = oracle();
+        o.tick_group_size = 1;
+        let d = account(4, 1024, 400, 758_634_162_063_829, 5_569_625_019_338_410_820, -23953, 1, 2);
+        let plain = to_pool_state([9u8; 32], &account(4, 4, 400, 758_634_162_063_829, 5_569_625_019_338_410_820, -23953, 1, 2), 1).unwrap();
+        let p = to_pool_state_adaptive([9u8; 32], &d, &o, 1_010, 1_020, 1).unwrap();
+        assert!(p.fee_ppm > 400, "the surcharge is charged: {}", p.fee_ppm);
+        let (a, b) = (p.leg_for_input(&[1u8; 32]).unwrap(), plain.leg_for_input(&[1u8; 32]).unwrap());
+        assert!(a.max_in < b.max_in, "one tick of room, not the spacing's four");
+        // Another pool's oracle, or trading not yet open, prices nothing.
+        assert!(to_pool_state_adaptive([8u8; 32], &d, &o, 1_010, 1_020, 1).is_err());
+        o.trade_enable_timestamp = 2_000;
+        assert!(to_pool_state_adaptive([9u8; 32], &d, &o, 1_010, 1_020, 1).is_err());
     }
 
     #[test]

@@ -304,15 +304,18 @@ mod tests {
         assert!(swap(&no_floor, &data).is_err());
     }
 
-    /// The decoder refuses adaptive-fee pools, and the encoder must inherit that
-    /// refusal rather than building a swap the quote never priced correctly.
+    /// An adaptive-fee pool is priced from its oracle now, and its swap must hand the
+    /// program that oracle writable: the program records the new accumulator in it.
     #[test]
-    fn an_adaptive_fee_pool_is_refused_by_inheritance() {
+    fn an_adaptive_fee_pool_encodes_with_its_oracle_writable() {
         let (src, dst, pool) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
         let mut data = whirlpool([1; 32], [2; 32], [3; 32], [4; 32]);
         // Break the seed/spacing agreement, which is the adaptive-fee marker.
         data[43..45].copy_from_slice(&7u16.to_le_bytes());
-        assert!(swap(&ctx(true, src, dst, pool), &data).is_err());
+        let ix = swap(&ctx(true, src, dst, pool), &data).unwrap();
+        let oracle = orca_oracle(&pool, &pk(cb_dex::orca_whirlpool::PROGRAM_ID));
+        let meta = ix.accounts.iter().find(|m| m.pubkey == oracle).expect("the oracle is named");
+        assert!(meta.is_writable, "the program writes the accumulator back");
     }
 }
 
