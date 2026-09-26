@@ -1666,6 +1666,11 @@ async fn spawn_live(
         // timer is cheaper than reasoning about which updates could matter — and it
         // has no blind spot for pools in the middle of a triangle.
         let mut sweep_timer = tokio::time::interval(SWEEP_INTERVAL);
+        // A sweep that attempts a trade waits on its round trips, often several ticks'
+        // worth. The default would then fire every missed tick back to back — sweeps of
+        // a market that has not moved, holding the feed off. One sweep, then the cadence
+        // again from there.
+        sweep_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Token valuations move slowly and are only used for sizing; rebuilding the
         // index every sweep would be work spent on a number that has not changed.
         let mut usd_timer = tokio::time::interval(USD_REFRESH);
