@@ -628,25 +628,39 @@ impl Rpc {
     /// # Errors
     /// If the call fails.
     pub async fn signature_status(&self, sig: &str) -> Result<Option<SignatureStatus>> {
+        Ok(self.signature_statuses(&[sig.to_string()]).await?.pop().flatten())
+    }
+
+    /// [`Rpc::signature_status`] for several signatures in one round trip, in order.
+    ///
+    /// # Errors
+    /// If the call fails.
+    pub async fn signature_statuses(&self, sigs: &[String]) -> Result<Vec<Option<SignatureStatus>>> {
+        if sigs.is_empty() {
+            return Ok(Vec::new());
+        }
         let r = self
             .call(
                 "getSignatureStatuses",
-                json!([[sig], {"searchTransactionHistory": false}]),
+                json!([sigs, {"searchTransactionHistory": false}]),
             )
             .await?;
-        let Some(first) = r["value"].as_array().and_then(|a| a.first()) else {
-            return Ok(None);
-        };
-        if first.is_null() {
-            return Ok(None);
-        }
-        Ok(Some(SignatureStatus {
-            confirmations: first["confirmations"].as_u64(),
-            err: match &first["err"] {
-                Value::Null => None,
-                e => Some(e.to_string()),
-            },
-        }))
+        let values = r["value"].as_array().cloned().unwrap_or_default();
+        Ok((0..sigs.len())
+            .map(|i| {
+                let v = values.get(i)?;
+                if v.is_null() {
+                    return None;
+                }
+                Some(SignatureStatus {
+                    confirmations: v["confirmations"].as_u64(),
+                    err: match &v["err"] {
+                        Value::Null => None,
+                        e => Some(e.to_string()),
+                    },
+                })
+            })
+            .collect())
     }
 
     /// Fetch several accounts in one round trip.

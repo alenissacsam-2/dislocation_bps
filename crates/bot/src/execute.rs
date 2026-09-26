@@ -2472,6 +2472,18 @@ impl Trader {
     /// Never: an RPC that cannot answer is reported as "not yet known", the same as a
     /// signature that has not landed. Nothing here decides whether money moves, so a
     /// failure to look is not a failure to trade.
+    /// Whether each of `signatures` has landed cleanly (`Some(true)`), landed and
+    /// failed (`Some(false)`), or is not seen yet (`None`) — one round trip for all.
+    pub async fn confirm_many(&self, signatures: &[String]) -> Vec<Option<bool>> {
+        match self.exec.rpc.signature_statuses(signatures).await {
+            Ok(v) => v.into_iter().map(|s| s.map(|s| s.landed_cleanly())).collect(),
+            Err(e) => {
+                tracing::debug!("could not read send statuses yet: {e:#}");
+                vec![None; signatures.len()]
+            }
+        }
+    }
+
     pub async fn confirm(&self, signature: &str, tries: u32) -> Option<bool> {
         const GAP: std::time::Duration = std::time::Duration::from_millis(2000);
         for attempt in 0..tries {

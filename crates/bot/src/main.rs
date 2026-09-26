@@ -1105,14 +1105,21 @@ async fn settle_pending(
     const GIVE_UP: Duration = Duration::from_secs(20);
     let mut keep = Vec::new();
     let mut settled = Vec::new();
+    // One status call for every send old enough to ask about: asked one at a time,
+    // a burst of sends held the main loop for a round trip each, every second.
+    let due: Vec<String> =
+        pending.iter().filter(|p| p.sent_at.elapsed() >= FIRST_LOOK).map(|p| p.sig.clone()).collect();
+    let statuses: std::collections::HashMap<String, Option<bool>> =
+        due.iter().cloned().zip(t.confirm_many(&due).await).collect();
     for p in std::mem::take(pending) {
-        if p.sent_at.elapsed() < FIRST_LOOK {
+        if p.sent_at.elapsed() < FIRST_LOOK || !statuses.contains_key(&p.sig) {
             keep.push(p);
             continue;
         }
         let sig = &p.sig;
+        let status = statuses.get(sig).copied().flatten();
         if let Some(tip) = p.probe_tip {
-            match t.confirm(sig, 1).await {
+            match status {
                 Some(landed) => {
                     t.note_probe(tip, true);
                     tracing::warn!(
@@ -1142,7 +1149,7 @@ async fn settle_pending(
             }
             continue;
         }
-        let (taken, reason, net) = match t.confirm(sig, 1).await {
+        let (taken, reason, net) = match status {
             Some(true) => {
                 t.note_landed();
                 tracing::error!("LANDED {sig} — the transaction confirmed on chain");
