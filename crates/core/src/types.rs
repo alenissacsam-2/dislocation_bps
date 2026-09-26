@@ -121,6 +121,25 @@ pub enum PoolMath {
     /// through them is flat to a rounding error across the whole permitted range, so the
     /// quote lands a hair **under** the constant-sum truth — the only direction an
     /// approximation of a fill is allowed to err in.
+    /// Concentrated liquidity whose fee, in one or both directions, comes off the
+    /// **output** rather than the input. Meteora DAMM v2 prices this way; which
+    /// direction does is the pool's fee-collection mode (measured on live pools on
+    /// 2026-09-26: mode 0 takes it from the output both ways; modes 1 and 2 take it in
+    /// token B, so from the output spending A and from the input spending B).
+    ///
+    /// A fee off a constant-product output is the same curve over an output reserve
+    /// scaled by `1 - f`, exactly, so the leg carries that reserve and no fee. Shaded by
+    /// [`QUOTE_SIDE_FEE_MARGIN_PPM`] against us either way.
+    ConcentratedFeeSide {
+        liquidity: u128,
+        sqrt_price_x64: u128,
+        sqrt_lo_x64: u128,
+        sqrt_hi_x64: u128,
+        /// Spending A pays the fee out of the output.
+        fee_on_output_a_to_b: bool,
+        /// Spending B pays the fee out of the output.
+        fee_on_output_b_to_a: bool,
+    },
     /// Constant product whose fee is taken on the quote side in both directions: out of
     /// what a sale of the base token receives, and out of what a purchase spends.
     /// PumpSwap prices this way.
@@ -255,6 +274,41 @@ impl PoolState {
                 let (r_in, r_out) = flat_reserves(rate, max_in)?;
                 Some(Leg::bounded(r_in, r_out, self.fee_ppm, max_in))
             }
+            PoolMath::ConcentratedFeeSide {
+                liquidity,
+                sqrt_price_x64,
+                sqrt_lo_x64,
+                sqrt_hi_x64,
+                fee_on_output_a_to_b,
+                fee_on_output_b_to_a,
+            } => {
+                let (r_in, r_out) =
+                    clmm::virtual_reserves_for_input(liquidity, sqrt_price_x64, a_to_b)?;
+                let f = u128::from(self.fee_ppm) + QUOTE_SIDE_FEE_MARGIN_PPM;
+                if f >= 1_000_000 {
+                    return None;
+                }
+                let on_output = if a_to_b { fee_on_output_a_to_b } else { fee_on_output_b_to_a };
+                // The bound is the input that walks the price to the range's edge; with the
+                // fee off the output, the whole input reaches the curve.
+                let in_fee = if on_output { 0 } else { u32::try_from(f).ok()? };
+                let max_in = clmm::capacity_for_input(
+                    liquidity,
+                    sqrt_price_x64,
+                    sqrt_lo_x64,
+                    sqrt_hi_x64,
+                    a_to_b,
+                    in_fee,
+                )?;
+                if max_in == 0 {
+                    return None;
+                }
+                if on_output {
+                    Some(Leg::bounded(r_in, r_out * (1_000_000 - f) / 1_000_000, 0, max_in))
+                } else {
+                    Some(Leg::bounded(r_in, r_out, in_fee, max_in))
+                }
+            }
             PoolMath::Concentrated { liquidity, sqrt_price_x64, sqrt_lo_x64, sqrt_hi_x64 } => {
                 let (r_in, r_out) =
                     clmm::virtual_reserves_for_input(liquidity, sqrt_price_x64, a_to_b)?;
@@ -310,7 +364,8 @@ impl PoolState {
             // and reporting it as a reserve would put a fictional depth on the
             // dashboard and in every depth comparison that ranks pools.
             PoolMath::Bounded { max_in_a, .. } => max_in_a,
-            PoolMath::Concentrated { liquidity, sqrt_price_x64, .. } => {
+            PoolMath::Concentrated { liquidity, sqrt_price_x64, .. }
+            | PoolMath::ConcentratedFeeSide { liquidity, sqrt_price_x64, .. } => {
                 clmm::virtual_reserves_for_input(liquidity, sqrt_price_x64, true)
                     .map_or(0, |(r_in, _)| r_in)
             }
@@ -325,7 +380,8 @@ impl PoolState {
                 reserve_b
             }
             PoolMath::Bounded { max_in_b, .. } => max_in_b,
-            PoolMath::Concentrated { liquidity, sqrt_price_x64, .. } => {
+            PoolMath::Concentrated { liquidity, sqrt_price_x64, .. }
+            | PoolMath::ConcentratedFeeSide { liquidity, sqrt_price_x64, .. } => {
                 clmm::virtual_reserves_for_input(liquidity, sqrt_price_x64, false)
                     .map_or(0, |(r_in, _)| r_in)
             }

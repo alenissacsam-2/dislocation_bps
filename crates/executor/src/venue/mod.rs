@@ -34,6 +34,7 @@
 //! always in range without knowing the exact extreme, and it is a real circuit breaker
 //! against a size that would move the pool by more than any plausible trade should.
 
+pub mod meteora_damm_v2;
 pub mod meteora_dlmm;
 pub mod orca;
 pub mod pumpswap;
@@ -131,6 +132,7 @@ pub fn build_swap(
         Dex::RaydiumAmmV4 => raydium_v4::swap(ctx, pool_data),
         Dex::MeteoraDlmm => meteora_dlmm::swap(ctx, pool_data),
         Dex::PumpSwap => pumpswap::swap(ctx, pool_data, extra.pump),
+        Dex::MeteoraDammV2 => meteora_damm_v2::swap(ctx, pool_data),
         other => bail!(
             "{} swaps are not encoded — see crates/executor/src/venue/mod.rs for why",
             other.name()
@@ -207,9 +209,9 @@ mod tests {
             tick_arrays: [Pubkey::new_unique(); crate::pda::TICK_ARRAYS_PER_SWAP],
         };
         let extra = VenueExtra::default();
-        for dex in [Dex::RaydiumCpmm, Dex::MeteoraDammV2, Dex::PumpSwap] {
-            let e = build_swap(dex, &ctx, &[0u8; 2000], &extra).unwrap_err().to_string();
-            assert!(e.contains(dex.name()), "refusal for {dex:?} does not name it: {e}");
-        }
+        // PumpSwap and DAMM v2 have encoders now; CP-Swap is the one venue left without.
+        let dex = Dex::RaydiumCpmm;
+        let e = build_swap(dex, &ctx, &[0u8; 2000], &extra).unwrap_err().to_string();
+        assert!(e.contains(dex.name()), "refusal for {dex:?} does not name it: {e}");
     }
 }

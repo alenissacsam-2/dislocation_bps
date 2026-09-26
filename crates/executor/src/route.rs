@@ -608,9 +608,9 @@ mod tests {
     fn a_cycle_through_an_unencodable_venue_refuses() {
         let owner = Pubkey::new_unique();
         let mut hops = cycle(3);
-        hops[1].dex = Dex::MeteoraDammV2;
+        hops[1].dex = Dex::RaydiumCpmm;
         let e = build(&owner, &hops, 0, &opts()).unwrap_err().to_string();
-        assert!(e.contains("Meteora DAMM v2"), "refusal must name the venue: {e}");
+        assert!(e.contains(Dex::RaydiumCpmm.name()), "refusal must name the venue: {e}");
     }
 }
 

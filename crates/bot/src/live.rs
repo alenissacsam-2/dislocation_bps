@@ -656,6 +656,48 @@ impl LiveMarket {
             }
         }
 
+        // Token-2022 mints that take something from a transfer — a fee, or a hook that
+        // needs accounts no swap here passes — make every quote through them too good.
+        // The pool accounts cannot show it; the mint accounts can, so read them once and
+        // drop any pool holding one.
+        let t22: Vec<Pubkey32> = {
+            let mut m: Vec<Pubkey32> = registry
+                .pools
+                .iter()
+                .filter(|p| watches.contains_key(&p.address))
+                .flat_map(|p| [p.mint_a, p.mint_b])
+                .filter(|m| registry.mints.get(m).is_some_and(|i| i.token_2022))
+                .collect();
+            m.sort_unstable();
+            m.dedup();
+            m
+        };
+        if !t22.is_empty() {
+            let keys: Vec<String> = t22.iter().map(|m| bs58::encode(m).into_string()).collect();
+            let (got, _) = get_multiple_accounts(&client, rpc_http, &keys).await?;
+            let costly: std::collections::HashSet<Pubkey32> = t22
+                .iter()
+                .zip(got.iter())
+                .filter(|(_, d)| {
+                    d.as_ref()
+                        .and_then(|d| cb_dex::token2022::transfer_costs(d).ok())
+                        .is_none_or(|c| !c.is_free())
+                })
+                .map(|(m, _)| *m)
+                .collect();
+            for p in &registry.pools {
+                if watches.contains_key(&p.address) && (costly.contains(&p.mint_a) || costly.contains(&p.mint_b)) {
+                    watches.remove(&p.address);
+                    // A self-contained pool was priced the moment it decoded.
+                    store.remove(&PoolId(p.address));
+                    failures.push(format!(
+                        "{}: a Token-2022 mint here charges a transfer fee or runs a transfer hook",
+                        p.label
+                    ));
+                }
+            }
+        }
+
         // PumpSwap's fee tiers, shared, and each coin's supply, which with the reserves
         // is the market cap that picks a tier.
         if !pump_pending.is_empty() {

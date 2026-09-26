@@ -167,12 +167,54 @@ pub fn decode(data: &[u8]) -> Result<DammV2Pool> {
     })
 }
 
+/// DAMM v2's volatility fee over 10^9, at the accumulator the pool last recorded plus two
+/// steps of headroom for the swap's own movement.
+///
+/// `(volatility x bin_step)^2 x variable_fee_control / 10^11`, rounded up — measured on
+/// pool 4MhsDW... on 2026-09-26, where the state gave 257.93 ppm and the program charged
+/// 257.95. The accumulator is the one stored at the pool's last swap and so already
+/// includes the distance from its reference at today's price; decay can only lower it,
+/// which is why it is not modelled. The two extra steps (20,000) cover the price moving
+/// during our own swap.
+#[must_use]
+pub fn variable_fee_numerator(d: &DammV2DynamicFee) -> u64 {
+    let vol = d
+        .volatility_accumulator
+        .saturating_add(20_000)
+        .min(u128::from(d.max_volatility_accumulator).max(d.volatility_accumulator));
+    let x = vol.saturating_mul(u128::from(d.bin_step));
+    let num = x.saturating_mul(x).saturating_mul(u128::from(d.variable_fee_control));
+    u64::try_from(num.div_ceil(100_000_000_000)).unwrap_or(u64::MAX)
+}
+
 /// Decode straight into a [`PoolState`].
 ///
 /// Unlike the tick-based venues there is no interval to resolve: the pool's own
 /// `[sqrt_min_price, sqrt_max_price]` *is* the range the quote is exact over.
+///
+/// # The fee, as the program charges it
+///
+/// Measured on live pools on 2026-09-26 with `cb-check-damm`, against the program's own
+/// `EvtSwap2`:
+///
+/// - The rate is the base fee (the cliff numerator over 10^9) plus the volatility fee
+///   ([`variable_fee_numerator`]); pools with a fee schedule are still refused.
+/// - Collection mode 0 takes it from the **output** in both directions (4 bp and 10 bp
+///   pools: the curve matched to the unit). Modes 1 and 2 take it in token B: from the
+///   output spending A, from the input spending B. Mode 2 compounds part of the fee
+///   back into the pool, which pays the swapper slightly *more* than this model — the
+///   safe side.
+/// - Token-2022 mints are accepted here; a mint with a transfer fee is screened out by
+///   the caller, which has the mint account and this function does not.
 pub fn to_pool_state(address: Pubkey32, data: &[u8], slot: u64) -> Result<PoolState> {
-    let p = decode(data)?;
+    let p = decode_layout(data)?;
+    ensure!(p.pool_status == 0, "damm v2 pool has swaps disabled");
+    ensure!(
+        !p.has_fee_schedule,
+        "damm v2 pool has a fee schedule: the fee moves over time and the cliff value \
+         alone does not price it"
+    );
+    ensure!(p.collect_fee_mode <= 2, "damm v2 fee collection mode {} is not one measured", p.collect_fee_mode);
     ensure!(p.liquidity > 0, "damm v2 pool has no liquidity");
     ensure!(
         p.sqrt_min_price_x64 < p.sqrt_max_price_x64,
@@ -186,19 +228,131 @@ pub fn to_pool_state(address: Pubkey32, data: &[u8], slot: u64) -> Result<PoolSt
         p.sqrt_max_price_x64
     );
 
+    let numerator = p
+        .cliff_fee_numerator
+        .saturating_add(p.dynamic_fee.as_ref().map_or(0, variable_fee_numerator));
+    ensure!(numerator < 1_000_000_000, "damm v2 fee {numerator} over 1e9 is not a fee");
+    let fee_ppm = u32::try_from(numerator.div_ceil(FEE_DENOM_PER_PPM)).expect("under a million");
+    let fee_on_output_b_to_a = p.collect_fee_mode == 0;
+
     Ok(PoolState {
         id: PoolId(address),
         dex: Dex::MeteoraDammV2,
         mint_a: p.mint_a,
         mint_b: p.mint_b,
-        math: PoolMath::Concentrated {
+        math: PoolMath::ConcentratedFeeSide {
             liquidity: p.liquidity,
             sqrt_price_x64: p.sqrt_price_x64,
             sqrt_lo_x64: p.sqrt_min_price_x64,
             sqrt_hi_x64: p.sqrt_max_price_x64,
+            fee_on_output_a_to_b: true,
+            fee_on_output_b_to_a,
         },
-        fee_ppm: p.fee_ppm,
+        fee_ppm,
         slot,
+    })
+}
+
+/// Every field of a DAMM v2 pool that pricing or a swap needs, decoded without judging it.
+///
+/// [`decode`] refuses any pool whose cost it cannot state; this reads them all, so the
+/// swap encoder can name any pool's accounts and a verification tool can see the fee
+/// features a pool actually uses. Offsets follow the program's IDL (read from chain on
+/// 2026-09-26): `pool_fees` spans 8..168 and holds the base fee blob, the protocol,
+/// referral and compounding shares, and the whole dynamic-fee state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DammV2Layout {
+    pub mint_a: Pubkey32,
+    pub mint_b: Pubkey32,
+    pub vault_a: Pubkey32,
+    pub vault_b: Pubkey32,
+    /// Already unscaled: the stored field divided by 2^64.
+    pub liquidity: u128,
+    pub sqrt_price_x64: u128,
+    pub sqrt_min_price_x64: u128,
+    pub sqrt_max_price_x64: u128,
+    /// The base fee's first word: the cliff numerator over 10^9.
+    pub cliff_fee_numerator: u64,
+    /// Whether the base fee blob holds anything past the cliff (a schedule).
+    pub has_fee_schedule: bool,
+    pub protocol_fee_percent: u8,
+    pub referral_fee_percent: u8,
+    pub compounding_fee_bps: u16,
+    pub dynamic_fee: Option<DammV2DynamicFee>,
+    pub activation_point: u64,
+    pub activation_type: u8,
+    pub pool_status: u8,
+    pub token_a_flag: u8,
+    pub token_b_flag: u8,
+    pub collect_fee_mode: u8,
+    pub fee_version: u8,
+}
+
+/// DAMM v2's volatility fee state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DammV2DynamicFee {
+    pub max_volatility_accumulator: u32,
+    pub variable_fee_control: u32,
+    pub bin_step: u16,
+    pub filter_period: u16,
+    pub decay_period: u16,
+    pub reduction_factor: u16,
+    pub last_update_timestamp: u64,
+    pub bin_step_u128: u128,
+    pub sqrt_price_reference: u128,
+    pub volatility_accumulator: u128,
+    pub volatility_reference: u128,
+}
+
+fn u16_at(d: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes([d[o], d[o + 1]])
+}
+
+fn u32_at(d: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes(d[o..o + 4].try_into().expect("4 bytes"))
+}
+
+/// Decode every field without refusing any pool. See [`DammV2Layout`].
+///
+/// # Errors
+/// If the account is too short to be a pool.
+pub fn decode_layout(data: &[u8]) -> Result<DammV2Layout> {
+    ensure!(data.len() >= POOL_LEN, "damm v2 account too short: {} bytes, need {POOL_LEN}", data.len());
+    let dynamic_fee = (data[OFF_DYNAMIC_FEE_INITIALIZED] != 0).then(|| DammV2DynamicFee {
+        max_volatility_accumulator: u32_at(data, 64),
+        variable_fee_control: u32_at(data, 68),
+        bin_step: u16_at(data, 72),
+        filter_period: u16_at(data, 74),
+        decay_period: u16_at(data, 76),
+        reduction_factor: u16_at(data, 78),
+        last_update_timestamp: u64_at(data, 80),
+        bin_step_u128: u128_at(data, 88),
+        sqrt_price_reference: u128_at(data, 104),
+        volatility_accumulator: u128_at(data, 120),
+        volatility_reference: u128_at(data, 136),
+    });
+    Ok(DammV2Layout {
+        mint_a: pubkey_at(data, OFF_MINT_A),
+        mint_b: pubkey_at(data, OFF_MINT_B),
+        vault_a: pubkey_at(data, 232),
+        vault_b: pubkey_at(data, 264),
+        liquidity: u128_at(data, OFF_LIQUIDITY) >> 64,
+        sqrt_price_x64: u128_at(data, OFF_SQRT_PRICE),
+        sqrt_min_price_x64: u128_at(data, OFF_SQRT_MIN_PRICE),
+        sqrt_max_price_x64: u128_at(data, OFF_SQRT_MAX_PRICE),
+        cliff_fee_numerator: u64_at(data, OFF_CLIFF_FEE),
+        has_fee_schedule: data[OFF_BASE_FEE_REST..OFF_BASE_FEE_REST_END].iter().any(|&b| b != 0),
+        protocol_fee_percent: data[48],
+        referral_fee_percent: data[50],
+        compounding_fee_bps: u16_at(data, 54),
+        dynamic_fee,
+        activation_point: u64_at(data, 472),
+        activation_type: data[480],
+        pool_status: data[OFF_POOL_STATUS],
+        token_a_flag: data[OFF_TOKEN_A_FLAG],
+        token_b_flag: data[OFF_TOKEN_B_FLAG],
+        collect_fee_mode: data[484],
+        fee_version: data[486],
     })
 }
 
@@ -316,6 +470,49 @@ mod tests {
         assert!(decode(&d).unwrap_err().to_string().contains("disabled"));
     }
 
+    /// Mode 0 takes the fee from the output both ways; modes 1 and 2 from the output
+    /// spending A and from the input spending B.
+    #[test]
+    fn the_fee_side_follows_the_collection_mode() {
+        for (mode, b_to_a_on_output) in [(0u8, true), (1, false), (2, false)] {
+            let mut d = account(Q64 * 1_000_000, 2 * Q64, Q64, 4 * Q64, 400_000);
+            d[484] = mode;
+            let s = to_pool_state([1; 32], &d, 7).unwrap();
+            match s.math {
+                PoolMath::ConcentratedFeeSide { fee_on_output_a_to_b, fee_on_output_b_to_a, .. } => {
+                    assert!(fee_on_output_a_to_b, "mode {mode}: spending A always pays from the output");
+                    assert_eq!(fee_on_output_b_to_a, b_to_a_on_output, "mode {mode}");
+                }
+                _ => panic!("wrong variant"),
+            }
+        }
+        let mut d = account(Q64 * 1_000_000, 2 * Q64, Q64, 4 * Q64, 400_000);
+        d[484] = 3;
+        assert!(to_pool_state([1; 32], &d, 7).is_err(), "an unmeasured mode is refused");
+    }
+
+    /// Pool 4MhsDW... on 2026-09-26: bin step 1, control 5,739, accumulator 2,120,000.
+    /// The program charged 257.95 ppm over its 6% base; the formula gives 257.93 at the
+    /// stored accumulator, and the headroom adds a little.
+    #[test]
+    fn the_volatility_fee_is_the_one_the_program_charged() {
+        let d = DammV2DynamicFee {
+            max_volatility_accumulator: 14_460_000,
+            variable_fee_control: 5_739,
+            bin_step: 1,
+            filter_period: 10,
+            decay_period: 120,
+            reduction_factor: 5_000,
+            last_update_timestamp: 0,
+            bin_step_u128: 0,
+            sqrt_price_reference: 0,
+            volatility_accumulator: 2_120_000,
+            volatility_reference: 580_000,
+        };
+        let ppm = variable_fee_numerator(&d) as f64 / 1_000.0;
+        assert!((257.9..263.0).contains(&ppm), "got {ppm} ppm");
+    }
+
     #[test]
     fn a_price_outside_its_own_range_is_refused() {
         let d = account(Q64 * 1000, 10, 100, 200, 400_000);
@@ -335,13 +532,11 @@ mod tests {
         let d = account(Q64 * 1_000_000, 2 * Q64, Q64, 4 * Q64, 400_000);
         let s = to_pool_state([1; 32], &d, 7).unwrap();
         match s.math {
-            PoolMath::Concentrated { sqrt_lo_x64, sqrt_hi_x64, .. } => {
+            PoolMath::ConcentratedFeeSide { sqrt_lo_x64, sqrt_hi_x64, .. } => {
                 assert_eq!(sqrt_lo_x64, Q64);
                 assert_eq!(sqrt_hi_x64, 4 * Q64, "a 4x price move, not a tick");
             }
-            PoolMath::ConstantProduct { .. } | PoolMath::Bounded { .. } | PoolMath::QuoteSideFee { .. } => {
-                panic!("damm v2 is concentrated")
-            }
+            _ => panic!("damm v2 is concentrated, with its fee on a measured side"),
         }
         assert_eq!(s.dex, Dex::MeteoraDammV2);
     }

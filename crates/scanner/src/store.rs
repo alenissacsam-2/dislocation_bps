@@ -35,6 +35,11 @@ impl PoolStore {
             .or_insert(p);
     }
 
+    /// Forget a pool: one found unfit after it was already priced, so no sweep quotes it.
+    pub fn remove(&self, id: &PoolId) {
+        self.pools.remove(id);
+    }
+
     #[must_use]
     pub fn get(&self, id: &PoolId) -> Option<PoolState> {
         self.pools.get(id).map(|r| *r.value())

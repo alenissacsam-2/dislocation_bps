@@ -11,3 +11,4 @@ pub mod pumpswap;
 pub mod raydium_clmm;
 pub mod raydium_cpmm;
 pub mod raydium_v4;
+pub mod token2022;
