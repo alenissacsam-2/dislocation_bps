@@ -297,6 +297,27 @@ const STRUCTURAL_COOLDOWN: Duration = Duration::from_secs(20);
 /// is unfundable no matter which loop it belongs to, and it stays unfundable until a
 /// balance moves rather than until a price does.
 const UNFUNDABLE_ENTRY_WINDOW: Duration = Duration::from_secs(20);
+/// How long a cycle refused on price is left alone while it comes back with exactly the
+/// edge it was refused at.
+///
+/// The price window above assumes the market is moving. A cycle whose pools nobody is
+/// trading does not move: on 2026-09-27 one DAMM v2 / PumpSwap loop that guaranteed
+/// 5,015 lamports against a 6,000 lamport landing cost was re-read and refused 4,204
+/// times in ninety minutes, each time with a fresh account read and a forced refresh,
+/// against pools whose state never changed. The same edge to the last bit means the
+/// same pool state and the same answer. The cap is for what the edge does not see: the
+/// landing cost, the tip floor, and a USD index that has not been rebuilt yet.
+const UNCHANGED_REFUSAL_HOLD: Duration = Duration::from_secs(30);
+/// How often an unchanged detection that nothing was attempted on is written to the
+/// ledger again.
+///
+/// Every sweep used to write a row for every cycle it found. Cycles that nobody can
+/// trade sit on the board unchanged for hours: on 2026-09-27 dust-deep DAMM v2 /
+/// PumpSwap loops wrote 25,000 identical rows each in ninety minutes, 150 rows a second
+/// overall, which is four gigabytes of ledger a day with nothing new in it. A row is
+/// still written the moment anything about the cycle changes, and for every attempt.
+const UNCHANGED_RECORD_EVERY: Duration = Duration::from_secs(60);
+
 /// How often the same refusal may reach the log, tracked separately from how often it
 /// may be retried. Retrying a cycle four times a second is correct; saying so four
 /// times a second is not.
@@ -1868,6 +1889,16 @@ async fn spawn_live(
         > = std::collections::HashMap::new();
         let mut recent_logged: std::collections::HashMap<String, std::time::Instant> =
             std::collections::HashMap::new();
+        // Cycles refused on price, and the edge they were refused at. See
+        // `UNCHANGED_REFUSAL_HOLD`.
+        let mut refused_at_edge: std::collections::HashMap<String, (u64, std::time::Instant)> =
+            std::collections::HashMap::new();
+        // The last row written per cycle, as (edge bits, outcome, when). See
+        // `UNCHANGED_RECORD_EVERY`.
+        let mut last_recorded: std::collections::HashMap<
+            String,
+            (u64, Option<String>, std::time::Instant),
+        > = std::collections::HashMap::new();
         // Mints the wallet has just been shown it cannot start a trade in. Held here
         // rather than in `recent_refusals` because the fact is about the mint: the
         // cycle key it arrived under covers the rotation that *can* be funded too.
@@ -2224,6 +2255,8 @@ async fn spawn_live(
                     // history, not state.
                     recent_refusals.retain(|_, (at, window)| at.elapsed() < *window * 5);
                     recent_logged.retain(|_, at| at.elapsed() < LOG_COOLDOWN * 5);
+                    refused_at_edge.retain(|_, (_, at)| at.elapsed() < UNCHANGED_REFUSAL_HOLD);
+                    last_recorded.retain(|_, (_, _, at)| at.elapsed() < UNCHANGED_RECORD_EVERY);
                     unfundable_entries.retain(|_, at| at.elapsed() < UNFUNDABLE_ENTRY_WINDOW);
                     for opp in opportunities {
                         let id = next_id;
@@ -2301,7 +2334,13 @@ async fn spawn_live(
                                     // that was already refused within the cooldown window —
                                     // see `recent_refusals`'s own comment for why.
                                     let on_cooldown =
-                                        on_refusal_cooldown(&recent_refusals, &opp.cycle_key);
+                                        on_refusal_cooldown(&recent_refusals, &opp.cycle_key)
+                                            || refused_at_edge.get(&opp.cycle_key).is_some_and(
+                                                |(edge, at)| {
+                                                    *edge == opp.edge_bps.to_bits()
+                                                        && at.elapsed() < UNCHANGED_REFUSAL_HOLD
+                                                },
+                                            );
                                     // Legs priced too far apart in time are not an
                                     // opportunity, they are the clock.
                                     //
@@ -2749,6 +2788,15 @@ async fn spawn_live(
                                                             opp.cycle_key.clone(),
                                                             (std::time::Instant::now(), window),
                                                         );
+                                                        if window == PRICE_MOVED_COOLDOWN {
+                                                            refused_at_edge.insert(
+                                                                opp.cycle_key.clone(),
+                                                                (
+                                                                    opp.edge_bps.to_bits(),
+                                                                    std::time::Instant::now(),
+                                                                ),
+                                                            );
+                                                        }
                                                     }
                                                 }
                                                 // `Intent::Trade` has no path that
@@ -2802,7 +2850,24 @@ async fn spawn_live(
                             }
                         }
 
-                        if let (Some(l), false) = (ledger.as_ref(), feed_stalled) {
+                        // Nothing attempted and nothing different since the last row for
+                        // this cycle: not written again until a minute has passed. See
+                        // `UNCHANGED_RECORD_EVERY`.
+                        let unchanged_row = latency_ms == 0
+                            && !landed
+                            && pending_new.is_none()
+                            && last_recorded.get(&opp.cycle_key).is_some_and(|(edge, reason, at)| {
+                                *edge == opp.edge_bps.to_bits()
+                                    && *reason == outcome_reason
+                                    && at.elapsed() < UNCHANGED_RECORD_EVERY
+                            });
+                        if !unchanged_row {
+                            last_recorded.insert(
+                                opp.cycle_key.clone(),
+                                (opp.edge_bps.to_bits(), outcome_reason.clone(), std::time::Instant::now()),
+                            );
+                        }
+                        if let (Some(l), false, false) = (ledger.as_ref(), feed_stalled, unchanged_row) {
                             let rec = cb_ledger::FillRecord {
                                 slot: opp.slot,
                                 route: opp.route.clone(),
