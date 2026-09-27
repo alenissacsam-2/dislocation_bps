@@ -394,8 +394,15 @@ impl Rpc {
                     if step > 0 {
                         // Announced, because a silent skip hides a provider that has
                         // quietly stopped answering.
+                        // With why the one before failed: 736 failovers in one run
+                        // said only that they happened, which cannot tell a rate
+                        // limit from a dropped connection from a provider outage.
+                        let why = last.as_ref().map_or(String::new(), |e| {
+                            let text = cb_core::redact::redact_urls_in(&format!("{e:#}"));
+                            format!(": {}", text.chars().take(160).collect::<String>())
+                        });
                         tracing::warn!(
-                            "rpc failed over to endpoint {} of {n} for {method}",
+                            "rpc failed over to endpoint {} of {n} for {method}{why}",
                             idx + 1
                         );
                     }
