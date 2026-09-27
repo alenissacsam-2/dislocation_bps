@@ -154,6 +154,22 @@ pub struct Config {
     #[serde(default)]
     pub jito_url: String,
 
+    /// A Jito block engine UUID, sent as `x-jito-auth` on every request to a block
+    /// engine. Empty sends unauthenticated.
+    ///
+    /// # Why it matters
+    ///
+    /// On 2026-09-27 every one of 104 unauthenticated sends — 100 trades and four
+    /// tip-only probes up to 27,000 lamports, each to all eight regions — was answered
+    /// with a signature and then never landed, and the block engines' own status call
+    /// answered `Invalid` (no record of the bundle) for every one of them, in every
+    /// region, while answering `Landed` for other searchers' bundles. The block engine
+    /// was dropping these sends before its auction, where no tip can help. Two public
+    /// reports from March 2026 describe the same thing for unauthenticated senders.
+    /// A UUID is issued through a ticket in Jito's Discord.
+    #[serde(default)]
+    pub jito_auth_uuid: String,
+
     /// The most one Jito tip may be, in lamports.
     ///
     /// The tip is a quarter of the trade's own gross, never under Jito's 1,000-lamport
@@ -383,6 +399,7 @@ mod tests {
             priority_micro_lamports: 0,
             submit_via: SubmitVia::Jito,
             jito_url: String::new(),
+            jito_auth_uuid: String::new(),
             jito_tip_max_lamports: 20_000,
             jito_simulate_first: true,
             extra_token_mints: Vec::new(),

@@ -747,7 +747,8 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
             endpoints.len()
         );
     }
-    let rpc = cb_executor::rpc::Rpc::with_fallbacks(endpoints)?;
+    let mut rpc = cb_executor::rpc::Rpc::with_fallbacks(endpoints)?;
+    rpc.set_jito_auth(&cfg.jito_auth_uuid);
     // From the file, not from Default. The application's Risk Limits panel writes these
     // and the operator expects them to bind.
     let limits = cb_executor::risk::Limits {
@@ -853,6 +854,26 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
              lands reverts it on chain and pays the whole fee (submit_via = \"jito\" \
              makes that free)"
         ),
+    }
+    if trader.sends_via_jito() {
+        let uuid = cfg.jito_auth_uuid.trim();
+        if uuid.is_empty() {
+            tracing::error!(
+                "Jito sends are unauthenticated (jito_auth_uuid is empty). On 2026-09-27 the \
+                 block engines dropped every unauthenticated send before their auction — 104 \
+                 of 104, probes with a 27,000 lamport tip included — so expect nothing to \
+                 land. A UUID comes from a ticket in Jito's Discord; put it in config.toml as \
+                 jito_auth_uuid and restart"
+            );
+        } else if !cb_executor::jito::looks_like_uuid(uuid) {
+            tracing::error!(
+                "jito_auth_uuid is set but is not shaped like a UUID (36 characters, hex in \
+                 groups of 8-4-4-4-12): check it for a stray quote or space. It is sent as \
+                 given"
+            );
+        } else {
+            tracing::info!("Jito sends are authenticated with the configured UUID");
+        }
     }
     // Which mints the classic token program does not own. Configuration, read once:
     // no swap changes a mint's owner, and getting it wrong derives the wrong
@@ -1149,6 +1170,100 @@ async fn post_mortem(rpc_url: String, ours: String, pools: Vec<cb_core::types::P
     }
 }
 
+/// How many sends the block engine has answered `Invalid` for this run, and whether the
+/// conclusion has been said. See `bundle_verdict`.
+static JITO_INVALID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static JITO_INVALID_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// This many `Invalid` answers, and none of anything else, is a pattern rather than luck.
+const JITO_INVALID_CONCLUSIVE: usize = 3;
+/// And whether any send has been answered with anything but `Invalid`, which means
+/// the block engine does take this bot's bundles.
+static JITO_SEEN_OTHER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask the block engine what it did with a Jito send that was not included, and say it.
+///
+/// # Why
+///
+/// "Not included" has three causes that call for different fixes, and only the block
+/// engine can tell them apart. `Invalid`: it has no record of the bundle, which never
+/// entered an auction. `Failed`: it simulated the bundle and the floor had already
+/// gone. `Pending`: the bundle reached the auction and was not picked — outbid, or no
+/// Jito leader in time. On 2026-09-27 every one of 104 sends, probes up to 27,000
+/// lamports included, was `Invalid` in all nine block engines while the same call said
+/// `Landed` for other searchers' bundles, and the bot had no way to show it.
+///
+/// Runs as its own task: the answer is a diagnosis, and nothing on the trading loop
+/// waits for it.
+async fn bundle_verdict(status: cb_executor::rpc::JitoStatus, url: String, sig: String, authenticated: bool) {
+    use std::sync::atomic::Ordering as O;
+    let id = cb_executor::jito::bundle_id(&sig);
+    let mut answer = status.status(&url, &id).await;
+    if answer.is_err() {
+        // One request a second per region unauthenticated: a send in the same second
+        // takes the allowance, so ask once more after it.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        answer = status.status(&url, &id).await;
+    }
+    let s = match answer {
+        Ok(Some(s)) => s,
+        Ok(None) => return tracing::debug!("Jito gave no status for {sig}"),
+        Err(e) => return tracing::debug!("could not ask Jito about {sig}: {e:#}"),
+    };
+    match s.as_str() {
+        "Invalid" => {
+            tracing::warn!(
+                "Jito on {sig}: Invalid — the block engine has no record of it, so it never \
+                 entered an auction"
+            );
+            let n = JITO_INVALID.fetch_add(1, O::Relaxed) + 1;
+            if n >= JITO_INVALID_CONCLUSIVE
+                && !JITO_SEEN_OTHER.load(O::Relaxed)
+                && !JITO_INVALID_SAID.swap(true, O::Relaxed)
+            {
+                if authenticated {
+                    tracing::error!(
+                        "every Jito send this run is Invalid at the block engine, even with \
+                         jito_auth_uuid set: check the key is the one Jito issued and that it \
+                         is enabled for this IP"
+                    );
+                } else {
+                    tracing::error!(
+                        "every Jito send this run is Invalid at the block engine: it is \
+                         dropping them before its auction, and no tip changes that. Nothing \
+                         can land through Jito until jito_auth_uuid is set (a ticket in \
+                         Jito's Discord issues one)"
+                    );
+                }
+            }
+        }
+        "Failed" => {
+            JITO_SEEN_OTHER.store(true, O::Relaxed);
+            tracing::warn!(
+                "Jito on {sig}: Failed — the block engine simulated it and it failed, so its \
+                 floor had gone before a leader could take it"
+            );
+        }
+        "Pending" => {
+            JITO_SEEN_OTHER.store(true, O::Relaxed);
+            tracing::warn!(
+                "Jito on {sig}: Pending — it reached the auction and no leader took it: \
+                 outbid, or no Jito leader in time"
+            );
+        }
+        other => {
+            JITO_SEEN_OTHER.store(true, O::Relaxed);
+            tracing::warn!("Jito on {sig}: {other}");
+        }
+    }
+}
+
+/// Ask what became of a missed Jito send, off the loop. See `bundle_verdict`.
+fn ask_verdict(t: &execute::Trader, sig: &str) {
+    if let Some((status, url)) = t.jito_status() {
+        tokio::spawn(bundle_verdict(status, url, sig.to_string(), t.jito_authenticated()));
+    }
+}
+
 /// Send a landing probe of `tip` lamports and follow it like a trade.
 async fn send_probe(t: &mut execute::Trader, pending: &mut Vec<PendingSend>, tip: u64) {
     match t.jito_probe(tip).await {
@@ -1209,6 +1324,7 @@ async fn settle_pending(
                 None if p.sent_at.elapsed() < GIVE_UP => keep.push(p),
                 None => {
                     t.note_probe(tip, false);
+                    ask_verdict(t, sig);
                     match execute::PROBE_TIPS.iter().find(|&&next| next > tip) {
                         Some(&next) => {
                             tracing::warn!(
@@ -1220,7 +1336,8 @@ async fn settle_pending(
                         None => tracing::error!(
                             "no Jito probe landed, up to a {tip} lamport tip sent to every \
                              region: bundles from here are not reaching leaders at all, so no \
-                             trade can land until that is found"
+                             trade can land until that is found. The block engine's own answer \
+                             for each send is logged as \"Jito on <signature>\""
                         ),
                     }
                 }
@@ -1258,6 +1375,7 @@ async fn settle_pending(
             }
             None if p.via_jito => {
                 t.settle_open(sig, false);
+                ask_verdict(t, sig);
                 if !p.pools.is_empty() && p.sent_slot > 0 {
                     tokio::spawn(post_mortem(rpc_url.to_string(), sig.clone(), p.pools.clone(), p.sent_slot));
                 }
@@ -1431,6 +1549,7 @@ async fn main() -> anyhow::Result<()> {
             priority_micro_lamports: 0,
             submit_via: SubmitVia::Jito,
             jito_url: String::new(),
+            jito_auth_uuid: String::new(),
             jito_tip_max_lamports: 20_000,
             jito_simulate_first: true,
             dry_run: true,

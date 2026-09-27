@@ -49,6 +49,24 @@ pub fn tip_account(seed: u64) -> Pubkey {
     Pubkey::from_str(TIP_ACCOUNTS[i]).expect("tip accounts are valid keys")
 }
 
+/// The id the block engine files a bundle of one under: the SHA-256 of its signature
+/// in base58, as lowercase hex. The same for every region, so a status can be asked of
+/// any of them without the `x-bundle-id` header the send answered with.
+#[must_use]
+pub fn bundle_id(signature: &str) -> String {
+    solana_sdk::hash::hashv(&[signature.as_bytes()]).to_bytes().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether `uuid` has the shape of the key Jito issues: 36 characters, hex digits in
+/// groups of 8-4-4-4-12. Checked so a pasted key with a stray quote or space is caught
+/// at start-up, where it can be said, rather than as sends that quietly fail.
+#[must_use]
+pub fn looks_like_uuid(uuid: &str) -> bool {
+    let groups: Vec<&str> = uuid.split('-').collect();
+    groups.len() == 5
+        && groups.iter().zip([8, 4, 4, 4, 12]).all(|(g, n)| g.len() == n && g.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 /// Another block engine method on the same host as `send_url`.
 ///
 /// `send_url` is the configured `.../api/v1/transactions?bundleOnly=true`; every other
@@ -101,6 +119,24 @@ pub fn fanout_urls(send_url: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bundle of one that landed, as Jito's explorer lists it.
+    #[test]
+    fn a_bundle_id_is_the_sha256_of_the_base58_signature() {
+        assert_eq!(
+            bundle_id("3D9KSDtv242JrQh7TV1mv7KfihmqnurSP8vtWjCQ1sSWv8U7zTsvvZhPGa6Ri7tcKYTPDBw9uyy5KhBN8TVeUUFC"),
+            "aa2103c79bc47e580f986d6f0fde88b26b877c430fab7eaa036ecfee3a081296"
+        );
+    }
+
+    #[test]
+    fn a_uuid_is_recognised_and_a_mangled_one_is_not() {
+        assert!(looks_like_uuid("123e4567-e89b-12d3-a456-426614174000"));
+        assert!(!looks_like_uuid("\"123e4567-e89b-12d3-a456-426614174000"));
+        assert!(!looks_like_uuid("123e4567-e89b-12d3-a456-42661417400 "));
+        assert!(!looks_like_uuid("123e4567e89b12d3a456426614174000"));
+        assert!(!looks_like_uuid(""));
+    }
 
     #[test]
     fn a_regional_url_fans_out_to_every_region_itself_first() {

@@ -173,6 +173,12 @@ priority_micro_lamports = 0
 submit_via = "jito"
 # Blank means Jito's global endpoint with bundleOnly=true.
 jito_url = ""
+# Jito block engine UUID, sent as x-jito-auth on every block engine request. Leave
+# empty to send unauthenticated -- but on 2026-09-27 the block engines dropped every
+# unauthenticated send before their auction (104 of 104, probes with a 27,000 lamport
+# tip included), so without one nothing lands through Jito. Jito issues one through a
+# ticket in its Discord. Paste it between the quotes and restart the bot.
+jito_auth_uuid = ""
 # The most one tip may be, in lamports. The tip is a quarter of the trade's gross, at
 # least Jito's 1,000-lamport minimum, and only paid when the trade lands.
 jito_tip_max_lamports = 20000

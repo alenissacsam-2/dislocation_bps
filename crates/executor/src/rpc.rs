@@ -40,6 +40,74 @@ pub struct Rpc {
     http: reqwest::Client,
     /// For the primary endpoint and Jito only; see [`WARM_POOL_IDLE`].
     http_warm: reqwest::Client,
+    /// Sent as `x-jito-auth` on every block engine request, when set. See
+    /// `Config::jito_auth_uuid` for why it matters.
+    jito_auth: Option<String>,
+}
+
+/// What asking the block engine about a bundle needs, detached from [`Rpc`] so a task
+/// can own it and ask off the trading loop. See [`Rpc::jito_status`].
+#[derive(Clone)]
+pub struct JitoStatus {
+    client: reqwest::Client,
+    auth: Option<String>,
+}
+
+impl JitoStatus {
+    /// What the block engine at `url` did with a bundle sent in the last five minutes:
+    /// `Invalid` (no record of it), `Pending`, `Failed` or `Landed`.
+    ///
+    /// # Why
+    ///
+    /// A bundle that is not included leaves no trace on chain, so "not included" alone
+    /// cannot tell one the block engine never took (`Invalid`) from one whose floor had
+    /// gone when it was simulated (`Failed`) or one that reached the auction and lost
+    /// (`Pending` until it expires). Those call for different fixes — authentication,
+    /// faster pricing, a bigger tip — and on 2026-09-26 the bot had sent 20 bundles with
+    /// no way to tell which it was facing.
+    ///
+    /// `Ok(None)` means the block engine did not answer with a status.
+    ///
+    /// # Errors
+    /// If the request fails or the answer is not JSON.
+    pub async fn status(&self, url: &str, bundle_id: &str) -> Result<Option<String>> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getInflightBundleStatuses",
+            "params": [[bundle_id]],
+        });
+        let endpoint = crate::jito::api_url(url, "getInflightBundleStatuses");
+        let req = with_jito_auth(self.client.post(&endpoint).json(&body), self.auth.as_deref());
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => bail!(
+                "Jito getInflightBundleStatuses failed: {}",
+                cb_core::redact::redact_urls_in(&e.to_string())
+            ),
+        };
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let parsed: Value = serde_json::from_str(&text).map_err(|_| {
+            anyhow!("Jito answered {status} rather than JSON ({} bytes)", text.len())
+        })?;
+        if let Some(e) = parsed.get("error") {
+            bail!("Jito refused the status request ({status}): {e}");
+        }
+        Ok(parsed["result"]["value"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|v| v["status"].as_str())
+            .map(String::from))
+    }
+}
+
+/// `req` with the block engine key on it, if there is one.
+fn with_jito_auth(req: reqwest::RequestBuilder, auth: Option<&str>) -> reqwest::RequestBuilder {
+    match auth {
+        Some(uuid) => req.header("x-jito-auth", uuid),
+        None => req,
+    }
 }
 
 /// What a simulation said would happen.
@@ -192,6 +260,7 @@ impl Rpc {
                 .tcp_keepalive(Duration::from_secs(15))
                 .tcp_nodelay(true)
                 .build()?,
+            jito_auth: None,
         })
     }
 
@@ -501,7 +570,7 @@ impl Rpc {
     /// # Errors
     /// If the request fails or the block engine refuses the transaction.
     pub async fn send_jito(&self, url: &str, tx_base64: &str) -> Result<JitoReceipt> {
-        post_jito(&self.http_warm, url, &jito_send_body(tx_base64)).await
+        post_jito(&self.http_warm, url, &jito_send_body(tx_base64), self.jito_auth.as_deref()).await
     }
 
     /// [`Rpc::send_jito`] to every URL in `urls` at once, answering with the first
@@ -524,8 +593,9 @@ impl Rpc {
         let (tx, mut rx) = tokio::sync::mpsc::channel(urls.len());
         for url in urls {
             let (client, body, url, tx) = (self.http_warm.clone(), body.clone(), url.clone(), tx.clone());
+            let auth = self.jito_auth.clone();
             tokio::spawn(async move {
-                let r = post_jito(&client, &url, &body).await;
+                let r = post_jito(&client, &url, &body, auth.as_deref()).await;
                 let _ = tx.send(r).await;
             });
         }
@@ -552,66 +622,56 @@ impl Rpc {
     /// seconds away on a cold connection, held that loop still every twenty seconds.
     /// A request that fails is logged at debug and costs only its warmth.
     pub fn keep_warm(&self, jito_urls: &[String]) {
-        async fn touch(client: reqwest::Client, url: String, body: Value) {
-            let r = async { client.post(&url).json(&body).send().await?.bytes().await }.await;
+        async fn touch(client: reqwest::Client, url: String, body: Value, auth: Option<String>) {
+            let req = with_jito_auth(client.post(&url).json(&body), auth.as_deref());
+            let r = async { req.send().await?.bytes().await }.await;
             if let Err(e) = r {
                 tracing::debug!("keep-warm request failed: {}", cb_core::redact::redact_urls_in(&e.to_string()));
             }
         }
         let tips = json!({"jsonrpc": "2.0", "id": 1, "method": "getTipAccounts", "params": []});
         for u in jito_urls {
-            tokio::spawn(touch(self.http_warm.clone(), crate::jito::api_url(u, "getTipAccounts"), tips.clone()));
+            tokio::spawn(touch(
+                self.http_warm.clone(),
+                crate::jito::api_url(u, "getTipAccounts"),
+                tips.clone(),
+                self.jito_auth.clone(),
+            ));
         }
         tokio::spawn(touch(
             self.http_warm.clone(),
             self.endpoints[0].clone(),
             json!({"jsonrpc": "2.0", "id": 1, "method": "getSlot"}),
+            None,
         ));
     }
 
-    /// What the block engine did with a bundle sent in the last five minutes.
-    ///
-    /// # Why
-    ///
-    /// A bundle that is not included leaves no trace on chain, so "not included" alone
-    /// cannot tell a trade whose floor was already gone (the block engine's own
-    /// simulation failed it: `Failed`) from one that was valid and lost the auction or
-    /// never reached a Jito leader (`Pending` until it expires). Those call for opposite
-    /// fixes — faster pricing for the first, a bigger tip for the second — and on
-    /// 2026-09-26 the bot had sent 20 bundles with no way to tell which it was facing.
-    ///
-    /// `Ok(None)` means the block engine did not answer with a status.
+    /// Send `uuid` as `x-jito-auth` on every block engine request from here on. Blank
+    /// leaves requests unauthenticated.
+    pub fn set_jito_auth(&mut self, uuid: &str) {
+        let uuid = uuid.trim();
+        self.jito_auth = (!uuid.is_empty()).then(|| uuid.to_string());
+    }
+
+    /// Whether block engine requests carry a key.
+    #[must_use]
+    pub fn jito_authenticated(&self) -> bool {
+        self.jito_auth.is_some()
+    }
+
+    /// A handle for asking the block engine about bundles, which a task can own. See
+    /// [`JitoStatus::status`].
+    #[must_use]
+    pub fn jito_status(&self) -> JitoStatus {
+        JitoStatus { client: self.http_warm.clone(), auth: self.jito_auth.clone() }
+    }
+
+    /// [`JitoStatus::status`], asked in place.
     ///
     /// # Errors
-    /// If the request fails or the answer is not JSON.
+    /// As [`JitoStatus::status`].
     pub async fn jito_bundle_status(&self, url: &str, bundle_id: &str) -> Result<Option<String>> {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getInflightBundleStatuses",
-            "params": [[bundle_id]],
-        });
-        let endpoint = crate::jito::api_url(url, "getInflightBundleStatuses");
-        let resp = match self.http_warm.post(&endpoint).json(&body).send().await {
-            Ok(r) => r,
-            Err(e) => bail!(
-                "Jito getInflightBundleStatuses failed: {}",
-                cb_core::redact::redact_urls_in(&e.to_string())
-            ),
-        };
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        let parsed: Value = serde_json::from_str(&text).map_err(|_| {
-            anyhow!("Jito answered {status} rather than JSON ({} bytes)", text.len())
-        })?;
-        if let Some(e) = parsed.get("error") {
-            bail!("Jito refused the status request ({status}): {e}");
-        }
-        Ok(parsed["result"]["value"]
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|v| v["status"].as_str())
-            .map(String::from))
+        self.jito_status().status(url, bundle_id).await
     }
 
     /// `Ok(None)` means the node has not seen it yet, which is not the same as failure.
@@ -940,8 +1000,8 @@ fn jito_send_body(tx_base64: &str) -> Value {
 }
 
 /// One `sendTransaction` to one block engine. See [`Rpc::send_jito`].
-async fn post_jito(client: &reqwest::Client, url: &str, body: &Value) -> Result<JitoReceipt> {
-    let resp = match client.post(url).json(body).send().await {
+async fn post_jito(client: &reqwest::Client, url: &str, body: &Value, auth: Option<&str>) -> Result<JitoReceipt> {
+    let resp = match with_jito_auth(client.post(url).json(body), auth).send().await {
         Ok(r) => r,
         Err(e) => bail!(
             "Jito sendTransaction failed: {}",

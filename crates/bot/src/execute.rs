@@ -713,6 +713,23 @@ impl Trader {
         }
     }
 
+    /// Who to ask what became of a Jito send, and where: the first block engine this
+    /// trader sends to. `None` off Jito.
+    #[must_use]
+    pub fn jito_status(&self) -> Option<(cb_executor::rpc::JitoStatus, String)> {
+        if !self.sends_via_jito() {
+            return None;
+        }
+        let url = self.jito_urls.first()?.clone();
+        Some((self.exec.rpc.jito_status(), url))
+    }
+
+    /// Whether block engine requests carry a Jito key.
+    #[must_use]
+    pub fn jito_authenticated(&self) -> bool {
+        self.exec.rpc.jito_authenticated()
+    }
+
     /// How many block engines each Jito send goes to.
     #[must_use]
     pub fn jito_regions(&self) -> usize {
