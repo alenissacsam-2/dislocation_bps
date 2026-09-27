@@ -1789,6 +1789,9 @@ async fn spawn_live(
         // Landing probes: the first tick is immediate, so a run starts by finding out
         // whether its bundles can land at all. See `Trader::jito_probe`.
         let mut probe_timer = tokio::time::interval(execute::PROBE_EVERY);
+        // Fees that fall on a schedule, re-priced on the clock. See
+        // `LiveMarket::reprice_timed_fees`.
+        let mut timed_fee_timer = tokio::time::interval(Duration::from_secs(1));
         let mut drift = (0usize, 0usize);
         // Both are edge-triggered: logged when they change, not every sweep. A warning
         // that fires five times a second is a warning nobody reads.
@@ -1890,6 +1893,9 @@ async fn spawn_live(
                     }
                 }
                 _ = usd_timer.tick() => market.rebuild_usd_index(),
+                _ = timed_fee_timer.tick() => {
+                    market.reprice_timed_fees();
+                }
                 _ = warm_timer.tick() => {
                     if let Some(t) = trader.as_mut() {
                         t.keep_warm().await;

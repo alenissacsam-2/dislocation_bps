@@ -97,7 +97,10 @@ enum Venue {
     },
     /// Same: self-contained, and quotable across the pool's whole range rather than
     /// one tick of it.
-    MeteoraDammV2,
+    /// Meteora DAMM v2. Self-contained like a whirlpool, but its base fee can fall on a
+    /// schedule with nothing on chain changing, so the account is kept to be re-priced
+    /// by the clock. See `LiveMarket::reprice_timed_fees`.
+    MeteoraDammV2 { pool: Vec<u8> },
     /// Everything except the fee, which comes from a shared config account.
     RaydiumClmm { trade_fee_ppm: u32 },
     /// Reserves live in two vaults, tracked separately and combined on read.
@@ -410,6 +413,12 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// The earliest unix time a swap priced now could land at: now, less the slack the
+/// chain's clock may run behind this one. A fee that falls with time is priced here.
+fn earliest_landing() -> u64 {
+    (now_ms() / 1_000).saturating_sub(ADAPTIVE_CLOCK_SLACK_SECS)
+}
+
 /// How far behind this machine's clock the chain's block time may run, in seconds.
 /// An adaptive fee depends on the block time a swap lands at; pricing from a little
 /// before now covers a lagging chain clock. See `Oracle::max_fee_rate`.
@@ -451,7 +460,7 @@ impl LiveMarket {
             match entry.dex {
                 // Priced once it is known whether its oracle exists: see below.
                 Dex::OrcaWhirlpool => orca_pending.push((addr, entry.label.clone(), data.clone())),
-                Dex::MeteoraDammV2 => match meteora_damm_v2::to_pool_state(addr, data, boot_slot)
+                Dex::MeteoraDammV2 => match meteora_damm_v2::to_pool_state(addr, data, boot_slot, earliest_landing())
                 {
                     Ok(ps) => {
                         store.upsert(ps);
@@ -460,7 +469,7 @@ impl LiveMarket {
                             Watch {
                                 label: entry.label.clone(),
                                 dex: entry.dex,
-                                venue: Venue::MeteoraDammV2,
+                                venue: Venue::MeteoraDammV2 { pool: data.clone() },
                                 slot: boot_slot,
                             },
                         );
@@ -902,8 +911,9 @@ impl LiveMarket {
                     pool.clone_from(&u.data);
                     self.watches.get(&u.pubkey)?.vault_state(u.pubkey)?
                 }
-                Venue::MeteoraDammV2 => {
-                    meteora_damm_v2::to_pool_state(u.pubkey, &u.data, u.slot).ok()?
+                Venue::MeteoraDammV2 { pool } => {
+                    pool.clone_from(&u.data);
+                    meteora_damm_v2::to_pool_state(u.pubkey, &u.data, u.slot, earliest_landing()).ok()?
                 }
                 Venue::RaydiumClmm { trade_fee_ppm } => {
                     raydium_clmm::to_pool_state(
@@ -1337,7 +1347,10 @@ impl LiveMarket {
                 *pool = data.to_vec();
                 self.watches.get(&addr)?.vault_state(addr)
             }
-            Venue::MeteoraDammV2 => meteora_damm_v2::to_pool_state(addr, data, slot).ok(),
+            Venue::MeteoraDammV2 { pool } => {
+                pool.clone_from(&data.to_vec());
+                meteora_damm_v2::to_pool_state(addr, data, slot, earliest_landing()).ok()
+            }
             Venue::RaydiumClmm { trade_fee_ppm } => {
                 raydium_clmm::to_pool_state(addr, data, *trade_fee_ppm, slot, now_ms() / 1_000).ok()
             }
@@ -1463,6 +1476,35 @@ impl LiveMarket {
         self.registry.pools.retain(|p| p.address != *pool);
         self.subscriptions.retain(|k| !gone.contains(k));
         gone
+    }
+
+    /// Re-price every DAMM v2 pool whose fee is on a running time schedule, from its
+    /// stored account at the current time. Returns how many changed price.
+    ///
+    /// # Why
+    ///
+    /// A scheduled fee steps down on the clock, with no transaction and so no feed
+    /// update to say so: a pool nobody has traded since the last step still shows the
+    /// old, higher fee. An arbitrage the step opens is then invisible until somebody
+    /// else trades the pool — which, for an opening made by a step, is usually the
+    /// arbitrageur who was waiting for it. Re-pricing on the clock makes it visible
+    /// within a second of the step.
+    pub fn reprice_timed_fees(&mut self) -> usize {
+        let t = earliest_landing();
+        let mut changed = 0;
+        for (addr, w) in &self.watches {
+            let Venue::MeteoraDammV2 { pool } = &w.venue else { continue };
+            let Ok(p) = meteora_damm_v2::decode_layout(pool) else { continue };
+            if !p.has_fee_schedule {
+                continue;
+            }
+            let Ok(state) = meteora_damm_v2::to_pool_state(*addr, pool, w.slot, t) else { continue };
+            if self.store.get(&PoolId(*addr)).is_none_or(|old| old.fee_ppm != state.fee_ppm) {
+                self.store.upsert(state);
+                changed += 1;
+            }
+        }
+        changed
     }
 
     /// How many pools this market watches.

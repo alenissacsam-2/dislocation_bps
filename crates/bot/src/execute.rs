@@ -949,7 +949,18 @@ impl Trader {
             // read beside them. The fee is the plan's: the tier the market cap had at
             // detection, which only changes when the cap crosses a tier boundary.
             // Self-contained: price, range and the whole fee are in the pool account.
-            Dex::MeteoraDammV2 => cb_dex::meteora_damm_v2::to_pool_state(address, data, 0).ok()?,
+            Dex::MeteoraDammV2 => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                cb_dex::meteora_damm_v2::to_pool_state(
+                    address,
+                    data,
+                    0,
+                    now.saturating_sub(crate::live::ADAPTIVE_CLOCK_SLACK_SECS),
+                )
+                .ok()?
+            }
             Dex::PumpSwap => {
                 let (base, quote) = vaults?;
                 let pool = cb_dex::pumpswap::decode_pool(data).ok()?;

@@ -65,6 +65,15 @@ const OFF_CLIFF_FEE: usize = 8;
 const OFF_BASE_FEE_REST: usize = 16;
 const OFF_BASE_FEE_REST_END: usize = 48;
 const OFF_DYNAMIC_FEE_INITIALIZED: usize = 56;
+// The base-fee blob as a time scheduler lays it out (`PodAlignedFeeTimeScheduler` in
+// cp-amm): the cliff, the mode byte, five of padding, the number of periods, the period
+// length, and the reduction per period.
+const OFF_BASE_FEE_MODE: usize = 16;
+const OFF_NUMBER_OF_PERIOD: usize = 22;
+const OFF_PERIOD_FREQUENCY: usize = 24;
+const OFF_SCHEDULE_REDUCTION: usize = 32;
+/// `activation_type` for a pool whose points are unix seconds rather than slots.
+const ACTIVATION_BY_TIMESTAMP: u8 = 1;
 const OFF_MINT_A: usize = 168;
 const OFF_MINT_B: usize = 200;
 const OFF_LIQUIDITY: usize = 360;
@@ -167,6 +176,69 @@ pub fn decode(data: &[u8]) -> Result<DammV2Pool> {
     })
 }
 
+/// The base fee over 10^9 the program charges a swap landing at unix time `t`, or later.
+///
+/// A flat fee is the cliff. A time schedule (`FeeTimeScheduler` in cp-amm, modes 0
+/// and 1) steps it down once per `period_frequency` seconds after activation, for
+/// `number_of_period` periods: by `schedule_reduction` each step when linear, by that
+/// many basis points of itself when exponential. From activation on the fee only falls,
+/// so its value at `t` bounds every later landing. Before activation only the pool's
+/// launch vault may trade, and the first public swap pays the cliff, so that is the
+/// price given. Slot-based schedules, the rate limiter and the market-cap schedulers
+/// are refused: 13% of the 1.55 million DAMM v2 pools carried a schedule on 2026-09-27,
+/// and over 99% of those were time-based and linear or exponential.
+///
+/// # Errors
+/// If the schedule is one of the unmodelled kinds, or its arithmetic would underflow.
+pub fn scheduled_base_fee(p: &DammV2Layout, t: u64) -> Result<u64> {
+    if !p.has_fee_schedule {
+        return Ok(p.cliff_fee_numerator);
+    }
+    ensure!(
+        p.base_fee_mode <= 1,
+        "damm v2 base fee mode {} (a rate limiter or market-cap scheduler) is not modelled",
+        p.base_fee_mode
+    );
+    ensure!(
+        p.activation_type == ACTIVATION_BY_TIMESTAMP,
+        "damm v2 fee schedule counts slots, and a quote here has no slot to count from"
+    );
+    if p.period_frequency == 0 || t < p.activation_point {
+        return Ok(p.cliff_fee_numerator);
+    }
+    let period = ((t - p.activation_point) / p.period_frequency).min(u64::from(p.number_of_period));
+    if p.base_fee_mode == 0 {
+        p.schedule_reduction
+            .checked_mul(period)
+            .and_then(|cut| p.cliff_fee_numerator.checked_sub(cut))
+            .ok_or_else(|| anyhow::anyhow!("damm v2 linear schedule runs below zero"))
+    } else {
+        fee_in_period(p.cliff_fee_numerator, p.schedule_reduction, period)
+            .ok_or_else(|| anyhow::anyhow!("damm v2 exponential schedule overflows"))
+    }
+}
+
+/// `cliff · (1 − reduction / 10⁴)^period`, exactly as cp-amm's `get_fee_in_period`
+/// computes it: in Q64.64, squaring and multiplying by bit, flooring every step.
+fn fee_in_period(cliff: u64, reduction_bps: u64, period: u64) -> Option<u64> {
+    const ONE_Q64: u128 = 1 << 64;
+    if reduction_bps == 0 {
+        return Some(cliff);
+    }
+    let bps = (u128::from(reduction_bps) << 64) / 10_000;
+    let base = ONE_Q64.checked_sub(bps)?;
+    let mut result = ONE_Q64;
+    let mut squared = base;
+    // Nineteen bits cover every exponent the program accepts; a u16 period needs sixteen.
+    for bit in 0..19u32 {
+        if period & (1 << bit) != 0 {
+            result = result.checked_mul(squared)? >> 64;
+        }
+        squared = squared.checked_mul(squared)? >> 64;
+    }
+    u64::try_from((result.checked_mul(u128::from(cliff))?) >> 64).ok()
+}
+
 /// DAMM v2's volatility fee over 10^9, at the accumulator the pool last recorded plus two
 /// steps of headroom for the swap's own movement.
 ///
@@ -197,8 +269,9 @@ pub fn variable_fee_numerator(d: &DammV2DynamicFee) -> u64 {
 /// Measured on live pools on 2026-09-26 with `cb-check-damm`, against the program's own
 /// `EvtSwap2`:
 ///
-/// - The rate is the base fee (the cliff numerator over 10^9) plus the volatility fee
-///   ([`variable_fee_numerator`]); pools with a fee schedule are still refused.
+/// - The rate is the base fee (the cliff numerator over 10^9, or what a time schedule
+///   has brought it down to — [`scheduled_base_fee`]) plus the volatility fee
+///   ([`variable_fee_numerator`]).
 /// - Collection mode 0 takes it from the **output** in both directions (4 bp and 10 bp
 ///   pools: the curve matched to the unit). Modes 1 and 2 take it in token B: from the
 ///   output spending A, from the input spending B. Mode 2 compounds part of the fee
@@ -206,14 +279,14 @@ pub fn variable_fee_numerator(d: &DammV2DynamicFee) -> u64 {
 ///   safe side.
 /// - Token-2022 mints are accepted here; a mint with a transfer fee is screened out by
 ///   the caller, which has the mint account and this function does not.
-pub fn to_pool_state(address: Pubkey32, data: &[u8], slot: u64) -> Result<PoolState> {
+///
+/// `earliest_time` is the earliest unix time a swap priced now could land at. A time
+/// schedule only lowers the fee after activation, so its fee then is the most any later
+/// landing pays.
+pub fn to_pool_state(address: Pubkey32, data: &[u8], slot: u64, earliest_time: u64) -> Result<PoolState> {
     let p = decode_layout(data)?;
     ensure!(p.pool_status == 0, "damm v2 pool has swaps disabled");
-    ensure!(
-        !p.has_fee_schedule,
-        "damm v2 pool has a fee schedule: the fee moves over time and the cliff value \
-         alone does not price it"
-    );
+    let base = scheduled_base_fee(&p, earliest_time)?;
     ensure!(p.collect_fee_mode <= 2, "damm v2 fee collection mode {} is not one measured", p.collect_fee_mode);
     ensure!(p.liquidity > 0, "damm v2 pool has no liquidity");
     ensure!(
@@ -228,9 +301,7 @@ pub fn to_pool_state(address: Pubkey32, data: &[u8], slot: u64) -> Result<PoolSt
         p.sqrt_max_price_x64
     );
 
-    let numerator = p
-        .cliff_fee_numerator
-        .saturating_add(p.dynamic_fee.as_ref().map_or(0, variable_fee_numerator));
+    let numerator = base.saturating_add(p.dynamic_fee.as_ref().map_or(0, variable_fee_numerator));
     ensure!(numerator < 1_000_000_000, "damm v2 fee {numerator} over 1e9 is not a fee");
     let fee_ppm = u32::try_from(numerator.div_ceil(FEE_DENOM_PER_PPM)).expect("under a million");
     let fee_on_output_b_to_a = p.collect_fee_mode == 0;
@@ -275,6 +346,15 @@ pub struct DammV2Layout {
     pub cliff_fee_numerator: u64,
     /// Whether the base fee blob holds anything past the cliff (a schedule).
     pub has_fee_schedule: bool,
+    /// The schedule, where there is one: 0 linear and 1 exponential in time; 2 the rate
+    /// limiter and 3–4 the market-cap schedulers, which this does not model.
+    pub base_fee_mode: u8,
+    pub number_of_period: u16,
+    /// Points (slots or seconds, by `activation_type`) per period.
+    pub period_frequency: u64,
+    /// Per period: numerator units for a linear schedule, basis points of the fee for
+    /// an exponential one.
+    pub schedule_reduction: u64,
     pub protocol_fee_percent: u8,
     pub referral_fee_percent: u8,
     pub compounding_fee_bps: u16,
@@ -342,6 +422,10 @@ pub fn decode_layout(data: &[u8]) -> Result<DammV2Layout> {
         sqrt_max_price_x64: u128_at(data, OFF_SQRT_MAX_PRICE),
         cliff_fee_numerator: u64_at(data, OFF_CLIFF_FEE),
         has_fee_schedule: data[OFF_BASE_FEE_REST..OFF_BASE_FEE_REST_END].iter().any(|&b| b != 0),
+        base_fee_mode: data[OFF_BASE_FEE_MODE],
+        number_of_period: u16_at(data, OFF_NUMBER_OF_PERIOD),
+        period_frequency: u64_at(data, OFF_PERIOD_FREQUENCY),
+        schedule_reduction: u64_at(data, OFF_SCHEDULE_REDUCTION),
         protocol_fee_percent: data[48],
         referral_fee_percent: data[50],
         compounding_fee_bps: u16_at(data, 54),
@@ -447,11 +531,55 @@ mod tests {
     }
 
     #[test]
-    fn a_scheduled_fee_pool_is_refused() {
+    fn a_scheduled_fee_pool_is_refused_by_the_flat_fee_decoder() {
         let mut d = account(Q64, 2, 1, 3, 400_000);
         d[OFF_BASE_FEE_REST] = 7; // any non-zero scheduler parameter
         let e = decode(&d).unwrap_err().to_string();
         assert!(e.contains("fee schedule"), "{e}");
+    }
+
+    fn scheduled(mode: u8, cliff: u64, periods: u16, every: u64, reduction: u64, activation: u64) -> DammV2Layout {
+        let mut d = account(Q64 * 1_000_000, 2 * Q64, Q64, 4 * Q64, cliff);
+        d[OFF_BASE_FEE_MODE] = mode;
+        d[OFF_NUMBER_OF_PERIOD..OFF_NUMBER_OF_PERIOD + 2].copy_from_slice(&periods.to_le_bytes());
+        d[OFF_PERIOD_FREQUENCY..OFF_PERIOD_FREQUENCY + 8].copy_from_slice(&every.to_le_bytes());
+        d[OFF_SCHEDULE_REDUCTION..OFF_SCHEDULE_REDUCTION + 8].copy_from_slice(&reduction.to_le_bytes());
+        d[472..480].copy_from_slice(&activation.to_le_bytes());
+        d[480] = ACTIVATION_BY_TIMESTAMP;
+        decode_layout(&d).unwrap()
+    }
+
+    /// 50% falling by 4.9% a minute for ten minutes, then flat at 1%.
+    #[test]
+    fn a_linear_schedule_steps_down_once_a_period_and_then_holds() {
+        let p = scheduled(0, 500_000_000, 10, 60, 49_000_000, 1_000);
+        assert_eq!(scheduled_base_fee(&p, 999).unwrap(), 500_000_000, "before activation: the cliff");
+        assert_eq!(scheduled_base_fee(&p, 1_000).unwrap(), 500_000_000);
+        assert_eq!(scheduled_base_fee(&p, 1_059).unwrap(), 500_000_000);
+        assert_eq!(scheduled_base_fee(&p, 1_060).unwrap(), 451_000_000);
+        assert_eq!(scheduled_base_fee(&p, 1_600).unwrap(), 10_000_000, "all ten periods");
+        assert_eq!(scheduled_base_fee(&p, 99_999).unwrap(), 10_000_000, "and no further");
+    }
+
+    /// Exponential: each period keeps (1 − r) of the fee. Within a unit of the float.
+    #[test]
+    fn an_exponential_schedule_matches_the_closed_form() {
+        let p = scheduled(1, 500_000_000, 30, 10, 2_500, 0);
+        for k in [0u64, 1, 7, 30, 31] {
+            let got = scheduled_base_fee(&p, k * 10).unwrap() as f64;
+            let want = 500_000_000.0 * 0.75f64.powi(k.min(30) as i32);
+            assert!((got - want).abs() <= 2.0 + want * 1e-12, "period {k}: {got} vs {want}");
+            assert!(got <= want + 1.0, "never above the exact value by more than rounding");
+        }
+    }
+
+    #[test]
+    fn unmodelled_schedules_are_refused() {
+        let mut p = scheduled(2, 500_000_000, 10, 60, 49_000_000, 0);
+        assert!(scheduled_base_fee(&p, 10).unwrap_err().to_string().contains("not modelled"));
+        p.base_fee_mode = 0;
+        p.activation_type = 0;
+        assert!(scheduled_base_fee(&p, 10).unwrap_err().to_string().contains("counts slots"));
     }
 
     #[test]
@@ -477,7 +605,7 @@ mod tests {
         for (mode, b_to_a_on_output) in [(0u8, true), (1, false), (2, false)] {
             let mut d = account(Q64 * 1_000_000, 2 * Q64, Q64, 4 * Q64, 400_000);
             d[484] = mode;
-            let s = to_pool_state([1; 32], &d, 7).unwrap();
+            let s = to_pool_state([1; 32], &d, 7, 0).unwrap();
             match s.math {
                 PoolMath::ConcentratedFeeSide { fee_on_output_a_to_b, fee_on_output_b_to_a, .. } => {
                     assert!(fee_on_output_a_to_b, "mode {mode}: spending A always pays from the output");
@@ -488,7 +616,7 @@ mod tests {
         }
         let mut d = account(Q64 * 1_000_000, 2 * Q64, Q64, 4 * Q64, 400_000);
         d[484] = 3;
-        assert!(to_pool_state([1; 32], &d, 7).is_err(), "an unmeasured mode is refused");
+        assert!(to_pool_state([1; 32], &d, 7, 0).is_err(), "an unmeasured mode is refused");
     }
 
     /// Pool 4MhsDW... on 2026-09-26: bin step 1, control 5,739, accumulator 2,120,000.
@@ -516,7 +644,7 @@ mod tests {
     #[test]
     fn a_price_outside_its_own_range_is_refused() {
         let d = account(Q64 * 1000, 10, 100, 200, 400_000);
-        let e = to_pool_state([0; 32], &d, 1).unwrap_err().to_string();
+        let e = to_pool_state([0; 32], &d, 1, 0).unwrap_err().to_string();
         assert!(e.contains("outside its own range"), "{e}");
     }
 
@@ -530,7 +658,7 @@ mod tests {
     #[test]
     fn the_quotable_range_is_the_pools_whole_range() {
         let d = account(Q64 * 1_000_000, 2 * Q64, Q64, 4 * Q64, 400_000);
-        let s = to_pool_state([1; 32], &d, 7).unwrap();
+        let s = to_pool_state([1; 32], &d, 7, 0).unwrap();
         match s.math {
             PoolMath::ConcentratedFeeSide { sqrt_lo_x64, sqrt_hi_x64, .. } => {
                 assert_eq!(sqrt_lo_x64, Q64);

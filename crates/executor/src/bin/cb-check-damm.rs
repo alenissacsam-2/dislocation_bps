@@ -167,12 +167,13 @@ async fn main() -> Result<()> {
         );
         if leg == "leg 1" {
             // The bot's own quote, fee and all, from the account read before the swap.
-            let model = damm::to_pool_state(address.to_bytes(), &data, 0)
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+            let model = damm::to_pool_state(address.to_bytes(), &data, 0, now.saturating_sub(10))
                 .ok()
                 .and_then(|st| st.leg_for_input(if sol_is_a { &p.mint_a } else { &p.mint_b }).and_then(|l| l.quote(u128::from(amount))));
             match model {
                 Some(m) => println!("        the bot's quote {m} vs paid {} ({:+.4} bps; must be <= 0)", e.out, (m as f64 / e.out as f64 - 1.0) * 1e4),
-                None => println!("        the bot refuses to quote this pool: {:?}", damm::to_pool_state(address.to_bytes(), &data, 0).err()),
+                None => println!("        the bot refuses to quote this pool: {:?}", damm::to_pool_state(address.to_bytes(), &data, 0, now.saturating_sub(10)).err()),
             }
             let input_is_a = sol_is_a;
             if let Some(gross) = curve(input_is_a, e.excluded_in) {
