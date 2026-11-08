@@ -27,7 +27,7 @@ use cb_dex::{meteora_damm_v2, meteora_dlmm, orca_whirlpool, pumpswap, raydium_cl
 use cb_executor::encode::{to_pubkey, to_raw};
 use cb_executor::pda::meteora_bin_array;
 use cb_feed::AccountUpdate;
-use cb_scanner::multi::{survey_and_find, SurveyedCycle, MAX_PLAUSIBLE_EDGE_BPS};
+use cb_scanner::multi::{depth_probe_units, survey_and_find, SurveyedCycle, MAX_PLAUSIBLE_EDGE_BPS};
 use cb_scanner::store::PoolStore;
 use cb_server::{Event, EventBus, RouteRow};
 use std::collections::HashMap;
@@ -348,7 +348,11 @@ pub struct ReconcileReport {
     /// persistently non-zero count means the WebSocket is dropping updates.
     pub drifted: usize,
     pub missing: usize,
+    /// Pools that priced before this pass and no longer do.
     pub undecodable: usize,
+    /// Watched pools that did not price before this pass and still do not — not open
+    /// yet, waiting on a vault or a bin array. Not news, so not counted as a fault.
+    pub unpriced: usize,
     pub slot: u64,
 }
 
@@ -1016,7 +1020,8 @@ impl LiveMarket {
                 continue;
             }
             let max_in = (tradable_usd / usd_per_unit) as u128;
-            let (cycles, found, refused) = survey_and_find(&snap, base, max_hops, max_in);
+            let (cycles, found, refused) =
+                survey_and_find(&snap, base, max_hops, max_in, depth_probe_units(usd_per_unit));
             self.note_implausible(&refused);
             let b = surveyed.len();
             for (i, sc) in cycles.iter().enumerate() {
@@ -1295,7 +1300,11 @@ impl LiveMarket {
             };
             let before = self.store.get(&PoolId(addr));
             let Some(state) = self.decode_at(addr, data, slot) else {
-                report.undecodable += 1;
+                if before.is_some() {
+                    report.undecodable += 1;
+                } else {
+                    report.unpriced += 1;
+                }
                 self.unprice(addr);
                 continue;
             };
@@ -1893,6 +1902,35 @@ mod tests {
         let other = AccountUpdate { pubkey: [9; 32], ..u };
         assert!(m.apply(&other, &bus).is_none());
         assert_eq!(m.watch_count(), 1);
+    }
+
+    /// A pool that priced and stops is a fault; a watched pool that never priced is
+    /// not, and is counted on its own so it does not inflate the fault count.
+    #[tokio::test]
+    async fn reconcile_counts_never_priced_pools_apart_from_ones_that_stopped_pricing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                // Every account answers with eight zero bytes, which no pool decodes from.
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":200},"value":[{"data":["AAAAAAAAAAA=","base64"]},{"data":["AAAAAAAAAAA=","base64"]}]}}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let mut m = market_with(vec![sol_usdc(1, 5_569_625_019_338_410_820, 400)]);
+        m.rpc_http = format!("http://{addr}");
+        for id in [1u8, 2] {
+            m.watches.insert([id; 32], Watch { label: format!("p{id}"), dex: Dex::OrcaWhirlpool, venue: Venue::Whirlpool, slot: 100 });
+        }
+        let r = m.reconcile().await.unwrap();
+        assert_eq!((r.checked, r.missing, r.undecodable, r.unpriced), (2, 0, 1, 1), "{r:?}");
     }
 
     /// A DAMM v2 pool that decodes but is not open yet is watched without a state; one

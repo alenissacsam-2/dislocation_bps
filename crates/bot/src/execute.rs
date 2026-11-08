@@ -2266,7 +2266,9 @@ impl Trader {
                     },
                     Submit::Sender { .. } => cb_executor::SendVia::Sender,
                 };
-                let r = plan_to_run.execute(&mut self.exec.gate, rpc, self.opts.dry_run, &via).await;
+                let r = plan_to_run
+                    .execute(&mut self.exec.gate, rpc, &self.exec.wallet, self.opts.dry_run, &via)
+                    .await;
                 // Counted from any send that reached the wire or failed trying: a send
                 // that errored may still have been received, and was a request either way.
                 if tipped && matches!(r, Ok(Attempt::Submitted { .. }) | Err(_)) {

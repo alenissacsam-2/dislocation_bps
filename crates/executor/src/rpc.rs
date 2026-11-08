@@ -31,15 +31,20 @@ const POOL_IDLE: Duration = Duration::from_secs(3);
 /// traffic on both well inside this window.
 const WARM_POOL_IDLE: Duration = Duration::from_secs(45);
 
+/// How long an endpoint that refused our credentials is left out before it is tried
+/// again: long enough that a dead key costs one wasted call per half hour, short enough
+/// that a key fixed mid-run comes back without a restart.
+const BENCH_FOR: Duration = Duration::from_secs(30 * 60);
+
 pub struct Rpc {
     /// Endpoints in preference order. Reads fail over down this list; sends never do.
     endpoints: Vec<String>,
     /// Which endpoint reads start from, so a provider that has just failed is not
     /// retried first on every subsequent call.
     cursor: std::sync::atomic::AtomicUsize,
-    /// One per endpoint: set once it has answered 401 or 403, after which nothing starts
-    /// or fails over to it for the rest of the run. See [`Rpc::bench`].
-    benched: Vec<std::sync::atomic::AtomicBool>,
+    /// One per endpoint: when it last answered 401 or 403, after which nothing starts or
+    /// fails over to it for [`BENCH_FOR`]. See [`Rpc::bench`].
+    benched: Vec<std::sync::Mutex<Option<std::time::Instant>>>,
     http: reqwest::Client,
     /// For the primary endpoint and Jito only; see [`WARM_POOL_IDLE`].
     http_warm: reqwest::Client,
@@ -270,7 +275,7 @@ impl Rpc {
         let endpoints: Vec<String> =
             endpoints.into_iter().map(|e| e.trim().to_string()).filter(|e| !e.is_empty()).collect();
         ensure!(!endpoints.is_empty(), "an RPC client needs at least one endpoint");
-        let benched = endpoints.iter().map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+        let benched = endpoints.iter().map(|_| std::sync::Mutex::new(None)).collect();
         Ok(Self {
             endpoints,
             cursor: std::sync::atomic::AtomicUsize::new(0),
@@ -355,7 +360,11 @@ impl Rpc {
             // a 5xx, so stop paying a round trip to hear it again.
             if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
                 self.bench(idx);
-                bail!("{method}: endpoint {} answered {status}; benched for the rest of the run", idx + 1);
+                bail!(
+                    "{method}: endpoint {} answered {status}; benched for {} minutes",
+                    idx + 1,
+                    BENCH_FOR.as_secs() / 60
+                );
             }
             let text = match resp.text().await {
                 Ok(t) => t,
@@ -417,20 +426,29 @@ impl Rpc {
     }
 
     fn order(&self, turn: usize) -> Vec<usize> {
-        let benched: Vec<bool> =
-            self.benched.iter().map(|b| b.load(std::sync::atomic::Ordering::Relaxed)).collect();
-        try_order(turn, &benched)
+        try_order(turn, &self.benched_now())
     }
 
-    /// Stop using endpoint `idx` for the rest of the run: it refused our credentials.
+    /// Which endpoints are benched right now: refused our credentials within [`BENCH_FOR`].
+    fn benched_now(&self) -> Vec<bool> {
+        self.benched
+            .iter()
+            .map(|b| b.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some_and(|at| at.elapsed() < BENCH_FOR))
+            .collect()
+    }
+
+    /// Stop using endpoint `idx` for [`BENCH_FOR`]: it refused our credentials.
     ///
     /// Measured on 2026-11-07: one configured key answered 401 to every call, and the
     /// rotation kept starting a third of all calls on it — a wasted round trip for every
     /// read, an outright failure for every `send` that drew it.
     fn bench(&self, idx: usize) {
-        use std::sync::atomic::Ordering;
-        if self.benched[idx].swap(true, Ordering::Relaxed) {
-            return;
+        {
+            let mut at = self.benched[idx].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if at.is_some_and(|t| t.elapsed() < BENCH_FOR) {
+                return;
+            }
+            *at = Some(std::time::Instant::now());
         }
         // Host only: some providers put the key in the path, which `redact_endpoint` keeps.
         let host = reqwest::Url::parse(&self.endpoints[idx])
@@ -439,10 +457,12 @@ impl Rpc {
             .unwrap_or_else(|| "unparseable url".into());
         let n = self.endpoint_count();
         tracing::error!(
-            "rpc endpoint {} of {n} ({host}) refused our credentials (401/403); not using it              again this run — check its API key",
-            idx + 1
+            "rpc endpoint {} of {n} ({host}) refused our credentials (401/403); not using it \
+             for {} minutes, then trying it again — check its API key",
+            idx + 1,
+            BENCH_FOR.as_secs() / 60
         );
-        if self.benched.iter().all(|b| b.load(Ordering::Relaxed)) {
+        if self.benched_now().iter().all(|b| *b) {
             tracing::error!(
                 "every one of the {n} rpc endpoint(s) has refused our credentials; still                  calling them, since there is nothing else to call"
             );
@@ -1696,6 +1716,20 @@ mod tests {
         assert_eq!(seq.iter().copied().collect::<std::collections::BTreeSet<_>>().len(), 3, "{seq:?}");
     }
 
+    /// A key can be fixed mid-run: a bench lapses after `BENCH_FOR` and the endpoint is
+    /// tried again, to be benched afresh if it still refuses.
+    #[test]
+    fn a_benched_endpoint_is_tried_again_once_its_bench_lapses() {
+        let rpc = Rpc::with_fallbacks(vec!["https://a.example".into(), "https://b.example".into()]).unwrap();
+        rpc.bench(1);
+        assert!((0..4).all(|_| rpc.next_start() != 1));
+        let lapsed = std::time::Instant::now().checked_sub(BENCH_FOR + Duration::from_secs(1)).unwrap();
+        *rpc.benched[1].lock().unwrap() = Some(lapsed);
+        assert!((0..4).any(|_| rpc.next_start() == 1), "back in the rotation");
+        rpc.bench(1);
+        assert!((0..4).all(|_| rpc.next_start() != 1), "and benched again on the next refusal");
+    }
+
     /// End to end: a 401 benches the endpoint that sent it; a connection failure, like
     /// any other transient error, does not.
     #[tokio::test]
@@ -1715,9 +1749,7 @@ mod tests {
         let rpc = Rpc::with_fallbacks(vec![format!("http://{addr}/?api-key=K"), "http://127.0.0.1:1/".into()])
             .unwrap();
         assert!(rpc.slot().await.is_err());
-        let benched: Vec<bool> =
-            rpc.benched.iter().map(|b| b.load(std::sync::atomic::Ordering::Relaxed)).collect();
-        assert_eq!(benched, vec![true, false]);
+        assert_eq!(rpc.benched_now(), vec![true, false]);
     }
 
     /// A local server answering every request with `response`, and its URL. Nothing

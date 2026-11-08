@@ -72,7 +72,7 @@ fn main() {
             // decision, and it must not be a side effect of logging in.
             if std::env::args().any(|a| a == "--start") {
                 let state = tauri_app.state::<app::App>();
-                if let Err(e) = state.runner.start(app::live_passphrase(&state)) {
+                if let Err(e) = app::start_checked(&state) {
                     eprintln!("--start failed: {e}");
                 }
             }
@@ -87,8 +87,14 @@ fn main() {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("cryptobot-desk failed to start");
+        .build(tauri::generate_context!())
+        .expect("cryptobot-desk failed to start")
+        .run(|handle, event| {
+            // Whatever ends the app, the bot goes with it (a kill is covered by the job object).
+            if let tauri::RunEvent::Exit = event {
+                let _ = handle.state::<app::App>().runner.stop();
+            }
+        });
 }
 
 fn build_tray(tauri_app: &tauri::App) -> tauri::Result<()> {
@@ -123,7 +129,9 @@ fn build_tray(tauri_app: &tauri::App) -> tauri::Result<()> {
                     }
                 }
                 "start" => {
-                    let _ = state.runner.start(app::live_passphrase(&state));
+                    if let Err(e) = app::start_checked(&state) {
+                        eprintln!("tray start refused: {e}");
+                    }
                 }
                 "stop" => {
                     let _ = state.runner.stop();

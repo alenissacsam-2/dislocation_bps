@@ -199,6 +199,15 @@ pub enum Event {
         ts_ms: u64,
     },
 
+    /// A send settled: what it actually cost or earned. `Execution` is published at send
+    /// time with nothing realised; this is the outcome, `realised_usd` negative on a loss.
+    #[serde(rename_all = "camelCase")]
+    Settled { opportunity_id: u64, landed: bool, realised_usd: f64, reason: String, ts_ms: u64 },
+
+    /// Events were dropped for a slow receiver; reload summary state.
+    #[serde(rename_all = "camelCase")]
+    Resync { skipped: u64 },
+
     /// One line of the bot's own log, pushed the instant it is written.
     ///
     /// This is what makes the Log tab real-time rather than a poll of the file: a
@@ -364,6 +373,17 @@ mod tests {
         .unwrap();
         assert!(json.contains("\"type\":\"logLine\""), "got: {json}");
         assert!(json.contains("\"line\":"), "got: {json}");
+    }
+
+    #[test]
+    fn settled_and_resync_carry_the_tags_the_ui_reads() {
+        let s = serde_json::to_string(&Event::Settled {
+            opportunity_id: 7, landed: false, realised_usd: -0.01, reason: "r".into(), ts_ms: 1,
+        })
+        .unwrap();
+        assert!(s.contains("\"type\":\"settled\"") && s.contains("\"realisedUsd\":-0.01"), "{s}");
+        let r = serde_json::to_string(&Event::Resync { skipped: 3 }).unwrap();
+        assert!(r.contains("\"type\":\"resync\""), "{r}");
     }
 
     #[tokio::test]

@@ -36,6 +36,20 @@ pub fn is_dead(silent: Duration) -> bool {
     silent > MAX_SILENCE
 }
 
+/// Bound on a connect or a single send, so a peer that stops reading cannot park the loop.
+const IO_TIMEOUT: Duration = Duration::from_secs(15);
+
+async fn send_timed<S>(socket: &mut S, m: Message) -> Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
+{
+    tokio::time::timeout(IO_TIMEOUT, socket.send(m))
+        .await
+        .map_err(|_| anyhow!("send timed out after {}s", IO_TIMEOUT.as_secs()))??;
+    Ok(())
+}
+
 const MIN_BACKOFF_MS: u64 = 500;
 const MAX_BACKOFF_MS: u64 = 30_000;
 
@@ -171,7 +185,7 @@ where
         "method": "accountSubscribe",
         "params": [bs58::encode(acct).into_string(), {"encoding": "base64", "commitment": "processed"}]
     });
-    socket.send(Message::Text(req.to_string().into())).await?;
+    send_timed(socket, Message::Text(req.to_string().into())).await?;
     pending.insert(id, *acct);
     Ok(())
 }
@@ -185,7 +199,9 @@ async fn run_once(
     // Updates the consumer had no room for, newest per account. See `deliver`.
     backlog: &mut std::collections::HashMap<Pubkey32, AccountUpdate>,
 ) -> Result<()> {
-    let (mut socket, _) = tokio_tungstenite::connect_async(url).await?;
+    let (mut socket, _) = tokio::time::timeout(IO_TIMEOUT, tokio_tungstenite::connect_async(url))
+        .await
+        .map_err(|_| anyhow!("connect timed out after {}s", IO_TIMEOUT.as_secs()))??;
     tracing::info!(
         "feed connected to {}, subscribing to {} accounts",
         cb_core::redact::redact_endpoint(url),
@@ -216,8 +232,17 @@ async fn run_once(
     // So: never block indefinitely. Probe with a ping when quiet, and give up entirely
     // once data has been absent long enough that the connection cannot be healthy.
     let mut last_data = std::time::Instant::now();
+    // Ids of our unsubscribe calls: an error reply to one is harmless.
+    let mut unsubs: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     loop {
+        // Every turn, not only on a read timeout: a server that keeps pinging us would
+        // otherwise never leave the timeout branch unvisited and this check never run.
+        let silent = last_data.elapsed();
+        if is_dead(silent) {
+            stats.stalls.fetch_add(1, Ordering::Relaxed);
+            return Err(anyhow!("no account data for {}s, treating connection as dead", silent.as_secs()));
+        }
         let read = tokio::select! {
             r = tokio::time::timeout(READ_TIMEOUT, socket.next()) => r,
             change = added.recv() => {
@@ -249,7 +274,8 @@ async fn run_once(
                                 "params": [id]
                             });
                             next_id += 1;
-                            socket.send(Message::Text(req.to_string().into())).await?;
+                            unsubs.insert(next_id - 1);
+                            send_timed(&mut socket, Message::Text(req.to_string().into())).await?;
                             stats.subscribed.fetch_sub(1, Ordering::Relaxed);
                         }
                     }
@@ -267,16 +293,8 @@ async fn run_once(
                 // then bail if data has been absent past the tolerance.
                 // A quiet socket is also the consumer's chance to drain what was parked.
                 flush(tx, backlog);
-                let silent = last_data.elapsed();
-                if is_dead(silent) {
-                    stats.stalls.fetch_add(1, Ordering::Relaxed);
-                    return Err(anyhow!(
-                        "no account data for {}s — treating connection as dead",
-                        silent.as_secs()
-                    ));
-                }
                 tracing::debug!("feed quiet for {}s, pinging", silent.as_secs());
-                socket.send(Message::Ping(Vec::new().into())).await?;
+                send_timed(&mut socket, Message::Ping(Vec::new().into())).await?;
                 continue;
             }
         };
@@ -286,7 +304,7 @@ async fn run_once(
             Message::Text(t) => t.to_string(),
             Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
             Message::Ping(p) => {
-                socket.send(Message::Pong(p)).await?;
+                send_timed(&mut socket, Message::Pong(p)).await?;
                 continue;
             }
             // A pong proves the socket is alive but carries no prices, so it must
@@ -320,6 +338,10 @@ async fn run_once(
         // limited would turn a partial outage into a total one, and the reconnect
         // would hit the same limit again.
         if let Some(err) = v.get("error") {
+            if v.get("id").and_then(|i| i.as_u64()).is_some_and(|id| unsubs.remove(&id)) {
+                tracing::debug!("unsubscribe refused: {err}");
+                continue;
+            }
             match v.get("id").and_then(|i| i.as_u64()).and_then(|id| pending.remove(&id)) {
                 Some(pk) => {
                     stats.subscribe_errors.fetch_add(1, Ordering::Relaxed);

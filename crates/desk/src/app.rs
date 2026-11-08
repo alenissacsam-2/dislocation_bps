@@ -92,12 +92,7 @@ pub async fn bot_status(app: tauri::State<'_, App>) -> Result<serde_json::Value,
 #[tauri::command]
 pub async fn bot_start(app: tauri::State<'_, App>) -> Result<(), String> {
     let runner = Arc::clone(&app.runner);
-    let secret = live_passphrase(&app);
-    // A live bot started without the key exits at once ("no passphrase arrived on
-    // stdin"), which reads as a crash. Say what to do instead.
-    if secret.is_none() && config::read_mode(&app.paths.config()).is_ok_and(|m| m.effective == "live") {
-        return Err("Live mode needs the wallet unlocked: unlock it with your passphrase, then press Start.".into());
-    }
+    let secret = passphrase_or_refuse(&app)?;
     let paths = app.paths.clone();
     let ledger = Arc::clone(&app.ledger);
     tauri::async_runtime::spawn_blocking(move || {
@@ -149,6 +144,29 @@ pub fn ledger_bytes(ledger: &std::path::Path) -> u64 {
         std::path::PathBuf::from(s)
     };
     size(ledger.to_path_buf()) + size(with("-wal")) + size(with("-shm"))
+}
+
+/// [`live_passphrase`], or a refusal when a live config has no unlocked key. A live bot
+/// started without the key exits at once ("no passphrase arrived on stdin"), which reads
+/// as a crash; say what to do instead. Shared by every way of starting the bot.
+///
+/// # Errors
+/// If the config asks for live mode and the key is not unlocked.
+pub fn passphrase_or_refuse(app: &App) -> Result<Option<String>, String> {
+    let secret = live_passphrase(app);
+    if secret.is_none() && config::read_mode(&app.paths.config()).is_ok_and(|m| m.effective == "live") {
+        return Err("Live mode needs the wallet unlocked: unlock it with your passphrase, then press Start.".into());
+    }
+    Ok(secret)
+}
+
+/// Start the bot the way `bot_start` does, minus the archive step.
+///
+/// # Errors
+/// If the unlock check or the start itself refuses.
+pub fn start_checked(app: &App) -> Result<(), String> {
+    let secret = passphrase_or_refuse(app)?;
+    app.runner.start(secret).map_err(|e| e.to_string())
 }
 
 /// The passphrase to hand the bot, or `None`.
@@ -656,15 +674,39 @@ pub fn read_limits(app: tauri::State<'_, App>) -> Result<cb_executor::risk::Limi
 }
 
 /// Saving limits deliberately does **not** archive the run — see `config::write_limits`.
+/// The bot reads limits once, at start, so a running one is restarted (as
+/// [`set_dry_run`] does) and the outcome reported the same way.
 ///
 /// # Errors
 /// If the limits are unusable or the file cannot be written.
 #[tauri::command]
-pub fn save_limits(
+pub async fn save_limits(
     app: tauri::State<'_, App>,
     limits: cb_executor::risk::Limits,
-) -> Result<(), String> {
-    config::write_limits(&app.paths.config(), &limits).map_err(|e| e.to_string())
+) -> Result<serde_json::Value, String> {
+    let runner = Arc::clone(&app.runner);
+    let paths = app.paths.clone();
+    let secret = live_passphrase(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        config::write_limits(&paths.config(), &limits).map_err(|e| e.to_string())?;
+        let was_running = matches!(runner.probe(), RunState::Running | RunState::Starting);
+        let mut restarted = false;
+        let mut restart_error = None;
+        if was_running {
+            runner.stop().map_err(|e| e.to_string())?;
+            match runner.start(secret) {
+                Ok(()) => restarted = true,
+                Err(e) => restart_error = Some(e.to_string()),
+            }
+        }
+        Ok(serde_json::json!({
+            "wasRunning": was_running,
+            "restarted": restarted,
+            "restartError": restart_error,
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// The directory this run reads and writes.

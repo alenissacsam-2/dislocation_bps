@@ -1184,6 +1184,10 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
         // for the same lamports. Raising it again is cheap to justify and cheap to do;
         // a transaction that runs out of units pays its fee and reverts, so the failure
         // is bounded but it is not free.
+        //
+        // Now the ceiling a trade is built and simulated under: an RPC or Sender send is
+        // re-signed asking for what its simulation used plus a margin
+        // (`cb_executor::limit_from_simulation`), so priority is paid on that instead.
         compute_units: 300_000,
         dry_run: cfg.dry_run,
         create_token_accounts: true,
@@ -1971,7 +1975,7 @@ async fn main() -> anyhow::Result<()> {
         let walk_us = t.elapsed().as_micros();
         let t = std::time::Instant::now();
         for base in &market.registry.base_mints {
-            let _ = cb_scanner::multi::survey_and_find(&snap, base, hops, u128::MAX / 4);
+            let _ = cb_scanner::multi::survey_and_find(&snap, base, hops, u128::MAX / 4, cb_scanner::multi::DEPTH_PROBE_IN);
         }
         let survey_us = t.elapsed().as_micros();
         println!(
@@ -2448,6 +2452,23 @@ struct SweepBudget {
     submitted: bool,
 }
 
+/// Whether an opportunity's row is written. A stalled feed pauses the measurement, but
+/// never a send: it spent real money, and its row is what the confirm timer settles.
+fn fill_row_due(feed_stalled: bool, unchanged_row: bool, sent: bool) -> bool {
+    !unchanged_row && (!feed_stalled || sent)
+}
+
+#[cfg(test)]
+mod fill_row_tests {
+    #[test]
+    fn a_send_is_recorded_even_while_the_feed_is_stalled() {
+        assert!(super::fill_row_due(true, false, true), "a send during a stall");
+        assert!(!super::fill_row_due(true, false, false), "a paper row during a stall");
+        assert!(super::fill_row_due(false, false, false));
+        assert!(!super::fill_row_due(false, true, false), "unchanged and nothing sent");
+    }
+}
+
 /// What became of one opportunity, for its ledger row and its execution event.
 #[derive(Default)]
 struct Fate {
@@ -2634,6 +2655,13 @@ impl LiveLoop {
                 if let Err(e) = l.update_fill_outcome(row, taken, &reason, net) {
                     tracing::warn!("could not record a send's outcome: {e}");
                 }
+                self.bus.publish(Event::Settled {
+                    opportunity_id: row as u64,
+                    landed: taken,
+                    realised_usd: net,
+                    reason,
+                    ts_ms: now_ms(),
+                });
             }
         }
     }
@@ -2650,8 +2678,8 @@ impl LiveLoop {
                 if r.drifted > 0 || r.missing > 0 || r.undecodable > 0 {
                     tracing::warn!(
                         "reconcile at slot {}: {}/{} pools drifted from the feed, \
-                         {} missing, {} undecodable",
-                        r.slot, r.drifted, r.checked, r.missing, r.undecodable
+                         {} missing, {} undecodable ({} watched but not yet priced)",
+                        r.slot, r.drifted, r.checked, r.missing, r.undecodable, r.unpriced
                     );
                 } else {
                     tracing::info!(
@@ -2672,6 +2700,7 @@ impl LiveLoop {
         // must not be the reason that takes longer to notice.
         if let Some(t) = trader.as_deref_mut() {
             t.tick_auto_resume();
+            self.announce_halt(t);
         }
         let sweep = self.market.sweep(self.tradable_usd, self.min_depth_usd, self.max_hops);
         self.evaluated_total = self.evaluated_total.saturating_add(sweep.evaluated);
@@ -2687,7 +2716,7 @@ impl LiveLoop {
             if feed_stalled {
                 tracing::warn!(
                     "feed silent for over {FEED_STALL_SECS}s — pausing the ledger; \
-                     sweeps continue but nothing is recorded"
+                     sweeps continue but nothing except a send is recorded"
                 );
             } else {
                 tracing::info!("feed recovered — recording resumed");
@@ -3291,15 +3320,18 @@ impl LiveLoop {
         }
         fate.latency_ms = started.elapsed().as_millis() as u64;
         self.on_attempt_outcome(t, r, opp, plan, budget, fate);
-        // The gate being halted is a global state, not
-        // a fact about this one cycle, so it does not
-        // fit the per-cycle-key cooldown above — every
-        // distinct cycle the sweep finds would otherwise
-        // re-announce the same halt once each. Throttled
-        // on its own timer instead: announced once, then
-        // at most once more per cooldown window for as
-        // long as it stays true, however many different
-        // cycles keep asking in between.
+        self.announce_halt(t);
+    }
+
+    /// Say so if the gate is halted.
+    ///
+    /// The gate being halted is a global state, not a fact about one cycle, so it does
+    /// not fit the per-cycle-key cooldown — every distinct cycle the sweep finds would
+    /// otherwise re-announce the same halt once each. Throttled on its own timer
+    /// instead: announced once, then at most once more per cooldown window for as long
+    /// as it stays true. Called after every attempt and at the top of every sweep, so a
+    /// halt a confirmed revert started is said within a sweep, not at the next attempt.
+    fn announce_halt(&mut self, t: &execute::Trader) {
         if let Some(why) = t.halted() {
             if self.cooldowns.should_announce_halt() {
                 tracing::error!("trading halted: {why}");
@@ -3484,7 +3516,8 @@ impl LiveLoop {
                 (opp.edge_bps.to_bits(), fate.reason.clone(), std::time::Instant::now()),
             );
         }
-        if let (Some(l), false, false) = (self.ledger.as_ref(), feed_stalled, unchanged_row) {
+        let due = fill_row_due(feed_stalled, unchanged_row, fate.pending.is_some());
+        if let (Some(l), true) = (self.ledger.as_ref(), due) {
             let rec = cb_ledger::FillRecord {
                 slot: opp.slot,
                 route: opp.route.clone(),

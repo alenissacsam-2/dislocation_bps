@@ -8,6 +8,7 @@
 //! server keeps the three endpoints and stops pretending to be a window.
 
 use crate::events::{Event, EventBus};
+use axum::{extract::Request, middleware::Next};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -51,6 +52,7 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
         .route("/api/health", get(health))
         .route("/api/stream", get(ws_handler))
         .route("/api/equity", get(equity))
+        .layer(axum::middleware::from_fn(host_guard))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -78,6 +80,19 @@ async fn ws_handler(
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
     ws.on_upgrade(move |socket| push_events(socket, state.bus)).into_response()
+}
+
+/// Refuse any request whose Host is not loopback or the desk webview: a DNS-rebound page
+/// reaches us under its own hostname, and CORS does not stop it reading plain GETs.
+async fn host_guard(req: Request, next: Next) -> axum::response::Response {
+    let host = req.headers().get(axum::http::header::HOST).and_then(|v| v.to_str().ok());
+    if host_allowed(host) { next.run(req).await } else { axum::http::StatusCode::FORBIDDEN.into_response() }
+}
+
+fn host_allowed(host: Option<&str>) -> bool {
+    let Some(host) = host else { return false };
+    let name = host.strip_prefix("[::1]").map_or_else(|| host.split(':').next().unwrap_or(""), |_| "[::1]");
+    matches!(name, "localhost" | "127.0.0.1" | "[::1]" | "tauri.localhost")
 }
 
 /// No Origin = not a browser. Otherwise only loopback pages and the desk webview
@@ -173,6 +188,10 @@ async fn push_events(mut socket: WebSocket, bus: EventBus) {
             }
             Err(RecvError::Lagged(skipped)) => {
                 tracing::debug!("dashboard lagged, skipped {skipped} events");
+                let Ok(text) = serde_json::to_string(&Event::Resync { skipped }) else { continue };
+                if socket.send(Message::Text(text.into())).await.is_err() {
+                    break;
+                }
             }
             Err(RecvError::Closed) => break,
         }
@@ -189,12 +208,19 @@ pub fn state_with_ledger(
     AppState { bus, mode: mode.into(), ledger_path: Some(ledger_path.into()) }
 }
 
-#[allow(unused_imports)]
-use Event as _EventInDocs;
-
 #[cfg(test)]
 mod tests {
-    use super::origin_allowed;
+    use super::{host_allowed, origin_allowed};
+
+    #[test]
+    fn only_loopback_hosts_are_served() {
+        for ok in ["127.0.0.1:8787", "localhost", "localhost:8787", "[::1]:8787", "tauri.localhost"] {
+            assert!(host_allowed(Some(ok)), "{ok}");
+        }
+        for bad in [None, Some("evil.com"), Some("evil.com:8787"), Some("127.0.0.1.evil.com"), Some("")] {
+            assert!(!host_allowed(bad), "{bad:?}");
+        }
+    }
 
     #[test]
     fn only_local_origins_may_open_the_stream() {

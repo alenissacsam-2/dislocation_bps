@@ -35,6 +35,7 @@ impl Ledger {
 
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // WAL lets the dashboard read while the bot writes.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -171,10 +172,11 @@ impl Ledger {
     /// # Errors
     /// If the update fails.
     pub fn update_fill_outcome(&self, id: i64, taken: bool, reason: &str, net_usd: f64) -> Result<()> {
-        self.conn.execute(
+        let n = self.conn.execute(
             "UPDATE paper_fills SET taken = ?1, skipped_reason = ?2, net_usd = ?3 WHERE id = ?4",
             rusqlite::params![i64::from(taken), reason, net_usd, id],
         )?;
+        anyhow::ensure!(n == 1, "no ledger row {id} to settle");
         Ok(())
     }
 
@@ -279,7 +281,8 @@ impl Ledger {
         )?;
 
         let realised_net: f64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(net_usd),0) FROM paper_fills WHERE taken = 1",
+            "SELECT COALESCE(SUM(net_usd),0) FROM paper_fills
+             WHERE taken = 1 AND skipped_reason LIKE 'submitted%'",
             [],
             |r| r.get(0),
         )?;
@@ -1489,6 +1492,13 @@ mod tests {
         }
     }
 
+    /// A taken fill that really was sent, as the live path writes it.
+    fn live(net: f64) -> FillRecord {
+        let mut f = fill(net, true);
+        f.skipped_reason = Some("submitted and landed".into());
+        f
+    }
+
     fn fill(net: f64, taken: bool) -> FillRecord {
         FillRecord {
             slot: 1,
@@ -1671,8 +1681,8 @@ mod tests {
     #[test]
     fn fills_separate_what_was_taken_from_what_was_merely_seen() {
         let l = Ledger::open_in_memory().unwrap();
-        l.record_fill(&fill(0.0002, true)).unwrap();
-        l.record_fill(&fill(0.0003, true)).unwrap();
+        l.record_fill(&live(0.0002)).unwrap();
+        l.record_fill(&live(0.0003)).unwrap();
         l.record_fill(&fill(-0.0011, false)).unwrap();
 
         let s = l.summary().unwrap();
@@ -1728,10 +1738,10 @@ mod tests {
     fn percentiles_describe_the_typical_opportunity_not_the_luckiest_one() {
         let l = Ledger::open_in_memory().unwrap();
         for _ in 0..90 {
-            l.record_fill(&fill(0.0001, true)).unwrap();
+            l.record_fill(&live(0.0001)).unwrap();
         }
         for _ in 0..10 {
-            let mut lucky = fill(1.0, true);
+            let mut lucky = live(1.0);
             lucky.profit_at_optimal_usd = 50.0;
             l.record_fill(&lucky).unwrap();
         }
@@ -1786,7 +1796,7 @@ mod tests {
         }
 
         let raw = l.summary().unwrap();
-        assert!((raw.realised_net_usd - 5.0).abs() < 1e-6, "the naive sum says $5");
+        assert!((raw.net_usd - 5.0).abs() < 1e-6, "the naive sum says $5");
 
         let e = l.episodes(5).unwrap();
         assert_eq!(e.count, 1, "it was one gap the whole time");
@@ -1952,6 +1962,15 @@ mod tests {
         assert!((l.realised_since("2026-11-07T00:00:00Z").unwrap() + 0.15).abs() < 1e-12);
         assert_eq!(l.realised_since("2026-11-08").unwrap(), 0.0);
         assert!(l.realised_since("yesterday").is_err());
+    }
+
+    #[test]
+    fn summary_realised_counts_live_sends_only_and_a_missing_row_is_an_error() {
+        let l = Ledger::open_in_memory().unwrap();
+        l.record_fill(&fill(5.0, true)).unwrap();
+        l.record_fill(&live(0.25)).unwrap();
+        assert!((l.summary().unwrap().realised_net_usd - 0.25).abs() < 1e-12);
+        assert!(l.update_fill_outcome(9999, true, "submitted", 0.0).is_err());
     }
 
     #[test]

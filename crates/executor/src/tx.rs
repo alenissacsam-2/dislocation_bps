@@ -288,9 +288,62 @@ pub fn signature_of(tx_base64: &str) -> Result<String> {
     Ok(first.to_string())
 }
 
+/// `tx_base64` re-signed with its compute unit limit lowered to `units`, or `None` when
+/// it carries no limit or already asks for no more than `units`.
+///
+/// Only the four limit bytes change, so the message keeps its size, accounts and
+/// blockhash; the new signature is the one the transaction will be known by.
+///
+/// # Errors
+/// If the text is not a transaction, or `wallet` is not its fee payer.
+pub fn with_compute_limit(wallet: &Wallet, tx_base64: &str, units: u32) -> Result<Option<String>> {
+    let raw = crate::rpc::base64_decode(tx_base64)
+        .ok_or_else(|| anyhow::anyhow!("the transaction is not valid base64"))?;
+    let mut tx: VersionedTransaction = bincode::deserialize(&raw)?;
+    let budget = pk(programs::COMPUTE_BUDGET);
+    let VersionedMessage::V0(msg) = &mut tx.message else { return Ok(None) };
+    ensure!(msg.account_keys.first() == Some(&wallet.pubkey()), "the wallet is not this transaction's fee payer");
+    let keys = msg.account_keys.clone();
+    let Some(ix) = msg.instructions.iter_mut().find(|ix| {
+        keys.get(usize::from(ix.program_id_index)) == Some(&budget) && ix.data.len() == 5 && ix.data[0] == 2
+    }) else {
+        return Ok(None);
+    };
+    let current = u32::from_le_bytes([ix.data[1], ix.data[2], ix.data[3], ix.data[4]]);
+    if units >= current {
+        return Ok(None);
+    }
+    ix.data[1..5].copy_from_slice(&units.to_le_bytes());
+    tx.signatures[0] = wallet.sign(&tx.message.serialize());
+    Ok(Some(crate::rpc::base64_encode(&bincode::serialize(&tx)?)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lowered_compute_limit_is_re_signed_and_nothing_else_changes() {
+        let w = wallet();
+        let ixs = [set_compute_limit(300_000), set_compute_price(7), noop(Pubkey::new_unique(), 3)];
+        let a = assemble(&w, &ixs, Hash::default()).unwrap();
+        let lowered = with_compute_limit(&w, &a.tx_base64, 160_000).unwrap().expect("lowered");
+        let raw = crate::rpc::base64_decode_for_test(&lowered).unwrap();
+        let tx: VersionedTransaction = bincode::deserialize(&raw).unwrap();
+        assert!(tx.verify_with_results().iter().all(|ok| *ok), "the new signature must verify");
+        let want = assemble(&w, &[set_compute_limit(160_000), set_compute_price(7), ixs[2].clone()], Hash::default()).unwrap();
+        let want: VersionedTransaction =
+            bincode::deserialize(&crate::rpc::base64_decode_for_test(&want.tx_base64).unwrap()).unwrap();
+        assert_eq!(tx.message, want.message, "only the limit moved");
+        assert_eq!(raw.len(), a.size_bytes);
+        assert_ne!(signature_of(&lowered).unwrap(), signature_of(&a.tx_base64).unwrap());
+        // Never raised, and a transaction with no limit is left alone.
+        assert_eq!(with_compute_limit(&w, &a.tx_base64, 300_000).unwrap(), None);
+        let bare = assemble(&w, &[noop(Pubkey::new_unique(), 3)], Hash::default()).unwrap();
+        assert_eq!(with_compute_limit(&w, &bare.tx_base64, 1).unwrap(), None);
+        // Another key cannot re-sign it.
+        assert!(with_compute_limit(&wallet(), &a.tx_base64, 1).is_err());
+    }
 
     /// A throwaway key. `Wallet` has no constructor from raw bytes on purpose — the
     /// only way to get one is through the sealed-file path — so a test wallet is

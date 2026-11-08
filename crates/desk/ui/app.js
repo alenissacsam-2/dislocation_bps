@@ -211,6 +211,8 @@ function onEvent(ev) {
   if (ev.type === "poolUpdate") return onPool(ev);
   if (ev.type === "opportunity") return onOpportunity(ev);
   if (ev.type === "execution") return onExecution(ev);
+  if (ev.type === "settled") return onSettled(ev);
+  if (ev.type === "resync") return onResync();
   if (ev.type === "logLine") return onLogLine(ev);
 }
 
@@ -451,7 +453,7 @@ const STAGES = [
   { key: "attempted", name: "Past the filters" },
   { key: "built", name: "Re-priced & built" },
   { key: "simulated", name: "Simulated clean" },
-  { key: "sent", name: "Sent to Jito" },
+  { key: "sent", name: "Sent" },
   { key: "landed", name: "Landed" },
 ];
 
@@ -479,8 +481,8 @@ const RULES = [
   [/no token account/, "built", "No token account (rent)"],
   [/would leave less than/, "built", "Balance too low for fees"],
   [/expected net .* below/, "built", "Below minimum profit"],
-  [/last Jito send/, "built", "Jito's one-a-second limit"],
-  [/Jito trade can only/, "built", "Not a SOL cycle (Jito)"],
+  [/last (?:Jito|Helius Sender) send/, "built", "One-a-second send limit"],
+  [/(?:Jito|Helius Sender) trade can only/, "built", "Not a SOL cycle"],
   [/will not fit|not yet re-priced|no encoder/, "built", "Route shape unsupported"],
   [/vanished|learned where pool/, "built", "Pool data refreshed"],
   [/^refused/, "built", "Refused: other"],
@@ -489,7 +491,7 @@ const RULES = [
   [/^simulation/, "simulated", "Simulation rejected the build", true],
   [/submitted and landed/, "landed", "Landed"],
   [/landed, reverted/, "landed", "Landed and reverted", true],
-  [/not included/, "landed", "Not included — cost nothing"],
+  [/not included/, "landed", "Not included"],
   [/not yet confirmed|awaiting (inclusion|confirmation)/, "landed", "Sent; confirmation pending"],
   [/^rpc error|^unexpected/, "built", "Error while attempting", true],
 ];
@@ -601,6 +603,28 @@ function onExecution(ev) {
   saveRun(); paintFunnel(); paintReasons(); paintMoneyWell(); paintBotWell();
 }
 
+/* A send settled: the outcome the send-time event could not know. Execution carries 0
+ * realised for a live send, so this is the only place a loss or gain is added. */
+function onSettled(ev) {
+  if (!RUN.store) return;
+  RUN.store.realised += ev.realisedUsd || 0;
+  saveRun(); paintMoneyWell();
+}
+
+/* Events were dropped for this client: reload what can be reloaded. */
+function onResync() {
+  if (S.view === "history") loadHistory(S.viewingArchive);
+}
+
+/* How the active send path treats a trade that misses its floor. Under Sender it lands,
+ * reverts and pays; under Jito it is dropped. */
+function sendPath() {
+  const via = (window.__mode && window.__mode.submitVia) || "sender";
+  if (via === "jito") return { name: "Jito", miss: "A bundle that misses costs nothing." };
+  if (via === "rpc") return { name: "RPC", miss: "A miss can land, revert and pay the base fee plus priority." };
+  return { name: "Helius Sender", miss: "A miss lands, reverts and pays the base fee plus priority." };
+}
+
 function topDrop(stage) {
   const d = RUN.store?.drops[stage];
   if (!d) return null;
@@ -652,7 +676,7 @@ function funnelVerdict(st) {
   }
   if (st.paper) return `Demo mode: ${int(c.attempted)} of ${int(c.seen)} would have been taken on paper.`;
   if (c.landed) return `${int(c.landed)} landed of ${int(c.sent)} sent.`;
-  if (c.sent) return `${int(c.sent)} sent to Jito; none included yet. A bundle that misses costs nothing.`;
+  if (c.sent) return `${int(c.sent)} sent to ${sendPath().name}; none landed yet. ${sendPath().miss}`;
   const worst = STAGES.slice(1).map((s, i) => ({ s, lost: (c[STAGES[i].key] || 0) - (c[s.key] || 0) }))
     .sort((a, b) => b.lost - a.lost)[0];
   return worst && worst.lost > 0
@@ -765,7 +789,7 @@ function classifyAttempt(msg) {
   if (/byte limit|address lookup table/.test(msg) && !/^\d+ hops will not fit/.test(msg.replace(/^refused: /, ""))) {
     return { kind: "packet", bps: null };
   }
-  if (/the last Jito send was/.test(msg)) return { rate: true };
+  if (/the last (?:Jito|Helius Sender) send was/.test(msg)) return { rate: true };
   // Both the startup open and the rotation confirm with this one line; the rotation's
   // own summary line follows it and would count the same account twice.
   if (/^opened \d+ token account\(s\), confirmed/.test(msg)) return { account: true };
@@ -803,13 +827,14 @@ function paintAttempts() {
     ["Real attempts", int(ATT.pts.length)],
     ["Median miss", losses.length ? fmt(median(losses)) + " bp" : "—"],
     ["Closest miss", losses.length ? fmt(Math.max(...losses)) + " bp" : "—"],
-    ["Sent to Jito", int(sent)],
+    ["Sent to " + sendPath().name, int(sent)],
     ["Landed", int(n.landed || 0), n.landed ? "ok" : ""],
-    ["Not included, free", int(n.miss || 0)],
+    [sendPath().name === "Jito" ? "Not included, free" : "Not included", int(n.miss || 0)],
     ["Tips paid", ATT.tipsUsd ? "$" + ATT.tipsUsd.toFixed(4) : "$0"],
     ["Turned away by the 1/s limit", int(ATT.rate)],
     ["Token accounts opened", int(ATT.accounts)],
   ];
+  $("hJito").textContent = sendPath().name;
   $("jitoKv").innerHTML = kv
     .map(([k, v, cls]) => `<div class="kv-row"><span>${esc(k)}</span><b class="num ${cls || ""}">${esc(v)}</b></div>`)
     .join("");
@@ -965,7 +990,7 @@ function paintBotWell() {
   const m = window.__mode, d = window.__dry;
   const live = m && m.effective === "live";
   $("wBotSub").textContent = !running ? (STATE_NOTE[s.state] || "")
-    : live ? (d && !d.effective ? "LIVE · submitting through Jito" : "LIVE · dry run, nothing sent") : "DEMO · signs nothing";
+    : live ? (d && !d.effective ? "LIVE · submitting through " + sendPath().name : "LIVE · dry run, nothing sent") : "DEMO · signs nothing";
   const last = RUN.store?.lastSend;
   $("wBotLast").textContent = last ? `last sent ${ago(last.ts)} · ${last.outcome.toLowerCase()}` : "no trade sent this run";
   $("wBotLast").className = "r-foot" + (last?.fault ? " bad" : "");
@@ -1283,7 +1308,9 @@ async function paintDryRun() {
   }
   lines.push(d.effective
     ? "<b>Dry run.</b> Transactions are built, signed and simulated against live state, and none are submitted."
-    : "<b>Real transactions will be submitted.</b> Each goes to Jito as a bundle of one: a missed floor is dropped and costs nothing, and every floor guarantees the fee and tip on chain — but money can move from here.");
+    : "<b>Real transactions will be submitted.</b> " + (sendPath().name === "Jito"
+      ? "Each goes to Jito as a bundle of one: a missed floor is dropped and costs nothing, and every floor guarantees the fee and tip on chain"
+      : `Each goes through ${sendPath().name}: a trade that misses its floor still lands, reverts and pays the base fee plus priority, so a miss is not free`) + " — and money can move from here.");
   $("dryState").innerHTML = lines.join("<br><br>");
   $("btnAllowSpend").disabled = !d.effective;
   $("btnDryRun").disabled = d.effective;
@@ -1342,9 +1369,7 @@ async function paintMode() {
       + `The file says <code>${esc(m.mode)}</code>; the bot will run as <code>${esc(m.effective)}</code>. `
       + `This application cannot change that — unset the variable and restart it.`);
   }
-  if (!m.executionImplemented) {
-    lines.push("<b>Live execution is not built in this binary.</b> Demo is the whole of what works here.");
-  } else if (m.effective === "live") {
+  if (m.effective === "live") {
     lines.push("<b>Live is armed.</b> Whether anything is actually submitted depends on Submission above: "
       + "while dry run is on, the bot builds, signs and simulates real transactions and sends none.");
   }
@@ -1417,8 +1442,8 @@ $("btnSaveLimits").onclick = async () => {
   const limits = Object.assign({}, window.__limits || {});
   for (const [id, key] of Object.entries(LIMIT_FIELDS)) limits[key] = Number($(id).value);
   try {
-    await invoke("save_limits", { limits });
-    $("limitsResult").textContent = "Limits saved. They apply to the next trade considered.";
+    const r = await invoke("save_limits", { limits });
+    $("limitsResult").textContent = (r && r.restarted ? "Limits saved. The running bot was restarted to apply them." : r && r.restartError ? "Limits saved, but the bot could not be restarted: " + r.restartError : "Limits saved. They apply from the next start.");
     await paintLimits();
   } catch (e) {
     $("limitsResult").textContent = "" + e;
@@ -1662,7 +1687,7 @@ const LOGV = { lines: [], filter: "all", query: "", paused: false, banner: null 
 
 function lineKind(p) {
   const m = p.msg;
-  if (/^(submitted |LANDED|sent to Jito)|was not included|landed and reverted/.test(m)) return m.includes("reverted") ? "fault" : "trade";
+  if (/^(submitted |LANDED|sent to (?:Jito|Helius Sender))|was not included|landed and reverted/.test(m)) return m.includes("reverted") ? "fault" : "trade";
   if (p.lv === "ERROR" && !/^(LIVE ARMED|mode: LIVE|a filter held back)/.test(m)) return "fault";
   if (/panicked|halted:|Jito refused|rpc error/.test(m)) return "fault";
   if (/^(refused|rejected|simulation|probe|not attempted)/.test(m)) return "refused";
@@ -1829,7 +1854,7 @@ function paintRail() {
     note.hidden = false;
     const d = window.__dry;
     note.innerHTML = d && !d.effective
-      ? "Armed and <b>submitting</b> through Jito."
+      ? "Armed and <b>submitting</b> through " + sendPath().name + "."
       : "Armed. Nothing is submitted while dry run is on — see Parameters.";
   } else if (!m.allowLiveSet) {
     note.hidden = false;

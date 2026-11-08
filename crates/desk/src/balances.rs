@@ -32,8 +32,17 @@ use std::str::FromStr;
 /// cannot change during a session is a round trip spent on nothing.
 pub const TOKEN_ACCOUNT_RENT: u64 = 2_039_280;
 
-/// A generous allowance for signature and priority fees on one cycle.
-pub const FEE_ALLOWANCE: u64 = 100_000;
+/// A generous allowance for signature and priority fees on one cycle, plus the least
+/// Helius Sender tip a send must carry.
+pub const FEE_ALLOWANCE: u64 = 100_000 + cb_executor::sender::MIN_TIP_LAMPORTS;
+
+/// How many of the mints a cycle starts and ends at (the named ones) the address already
+/// holds an account for. An unrelated token account opens nothing a cycle needs.
+#[must_use]
+pub fn held_needed(mints: &[&str]) -> usize {
+    let set: std::collections::HashSet<&&str> = mints.iter().filter(|m| well_known(m).is_some()).collect();
+    set.len()
+}
 
 /// Hide the credential in an endpoint before it is shown to anyone.
 ///
@@ -200,7 +209,8 @@ pub async fn fetch(rpc_url: &str, address: &str, mints_needed: usize) -> anyhow:
         (a.symbol.is_empty(), &a.symbol, &a.mint).cmp(&(b.symbol.is_empty(), &b.symbol, &b.mint))
     });
 
-    let readiness = readiness(lamports, tokens.len(), mints_needed);
+    let mints: Vec<&str> = tokens.iter().map(|t| t.mint.as_str()).collect();
+    let readiness = readiness(lamports, held_needed(&mints), mints_needed);
 
     Ok(Holdings {
         address: address.to_string(),
@@ -245,6 +255,16 @@ mod tests {
         assert!(r.short_by_lamports > 0);
         assert!(r.reason.contains("rent"), "the reason must name rent: {}", r.reason);
     }
+
+    #[test]
+    fn only_the_needed_mints_count_as_held_and_the_tip_is_budgeted() {
+        let junk = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
+        let usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        assert_eq!(held_needed(&[junk, junk, "abc"]), 0);
+        assert_eq!(held_needed(&[junk, usdc, usdc]), 1);
+    }
+
+    const _: () = assert!(FEE_ALLOWANCE >= 100_000 + cb_executor::sender::MIN_TIP_LAMPORTS);
 
     #[test]
     fn an_address_holding_every_account_needs_only_fees() {

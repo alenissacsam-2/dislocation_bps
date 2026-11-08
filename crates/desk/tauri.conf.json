@@ -28,7 +28,7 @@
     "targets": ["nsis"],
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
     "shortDescription": "An instrument for measuring Solana arbitrage",
-    "longDescription": "Watches Solana AMM pools, prices every arbitrage cycle it can see, and records what would have cleared. Paper mode only: it never signs or sends a transaction.",
+    "longDescription": "Watches Solana AMM pools, prices every arbitrage cycle it can see, and records what would have cleared. Demo mode never signs; Live mode, once armed and unlocked, sends real transactions.",
     "licenseFile": "../../LICENSE",
     "windows": {
       "nsis": {

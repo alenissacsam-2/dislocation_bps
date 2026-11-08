@@ -119,7 +119,7 @@
       </div>
       <div class="well readout ch-teal" id="wMoney">
         <div class="r-head"><span class="label">Money this run</span>
-          <button class="info" type="button" data-tip="Realised profit and loss from trades that actually executed since this run started, against the daily loss limit set under Parameters. A Jito bundle that is not included costs nothing and moves nothing."><svg class="ic"><use href="#i-info"/></svg></button></div>
+          <button class="info" type="button" data-tip="Realised profit and loss from trades that actually executed since this run started, against the daily loss limit set under Parameters. Under Jito a missed floor is dropped and costs nothing; under Helius Sender it lands, reverts and pays the base fee plus priority."><svg class="ic"><use href="#i-info"/></svg></button></div>
         <div class="r-val num" id="wMoneyVal">$0.0000</div>
         <div class="gauge" aria-hidden="true"><div class="gauge-fill" id="gBudgetFill"></div></div>
         <div class="r-sub" id="wMoneySub">of the loss budget used</div>
@@ -138,7 +138,7 @@
         <div class="mod-head">
           <h2 id="hFunnel">Where opportunities die</h2>
           <span class="scope" id="funnelScope">since —</span>
-          <button class="info" type="button" data-tip="Every opportunity the bot surfaces, followed through the pipeline: net of the tip, past the executable filters, re-priced and built against fresh state, simulated, sent to Jito, and included in a block. Each chamber is the count that got that far; under each drop is the most common reason it stopped there. Counted from the live event stream since the time shown, and kept if the window reloads during the same run."><svg class="ic"><use href="#i-info"/></svg></button>
+          <button class="info" type="button" data-tip="Every opportunity the bot surfaces, followed through the pipeline: net of the tip, past the executable filters, re-priced and built against fresh state, simulated, sent, and included in a block. Each chamber is the count that got that far; under each drop is the most common reason it stopped there. Counted from the live event stream since the time shown, and kept if the window reloads during the same run."><svg class="ic"><use href="#i-info"/></svg></button>
         </div>
         <div class="funnel" id="funnel"></div>
       </section>
@@ -147,7 +147,7 @@
         <div class="mod-head">
           <h2 id="hAttempts">Every real attempt</h2>
           <span class="scope" id="attScope">this run</span>
-          <button class="info" type="button" data-tip="Each dot is one cycle the bot actually tried: it fetched fresh state, re-priced the route and built the floor. Height is how far the fresh price landed from that floor — above the line the trade cleared and went to Jito, below it the price had already moved and nothing was sent. Coral is a loss on the fresh price, amber cleared the price but not the fee, green cleared but was too many accounts for one packet, violet was sent and not included, teal landed. Read from the log at start, then live."><svg class="ic"><use href="#i-info"/></svg></button>
+          <button class="info" type="button" data-tip="Each dot is one cycle the bot actually tried: it fetched fresh state, re-priced the route and built the floor. Height is how far the fresh price landed from that floor — above the line the trade cleared and was sent, below it the price had already moved and nothing was sent. Coral is a loss on the fresh price, amber cleared the price but not the fee, green cleared but was too many accounts for one packet, violet was sent and not included, teal landed. Read from the log at start, then live."><svg class="ic"><use href="#i-info"/></svg></button>
         </div>
         <canvas id="attChart" class="chart"></canvas>
         <div class="legend" id="attLegend"></div>
@@ -174,8 +174,8 @@
 
       <section class="module" aria-labelledby="hJito">
         <div class="mod-head">
-          <h2 id="hJito">Jito</h2>
-          <button class="info" type="button" data-tip="What reached the block engine this run. A bundle that is not included costs nothing; one that lands pays the base fee and its tip, both guaranteed on chain by the floor. Rate-limited counts attempts turned away before any work because the engine takes one send a second."><svg class="ic"><use href="#i-info"/></svg></button>
+          <h2 id="hJito">Helius Sender</h2>
+          <button class="info" type="button" data-tip="What was sent this run, on the active send path. Under Jito a bundle that is not included costs nothing, and one that lands pays the base fee and its tip, both guaranteed on chain by the floor. Under Helius Sender a trade that misses its floor lands, reverts and pays the base fee plus priority. Rate-limited counts attempts turned away before any work because the path takes one send a second."><svg class="ic"><use href="#i-info"/></svg></button>
         </div>
         <div class="kv" id="jitoKv"></div>
       </section>
@@ -312,7 +312,7 @@
           </div>
           <div class="field">
             <label for="fPriority">Priority bid <span class="unit">µ-lamports / CU</span>
-              <button class="info" type="button" data-tip="Only used when trades go through the RPC (submit_via = &quot;rpc&quot;). Through Jito, the default, the tip does this job and this number is ignored. 0 pays the base fee only."><svg class="ic"><use href="#i-info"/></svg></button></label>
+              <button class="info" type="button" data-tip="Only used when trades go through the RPC (submit_via = &quot;rpc&quot;). Through Helius Sender or Jito the tip does this job and this number is ignored. 0 pays the base fee only."><svg class="ic"><use href="#i-info"/></svg></button></label>
             <input type="number" id="fPriority" step="1" min="0">
           </div>
         </div>

@@ -150,6 +150,13 @@ impl BotRunner for NativeRunner {
             drop(sink);
         }
 
+        // If the desk is killed, Windows closes this job and takes the bot with it; an
+        // orphan would hold the port and the next desk would refuse to start.
+        #[cfg(target_os = "windows")]
+        if let Err(e) = kill_with_us(&child) {
+            eprintln!("could not tie the instrument to this app's lifetime: {e}");
+        }
+
         *guard = Some(child);
         // Only here: a start that bails above leaves a failed run failed, so the
         // watcher keeps retrying it.
@@ -389,5 +396,65 @@ mod tests {
             std::env::temp_dir().join("cbdesk-test2.log"),
         );
         assert!(r.stop().is_ok());
+    }
+}
+
+/// Put `child` in a job object that kills its members when the last handle closes. The
+/// handle is held for the life of this process, so the job closes exactly when we die.
+#[cfg(target_os = "windows")]
+pub fn kill_with_us(child: &Child) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    // Raw handle as usize so the static is Sync.
+    static JOB: OnceLock<usize> = OnceLock::new();
+    let job = match JOB.get() {
+        Some(j) => *j,
+        None => {
+            // SAFETY: plain Win32 calls with a zeroed, correctly sized info struct.
+            let h = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if h.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = unsafe {
+                SetInformationJobObject(
+                    h,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::addr_of!(info).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            *JOB.get_or_init(|| h as usize)
+        }
+    };
+    // SAFETY: both handles are valid; the child handle is owned by `child`.
+    if unsafe { AssignProcessToJobObject(job as _, child.as_raw_handle() as _) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod job_tests {
+    #[test]
+    fn a_child_can_be_tied_to_the_desks_lifetime() {
+        let mut c = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let r = super::kill_with_us(&c);
+        let _ = c.kill();
+        let _ = c.wait();
+        r.unwrap();
     }
 }

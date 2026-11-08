@@ -154,6 +154,14 @@ pub enum SendVia {
     Sender,
 }
 
+/// The compute limit a send asks for after its simulation used `consumed` units: a
+/// quarter more plus 10,000, room for a few more ticks or bins crossed by the time it
+/// lands. Running out reverts the trade and still pays the fee, so the margin is wide.
+#[must_use]
+pub fn limit_from_simulation(consumed: u64) -> u32 {
+    u32::try_from(consumed.saturating_add(consumed / 4).saturating_add(10_000)).unwrap_or(u32::MAX)
+}
+
 /// A trade that has been priced and is ready to be considered.
 pub struct Plan {
     pub size_usd: f64,
@@ -182,6 +190,7 @@ impl Plan {
         &self,
         gate: &mut RiskGate,
         rpc: &Rpc,
+        signer: &Wallet,
         dry_run: bool,
         via: &SendVia,
     ) -> Result<Attempt> {
@@ -201,9 +210,11 @@ impl Plan {
                 SendVia::Rpc | SendVia::Sender => true,
                 SendVia::Jito { simulate_first, .. } => *simulate_first,
             };
+        let mut units = None;
         if simulate {
-            if let Some(rejected) = self.simulate_for(gate, rpc).await? {
-                return Ok(rejected);
+            match self.simulate_for(gate, rpc).await? {
+                Ok(u) => units = u,
+                Err(rejected) => return Ok(rejected),
             }
         }
 
@@ -213,16 +224,29 @@ impl Plan {
             ));
         }
 
+        // Priority is charged on the limit requested, so a fee-paying send asks for what
+        // the simulation used plus a margin, not the static ceiling. Jito pays no priority.
+        let resized = match (via, units) {
+            (SendVia::Rpc | SendVia::Sender, Some(u)) => {
+                tx::with_compute_limit(signer, &self.tx_base64, limit_from_simulation(u)).unwrap_or_else(|e| {
+                    tracing::warn!("could not lower the compute limit; sending as simulated: {e:#}");
+                    None
+                })
+            }
+            _ => None,
+        };
+        let tx_base64 = resized.as_deref().unwrap_or(&self.tx_base64);
+
         // Known before sending, so a send that errors is not forgotten: a timeout can
         // come after the node took the transaction, and only the signature can say.
-        let own_signature = tx::signature_of(&self.tx_base64)?;
+        let own_signature = tx::signature_of(tx_base64)?;
         let sent = match via {
-            SendVia::Rpc => rpc.send(&self.tx_base64, true).await.map(|s| (s, None)),
+            SendVia::Rpc => rpc.send(tx_base64, true).await.map(|s| (s, None)),
             SendVia::Jito { urls, .. } => rpc
-                .send_jito_all(urls, &self.tx_base64)
+                .send_jito_all(urls, tx_base64)
                 .await
                 .map(|r| (r.signature, r.bundle_id)),
-            SendVia::Sender => rpc.send_sender(&self.tx_base64).await.map(|s| (s, None)),
+            SendVia::Sender => rpc.send_sender(tx_base64).await.map(|s| (s, None)),
         };
         let (signature, bundle_id) = sent.unwrap_or_else(|e| {
             tracing::warn!(
@@ -234,9 +258,9 @@ impl Plan {
         Ok(Attempt::Submitted { signature, expected_net_usd: self.expected_net_usd, bundle_id })
     }
 
-    /// The simulation half of [`Plan::execute`]: `Some` is the rejection to return,
-    /// `None` means the trade may go ahead.
-    async fn simulate_for(&self, gate: &mut RiskGate, rpc: &Rpc) -> Result<Option<Attempt>> {
+    /// The simulation half of [`Plan::execute`]: `Err` is the rejection to return, `Ok`
+    /// means the trade may go ahead and carries the compute units the simulation used.
+    async fn simulate_for(&self, gate: &mut RiskGate, rpc: &Rpc) -> Result<Result<Option<u64>, Attempt>> {
         // The chain's opinion, before anything irreversible.
         let sim = rpc.simulate(&self.tx_base64, &[self.profit.address()]).await?;
         if !sim.succeeded() {
@@ -273,7 +297,7 @@ impl Plan {
             // simulation nineteen times, missed the floor on fifteen of them, and spent
             // the gaps refusing everything with "trading is halted".
             gate.record(if missed_floor { Outcome::Missed } else { Outcome::Failed });
-            return Ok(Some(Attempt::SimulationRejected { reason, observed_net_usd: None }));
+            return Ok(Err(Attempt::SimulationRejected { reason, observed_net_usd: None }));
         }
 
         // Read the balance from whichever place this route's profit lands in. Reading a
@@ -285,14 +309,14 @@ impl Plan {
         };
         let Some(after) = observed else {
             gate.record(Outcome::Failed);
-            return Ok(Some(Attempt::SimulationRejected {
+            return Ok(Err(Attempt::SimulationRejected {
                 reason: "simulation returned no balance for the profit account".into(),
                 observed_net_usd: None,
             }));
         };
 
         if after < self.min_post_balance {
-            return Ok(Some(Attempt::SimulationRejected {
+            return Ok(Err(Attempt::SimulationRejected {
                 reason: format!(
                     "simulated balance {after} is below the {} this trade must reach \
                      to have profited",
@@ -301,7 +325,7 @@ impl Plan {
                 observed_net_usd: None,
             }));
         }
-        Ok(None)
+        Ok(Ok(sim.units_consumed))
     }
 
     /// Ask the chain what would have happened, and stop there.
@@ -434,6 +458,11 @@ mod sender_tests {
                     path.split('?').next().unwrap_or(""),
                     if simulating { "simulate" } else { "send" }
                 ));
+                if !simulating {
+                    let body: serde_json::Value =
+                        serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap_or_default();
+                    log.lock().unwrap().push(format!("tx {}", body["params"][0].as_str().unwrap_or("")));
+                }
                 let body = if simulating { sim } else { r#"{"jsonrpc":"2.0","id":"1","result":"SIGX"}"# };
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -445,12 +474,22 @@ mod sender_tests {
         (format!("http://{addr}"), seen)
     }
 
-    fn signed_tx(owner_out: &mut Pubkey) -> String {
+    fn signed_tx(w: &Wallet, limit: u32) -> String {
+        let ixs = [tx::set_compute_limit(limit), tx::set_compute_price(1), tx::transfer_lamports(&w.pubkey(), &sender::tip_account(0), 5_000)];
+        tx::assemble(w, &ixs, solana_sdk::hash::Hash::default()).unwrap().tx_base64
+    }
+
+    fn wallet() -> Wallet {
         use solana_sdk::signer::keypair::Keypair;
-        let w = cb_wallet::EncryptedKey::seal(&Keypair::new().to_bytes(), "p").and_then(|e| e.unseal("p")).unwrap();
-        *owner_out = w.pubkey();
-        let ixs = [tx::set_compute_limit(1_000), tx::set_compute_price(1), tx::transfer_lamports(&w.pubkey(), &sender::tip_account(0), 5_000)];
-        tx::assemble(&w, &ixs, solana_sdk::hash::Hash::default()).unwrap().tx_base64
+        cb_wallet::EncryptedKey::seal(&Keypair::new().to_bytes(), "p").and_then(|e| e.unseal("p")).unwrap()
+    }
+
+    /// The compute limit inside a transaction the mock was sent.
+    fn limit_in(entry: &str) -> u32 {
+        let raw = rpc::base64_decode_for_test(entry.strip_prefix("tx ").unwrap()).unwrap();
+        let tx: solana_sdk::transaction::VersionedTransaction = bincode::deserialize(&raw).unwrap();
+        let ix = &tx.message.instructions()[0];
+        u32::from_le_bytes(ix.data[1..5].try_into().unwrap())
     }
 
     fn plan(owner: Pubkey, tx_base64: String) -> Plan {
@@ -466,15 +505,14 @@ mod sender_tests {
     const SIM_OK: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"err":null,"logs":[],"unitsConsumed":450,"accounts":[{"lamports":1000000,"data":["","base64"],"owner":"11111111111111111111111111111111"}]}}}"#;
     const SIM_SHORT: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"err":null,"logs":[],"unitsConsumed":450,"accounts":[{"lamports":998000,"data":["","base64"],"owner":"11111111111111111111111111111111"}]}}}"#;
 
-    async fn run(sim: &'static str) -> (Attempt, Vec<String>) {
+    async fn run(sim: &'static str, limit: u32) -> (Attempt, Vec<String>) {
         let (base, seen) = mock(sim).await;
         let mut rpc = Rpc::new(format!("{base}/rpc")).unwrap();
         rpc.set_sender_url_for_test(&format!("{base}/fast?swqos_only=true&api-key=K"));
-        let mut owner = Pubkey::default();
-        let tx = signed_tx(&mut owner);
-        let p = plan(owner, tx);
+        let w = wallet();
+        let p = plan(w.pubkey(), signed_tx(&w, limit));
         let mut gate = RiskGate::new(risk::Limits::default());
-        let a = p.execute(&mut gate, &rpc, false, &SendVia::Sender).await.unwrap();
+        let a = p.execute(&mut gate, &rpc, &w, false, &SendVia::Sender).await.unwrap();
         let log = seen.lock().unwrap().clone();
         (a, log)
     }
@@ -482,14 +520,26 @@ mod sender_tests {
     /// No revert protection on Sender, so the chain is asked first, every time.
     #[tokio::test]
     async fn a_trade_via_sender_is_simulated_before_it_is_sent() {
-        let (a, log) = run(SIM_OK).await;
+        let (a, log) = run(SIM_OK, 1_000).await;
         assert!(matches!(&a, Attempt::Submitted { signature, bundle_id: None, .. } if signature == "SIGX"), "{a:?}");
-        assert_eq!(log, vec!["/rpc simulate".to_string(), "/fast send".to_string()]);
+        assert_eq!(log[..2], ["/rpc simulate".to_string(), "/fast send".to_string()]);
+        // 450 used plus the margin is over the 1,000 asked for: never raised.
+        assert_eq!(limit_in(&log[2]), 1_000);
+    }
+
+    /// Priority is limit times price: the send asks for what the simulation used plus a
+    /// margin, not the static ceiling it was built with.
+    #[tokio::test]
+    async fn a_sender_trade_is_sent_with_the_limit_its_simulation_needed() {
+        let (a, log) = run(SIM_OK, 300_000).await;
+        assert!(matches!(&a, Attempt::Submitted { .. }), "{a:?}");
+        assert_eq!(limit_in(&log[2]), limit_from_simulation(450));
+        assert_eq!(limit_from_simulation(127_523), 169_403);
     }
 
     #[tokio::test]
     async fn a_trade_via_sender_that_simulates_short_is_never_sent() {
-        let (a, log) = run(SIM_SHORT).await;
+        let (a, log) = run(SIM_SHORT, 1_000).await;
         assert!(matches!(a, Attempt::SimulationRejected { .. }), "{a:?}");
         assert_eq!(log, vec!["/rpc simulate".to_string()]);
     }

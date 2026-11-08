@@ -238,33 +238,9 @@ pub struct ModeStatus {
     /// Whether `CRYPTOBOT_ALLOW_LIVE=1` — the half of the guard that lives outside
     /// this application and which it deliberately does not set.
     pub allow_live_set: bool,
-    /// Whether this build can actually execute a trade. Reported rather than assumed,
-    /// because selecting Live while this is false means the bot refuses to start, and
-    /// an operator deserves to know that before they flip it rather than after.
-    pub execution_implemented: bool,
+    /// How trades are sent: `sender`, `jito` or `rpc`. Decides what a missed floor costs.
+    pub submit_via: String,
 }
-
-/// Live execution is built. Changed 2026-08-30.
-///
-/// `crates/bot/src/execute.rs` encodes real swaps for Orca Whirlpool and Raydium CLMM,
-/// and `cb-bot` now links `cb-executor`, `cb-wallet` and `solana-sdk`. The guarantee
-/// that no argument about flags could produce a signature — because the code was absent
-/// — is gone, and nothing brings it back short of deleting that module.
-///
-/// What carries the weight now, all of it checkable and none of it in this constant:
-///
-/// - `mode = "live"` in the config **and** `CRYPTOBOT_ALLOW_LIVE=1` in the environment,
-///   which this application deliberately does not set.
-/// - A passphrase, read from the bot's stdin at spawn. A live config on its own loads
-///   no key and signs nothing.
-/// - `dry_run`, which defaults to **true** and is a separate decision from `mode`, so
-///   arming execution and spending money are two acts rather than one.
-/// - The risk gate, and simulation against live state with the profit read from the
-///   resulting balance rather than from the quote.
-///
-/// This constant now says only that the machinery exists, which is why the UI stopped
-/// using it to refuse and started using it to warn.
-pub const EXECUTION_IMPLEMENTED: bool = true;
 
 /// Whether the bot will submit anything, and whether the environment is overriding it.
 ///
@@ -328,7 +304,12 @@ pub fn read_mode(path: &Path) -> anyhow::Result<ModeStatus> {
         effective,
         env_override,
         allow_live_set,
-        execution_implemented: EXECUTION_IMPLEMENTED,
+        submit_via: std::env::var("CRYPTOBOT_SUBMIT_VIA")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| doc.get("submit_via").and_then(toml_edit::Item::as_str).map(str::to_string))
+            .unwrap_or_else(|| "sender".into())
+            .to_ascii_lowercase(),
     })
 }
 
@@ -582,30 +563,20 @@ max_position_lamports = 20000000
         assert!(after.contains("mode = \"live\""));
     }
 
+    #[test]
+    fn submit_path_is_read_and_defaults_to_sender() {
+        assert_eq!(read_mode(&mode_file("sv-none", "mode = \"paper\"
+")).unwrap().submit_via, "sender");
+        assert_eq!(read_mode(&mode_file("sv-jito", "submit_via = \"jito\"
+")).unwrap().submit_via, "jito");
+    }
+
     /// A config with no `mode` key deserialises to Paper in cb-core, so reading one
     /// must agree rather than inventing a different default.
     #[test]
     fn a_config_without_a_mode_key_reads_as_paper() {
         let p = mode_file("nomode", "capital_usd = 100.0\n");
         assert_eq!(read_mode(&p).unwrap().mode, "paper");
-    }
-
-    /// The canary that used to assert execution was unbuilt fired, as designed, when
-    /// execution was built. This is what replaced it.
-    ///
-    /// The constant no longer carries a safety claim — it says only that the machinery
-    /// exists, which is why `set_mode` stopped refusing on it and started warning. The
-    /// guarantee moved to the two switches, the stdin passphrase, `dry_run`, the risk
-    /// gate, and simulation-before-send.
-    // Asserting on a constant is normally pointless. Here the constant is the subject.
-    #[allow(clippy::assertions_on_constants)]
-    #[test]
-    fn execution_is_implemented_and_the_guarantee_moved_to_the_runtime_guards() {
-        assert!(
-            EXECUTION_IMPLEMENTED,
-            "if execution is being removed, restore set_mode's refusal and the bot's \
-             startup bail in the same change"
-        );
     }
 
     /// The panel must report balances from the same endpoint the bot is using, or a

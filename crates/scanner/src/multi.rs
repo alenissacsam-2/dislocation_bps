@@ -286,23 +286,41 @@ fn lollipops(snap: &Snapshot, base_mint: &Pubkey32, out: &mut Vec<Cycle>) {
 /// 2026-11-07 printed 17,000,086,981. Real fresh-state edges are a few bps.
 pub const MAX_PLAUSIBLE_EDGE_BPS: f64 = 10_000.0;
 
-/// A cycle must hand back at least half of this many base units to be worth surveying.
+/// A cycle must hand back at least half of a probe this many dollars in size to be
+/// worth sizing.
 ///
 /// A drained pool quotes a real marginal price with nothing behind it: 4 lamports in a
 /// PumpSwap SOL vault showed 54M bps, and no input returned more than 3 lamports.
 /// Judged by the first unit that is indistinguishable from a deep pool; judged at a
 /// probe, a real route returns about what it was given.
-/// shortcut: a fixed probe in base units, so a base mint with very high unit value or
-/// very low decimals wants a scaled one.
+///
+/// In dollars rather than base units, so the probe means the same for every base mint:
+/// a fixed 10,000 units was a cent of USDC, a fifth of a cent of SOL, and would be a
+/// fortune of a mint with few decimals and a high price.
+pub const DEPTH_PROBE_USD: f64 = 0.01;
+
+/// The fixed probe this replaced, in base units: what [`depth_probe_units`] gives for a
+/// stablecoin with six decimals.
 pub const DEPTH_PROBE_IN: u128 = 10_000;
 
-fn has_depth(legs: &[Leg]) -> bool {
-    cb_core::path::chain_quote(legs, DEPTH_PROBE_IN).is_some_and(|out| out >= DEPTH_PROBE_IN / 2)
+/// [`DEPTH_PROBE_USD`] in base units of a mint worth `usd_per_unit` a base unit; at
+/// least two, since a probe whose half rounds to zero passes any check.
+#[must_use]
+pub fn depth_probe_units(usd_per_unit: f64) -> u128 {
+    if usd_per_unit > 0.0 && usd_per_unit.is_finite() {
+        ((DEPTH_PROBE_USD / usd_per_unit) as u128).max(2)
+    } else {
+        DEPTH_PROBE_IN
+    }
+}
+
+fn has_depth(legs: &[Leg], probe: u128) -> bool {
+    cb_core::path::chain_quote(legs, probe).is_some_and(|out| out >= probe / 2)
 }
 
 /// Every cycle from `base_mint` priced for its marginal edge (sorted best first), and
-/// the profitable ones sized against `max_in` (sorted by profit), from a single
-/// enumeration. Third, the cycles refused for an edge past [`MAX_PLAUSIBLE_EDGE_BPS`]:
+/// the profitable ones that return half of `depth_probe` (see [`depth_probe_units`])
+/// sized against `max_in` (sorted by profit), from a single enumeration. Third, the cycles refused for an edge past [`MAX_PLAUSIBLE_EDGE_BPS`]:
 /// in neither of the first two, so never counted, recorded, asked for or attempted.
 ///
 /// The live sweep used to survey and size in two calls, enumerating every cycle twice
@@ -314,6 +332,7 @@ pub fn survey_and_find(
     base_mint: &Pubkey32,
     max_hops: usize,
     max_in: u128,
+    depth_probe: u128,
 ) -> (Vec<SurveyedCycle>, Vec<PricedCycle>, Vec<SurveyedCycle>) {
     let (mut surveyed, implausible): (Vec<SurveyedCycle>, Vec<SurveyedCycle>) =
         enumerate_from_base(snap, base_mint, max_hops)
@@ -323,7 +342,7 @@ pub fn survey_and_find(
     let mut found: Vec<PricedCycle> = if max_in == 0 {
         Vec::new()
     } else {
-        surveyed.iter().filter_map(|s| price(&s.cycle, max_in)).collect()
+        surveyed.iter().filter_map(|s| price(&s.cycle, max_in, depth_probe)).collect()
     };
     found.sort_by_key(|c| std::cmp::Reverse(c.profit));
     surveyed.sort_by(|a, b| b.edge_bps.total_cmp(&a.edge_bps));
@@ -380,7 +399,7 @@ impl Path {
     }
 }
 
-fn price(cycle: &Cycle, max_in: u128) -> Option<PricedCycle> {
+fn price(cycle: &Cycle, max_in: u128, depth_probe: u128) -> Option<PricedCycle> {
     // A float first, the exact rational only near break-even. The exact check is
     // 512-bit arithmetic per leg, and ran for every one of fourteen thousand cycles a pass
     // when almost all are tens of basis points under water; f64 is good to 1e-15 per
@@ -388,7 +407,7 @@ fn price(cycle: &Cycle, max_in: u128) -> Option<PricedCycle> {
     if marginal_edge_bps(&cycle.legs).is_none_or(|e| e < -1.0) {
         return None;
     }
-    if !is_profitable(&cycle.legs) || !has_depth(&cycle.legs) {
+    if !is_profitable(&cycle.legs) || !has_depth(&cycle.legs, depth_probe) {
         return None;
     }
     let optimal_in = optimal_input(&cycle.legs, u128::MAX)?;
@@ -434,11 +453,11 @@ mod tests {
     }
 
     fn find_base(snap: &Snapshot, base: &Pubkey32, hops: usize, max_in: u128) -> Vec<PricedCycle> {
-        survey_and_find(snap, base, hops, max_in).1
+        survey_and_find(snap, base, hops, max_in, DEPTH_PROBE_IN).1
     }
 
     fn survey_base(snap: &Snapshot, base: &Pubkey32, hops: usize) -> Vec<SurveyedCycle> {
-        survey_and_find(snap, base, hops, 0).0
+        survey_and_find(snap, base, hops, 0, DEPTH_PROBE_IN).0
     }
 
     /// Two pools quoting one token against USDC disagree. From SOL the only way to reach
@@ -704,12 +723,12 @@ mod tests {
             ])
         };
 
-        let (surveyed, found, refused) = survey_and_find(&market(u128::from(u64::MAX)), &USDC, 3, 5_000_000);
+        let (surveyed, found, refused) = survey_and_find(&market(u128::from(u64::MAX)), &USDC, 3, 5_000_000, DEPTH_PROBE_IN);
         assert!(refused.iter().any(|s| s.edge_bps > 1e10), "{refused:?}");
         assert!(surveyed.iter().all(|s| s.edge_bps <= MAX_PLAUSIBLE_EDGE_BPS));
         assert!(found.is_empty(), "a refused cycle is never sized");
 
-        let (surveyed, _, refused) = survey_and_find(&market(10_827_265_779_385), &USDC, 3, 5_000_000);
+        let (surveyed, _, refused) = survey_and_find(&market(10_827_265_779_385), &USDC, 3, 5_000_000, DEPTH_PROBE_IN);
         assert!(refused.is_empty());
         assert!(surveyed[0].edge_bps.abs() < 100.0, "venues that agree: {}", surveyed[0].edge_bps);
     }
@@ -721,14 +740,31 @@ mod tests {
             pool(1, SOL, USDC, 1_000_000_000_000, 91_000_000_000_000),
             pool(2, SOL, USDC, 4, 370),
         ]);
-        let (surveyed, found, _) = survey_and_find(&drained, &SOL, 2, u128::MAX);
+        let (surveyed, found, _) = survey_and_find(&drained, &SOL, 2, u128::MAX, DEPTH_PROBE_IN);
         assert!(surveyed.iter().any(|s| s.edge_bps > 50.0), "the rate is still measured");
         assert!(found.is_empty(), "{found:?}");
         let deep = Snapshot::new(vec![
             pool(1, SOL, USDC, 1_000_000_000_000, 91_000_000_000_000),
             pool(2, SOL, USDC, 1_000_000_000_000, 92_500_000_000_000),
         ]);
-        assert!(!survey_and_find(&deep, &SOL, 2, u128::MAX).1.is_empty());
+        assert!(!survey_and_find(&deep, &SOL, 2, u128::MAX, DEPTH_PROBE_IN).1.is_empty());
+    }
+
+    /// A base mint worth a dollar a base unit: 10,000 units is $10,000, half of these
+    /// $20,000 pools, so a fixed probe called them drained. A cent's probe does not.
+    #[test]
+    fn the_depth_probe_is_a_cent_whatever_a_base_unit_is_worth() {
+        assert_eq!(depth_probe_units(1e-6), DEPTH_PROBE_IN, "USDC, six decimals");
+        assert_eq!(depth_probe_units(150e-9), 66_666, "SOL at $150");
+        assert_eq!(depth_probe_units(1.0), 2, "never a probe whose half is zero");
+        assert_eq!(depth_probe_units(0.0), DEPTH_PROBE_IN);
+
+        let dear = Snapshot::new(vec![
+            pool(1, WIF, USDC, 10_000, 10_000_000_000),
+            pool(2, WIF, USDC, 10_000, 11_000_000_000),
+        ]);
+        assert!(survey_and_find(&dear, &WIF, 2, 5_000, DEPTH_PROBE_IN).1.is_empty());
+        assert!(!survey_and_find(&dear, &WIF, 2, 5_000, depth_probe_units(1.0)).1.is_empty());
     }
 
     #[test]
