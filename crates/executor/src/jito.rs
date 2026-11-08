@@ -23,6 +23,9 @@ pub const MIN_TIP_LAMPORTS: u64 = 1_000;
 /// little over it so clock jitter on this side cannot produce a 429 on that one.
 pub const MIN_SEND_GAP_MS: u64 = 1_100;
 
+/// The most bundle ids one `getInflightBundleStatuses` request may ask about.
+pub const MAX_STATUS_IDS: usize = 5;
+
 /// The eight tip accounts `getTipAccounts` returns, as documented by Jito.
 ///
 /// Fixed rather than fetched: they have not changed since bundles launched, and asking

@@ -77,6 +77,10 @@ const OFF_PROTOCOL_FEES_0: usize = 341;
 const OFF_PROTOCOL_FEES_1: usize = 349;
 const OFF_FUND_FEES_0: usize = 357;
 const OFF_FUND_FEES_1: usize = 365;
+/// Unix second swaps open (`swap_base_input`/`_output` refuse `block_timestamp <
+/// open_time`). Between `fund_fees_token_1` and `recent_epoch`; on 9 live pools read on
+/// 2026-11-07 the u64 at 381 was the current epoch or one before, and this a past time.
+const OFF_OPEN_TIME: usize = 373;
 // After `recent_epoch` at 381 come `creator_fee_on: u8`, `enable_creator_fee: bool`
 // and six bytes of padding, then a **third** pair of fee buckets. These landed in what
 // used to be reserved padding, so a decoder written against the older layout reads
@@ -90,6 +94,8 @@ const OFF_CREATOR_FEES_1: usize = 405;
 
 /// Bit in `status` that disables swapping. Set means the pool will reject a trade.
 const STATUS_SWAP_DISABLED: u8 = 1 << 2;
+/// How far this machine's clock may run ahead of the chain's when judging `open_time`.
+const CLOCK_MARGIN_SECS: u64 = 5;
 
 // Verified byte offsets into AmmConfig: bump, disable_create_pool, index, then the
 // trade, protocol and fund rates, the pool-creation fee, two owners, and the creator rate.
@@ -135,6 +141,8 @@ pub struct CpmmPool {
     /// Whether each mint is owned by Token-2022 rather than the classic program.
     pub token_2022_0: bool,
     pub token_2022_1: bool,
+    /// The unix second swaps open; [`to_pool_state`] refuses the pool before it.
+    pub open_time: u64,
 }
 
 impl CpmmPool {
@@ -200,6 +208,7 @@ pub fn decode(data: &[u8]) -> Result<CpmmPool> {
         creator_fee_on,
         token_2022_0: prog_0 == t22,
         token_2022_1: prog_1 == t22,
+        open_time: u64_at(data, OFF_OPEN_TIME),
     })
 }
 
@@ -236,7 +245,8 @@ pub fn decode_trade_fee_ppm(data: &[u8]) -> Result<u32> {
 /// [`PoolMath::ConstantProductExtraFee`].
 ///
 /// Errors if a vault holds less than the fees recorded against it, which means the
-/// three accounts were read at inconsistent slots and must not be quoted on.
+/// three accounts were read at inconsistent slots and must not be quoted on, and if the
+/// pool's `open_time` is not yet behind the chain's clock.
 pub fn to_pool_state(
     address: Pubkey32,
     pool: &CpmmPool,
@@ -246,6 +256,14 @@ pub fn to_pool_state(
     creator_fee_ppm: u32,
     slot: u64,
 ) -> Result<PoolState> {
+    // shortcut: reads this machine's clock because no caller passes a time; take `now` as a
+    // parameter when the bot's two call sites are next changed.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    ensure!(
+        pool.open_time <= now.saturating_sub(CLOCK_MARGIN_SECS),
+        "cpmm pool does not open to swaps until unix time {}",
+        pool.open_time
+    );
     ensure!(trade_fee_ppm < 1_000_000, "cpmm trade fee {trade_fee_ppm}ppm is not a fee");
     ensure!(creator_fee_ppm < 1_000_000, "cpmm creator fee {creator_fee_ppm}ppm is not a fee");
 
@@ -412,6 +430,22 @@ mod tests {
 
         // Other status bits are not our problem — only the swap one.
         assert!(decode(&account(0b11, bs58_expect(SPL_TOKEN_PROGRAM), (9, 6), [0; 6])).is_ok());
+    }
+
+    /// Before `open_time` the program refuses every swap, so the pool must not price.
+    #[test]
+    fn a_pool_before_its_open_time_is_refused() {
+        assert_eq!(OFF_OPEN_TIME, OFF_FUND_FEES_1 + 8, "open_time follows fund_fees_token_1");
+        let mut d = live();
+        // Year 2286: never open by this machine's clock.
+        d[OFF_OPEN_TIME..OFF_OPEN_TIME + 8].copy_from_slice(&10_000_000_000u64.to_le_bytes());
+        let p = decode(&d).unwrap();
+        assert_eq!(p.open_time, 10_000_000_000);
+        let e = to_pool_state([9u8; 32], &p, 10_000_000_000, 20_000_000_000, 2500, 0, 1).unwrap_err().to_string();
+        assert!(e.contains("does not open"), "{e}");
+        // WSOL/ALNOOR pool 8BELgBQ5... read on 2026-11-07 carried 1782844250: long past.
+        d[OFF_OPEN_TIME..OFF_OPEN_TIME + 8].copy_from_slice(&1_782_844_250u64.to_le_bytes());
+        assert!(to_pool_state([9u8; 32], &decode(&d).unwrap(), 10_000_000_000, 20_000_000_000, 2500, 0, 1).is_ok());
     }
 
     /// This program, unlike Raydium v4, accepts Token-2022 mints. The pool cannot say

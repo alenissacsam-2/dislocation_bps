@@ -9,7 +9,7 @@
 //!   *lower bound*, not a census.
 //! - It degrades past a few hundred subscriptions.
 //!
-//! A Yellowstone gRPC implementation behind the same [`Feed`] trait would cut latency
+//! A Yellowstone gRPC implementation with the same interface as [`WsFeed`] would cut latency
 //! to single-digit milliseconds, but costs ~$99+/month — a decision that should be
 //! made from measured data, not before.
 
@@ -27,13 +27,4 @@ pub struct AccountUpdate {
     pub slot: u64,
     /// When we received it locally. Used to measure our own lag, not the chain's.
     pub received_ms: u64,
-}
-
-/// A source of account updates. Implemented by [`WsFeed`] now, gRPC later.
-pub trait Feed {
-    /// Subscribe to a fixed set of accounts and stream their updates.
-    fn subscribe(
-        &self,
-        accounts: Vec<Pubkey32>,
-    ) -> tokio::sync::mpsc::Receiver<AccountUpdate>;
 }

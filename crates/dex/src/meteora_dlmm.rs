@@ -302,22 +302,30 @@ impl LbPair {
         self.base_fee_rate().saturating_add(self.variable_fee_rate(accumulator)).min(MAX_FEE_RATE)
     }
 
-    /// The accumulator a swap reaching `bin_id` would be charged at, assuming no decay.
+    /// The most the program could charge a swap reaching `bin_id` at, whenever it lands.
     ///
-    /// # Why no decay is the safe assumption
+    /// # Both anchors, the larger taken
     ///
-    /// The program re-anchors its references once `filter_period` seconds of quiet have
-    /// passed, and re-anchoring can only *reduce* the accumulator — the reference index
-    /// becomes the active bin, so the distance term vanishes, and the surviving
-    /// volatility is scaled down by `reduction_factor`. Assuming the anchor still stands
-    /// therefore over-estimates the fee, never under-estimates it, and an over-estimated
-    /// fee costs an opportunity while an under-estimated one costs money.
+    /// Within `filter_period` of the last swap the stored references stand. After it the
+    /// program re-anchors: the reference index becomes the active bin and the reference
+    /// volatility the stored accumulator scaled by `reduction_factor` (zero once
+    /// `decay_period` has passed too, which is never more). Re-anchoring lowers the
+    /// accumulator near the old reference but *raises* it for bins between the active bin
+    /// and that reference: reference 100 at volatility 0, active 102 at 20,000, halved on
+    /// re-anchoring, charges 30,000 at bin 100 where the stale anchor gives 0. Which one
+    /// applies depends on the landing time, so both are evaluated and the larger used — an
+    /// over-estimated fee costs an opportunity while an under-estimated one costs money.
     #[must_use]
     pub fn accumulator_at(&self, bin_id: i32) -> u32 {
-        let distance = self.index_reference.abs_diff(bin_id);
-        self.volatility_reference
-            .saturating_add(distance.saturating_mul(BASIS_POINT_MAX))
-            .min(self.max_volatility_accumulator)
+        let from = |reference: u64, index: i32| {
+            reference + u64::from(index.abs_diff(bin_id)) * u64::from(BASIS_POINT_MAX)
+        };
+        let reanchored = u64::from(self.volatility_accumulator) * u64::from(self.reduction_factor)
+            / u64::from(BASIS_POINT_MAX);
+        let worst = from(u64::from(self.volatility_reference), self.index_reference)
+            .max(from(reanchored, self.active_id))
+            .min(u64::from(self.max_volatility_accumulator));
+        u32::try_from(worst).expect("capped at a u32")
     }
 
     /// Total fee as parts per million, rounded **up** to the next whole ppm.
@@ -947,7 +955,14 @@ mod tests {
     #[test]
     fn the_accumulator_grows_one_unit_per_bin_and_then_stops() {
         let (pool, _) = coherent();
-        let p = decode(&pool).unwrap();
+        let mut p = decode(&pool).unwrap();
+        // As captured the active bin sits two from the reference, so a re-anchored swap
+        // back at the reference pays 22,530 halved plus two bins, not the stored 2,530.
+        assert_eq!((p.volatility_accumulator, p.active_id.abs_diff(p.index_reference)), (22_530, 2));
+        assert_eq!(p.accumulator_at(p.index_reference), 31_265);
+        // Pinned at the reference, re-anchoring cannot raise it, and distance alone counts.
+        p.active_id = p.index_reference;
+        p.volatility_accumulator = p.volatility_reference;
         assert_eq!(p.accumulator_at(p.index_reference), p.volatility_reference);
         assert_eq!(p.accumulator_at(p.index_reference - 1), p.volatility_reference + 10_000);
         assert_eq!(
@@ -955,6 +970,31 @@ mod tests {
             p.max_volatility_accumulator,
             "distance must saturate at the ceiling, not overflow past it"
         );
+    }
+
+    /// Re-anchoring after `filter_period` moves the reference to the active bin, which
+    /// raises the accumulator for bins back toward the old reference. Reference 100 at 0,
+    /// active 102 at 20,000, half surviving: the program charges bin 100 at 10,000 plus
+    /// two bins, 30,000, where the stale anchor alone gives 0.
+    #[test]
+    fn re_anchoring_can_raise_the_accumulator_and_the_larger_is_charged() {
+        let (pool, _) = coherent();
+        let mut p = decode(&pool).unwrap();
+        p.index_reference = 100;
+        p.volatility_reference = 0;
+        p.active_id = 102;
+        p.volatility_accumulator = 20_000;
+        p.reduction_factor = 5_000;
+        p.bin_step = 1;
+        p.max_volatility_accumulator = 350_000;
+        assert_eq!(p.accumulator_at(100), 30_000, "the re-anchored reference wins here");
+        assert_eq!(p.accumulator_at(98), 50_000, "and keeps winning past the old reference");
+        p.volatility_reference = 50_000;
+        assert_eq!(p.accumulator_at(100), 50_000, "the stale anchor wins when it is larger");
+        p.max_volatility_accumulator = 25_000;
+        p.volatility_reference = 0;
+        assert_eq!(p.accumulator_at(100), 25_000, "both are capped where the program caps");
+        assert_eq!(p.fee_ppm_at(100), u32::try_from(p.total_fee_rate(25_000).div_ceil(1_000)).unwrap());
     }
 
     /// The census that established the bin layout, reproduced from the fixture: the array

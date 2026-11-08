@@ -795,6 +795,7 @@ dependencies = [
  "cb-scanner",
  "cb-server",
  "cb-wallet",
+ "chrono",
  "futures",
  "reqwest 0.12.28",
  "serde",

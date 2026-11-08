@@ -93,6 +93,11 @@ pub async fn bot_status(app: tauri::State<'_, App>) -> Result<serde_json::Value,
 pub async fn bot_start(app: tauri::State<'_, App>) -> Result<(), String> {
     let runner = Arc::clone(&app.runner);
     let secret = live_passphrase(&app);
+    // A live bot started without the key exits at once ("no passphrase arrived on
+    // stdin"), which reads as a crash. Say what to do instead.
+    if secret.is_none() && config::read_mode(&app.paths.config()).is_ok_and(|m| m.effective == "live") {
+        return Err("Live mode needs the wallet unlocked: unlock it with your passphrase, then press Start.".into());
+    }
     let paths = app.paths.clone();
     let ledger = Arc::clone(&app.ledger);
     tauri::async_runtime::spawn_blocking(move || {
@@ -273,13 +278,15 @@ pub async fn save_config(
         if was_running {
             runner.stop().map_err(|e| e.to_string())?;
         }
-        config::write_params(&paths.config(), &params).map_err(|e| e.to_string())?;
+        // Archive before the write, as `set_mode` does: if archiving fails, the new
+        // parameters must not have been written over a ledger the old ones produced.
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
         let archived = {
             let _reading = ledger.lock().map_err(|e| e.to_string())?;
             archive::archive_ledger(&paths.ledger(), &paths.archive_dir(), &stamp)
                 .map_err(|e| e.to_string())?
         };
+        config::write_params(&paths.config(), &params).map_err(|e| e.to_string())?;
         let mut restarted = false;
         let mut restart_error = None;
         if restart && was_running {
@@ -407,7 +414,10 @@ pub fn wallet_import(
     secret: String,
     passphrase: String,
 ) -> Result<crate::wallet::WalletStatus, String> {
-    crate::wallet::import(&app.paths.wallet(), secret, &passphrase)
+    let status = crate::wallet::import(&app.paths.wallet(), secret, &passphrase)?;
+    // Whatever was unlocked before is not the key on disk now.
+    app.custody.forget();
+    Ok(status)
 }
 
 /// # Errors
@@ -468,14 +478,19 @@ pub fn read_dry_run(app: tauri::State<'_, App>) -> Result<config::DryRunStatus, 
 /// same treatment the mode switch gets. Turning it back on is always allowed and never
 /// asks: making the safe direction cheap is the whole point.
 ///
+/// The bot reads `dry_run` once, at start. A running one is therefore restarted, or the
+/// switch would say one thing while the instrument did the other; the outcome is reported
+/// the same way [`set_mode`] reports it.
+///
 /// # Errors
-/// If the confirmation is missing, or the file cannot be written.
+/// If the confirmation is missing, the file cannot be written, or the bot cannot be
+/// stopped.
 #[tauri::command]
 pub async fn set_dry_run(
     app: tauri::State<'_, App>,
     dry_run: bool,
     confirm: String,
-) -> Result<config::DryRunStatus, String> {
+) -> Result<serde_json::Value, String> {
     if !dry_run {
         if confirm.trim() != "SPEND" {
             return Err("Type SPEND to allow real transactions. Nothing has been changed.".into());
@@ -494,10 +509,30 @@ pub async fn set_dry_run(
         let limits = config::read_limits(&app.paths.config()).map_err(|e| e.to_string())?;
         limits.validate()?;
     }
+    let runner = Arc::clone(&app.runner);
     let paths = app.paths.clone();
+    // Captured out here: `app` is a borrow and cannot cross into a 'static task.
+    let secret = live_passphrase(&app);
     tauri::async_runtime::spawn_blocking(move || {
+        // Written first: a write that fails leaves the running bot as it was.
         config::write_dry_run(&paths.config(), dry_run).map_err(|e| e.to_string())?;
-        config::read_dry_run(&paths.config()).map_err(|e| e.to_string())
+        let was_running = matches!(runner.probe(), RunState::Running | RunState::Starting);
+        let mut restarted = false;
+        let mut restart_error = None;
+        if was_running {
+            runner.stop().map_err(|e| e.to_string())?;
+            match runner.start(secret) {
+                Ok(()) => restarted = true,
+                Err(e) => restart_error = Some(e.to_string()),
+            }
+        }
+        let status = config::read_dry_run(&paths.config()).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "status": status,
+            "wasRunning": was_running,
+            "restarted": restarted,
+            "restartError": restart_error,
+        }))
     })
     .await
     .map_err(|e| e.to_string())?

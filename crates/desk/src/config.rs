@@ -18,6 +18,27 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::Mutex;
+
+/// Held across every read-modify-write of the file, so two commands landing together
+/// cannot each read the old file and have the second write silently undo the first.
+static EDITING: Mutex<()> = Mutex::new(());
+
+/// Read the document, apply `change`, and put the result in place in one step.
+///
+/// Written beside the file and renamed over it: a plain write truncates first, so a
+/// crash or a bot starting at that moment would find a half-written config.
+fn edit(path: &Path, change: impl FnOnce(&mut toml_edit::DocumentMut)) -> anyhow::Result<()> {
+    let _held = EDITING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(path)?.parse()?;
+    change(&mut doc);
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    std::fs::write(&tmp, doc.to_string())?;
+    // Replaces the target on Windows too: std renames with MOVEFILE_REPLACE_EXISTING.
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -169,35 +190,33 @@ pub fn write_params(path: &Path, p: &Params) -> anyhow::Result<()> {
     if let Err(why) = validate(p) {
         anyhow::bail!(why);
     }
-    let text = std::fs::read_to_string(path)?;
-    let mut doc: toml_edit::DocumentMut = text.parse()?;
-    doc["capital_usd"] = toml_edit::value(p.capital_usd);
-    doc["fee_buffer_usd"] = toml_edit::value(p.fee_buffer_usd);
-    doc["min_trade_usd"] = toml_edit::value(p.min_trade_usd);
-    doc["max_hops"] = toml_edit::value(i64::try_from(p.max_hops).unwrap_or(3));
-    doc["slippage_tenth_bps"] = toml_edit::value(i64::from(p.slippage_tenth_bps));
-    doc["priority_micro_lamports"] =
-        toml_edit::value(i64::try_from(p.priority_micro_lamports).unwrap_or(0));
-    // Blank means "use the public one" rather than "write an empty string", which the
-    // bot would fail to parse as a URL at the least helpful possible moment.
-    // One endpoint per line in the field; the first is primary and the rest are
-    // fallbacks, written as a TOML array so the file stays readable.
-    let mut lines: Vec<&str> =
-        p.rpc_http_url.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-    if lines.is_empty() {
-        lines.push(PUBLIC_HTTP);
-    }
-    doc["rpc_http_url"] = toml_edit::value(lines[0]);
-    let mut arr = toml_edit::Array::new();
-    for extra in &lines[1..] {
-        arr.push(*extra);
-    }
-    doc["rpc_http_fallbacks"] = toml_edit::value(arr);
+    edit(path, |doc| {
+        doc["capital_usd"] = toml_edit::value(p.capital_usd);
+        doc["fee_buffer_usd"] = toml_edit::value(p.fee_buffer_usd);
+        doc["min_trade_usd"] = toml_edit::value(p.min_trade_usd);
+        doc["max_hops"] = toml_edit::value(i64::try_from(p.max_hops).unwrap_or(3));
+        doc["slippage_tenth_bps"] = toml_edit::value(i64::from(p.slippage_tenth_bps));
+        doc["priority_micro_lamports"] =
+            toml_edit::value(i64::try_from(p.priority_micro_lamports).unwrap_or(0));
+        // Blank means "use the public one" rather than "write an empty string", which the
+        // bot would fail to parse as a URL at the least helpful possible moment.
+        // One endpoint per line in the field; the first is primary and the rest are
+        // fallbacks, written as a TOML array so the file stays readable.
+        let mut lines: Vec<&str> =
+            p.rpc_http_url.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        if lines.is_empty() {
+            lines.push(PUBLIC_HTTP);
+        }
+        doc["rpc_http_url"] = toml_edit::value(lines[0]);
+        let mut arr = toml_edit::Array::new();
+        for extra in &lines[1..] {
+            arr.push(*extra);
+        }
+        doc["rpc_http_fallbacks"] = toml_edit::value(arr);
 
-    let ws = if p.rpc_ws_url.trim().is_empty() { PUBLIC_WS } else { p.rpc_ws_url.trim() };
-    doc["rpc_ws_url"] = toml_edit::value(ws);
-    std::fs::write(path, doc.to_string())?;
-    Ok(())
+        let ws = if p.rpc_ws_url.trim().is_empty() { PUBLIC_WS } else { p.rpc_ws_url.trim() };
+        doc["rpc_ws_url"] = toml_edit::value(ws);
+    })
 }
 
 /// Everything the operator needs to know about which mode this machine is actually in.
@@ -285,11 +304,7 @@ pub fn read_dry_run(path: &Path) -> anyhow::Result<DryRunStatus> {
 /// # Errors
 /// If the file cannot be read or written.
 pub fn write_dry_run(path: &Path, dry_run: bool) -> anyhow::Result<()> {
-    let text = std::fs::read_to_string(path)?;
-    let mut doc: toml_edit::DocumentMut = text.parse()?;
-    doc["dry_run"] = toml_edit::value(dry_run);
-    std::fs::write(path, doc.to_string())?;
-    Ok(())
+    edit(path, |doc| doc["dry_run"] = toml_edit::value(dry_run))
 }
 
 /// # Errors
@@ -334,11 +349,7 @@ pub fn write_mode(path: &Path, mode: &str) -> anyhow::Result<()> {
     if mode != "paper" && mode != "live" {
         anyhow::bail!("mode must be \"paper\" or \"live\", not {mode:?}");
     }
-    let text = std::fs::read_to_string(path)?;
-    let mut doc: toml_edit::DocumentMut = text.parse()?;
-    doc["mode"] = toml_edit::value(mode);
-    std::fs::write(path, doc.to_string())?;
-    Ok(())
+    edit(path, |doc| doc["mode"] = toml_edit::value(mode))
 }
 
 /// Read the risk limits, falling back to the conservative defaults for anything the
@@ -375,7 +386,6 @@ pub fn read_limits(path: &Path) -> anyhow::Result<cb_executor::risk::Limits> {
         max_position_usd: num("max_position_usd", d.max_position_usd),
         max_daily_loss_usd: num("max_daily_loss_usd", d.max_daily_loss_usd),
         min_net_profit_usd: num("min_net_profit_usd", d.min_net_profit_usd),
-        max_slippage_bps: num("max_slippage_bps", d.max_slippage_bps),
         max_consecutive_failures: int("max_consecutive_failures", d.max_consecutive_failures),
         max_daily_trades: int("max_daily_trades", d.max_daily_trades),
         halt_cooldown_secs: int64("halt_cooldown_secs", d.halt_cooldown_secs),
@@ -395,19 +405,16 @@ pub fn write_limits(path: &Path, l: &cb_executor::risk::Limits) -> anyhow::Resul
     if let Err(why) = l.validate() {
         anyhow::bail!(why);
     }
-    let text = std::fs::read_to_string(path)?;
-    let mut doc: toml_edit::DocumentMut = text.parse()?;
-    doc["max_position_usd"] = toml_edit::value(l.max_position_usd);
-    doc["max_daily_loss_usd"] = toml_edit::value(l.max_daily_loss_usd);
-    doc["min_net_profit_usd"] = toml_edit::value(l.min_net_profit_usd);
-    doc["max_slippage_bps"] = toml_edit::value(l.max_slippage_bps);
-    doc["max_consecutive_failures"] =
-        toml_edit::value(i64::from(l.max_consecutive_failures));
-    doc["max_daily_trades"] = toml_edit::value(i64::from(l.max_daily_trades));
-    doc["halt_cooldown_secs"] =
-        toml_edit::value(i64::try_from(l.halt_cooldown_secs).unwrap_or(i64::MAX));
-    std::fs::write(path, doc.to_string())?;
-    Ok(())
+    edit(path, |doc| {
+        doc["max_position_usd"] = toml_edit::value(l.max_position_usd);
+        doc["max_daily_loss_usd"] = toml_edit::value(l.max_daily_loss_usd);
+        doc["min_net_profit_usd"] = toml_edit::value(l.min_net_profit_usd);
+        doc["max_consecutive_failures"] =
+            toml_edit::value(i64::from(l.max_consecutive_failures));
+        doc["max_daily_trades"] = toml_edit::value(i64::from(l.max_daily_trades));
+        doc["halt_cooldown_secs"] =
+            toml_edit::value(i64::try_from(l.halt_cooldown_secs).unwrap_or(i64::MAX));
+    })
 }
 
 /// The RPC endpoint the app should ask about balances.

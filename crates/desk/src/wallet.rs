@@ -108,19 +108,26 @@ pub fn status(path: &std::path::Path, custody: &Custody) -> WalletStatus {
     }
 }
 
-/// Encrypt a pasted key and write it, replacing any existing one.
+/// Encrypt a pasted key and write it. Never over an existing one.
 ///
 /// Takes the secret by value and drops it here. The caller must not keep a copy, and
 /// the signature is written so that keeping one is visibly deliberate.
 ///
 /// # Errors
-/// If the key is not a valid keypair, the passphrase is empty, or the file cannot be
-/// written.
+/// If a key file already exists, the key is not a valid keypair, the passphrase is
+/// empty, or the file cannot be written.
 pub fn import(
     path: &std::path::Path,
     secret_text: String,
     passphrase: &str,
 ) -> Result<WalletStatus, String> {
+    // Replacing a key is two decisions, not one: the old one may hold funds and this
+    // copy may be its only one, so it has to be forgotten deliberately first.
+    if path.exists() {
+        return Err("A key is already configured. Forget the current key first, then import \
+                    the new one."
+            .into());
+    }
     // Parse first: a mistyped key should fail before anything is written, so a bad
     // paste never destroys a working wallet that was already there.
     let secret = cb_wallet::parse_secret(&secret_text).map_err(|e| e.to_string())?;
@@ -249,6 +256,19 @@ mod tests {
         let after = status(&p, &Custody::default());
         assert!(after.configured, "the working key was deleted by a failed import");
         assert_eq!(after.pubkey, good.pubkey);
+    }
+
+    /// A valid key must not silently replace one that is already there either.
+    #[test]
+    fn a_second_import_is_refused_until_the_first_key_is_forgotten() {
+        let p = tmp("overwrite");
+        let first = import(&p, a_keypair_string(), "one").unwrap();
+        let Err(e) = import(&p, a_keypair_string(), "two") else { panic!("overwrote a key") };
+        assert!(e.contains("Forget"), "{e}");
+        assert!(unlock(&p, "one", &Custody::default()).is_ok(), "the first key was replaced");
+
+        remove(&p, &Custody::default()).unwrap();
+        assert_eq!(import(&p, a_keypair_string(), "two").unwrap().pubkey, first.pubkey);
     }
 
     #[test]

@@ -72,6 +72,8 @@ const OFF_BASE_FEE_MODE: usize = 16;
 const OFF_NUMBER_OF_PERIOD: usize = 22;
 const OFF_PERIOD_FREQUENCY: usize = 24;
 const OFF_SCHEDULE_REDUCTION: usize = 32;
+/// `activation_type` for a pool whose points are slots.
+const ACTIVATION_BY_SLOT: u8 = 0;
 /// `activation_type` for a pool whose points are unix seconds rather than slots.
 const ACTIVATION_BY_TIMESTAMP: u8 = 1;
 const OFF_MINT_A: usize = 168;
@@ -283,9 +285,29 @@ pub fn variable_fee_numerator(d: &DammV2DynamicFee) -> u64 {
 /// `earliest_time` is the earliest unix time a swap priced now could land at. A time
 /// schedule only lowers the fee after activation, so its fee then is the most any later
 /// landing pays.
+///
+/// # Not yet active
+///
+/// The program refuses a public swap until the clock reaches `activation_point`, in slots
+/// or unix seconds by `activation_type` (cp-amm `can_swap`: `current_point >=
+/// activation_point`). `slot` (the slot the account was read at) and `earliest_time` are
+/// both lower bounds on when a swap priced now lands, so a pool active at them is active
+/// at every landing, and one that is not is refused. A caller that passes slot 0 has
+/// every slot-activated pool refused.
 pub fn to_pool_state(address: Pubkey32, data: &[u8], slot: u64, earliest_time: u64) -> Result<PoolState> {
     let p = decode_layout(data)?;
     ensure!(p.pool_status == 0, "damm v2 pool has swaps disabled");
+    let now = match p.activation_type {
+        ACTIVATION_BY_SLOT => slot,
+        ACTIVATION_BY_TIMESTAMP => earliest_time,
+        other => anyhow::bail!("damm v2 activation type {other} is neither slots nor seconds"),
+    };
+    ensure!(
+        p.activation_point <= now,
+        "damm v2 pool is not open to public swaps until point {} (type {}), now {now}",
+        p.activation_point,
+        p.activation_type
+    );
     let base = scheduled_base_fee(&p, earliest_time)?;
     ensure!(p.collect_fee_mode <= 2, "damm v2 fee collection mode {} is not one measured", p.collect_fee_mode);
     ensure!(p.liquidity > 0, "damm v2 pool has no liquidity");
@@ -639,6 +661,24 @@ mod tests {
         };
         let ppm = variable_fee_numerator(&d) as f64 / 1_000.0;
         assert!((257.9..263.0).contains(&ppm), "got {ppm} ppm");
+    }
+
+    /// Before its activation point only the launch vault may swap, so pricing the pool for
+    /// anyone else would quote a trade the program rejects. Slots or seconds, by type.
+    #[test]
+    fn a_pool_not_yet_active_is_refused() {
+        for (kind, slot, time) in [(ACTIVATION_BY_SLOT, 500u64, 0u64), (ACTIVATION_BY_TIMESTAMP, 0, 500)] {
+            let mut d = account(Q64 * 1_000_000, 2 * Q64, Q64, 4 * Q64, 400_000);
+            d[480] = kind;
+            d[472..480].copy_from_slice(&501u64.to_le_bytes());
+            let e = to_pool_state([1; 32], &d, slot, time).unwrap_err().to_string();
+            assert!(e.contains("not open to public swaps"), "type {kind}: {e}");
+            d[472..480].copy_from_slice(&500u64.to_le_bytes());
+            assert!(to_pool_state([1; 32], &d, slot, time).is_ok(), "type {kind}: open at its point");
+        }
+        let mut d = account(Q64 * 1_000_000, 2 * Q64, Q64, 4 * Q64, 400_000);
+        d[480] = 2;
+        assert!(to_pool_state([1; 32], &d, 1, 1).is_err(), "an unknown activation type is refused");
     }
 
     #[test]

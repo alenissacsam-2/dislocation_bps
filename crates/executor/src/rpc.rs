@@ -37,12 +37,19 @@ pub struct Rpc {
     /// Which endpoint reads start from, so a provider that has just failed is not
     /// retried first on every subsequent call.
     cursor: std::sync::atomic::AtomicUsize,
+    /// One per endpoint: set once it has answered 401 or 403, after which nothing starts
+    /// or fails over to it for the rest of the run. See [`Rpc::bench`].
+    benched: Vec<std::sync::atomic::AtomicBool>,
     http: reqwest::Client,
     /// For the primary endpoint and Jito only; see [`WARM_POOL_IDLE`].
     http_warm: reqwest::Client,
     /// Sent as `x-jito-auth` on every block engine request, when set. See
     /// `Config::jito_auth_uuid` for why it matters.
     jito_auth: Option<String>,
+    /// Where [`Rpc::send_sender`] posts. Carries the api key when there is one, so it is
+    /// never printed except through `cb_core::redact`.
+    sender_url: String,
+    sender_keyed: bool,
 }
 
 /// What asking the block engine about a bundle needs, detached from [`Rpc`] so a task
@@ -71,11 +78,22 @@ impl JitoStatus {
     /// # Errors
     /// If the request fails or the answer is not JSON.
     pub async fn status(&self, url: &str, bundle_id: &str) -> Result<Option<String>> {
+        Ok(self.statuses(url, &[bundle_id.to_string()]).await?.pop().flatten())
+    }
+
+    /// [`JitoStatus::status`] for up to [`crate::jito::MAX_STATUS_IDS`] bundles in one
+    /// request, answered in the order asked. Each answer is matched to its id by the
+    /// `bundle_id` the block engine echoes, by position where it echoes none.
+    ///
+    /// # Errors
+    /// If the request fails, is refused, or the answer is not JSON. The HTTP status is
+    /// in the message whenever there was one.
+    pub async fn statuses(&self, url: &str, bundle_ids: &[String]) -> Result<Vec<Option<String>>> {
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getInflightBundleStatuses",
-            "params": [[bundle_id]],
+            "params": [bundle_ids],
         });
         let endpoint = crate::jito::api_url(url, "getInflightBundleStatuses");
         let req = with_jito_auth(self.client.post(&endpoint).json(&body), self.auth.as_deref());
@@ -88,17 +106,36 @@ impl JitoStatus {
         };
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let parsed: Value = serde_json::from_str(&text).map_err(|_| {
-            anyhow!("Jito answered {status} rather than JSON ({} bytes)", text.len())
-        })?;
+        let parsed: Value = serde_json::from_str(&text)
+            .map_err(|_| anyhow!("Jito answered {status} rather than JSON: {}", clip(&text)))?;
         if let Some(e) = parsed.get("error") {
-            bail!("Jito refused the status request ({status}): {e}");
+            bail!("Jito refused the status request ({status}): {}", clip(&e.to_string()));
         }
-        Ok(parsed["result"]["value"]
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|v| v["status"].as_str())
-            .map(String::from))
+        let values = parsed["result"]["value"].as_array().cloned().unwrap_or_default();
+        Ok(bundle_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                values
+                    .iter()
+                    .find(|v| v["bundle_id"].as_str() == Some(id))
+                    .or_else(|| values.get(i).filter(|v| v["bundle_id"].is_null()))
+                    .and_then(|v| v["status"].as_str())
+                    .map(String::from)
+            })
+            .collect())
+    }
+}
+
+/// At most this many characters of an answer go into a log line or an error.
+const CLIP_CHARS: usize = 120;
+
+/// `s` cut to [`CLIP_CHARS`] characters, on a character boundary.
+fn clip(s: &str) -> String {
+    let s = s.trim();
+    match s.char_indices().nth(CLIP_CHARS) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
     }
 }
 
@@ -233,9 +270,11 @@ impl Rpc {
         let endpoints: Vec<String> =
             endpoints.into_iter().map(|e| e.trim().to_string()).filter(|e| !e.is_empty()).collect();
         ensure!(!endpoints.is_empty(), "an RPC client needs at least one endpoint");
+        let benched = endpoints.iter().map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
         Ok(Self {
             endpoints,
             cursor: std::sync::atomic::AtomicUsize::new(0),
+            benched,
             http: reqwest::Client::builder()
                 .timeout(TIMEOUT)
                 // Drop idle connections well before the server does.
@@ -261,6 +300,8 @@ impl Rpc {
                 .tcp_nodelay(true)
                 .build()?,
             jito_auth: None,
+            sender_url: crate::sender::url(None),
+            sender_keyed: false,
         })
     }
 
@@ -280,7 +321,8 @@ impl Rpc {
     }
 
     /// One attempt against one endpoint.
-    async fn call_on(&self, url: &str, method: &str, params: &Value) -> Result<Value> {
+    async fn call_on(&self, idx: usize, method: &str, params: &Value) -> Result<Value> {
+        let url = self.endpoints[idx].as_str();
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
 
         let mut backoff = Duration::from_millis(400);
@@ -309,6 +351,12 @@ impl Rpc {
             // on `getMultipleAccounts returned something that is not JSON`, which was
             // the public endpoint rate-limiting mid-trade.
             let status = resp.status();
+            // A refused credential is not going to start working mid-run, unlike a 429 or
+            // a 5xx, so stop paying a round trip to hear it again.
+            if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+                self.bench(idx);
+                bail!("{method}: endpoint {} answered {status}; benched for the rest of the run", idx + 1);
+            }
             let text = match resp.text().await {
                 Ok(t) => t,
                 Err(e) => bail!(
@@ -357,15 +405,54 @@ impl Rpc {
     ///
     /// A single atomic counter, so concurrent callers each get a distinct, correctly
     /// incrementing start index rather than racing to read-then-write the same value.
+    ///
+    /// Benched endpoints are skipped; see [`try_order`].
     fn next_start(&self) -> usize {
+        self.next_order()[0]
+    }
+
+    /// The endpoints the next rotating call should try, in order. Advances the rotation.
+    fn next_order(&self) -> Vec<usize> {
+        self.order(self.cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn order(&self, turn: usize) -> Vec<usize> {
+        let benched: Vec<bool> =
+            self.benched.iter().map(|b| b.load(std::sync::atomic::Ordering::Relaxed)).collect();
+        try_order(turn, &benched)
+    }
+
+    /// Stop using endpoint `idx` for the rest of the run: it refused our credentials.
+    ///
+    /// Measured on 2026-11-07: one configured key answered 401 to every call, and the
+    /// rotation kept starting a third of all calls on it — a wasted round trip for every
+    /// read, an outright failure for every `send` that drew it.
+    fn bench(&self, idx: usize) {
         use std::sync::atomic::Ordering;
-        self.cursor.fetch_add(1, Ordering::Relaxed) % self.endpoint_count()
+        if self.benched[idx].swap(true, Ordering::Relaxed) {
+            return;
+        }
+        // Host only: some providers put the key in the path, which `redact_endpoint` keeps.
+        let host = reqwest::Url::parse(&self.endpoints[idx])
+            .ok()
+            .and_then(|u| u.host_str().map(String::from))
+            .unwrap_or_else(|| "unparseable url".into());
+        let n = self.endpoint_count();
+        tracing::error!(
+            "rpc endpoint {} of {n} ({host}) refused our credentials (401/403); not using it              again this run — check its API key",
+            idx + 1
+        );
+        if self.benched.iter().all(|b| b.load(Ordering::Relaxed)) {
+            tracing::error!(
+                "every one of the {n} rpc endpoint(s) has refused our credentials; still                  calling them, since there is nothing else to call"
+            );
+        }
     }
 
     /// A read, rotating across the configured endpoints and failing over within one
     /// call if the one it started on does not answer.
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
-        self.call_from(self.next_start(), method, params).await
+        self.call_in(self.next_order(), method, params).await
     }
 
     /// A read on a trade's critical path: the first configured endpoint, and the others
@@ -380,16 +467,16 @@ impl Rpc {
     /// send whose price is decided by exactly that gap, and read state from a node the
     /// feed was not watching. A median attempt spent 546 ms before it could refuse.
     async fn call_primary(&self, method: &str, params: Value) -> Result<Value> {
-        self.call_from(0, method, params).await
+        self.call_in(self.order(0), method, params).await
     }
 
-    async fn call_from(&self, start: usize, method: &str, params: Value) -> Result<Value> {
+    async fn call_in(&self, order: Vec<usize>, method: &str, params: Value) -> Result<Value> {
         let n = self.endpoint_count();
+        let tried = order.len();
         let mut last: Option<anyhow::Error> = None;
 
-        for step in 0..n {
-            let idx = (start + step) % n;
-            match self.call_on(&self.endpoints[idx], method, &params).await {
+        for (step, idx) in order.into_iter().enumerate() {
+            match self.call_on(idx, method, &params).await {
                 Ok(v) => {
                     if step > 0 {
                         // Announced, because a silent skip hides a provider that has
@@ -412,7 +499,7 @@ impl Rpc {
             }
         }
         Err(last.unwrap_or_else(|| anyhow!("{method}: no endpoints configured")))
-            .with_context(|| format!("all {n} endpoint(s) failed"))
+            .with_context(|| format!("all {tried} endpoint(s) tried failed"))
     }
 
     /// # Errors
@@ -545,7 +632,7 @@ impl Rpc {
         // to do about it needs the signature status, not another attempt.
         let idx = self.next_start();
         let params = json!([tx_base64, cfg]);
-        let r = self.call_on(&self.endpoints[idx], "sendTransaction", &params).await?;
+        let r = self.call_on(idx, "sendTransaction", &params).await?;
         r.as_str()
             .map(String::from)
             .ok_or_else(|| anyhow!("sendTransaction did not return a signature"))
@@ -577,44 +664,124 @@ impl Rpc {
     /// # Errors
     /// If the request fails or the block engine refuses the transaction.
     pub async fn send_jito(&self, url: &str, tx_base64: &str) -> Result<JitoReceipt> {
-        post_jito(&self.http_warm, url, &jito_send_body(tx_base64), self.jito_auth.as_deref()).await
+        post_jito(&self.http_warm, url, &jito_send_body(tx_base64), self.jito_auth.as_deref()).await.result
     }
 
     /// [`Rpc::send_jito`] to every URL in `urls` at once, answering with the first
     /// block engine to accept it. See [`crate::jito::REGIONS`] for why.
     ///
     /// The same signed bytes go to each, so however many regions forward it, the
-    /// transaction is included at most once and pays at most once. The requests still
-    /// in flight when the first answer arrives are left to finish on their own; a
-    /// region that refuses is only reported if every region does.
+    /// transaction is included at most once and pays at most once.
+    ///
+    /// Every region's answer is kept: the others are collected in the background for up
+    /// to [`JITO_SUMMARY_WAIT`] after the first acceptance, and one line per send says
+    /// what each region answered, whether it named a bundle, and why not — INFO when any
+    /// region made a bundle, WARN when none did. On 2026-11 every send was `Invalid` at
+    /// the status query, and the answers that would have said why were being dropped.
     ///
     /// # Errors
     /// If every block engine refuses the transaction or cannot be reached.
     pub async fn send_jito_all(&self, urls: &[String], tx_base64: &str) -> Result<JitoReceipt> {
-        match urls {
-            [] => bail!("no block engine to send to"),
-            [one] => return self.send_jito(one, tx_base64).await,
-            _ => {}
+        ensure!(!urls.is_empty(), "no block engine to send to");
+        let deadline = tokio::time::Instant::now() + JITO_SUMMARY_WAIT;
+        let mut rx = self.spawn_jito_sends(urls, tx_base64);
+        let asked = urls.len();
+        let mut answers = Vec::new();
+        while let Some(a) = rx.recv().await {
+            let accepted = a.result.as_ref().ok().cloned();
+            answers.push(a);
+            if let Some(receipt) = accepted {
+                let sig = receipt.signature.clone();
+                tokio::spawn(async move {
+                    while let Ok(Some(a)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+                        answers.push(a);
+                    }
+                    log_jito_summary(Some(&sig), &answers, asked);
+                });
+                return Ok(receipt);
+            }
         }
+        let (_, line) = jito_summary(None, &answers, asked);
+        tracing::warn!("{line}");
+        bail!("every block engine refused the transaction: {line}")
+    }
+
+    /// One send per URL, each answering on the returned channel as it finishes.
+    fn spawn_jito_sends(&self, urls: &[String], tx_base64: &str) -> tokio::sync::mpsc::Receiver<RegionAnswer> {
         let body = jito_send_body(tx_base64);
-        let (tx, mut rx) = tokio::sync::mpsc::channel(urls.len());
+        let (tx, rx) = tokio::sync::mpsc::channel(urls.len().max(1));
         for url in urls {
             let (client, body, url, tx) = (self.http_warm.clone(), body.clone(), url.clone(), tx.clone());
             let auth = self.jito_auth.clone();
             tokio::spawn(async move {
-                let r = post_jito(&client, &url, &body, auth.as_deref()).await;
-                let _ = tx.send(r).await;
+                let _ = tx.send(post_jito(&client, &url, &body, auth.as_deref()).await).await;
             });
         }
-        drop(tx);
-        let mut refusals = Vec::new();
-        while let Some(r) = rx.recv().await {
-            match r {
-                Ok(receipt) => return Ok(receipt),
-                Err(e) => refusals.push(format!("{e:#}")),
-            }
+        rx
+    }
+
+    /// Send through Helius Sender (SWQOS-only), which forwards to leaders over staked
+    /// connections. Returns the signature.
+    ///
+    /// # Why this and not [`Rpc::send_jito`]
+    ///
+    /// Jito drops unauthenticated sends before its auction: 104 of 104 were `Invalid` on
+    /// 2026-09-27. Sender takes them, at the price of revert protection — a transaction
+    /// whose floor is missed lands, reverts, and pays the base and priority fees (the
+    /// tip, an instruction inside it, reverts too). So a trade only comes here after it
+    /// has simulated profitably; see [`crate::SendVia::Sender`].
+    ///
+    /// The transaction must carry a compute-unit price and limit and a transfer of at
+    /// least [`crate::sender::MIN_TIP_LAMPORTS`] to a [`crate::sender::TIP_ACCOUNTS`]
+    /// account, or Sender refuses it. One request, never retried: a timeout may still have
+    /// been received, and a retry elsewhere is how one trade becomes two. The URL carries
+    /// the api key, so every error is built from redacted text.
+    ///
+    /// # Errors
+    /// If the request fails or Sender refuses the transaction; the message carries the
+    /// HTTP status and a clipped body.
+    pub async fn send_sender(&self, tx_base64: &str) -> Result<String> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "sendTransaction",
+            "params": [tx_base64, {"encoding": "base64", "skipPreflight": true, "maxRetries": 0}],
+        });
+        let redact = |s: &str| clip(&cb_core::redact::redact_urls_in(s));
+        let resp = match self.http_warm.post(&self.sender_url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => bail!("Helius Sender sendTransaction failed: {}", redact(&e.to_string())),
+        };
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let parsed: Value = serde_json::from_str(&text)
+            .map_err(|_| anyhow!("Helius Sender answered {status} rather than JSON: {}", redact(&text)))?;
+        if let Some(e) = parsed.get("error") {
+            bail!("Helius Sender refused the transaction ({status}): {}", redact(&e.to_string()));
         }
-        bail!("every block engine refused the transaction: {}", refusals.join(" | "))
+        parsed["result"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow!("Helius Sender answered {status} with no signature: {}", redact(&text)))
+    }
+
+    /// Send [`Rpc::send_sender`] with this Helius api key (blank or `None` sends
+    /// keyless, at one request a second).
+    pub fn set_sender_key(&mut self, api_key: Option<&str>) {
+        let key = api_key.map(str::trim).filter(|k| !k.is_empty());
+        self.sender_url = crate::sender::url(key);
+        self.sender_keyed = key.is_some();
+    }
+
+    /// Whether Sender requests carry an api key.
+    #[must_use]
+    pub fn sender_keyed(&self) -> bool {
+        self.sender_keyed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sender_url_for_test(&mut self, url: &str) {
+        self.sender_url = url.to_string();
     }
 
     /// Touch the primary RPC and every Jito block engine given, so the next trade finds
@@ -794,9 +961,11 @@ impl Rpc {
     /// # Errors
     /// If the call fails or the response is not the expected shape.
     pub async fn accounts(&self, keys: &[Pubkey]) -> Result<Vec<Option<Vec<u8>>>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
+        Ok(chunked(keys, |c| self.accounts_chunk(c)).await?.1)
+    }
+
+    /// One `getMultipleAccounts` of [`Rpc::accounts`], at most [`MAX_KEYS_PER_CALL`] keys.
+    async fn accounts_chunk(&self, keys: &[Pubkey]) -> Result<(Option<u64>, Vec<Option<Vec<u8>>>)> {
         let addresses: Vec<String> = keys.iter().map(ToString::to_string).collect();
         let r = self
             .call(
@@ -807,19 +976,21 @@ impl Rpc {
         let arr = r["value"]
             .as_array()
             .ok_or_else(|| anyhow!("getMultipleAccounts returned no account array"))?;
-        Ok(arr
-            .iter()
-            .map(|a| {
-                if a.is_null() {
-                    return None;
-                }
-                a["data"]
-                    .as_array()
-                    .and_then(|d| d.first())
-                    .and_then(Value::as_str)
-                    .and_then(base64_decode)
-            })
-            .collect())
+        Ok((
+            None,
+            arr.iter()
+                .map(|a| {
+                    if a.is_null() {
+                        return None;
+                    }
+                    a["data"]
+                        .as_array()
+                        .and_then(|d| d.first())
+                        .and_then(Value::as_str)
+                        .and_then(base64_decode)
+                })
+                .collect(),
+        ))
     }
 
     /// Fetch several accounts with their owning programs, in one round trip.
@@ -833,7 +1004,7 @@ impl Rpc {
     /// # Errors
     /// If the call fails or the response is not the expected shape.
     pub async fn accounts_full(&self, keys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
-        self.accounts_full_at(keys, "confirmed").await
+        Ok(self.accounts_full_at(keys, "confirmed").await?.1)
     }
 
     /// [`Rpc::accounts_full`] at `processed`: the newest state the node has, which is
@@ -851,17 +1022,38 @@ impl Rpc {
     /// # Errors
     /// If the call fails or the response is not the expected shape.
     pub async fn accounts_latest(&self, keys: &[Pubkey]) -> Result<Vec<Option<Account>>> {
-        self.accounts_full_at(keys, "processed").await
+        Ok(self.accounts_full_at(keys, "processed").await?.1)
+    }
+
+    /// [`Rpc::accounts_latest`] with the slot the node read them at.
+    ///
+    /// A slot-activated DAMM v2 pool is only priceable once that slot has reached its
+    /// activation point, so a re-price needs the read's own slot rather than a guess.
+    ///
+    /// # Errors
+    /// If the call fails, the response is not the expected shape, or it carries no slot.
+    pub async fn accounts_latest_with_slot(
+        &self,
+        keys: &[Pubkey],
+    ) -> Result<(u64, Vec<Option<Account>>)> {
+        let (slot, accounts) = self.accounts_full_at(keys, "processed").await?;
+        Ok((slot.ok_or_else(|| anyhow!("getMultipleAccounts returned no context slot"))?, accounts))
     }
 
     async fn accounts_full_at(
         &self,
         keys: &[Pubkey],
         commitment: &str,
-    ) -> Result<Vec<Option<Account>>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
+    ) -> Result<(Option<u64>, Vec<Option<Account>>)> {
+        chunked(keys, |c| self.accounts_chunk_at(c, commitment)).await
+    }
+
+    /// One `getMultipleAccounts` of [`Rpc::accounts_full_at`], at most [`MAX_KEYS_PER_CALL`] keys.
+    async fn accounts_chunk_at(
+        &self,
+        keys: &[Pubkey],
+        commitment: &str,
+    ) -> Result<(Option<u64>, Vec<Option<Account>>)> {
         let addresses: Vec<String> = keys.iter().map(ToString::to_string).collect();
         // `processed` is only ever asked for on a trade's re-price; see [`Rpc::call_primary`].
         //
@@ -878,25 +1070,7 @@ impl Rpc {
         } else {
             self.call("getMultipleAccounts", params).await?
         };
-        let arr = r["value"]
-            .as_array()
-            .ok_or_else(|| anyhow!("getMultipleAccounts returned no account array"))?;
-        Ok(arr
-            .iter()
-            .map(|a| {
-                if a.is_null() {
-                    return None;
-                }
-                let field = a["data"].as_array()?;
-                let raw = field.first().and_then(Value::as_str).and_then(base64_decode)?;
-                let data = match field.get(1).and_then(Value::as_str) {
-                    Some("base64+zstd") => zstd_decode(&raw)?,
-                    _ => raw,
-                };
-                let owner = a["owner"].as_str().and_then(|o| Pubkey::from_str(o).ok())?;
-                Some(Account { owner, data, lamports: a["lamports"].as_u64().unwrap_or(0) })
-            })
-            .collect())
+        accounts_of(&r)
     }
 
     /// Every token account `owner` holds under `token_program`.
@@ -935,7 +1109,8 @@ impl Rpc {
                 // `amount` is a decimal string because it does not fit a JSON number.
                 let amount = info["tokenAmount"]["amount"].as_str()?.parse().ok()?;
                 let decimals = u8::try_from(info["tokenAmount"]["decimals"].as_u64()?).ok()?;
-                Some(TokenHolding { mint, amount, decimals })
+                let address = a["pubkey"].as_str()?.to_string();
+                Some(TokenHolding { address, mint, amount, decimals })
             })
             .collect())
     }
@@ -974,6 +1149,8 @@ impl Rpc {
 /// decimals applied to a USDC balance is off by a thousand.
 #[derive(Debug, Clone)]
 pub struct TokenHolding {
+    /// The token account itself.
+    pub address: String,
     pub mint: String,
     pub amount: u64,
     pub decimals: u8,
@@ -1006,14 +1183,66 @@ fn jito_send_body(tx_base64: &str) -> Value {
     })
 }
 
+/// How long [`Rpc::send_jito_all`] keeps listening for the regions that have not
+/// answered yet, counted from the send.
+pub const JITO_SUMMARY_WAIT: Duration = Duration::from_secs(1);
+
+/// One block engine's answer to one send.
+#[derive(Debug)]
+struct RegionAnswer {
+    /// The URL's host: what tells the regions apart, and holds no key.
+    host: String,
+    /// `None` when no HTTP answer came back at all.
+    http: Option<u16>,
+    result: Result<JitoReceipt>,
+}
+
+/// The host `url` names, without scheme, credentials, path or query: a key can sit in
+/// the query or before an `@`, and neither belongs in a log.
+fn host_of(url: &str) -> &str {
+    let rest = url.find("://").map_or(url, |i| &url[i + 3..]);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    authority.rsplit('@').next().unwrap_or(authority)
+}
+
+/// The one line [`Rpc::send_jito_all`] logs per send, and whether any region made a
+/// bundle (named it in `x-bundle-id`).
+fn jito_summary(sig: Option<&str>, answers: &[RegionAnswer], asked: usize) -> (bool, String) {
+    let made = answers.iter().filter(|a| matches!(&a.result, Ok(r) if r.bundle_id.is_some())).count();
+    let mut parts: Vec<String> = answers
+        .iter()
+        .map(|a| {
+            let http = a.http.map_or_else(|| "no HTTP answer".to_string(), |c| c.to_string());
+            match &a.result {
+                Ok(r) if r.bundle_id.is_some() => format!("{} → {http}, bundle id", a.host),
+                Ok(_) => format!("{} → {http}, no x-bundle-id", a.host),
+                Err(e) => format!("{} → {http}, no x-bundle-id: {e:#}", a.host),
+            }
+        })
+        .collect();
+    if answers.len() < asked {
+        parts.push(format!("{} more did not answer within {} ms", asked - answers.len(), JITO_SUMMARY_WAIT.as_millis()));
+    }
+    let what = sig.map_or_else(|| "Jito send".to_string(), |s| format!("Jito send {s}"));
+    (made > 0, format!("{what}: {made} of {asked} block engines made a bundle — {}", parts.join("; ")))
+}
+
+fn log_jito_summary(sig: Option<&str>, answers: &[RegionAnswer], asked: usize) {
+    match jito_summary(sig, answers, asked) {
+        (true, line) => tracing::info!("{line}"),
+        (false, line) => tracing::warn!("{line}"),
+    }
+}
+
 /// One `sendTransaction` to one block engine. See [`Rpc::send_jito`].
-async fn post_jito(client: &reqwest::Client, url: &str, body: &Value, auth: Option<&str>) -> Result<JitoReceipt> {
+async fn post_jito(client: &reqwest::Client, url: &str, body: &Value, auth: Option<&str>) -> RegionAnswer {
+    let host = host_of(url).to_string();
     let resp = match with_jito_auth(client.post(url).json(body), auth).send().await {
         Ok(r) => r,
-        Err(e) => bail!(
-            "Jito sendTransaction failed: {}",
-            cb_core::redact::redact_urls_in(&e.to_string())
-        ),
+        Err(e) => {
+            let why = clip(&cb_core::redact::redact_urls_in(&e.to_string()));
+            return RegionAnswer { host, http: None, result: Err(anyhow!("Jito sendTransaction failed: {why}")) };
+        }
     };
     let status = resp.status();
     let bundle_id = resp
@@ -1022,17 +1251,19 @@ async fn post_jito(client: &reqwest::Client, url: &str, body: &Value, auth: Opti
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     let text = resp.text().await.unwrap_or_default();
-    let parsed: Value = serde_json::from_str(&text).map_err(|_| {
-        anyhow!("Jito answered {status} rather than JSON ({} bytes)", text.len())
-    })?;
-    if let Some(e) = parsed.get("error") {
-        bail!("Jito refused the transaction ({status}): {e}");
-    }
-    let signature = parsed["result"]
-        .as_str()
-        .map(String::from)
-        .ok_or_else(|| anyhow!("Jito sendTransaction did not return a signature"))?;
-    Ok(JitoReceipt { signature, bundle_id })
+    let result = (|| {
+        let parsed: Value = serde_json::from_str(&text)
+            .map_err(|_| anyhow!("Jito answered {status} rather than JSON: {}", clip(&text)))?;
+        if let Some(e) = parsed.get("error") {
+            bail!("Jito refused the transaction ({status}): {}", clip(&e.to_string()));
+        }
+        let signature = parsed["result"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow!("Jito sendTransaction did not return a signature"))?;
+        Ok(JitoReceipt { signature, bundle_id })
+    })();
+    RegionAnswer { host, http: Some(status.as_u16()), result }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1050,6 +1281,102 @@ impl SignatureStatus {
 
 /// Pull the SPL amount out of a returned account, if it is a token account at all.
 ///
+/// The most keys one `getMultipleAccounts` may carry. Helius refuses more with
+/// `-32602 Too many inputs provided; max 100`, which cost a failover on every big read.
+const MAX_KEYS_PER_CALL: usize = 100;
+
+/// `fetch` over `keys` in slices of at most [`MAX_KEYS_PER_CALL`], all slices at once.
+///
+/// The results come back in key order. The slot is the *oldest* any slice was read at,
+/// and `None` if any slice did not say: a caller gating on "has the chain reached slot
+/// X" must not be told yes on the strength of the freshest slice when another slice
+/// may predate it.
+async fn chunked<'a, T, F, Fut>(keys: &'a [Pubkey], fetch: F) -> Result<(Option<u64>, Vec<T>)>
+where
+    F: Fn(&'a [Pubkey]) -> Fut,
+    Fut: std::future::Future<Output = Result<(Option<u64>, Vec<T>)>>,
+{
+    let parts = join_all(keys.chunks(MAX_KEYS_PER_CALL).map(&fetch).collect()).await;
+    let mut slots = Vec::with_capacity(parts.len());
+    let mut out = Vec::with_capacity(keys.len());
+    for (chunk, part) in keys.chunks(MAX_KEYS_PER_CALL).zip(parts) {
+        let (slot, accounts) = part?;
+        // A short slice would shift every later account onto the wrong key.
+        ensure!(
+            accounts.len() == chunk.len(),
+            "getMultipleAccounts returned {} accounts for {} keys",
+            accounts.len(),
+            chunk.len()
+        );
+        slots.push(slot);
+        out.extend(accounts);
+    }
+    let slot = slots.into_iter().collect::<Option<Vec<u64>>>().and_then(|s| s.into_iter().min());
+    Ok((slot, out))
+}
+
+/// Poll every future until all are done; outputs in input order.
+///
+/// shortcut: hand-rolled because `futures::future::join_all` is not a dependency of this
+/// crate; swap it in if `futures` ever is.
+async fn join_all<F: std::future::Future>(futs: Vec<F>) -> Vec<F::Output> {
+    use std::task::Poll;
+    let mut futs: Vec<_> = futs.into_iter().map(Box::pin).collect();
+    let mut done: Vec<Option<F::Output>> = futs.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (f, d) in futs.iter_mut().zip(done.iter_mut()) {
+            if d.is_none() {
+                match f.as_mut().poll(cx) {
+                    Poll::Ready(v) => *d = Some(v),
+                    Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending { Poll::Pending } else { Poll::Ready(()) }
+    })
+    .await;
+    done.into_iter().map(|d| d.expect("every future was polled to completion")).collect()
+}
+
+/// The endpoint indices a call on rotation `turn` should try, in order.
+///
+/// The live (not benched) endpoints in preference order, rotated by `turn`, so turn 0
+/// starts at the first live endpoint and successive turns spread evenly over the live
+/// ones only. If every endpoint is benched, all of them, as before benching existed: a
+/// bot that refuses to make any call is worse than one that makes doomed ones.
+fn try_order(turn: usize, benched: &[bool]) -> Vec<usize> {
+    let live: Vec<usize> = (0..benched.len()).filter(|&i| !benched[i]).collect();
+    let pool = if live.is_empty() { (0..benched.len()).collect() } else { live };
+    let k = turn % pool.len();
+    pool[k..].iter().chain(&pool[..k]).copied().collect()
+}
+
+/// A `getMultipleAccounts` result: the slot it was read at, if the node said, and each
+/// account with its owner, `None` where it does not exist.
+fn accounts_of(r: &Value) -> Result<(Option<u64>, Vec<Option<Account>>)> {
+    let arr = r["value"]
+        .as_array()
+        .ok_or_else(|| anyhow!("getMultipleAccounts returned no account array"))?;
+    let accounts = arr
+        .iter()
+        .map(|a| {
+            if a.is_null() {
+                return None;
+            }
+            let field = a["data"].as_array()?;
+            let raw = field.first().and_then(Value::as_str).and_then(base64_decode)?;
+            let data = match field.get(1).and_then(Value::as_str) {
+                Some("base64+zstd") => zstd_decode(&raw)?,
+                _ => raw,
+            };
+            let owner = a["owner"].as_str().and_then(|o| Pubkey::from_str(o).ok())?;
+            Some(Account { owner, data, lamports: a["lamports"].as_u64().unwrap_or(0) })
+        })
+        .collect();
+    Ok((r["context"]["slot"].as_u64(), accounts))
+}
+
 /// The node hands back the raw account; a token account's amount is a little-endian u64
 /// at offset 64 of its 165-byte layout. Anything else is not a token account and gets
 /// `None` rather than a misread number.
@@ -1077,7 +1404,7 @@ fn zstd_decode(compressed: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut rev = [255u8; 256];
     for (i, c) in TABLE.iter().enumerate() {
@@ -1170,6 +1497,28 @@ mod tests {
         assert_eq!(token_amount_of(&json!({})), None);
     }
 
+    /// The re-price needs the slot the accounts were read at, which the node puts in
+    /// the result's `context` rather than beside the accounts.
+    #[test]
+    fn a_multiple_accounts_result_carries_its_context_slot() {
+        let owner = Pubkey::new_unique();
+        let r = json!({
+            "context": {"apiVersion": "2.2.0", "slot": 412_345_678u64},
+            "value": [
+                {"data": [base64_encode(&[1, 2, 3]), "base64"], "owner": owner.to_string(), "lamports": 5},
+                null
+            ]
+        });
+        let (slot, accounts) = accounts_of(&r).expect("well formed");
+        assert_eq!(slot, Some(412_345_678));
+        let first = accounts[0].as_ref().expect("present");
+        assert_eq!((first.owner, first.data.as_slice(), first.lamports), (owner, &[1u8, 2, 3][..], 5));
+        assert!(accounts[1].is_none());
+        // No context is no slot, not slot zero.
+        assert_eq!(accounts_of(&json!({"value": []})).expect("well formed").0, None);
+        assert!(accounts_of(&json!({"context": {"slot": 1}})).is_err());
+    }
+
     #[test]
     fn a_token_account_amount_is_read_from_the_right_offset() {
         let mut raw = vec![0u8; 165];
@@ -1192,6 +1541,7 @@ mod tests {
             f[..f.find("\n    }").expect("body ends")].to_string()
         };
         assert!(body_of("pub async fn accounts_latest(").contains("\"processed\""));
+        assert!(body_of("pub async fn accounts_latest_with_slot(").contains("\"processed\""));
         assert!(body_of("pub async fn simulate(").contains("\"commitment\": \"processed\""));
         // And the blockhash stays confirmed: one from a fork that is later dropped
         // would fail the transaction for a reason that has nothing to do with price.
@@ -1258,6 +1608,230 @@ mod tests {
         }
         assert_eq!(counts[0] + counts[1], 40, "every call must land on a real index");
         assert_eq!(counts[0], counts[1], "an even split across the two endpoints: {counts:?}");
+    }
+
+    #[tokio::test]
+    async fn big_reads_are_split_into_slices_of_at_most_100_in_key_order() {
+        for n in [0usize, 1, 100, 101, 250] {
+            let keys: Vec<Pubkey> = (0..n).map(|_| Pubkey::new_unique()).collect();
+            let sizes = std::sync::Mutex::new(Vec::new());
+            let (slot, got) = chunked(&keys, |c: &[Pubkey]| {
+                sizes.lock().unwrap().push(c.len());
+                // Each slice reports a different slot, so the minimum is observable.
+                std::future::ready(Ok((Some(500 + c.len() as u64), c.to_vec())))
+            })
+            .await
+            .unwrap();
+            let sizes = sizes.into_inner().unwrap();
+            assert_eq!(got, keys, "{n} keys: order must survive the split");
+            assert_eq!(sizes.len(), n.div_ceil(100), "{n} keys: {sizes:?}");
+            assert!(sizes.iter().all(|&s| (1..=100).contains(&s)), "{n} keys: {sizes:?}");
+            let oldest = sizes.iter().map(|&s| 500 + s as u64).min();
+            assert_eq!(slot, oldest, "{n} keys: the oldest slice's slot");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slice_without_a_slot_or_with_missing_accounts_is_not_papered_over() {
+        let keys: Vec<Pubkey> = (0..150).map(|_| Pubkey::new_unique()).collect();
+        let (slot, _) = chunked(&keys, |c: &[Pubkey]| {
+            let s = if c.len() == 100 { Some(7) } else { None };
+            std::future::ready(Ok((s, c.to_vec())))
+        })
+        .await
+        .unwrap();
+        assert_eq!(slot, None, "one slice not saying is no slot, not the other slice's");
+        let short = chunked(&keys, |c: &[Pubkey]| std::future::ready(Ok((Some(1), c[1..].to_vec())))).await;
+        assert!(short.is_err(), "a short slice would misalign every later account");
+    }
+
+    /// The slices go out together: three that each wait for the other two would never
+    /// finish if they were sent one after another.
+    #[tokio::test]
+    async fn slices_are_fetched_concurrently() {
+        let keys: Vec<Pubkey> = (0..250).map(|_| Pubkey::new_unique()).collect();
+        let barrier = tokio::sync::Barrier::new(3);
+        let run = chunked(&keys, |c: &[Pubkey]| {
+            let b = &barrier;
+            async move {
+                b.wait().await;
+                Ok((None, c.to_vec()))
+            }
+        });
+        let (_, got) = tokio::time::timeout(Duration::from_secs(5), run).await.expect("concurrent").unwrap();
+        assert_eq!(got, keys);
+    }
+
+    #[test]
+    fn benched_endpoints_are_skipped_and_the_rest_share_the_load() {
+        // Nothing benched: exactly the old rotation, with full failover.
+        assert_eq!(try_order(0, &[false; 3]), vec![0, 1, 2]);
+        assert_eq!(try_order(4, &[false; 3]), vec![1, 2, 0]);
+        // Endpoint 2 (index 1) benched: never tried, and the other two alternate.
+        let b = [false, true, false];
+        let starts: Vec<usize> = (0..6).map(|t| try_order(t, &b)[0]).collect();
+        assert_eq!(starts, vec![0, 2, 0, 2, 0, 2]);
+        assert!((0..6).all(|t| !try_order(t, &b).contains(&1)));
+        // The primary path (turn 0) moves to the next live endpoint in preference order.
+        assert_eq!(try_order(0, &[true, false, false]), vec![1, 2]);
+        // Everything benched: use them all rather than nothing.
+        assert_eq!(try_order(1, &[true; 3]), vec![1, 2, 0]);
+        assert_eq!(try_order(9, &[true]), vec![0]);
+    }
+
+    #[test]
+    fn a_benched_endpoint_is_never_where_a_send_starts() {
+        let rpc = Rpc::with_fallbacks(vec![
+            "https://a.example".into(),
+            "https://b.example/?api-key=SECRET".into(),
+            "https://c.example".into(),
+        ])
+        .unwrap();
+        rpc.bench(1);
+        rpc.bench(1); // idempotent
+        assert!((0..9).all(|_| rpc.next_start() != 1));
+        rpc.bench(0);
+        rpc.bench(2);
+        let seq: Vec<usize> = (0..3).map(|_| rpc.next_start()).collect();
+        assert_eq!(seq.iter().copied().collect::<std::collections::BTreeSet<_>>().len(), 3, "{seq:?}");
+    }
+
+    /// End to end: a 401 benches the endpoint that sent it; a connection failure, like
+    /// any other transient error, does not.
+    #[tokio::test]
+    async fn an_unauthorized_answer_benches_its_endpoint_and_a_dead_one_does_not() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        let rpc = Rpc::with_fallbacks(vec![format!("http://{addr}/?api-key=K"), "http://127.0.0.1:1/".into()])
+            .unwrap();
+        assert!(rpc.slot().await.is_err());
+        let benched: Vec<bool> =
+            rpc.benched.iter().map(|b| b.load(std::sync::atomic::Ordering::Relaxed)).collect();
+        assert_eq!(benched, vec![true, false]);
+    }
+
+    /// A local server answering every request with `response`, and its URL. Nothing
+    /// here leaves the machine.
+    async fn mock_jito(response: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}/api/v1/transactions?bundleOnly=true")
+    }
+
+    const SENT_WITH_ID: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nx-bundle-id: abc123\r\n\
+        Connection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"result\":\"SIG\",\"id\":1}";
+    const SENT_WITHOUT_ID: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+        Connection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"result\":\"SIG\",\"id\":1}";
+    const RATE_LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 17\r\nConnection: close\r\n\r\n\
+        Too many requests";
+
+    fn local_rpc() -> Rpc {
+        Rpc::with_fallbacks(vec!["http://127.0.0.1:1/".into()]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_send_keeps_the_bundle_id_header_when_there_is_one() {
+        let rpc = local_rpc();
+        let with = rpc.send_jito(&mock_jito(SENT_WITH_ID).await, "AA==").await.unwrap();
+        assert_eq!(with, JitoReceipt { signature: "SIG".into(), bundle_id: Some("abc123".into()) });
+        let without = rpc.send_jito(&mock_jito(SENT_WITHOUT_ID).await, "AA==").await.unwrap();
+        assert_eq!(without.bundle_id, None, "a 200 without the header made no bundle");
+    }
+
+    #[tokio::test]
+    async fn the_summary_has_every_regions_answer_and_why() {
+        let rpc = local_rpc();
+        let (limited, sent) = (mock_jito(RATE_LIMITED).await, mock_jito(SENT_WITH_ID).await);
+        let urls = vec![limited.clone(), sent.clone()];
+        let mut rx = rpc.spawn_jito_sends(&urls, "AA==");
+        let mut answers = Vec::new();
+        while let Some(a) = rx.recv().await {
+            answers.push(a);
+        }
+        let (made, line) = jito_summary(Some("SIG"), &answers, urls.len());
+        assert!(made, "{line}");
+        assert!(line.contains("1 of 2 block engines made a bundle"), "{line}");
+        assert!(line.contains(&format!("{} → 429, no x-bundle-id", host_of(&limited))), "{line}");
+        assert!(line.contains("Too many requests"), "the refusal's body is kept: {line}");
+        assert!(line.contains(&format!("{} → 200, bundle id", host_of(&sent))), "{line}");
+
+        // The fast path still answers with the region that accepted.
+        let receipt = rpc.send_jito_all(&urls, "AA==").await.unwrap();
+        assert_eq!(receipt.bundle_id.as_deref(), Some("abc123"));
+    }
+
+    #[tokio::test]
+    async fn when_no_region_makes_a_bundle_the_error_says_why_for_each() {
+        let rpc = local_rpc();
+        let urls = vec![mock_jito(RATE_LIMITED).await, mock_jito(RATE_LIMITED).await];
+        let e = format!("{:#}", rpc.send_jito_all(&urls, "AA==").await.unwrap_err());
+        assert!(e.contains("0 of 2 block engines made a bundle"), "{e}");
+        assert_eq!(e.matches("→ 429").count(), 2, "{e}");
+        assert!(rpc.send_jito_all(&[], "AA==").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn statuses_are_matched_to_their_ids_not_their_order() {
+        const ANSWER: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+            Connection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"result\":{\"context\":{\"slot\":1},\"value\":[\
+            {\"bundle_id\":\"b\",\"status\":\"Pending\"},{\"bundle_id\":\"a\",\"status\":\"Invalid\"}]},\"id\":1}";
+        let url = mock_jito(ANSWER).await;
+        let got = local_rpc().jito_status().statuses(&url, &["a".into(), "b".into(), "c".into()]).await.unwrap();
+        assert_eq!(got, vec![Some("Invalid".into()), Some("Pending".into()), None]);
+        let refused = local_rpc().jito_status().status(&mock_jito(RATE_LIMITED).await, "a").await.unwrap_err();
+        assert!(format!("{refused:#}").contains("429"), "the HTTP status is said: {refused:#}");
+    }
+
+    #[tokio::test]
+    async fn sender_answers_a_signature_and_its_errors_say_the_status_without_the_key() {
+        let mut rpc = local_rpc();
+        assert!(!rpc.sender_keyed());
+        rpc.set_sender_key(Some(" "));
+        assert!(!rpc.sender_keyed(), "a blank key is keyless");
+
+        let ok = mock_jito(SENT_WITHOUT_ID).await;
+        rpc.set_sender_url_for_test(&format!("{ok}&api-key=SUPER-SECRET-VALUE"));
+        assert_eq!(rpc.send_sender("AA==").await.unwrap(), "SIG");
+
+        let limited = mock_jito(RATE_LIMITED).await;
+        rpc.set_sender_url_for_test(&format!("{limited}&api-key=SUPER-SECRET-VALUE"));
+        let e = format!("{:#}", rpc.send_sender("AA==").await.unwrap_err());
+        assert!(e.contains("429") && e.contains("Too many requests"), "{e}");
+        assert!(!e.contains("SUPER-SECRET-VALUE"), "{e}");
+
+        // A real connection failure, whose reqwest text embeds the URL.
+        rpc.set_sender_url_for_test("http://127.0.0.1:1/fast?swqos_only=true&api-key=SUPER-SECRET-VALUE");
+        let e = format!("{:#}", rpc.send_sender("AA==").await.unwrap_err());
+        assert!(!e.contains("SUPER-SECRET-VALUE"), "{e}");
+
+        rpc.set_sender_key(Some("k"));
+        assert!(rpc.sender_keyed());
+    }
+
+    #[test]
+    fn a_region_is_named_by_its_host_alone() {
+        assert_eq!(host_of("https://ny.mainnet.block-engine.jito.wtf/api/v1/transactions?bundleOnly=true"), "ny.mainnet.block-engine.jito.wtf");
+        assert_eq!(host_of("https://user:SECRET@relay.example:8443?key=SECRET"), "relay.example:8443");
+        assert_eq!(clip(&"x".repeat(500)).chars().count(), CLIP_CHARS + 1);
+        assert_eq!(clip("ünïcödé"), "ünïcödé");
     }
 
     #[test]

@@ -35,6 +35,7 @@ pub mod pda;
 pub mod risk;
 pub mod route;
 pub mod rpc;
+pub mod sender;
 pub mod ticks;
 pub mod tx;
 pub mod venue;
@@ -147,6 +148,10 @@ pub enum SendVia {
         /// the floors doing that job; turning it off is then worth one round trip.
         simulate_first: bool,
     },
+    /// Helius Sender; see [`rpc::Rpc::send_sender`]. No revert protection, so always
+    /// simulated first: a miss after that lands, reverts and pays the base and priority
+    /// fees.
+    Sender,
 }
 
 /// A trade that has been priced and is ready to be considered.
@@ -193,7 +198,7 @@ impl Plan {
         // only thing a dry run is for.
         let simulate = dry_run
             || match via {
-                SendVia::Rpc => true,
+                SendVia::Rpc | SendVia::Sender => true,
                 SendVia::Jito { simulate_first, .. } => *simulate_first,
             };
         if simulate {
@@ -208,13 +213,24 @@ impl Plan {
             ));
         }
 
-        let (signature, bundle_id) = match via {
-            SendVia::Rpc => (rpc.send(&self.tx_base64, true).await?, None),
-            SendVia::Jito { urls, .. } => {
-                let r = rpc.send_jito_all(urls, &self.tx_base64).await?;
-                (r.signature, r.bundle_id)
-            }
+        // Known before sending, so a send that errors is not forgotten: a timeout can
+        // come after the node took the transaction, and only the signature can say.
+        let own_signature = tx::signature_of(&self.tx_base64)?;
+        let sent = match via {
+            SendVia::Rpc => rpc.send(&self.tx_base64, true).await.map(|s| (s, None)),
+            SendVia::Jito { urls, .. } => rpc
+                .send_jito_all(urls, &self.tx_base64)
+                .await
+                .map(|r| (r.signature, r.bundle_id)),
+            SendVia::Sender => rpc.send_sender(&self.tx_base64).await.map(|s| (s, None)),
         };
+        let (signature, bundle_id) = sent.unwrap_or_else(|e| {
+            tracing::warn!(
+                "send of {own_signature} errored and may still have been received; \
+                 treating it as submitted until its status is known: {e:#}"
+            );
+            (own_signature, None)
+        });
         Ok(Attempt::Submitted { signature, expected_net_usd: self.expected_net_usd, bundle_id })
     }
 
@@ -373,6 +389,109 @@ impl Executor {
     #[must_use]
     pub fn pubkey(&self) -> Pubkey {
         self.wallet.pubkey()
+    }
+}
+
+#[cfg(test)]
+mod sender_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A local server that records `path method` for every request and answers
+    /// `simulateTransaction` with `sim` and anything else with a Sender signature.
+    async fn mock(sim: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                // Headers, then as much body as Content-Length says.
+                loop {
+                    let n = sock.read(&mut chunk).await.unwrap_or(0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(h) = text.find("\r\n\r\n") {
+                        let len = text[..h]
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            .unwrap_or(0);
+                        if buf.len() >= h + 4 + len || n == 0 {
+                            break;
+                        }
+                    } else if n == 0 {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let path = text.split_whitespace().nth(1).unwrap_or("").to_string();
+                let simulating = text.contains("simulateTransaction");
+                log.lock().unwrap().push(format!(
+                    "{} {}",
+                    path.split('?').next().unwrap_or(""),
+                    if simulating { "simulate" } else { "send" }
+                ));
+                let body = if simulating { sim } else { r#"{"jsonrpc":"2.0","id":"1","result":"SIGX"}"# };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn signed_tx(owner_out: &mut Pubkey) -> String {
+        use solana_sdk::signer::keypair::Keypair;
+        let w = cb_wallet::EncryptedKey::seal(&Keypair::new().to_bytes(), "p").and_then(|e| e.unseal("p")).unwrap();
+        *owner_out = w.pubkey();
+        let ixs = [tx::set_compute_limit(1_000), tx::set_compute_price(1), tx::transfer_lamports(&w.pubkey(), &sender::tip_account(0), 5_000)];
+        tx::assemble(&w, &ixs, solana_sdk::hash::Hash::default()).unwrap().tx_base64
+    }
+
+    fn plan(owner: Pubkey, tx_base64: String) -> Plan {
+        Plan {
+            size_usd: 1.0,
+            expected_net_usd: 0.05,
+            profit: route::Profit::Lamports(owner),
+            min_post_balance: 999_000,
+            tx_base64,
+        }
+    }
+
+    const SIM_OK: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"err":null,"logs":[],"unitsConsumed":450,"accounts":[{"lamports":1000000,"data":["","base64"],"owner":"11111111111111111111111111111111"}]}}}"#;
+    const SIM_SHORT: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"err":null,"logs":[],"unitsConsumed":450,"accounts":[{"lamports":998000,"data":["","base64"],"owner":"11111111111111111111111111111111"}]}}}"#;
+
+    async fn run(sim: &'static str) -> (Attempt, Vec<String>) {
+        let (base, seen) = mock(sim).await;
+        let mut rpc = Rpc::new(format!("{base}/rpc")).unwrap();
+        rpc.set_sender_url_for_test(&format!("{base}/fast?swqos_only=true&api-key=K"));
+        let mut owner = Pubkey::default();
+        let tx = signed_tx(&mut owner);
+        let p = plan(owner, tx);
+        let mut gate = RiskGate::new(risk::Limits::default());
+        let a = p.execute(&mut gate, &rpc, false, &SendVia::Sender).await.unwrap();
+        let log = seen.lock().unwrap().clone();
+        (a, log)
+    }
+
+    /// No revert protection on Sender, so the chain is asked first, every time.
+    #[tokio::test]
+    async fn a_trade_via_sender_is_simulated_before_it_is_sent() {
+        let (a, log) = run(SIM_OK).await;
+        assert!(matches!(&a, Attempt::Submitted { signature, bundle_id: None, .. } if signature == "SIGX"), "{a:?}");
+        assert_eq!(log, vec!["/rpc simulate".to_string(), "/fast send".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_trade_via_sender_that_simulates_short_is_never_sent() {
+        let (a, log) = run(SIM_SHORT).await;
+        assert!(matches!(a, Attempt::SimulationRejected { .. }), "{a:?}");
+        assert_eq!(log, vec!["/rpc simulate".to_string()]);
     }
 }
 

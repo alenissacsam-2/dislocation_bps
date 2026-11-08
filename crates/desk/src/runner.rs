@@ -12,6 +12,7 @@ use serde::Serialize;
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -69,12 +70,17 @@ pub struct NativeRunner {
     cwd: PathBuf,
     log: PathBuf,
     child: Mutex<Option<Child>>,
+    /// Set when `probe` finds our child gone; cleared only by a successful `start` or a
+    /// `stop`. Sticky because two pollers probe — the window every 2s, the watcher
+    /// every 4s — and a one-shot `Failed` went to whichever asked first, so the watcher
+    /// usually saw `Stopped` and never restarted. Written only under the `child` lock.
+    failed: AtomicBool,
 }
 
 impl NativeRunner {
     #[must_use]
     pub fn new(exe: PathBuf, cwd: PathBuf, log: PathBuf) -> Self {
-        Self { exe, cwd, log, child: Mutex::new(None) }
+        Self { exe, cwd, log, child: Mutex::new(None), failed: AtomicBool::new(false) }
     }
 }
 
@@ -145,11 +151,15 @@ impl BotRunner for NativeRunner {
         }
 
         *guard = Some(child);
+        // Only here: a start that bails above leaves a failed run failed, so the
+        // watcher keeps retrying it.
+        self.failed.store(false, Ordering::Relaxed);
         Ok(())
     }
 
     fn stop(&self) -> anyhow::Result<()> {
         let mut guard = self.child.lock().unwrap();
+        self.failed.store(false, Ordering::Relaxed);
         if let Some(mut c) = guard.take() {
             let _ = c.kill();
             let _ = c.wait();
@@ -175,10 +185,18 @@ impl BotRunner for NativeRunner {
     /// nothing as an interlock. The real guard against a second writer is the bound
     /// port, and it still runs: releasing the handle leaves `Foreign` reachable, so a
     /// bot that genuinely is alive is never raced.
+    ///
+    /// The verdict itself outlives the handle: see `failed`.
     fn probe(&self) -> RunState {
         let mut guard = self.child.lock().unwrap();
         let Some(child) = guard.as_mut() else {
-            return if port_is_bound(BOT_PORT) { RunState::Foreign } else { RunState::Stopped };
+            return if self.failed.load(Ordering::Relaxed) {
+                RunState::Failed
+            } else if port_is_bound(BOT_PORT) {
+                RunState::Foreign
+            } else {
+                RunState::Stopped
+            };
         };
         let gone = match child.try_wait() {
             Ok(Some(_)) => true,
@@ -187,6 +205,7 @@ impl BotRunner for NativeRunner {
         };
         if gone {
             *guard = None;
+            self.failed.store(true, Ordering::Relaxed);
             return RunState::Failed;
         }
         if port_is_bound(BOT_PORT) {
@@ -287,6 +306,13 @@ mod tests {
             !e.contains("already running"),
             "start refused because of a handle probe should have dropped: {e}"
         );
+
+        // Sticky: the window polls too, and must not consume the verdict the watcher
+        // restarts on — nor may a restart that failed to spawn clear it.
+        assert_eq!(r.probe(), RunState::Failed, "a second probe must still see the failure");
+        // Only a deliberate stop ends it.
+        r.stop().unwrap();
+        assert_ne!(r.probe(), RunState::Failed, "a stop clears the failure");
     }
 
     #[test]

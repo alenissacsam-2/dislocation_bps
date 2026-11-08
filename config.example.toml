@@ -83,9 +83,6 @@ max_daily_loss_usd = 5.0
 # hop's haircut rather than all of them.
 min_net_profit_usd = 0.01
 
-# How far the simulated result may fall short of the quote before it is refused.
-max_slippage_bps = 30.0
-
 # Consecutive reverts or rejections before the breaker trips. A lost race does not
 # count: losing races is what racing is, and counting it would stop trading on a busy
 # day rather than a broken one.
@@ -137,8 +134,8 @@ halt_cooldown_secs = 600
 # and nothing is submitted that has not already simulated profitably, so this floor
 # only has to survive the slot or two between simulation and landing.
 #
-# Not the same number as max_slippage_bps above: that one judges the simulated result
-# after the fact, this one is written into the instruction the pool must honour.
+# This one is written into the instruction the pool must honour; the simulated result
+# is judged separately, against the min_post_balance floor.
 #
 # This is now a FLOOR on the search rather than the value used. The haircut is pulled
 # in two directions and no constant satisfies both:
@@ -159,18 +156,24 @@ halt_cooldown_secs = 600
 # the most tolerance for the price moving before it lands.
 slippage_tenth_bps = 3
 
-# Priority bid in micro-lamports per compute unit. 0 pays the base fee only.
-# Only used with submit_via = "rpc"; through Jito the tip does this job.
+# Priority bid in micro-lamports per compute unit, as a ceiling. 0 pays the base fee
+# only through "rpc"; "sender" always bids at least 1, since Sender requires a priority
+# fee. Through Jito the tip does this job.
 priority_micro_lamports = 0
 
 # Where live trades go.
 #
-# "jito" (the default) sends each trade as a bundle of one through Jito's block engine.
-# A trade whose floor is missed by the time a leader reaches it is dropped and costs
-# nothing, and every floor guarantees the base fee and the tip on chain, so a trade that
-# lands has paid for itself. "rpc" is ordinary sendTransaction: a miss lands, reverts,
-# and pays the whole fee.
-submit_via = "jito"
+# "sender" (the default) sends through Helius Sender (SWQOS-only), tipping a Helius tip
+# account at least 5,000 lamports and bidding a priority fee. Its api key is taken from
+# the Helius rpc_http_url, if there is one; keyless it allows one send a second. There is
+# no revert protection, so every trade is simulated first, and every floor still
+# guarantees the base fee, the priority fee and the tip on chain. A miss after the
+# simulation lands, reverts, and pays the base fee and the priority fee (not the tip).
+# "jito" sends each trade as a bundle of one through Jito's block engine: a miss is
+# dropped and costs nothing, but unauthenticated sends are never included (see
+# jito_auth_uuid). "rpc" is ordinary sendTransaction: a miss lands, reverts, and pays
+# the whole fee.
+submit_via = "sender"
 # Blank means Jito's global endpoint with bundleOnly=true.
 jito_url = ""
 # Jito block engine UUID, sent as x-jito-auth on every block engine request. Leave
@@ -179,8 +182,9 @@ jito_url = ""
 # tip included), so without one nothing lands through Jito. Jito issues one through a
 # ticket in its Discord. Paste it between the quotes and restart the bot.
 jito_auth_uuid = ""
-# The most one tip may be, in lamports. The tip is a quarter of the trade's gross, at
-# least Jito's 1,000-lamport minimum, and only paid when the trade lands.
+# The most one tip may be, in lamports, through Jito or Sender. The tip is half the
+# trade's gross, at least the path's minimum (Jito 1,000, Sender 5,000), and only paid
+# when the trade lands.
 jito_tip_max_lamports = 20000
 # Simulate before sending through Jito. The on-chain floors protect the budget either
 # way; switching this off saves one round trip (~100 ms) per trade.

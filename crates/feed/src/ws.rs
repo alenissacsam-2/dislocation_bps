@@ -36,6 +36,17 @@ pub fn is_dead(silent: Duration) -> bool {
     silent > MAX_SILENCE
 }
 
+const MIN_BACKOFF_MS: u64 = 500;
+const MAX_BACKOFF_MS: u64 = 30_000;
+
+/// How long to wait before reconnecting, given the escalated backoff so far.
+///
+/// A connection that delivered data was healthy, so its failure starts the backoff
+/// over; otherwise one stall after hours of good service would cost the full cap.
+fn reconnect_wait(backoff_ms: u64, delivered: bool) -> u64 {
+    if delivered { MIN_BACKOFF_MS } else { backoff_ms }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
@@ -121,15 +132,21 @@ impl WsFeed {
 
         tokio::spawn(async move {
             let mut accounts = accounts;
-            let mut backoff_ms = 500u64;
+            let mut backoff_ms = MIN_BACKOFF_MS;
+            // Lives across reconnects: accountSubscribe does not resend current state, so
+            // a parked update dropped here would be lost until that account changes again.
+            let mut backlog = std::collections::HashMap::new();
             loop {
-                match run_once(&url, &mut accounts, &mut add_rx, &tx, &stats).await {
+                let before = stats.updates.load(Ordering::Relaxed);
+                match run_once(&url, &mut accounts, &mut add_rx, &tx, &stats, &mut backlog).await {
                     Ok(()) => tracing::warn!("feed stream ended cleanly; reconnecting"),
                     Err(e) => tracing::warn!("feed error: {e:#}; reconnecting"),
                 }
+                let delivered = stats.updates.load(Ordering::Relaxed) > before;
+                let wait_ms = reconnect_wait(backoff_ms, delivered);
                 stats.reconnects.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(30_000);
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                backoff_ms = (wait_ms * 2).min(MAX_BACKOFF_MS);
             }
         });
 
@@ -165,6 +182,8 @@ async fn run_once(
     added: &mut mpsc::UnboundedReceiver<Watch>,
     tx: &mpsc::Sender<AccountUpdate>,
     stats: &FeedStats,
+    // Updates the consumer had no room for, newest per account. See `deliver`.
+    backlog: &mut std::collections::HashMap<Pubkey32, AccountUpdate>,
 ) -> Result<()> {
     let (mut socket, _) = tokio_tungstenite::connect_async(url).await?;
     tracing::info!(
@@ -177,9 +196,6 @@ async fn run_once(
     // subscription id, so without this table we cannot tell which account changed.
     let mut pending: std::collections::HashMap<u64, Pubkey32> = std::collections::HashMap::new();
     let mut subs: std::collections::HashMap<u64, Pubkey32> = std::collections::HashMap::new();
-    // Updates the consumer had no room for, newest per account. See `deliver`.
-    let mut backlog: std::collections::HashMap<Pubkey32, AccountUpdate> =
-        std::collections::HashMap::new();
 
     stats.subscribed.store(0, Ordering::Relaxed);
     stats.subscribe_errors.store(0, Ordering::Relaxed);
@@ -221,6 +237,7 @@ async fn run_once(
                     }
                     Some(Watch::Drop(gone)) => {
                         accounts.retain(|a| !gone.contains(a));
+                        backlog.retain(|a, _| !gone.contains(a));
                         let ids: Vec<u64> =
                             subs.iter().filter(|(_, pk)| gone.contains(pk)).map(|(id, _)| *id).collect();
                         for id in ids {
@@ -248,8 +265,10 @@ async fn run_once(
                 // Nothing arrived within the read window. Distinguish "quiet" from
                 // "dead": ping to keep intermediaries from reaping the connection,
                 // then bail if data has been absent past the tolerance.
+                // A quiet socket is also the consumer's chance to drain what was parked.
+                flush(tx, backlog);
                 let silent = last_data.elapsed();
-                if silent > MAX_SILENCE {
+                if is_dead(silent) {
                     stats.stalls.fetch_add(1, Ordering::Relaxed);
                     return Err(anyhow!(
                         "no account data for {}s — treating connection as dead",
@@ -352,7 +371,7 @@ async fn run_once(
         stats.last_update_ms.store(now_ms(), Ordering::Relaxed);
 
         let update = AccountUpdate { pubkey, data, slot, received_ms: now_ms() };
-        deliver(tx, &mut backlog, update, stats);
+        deliver(tx, backlog, update, stats);
     }
 }
 
@@ -368,29 +387,36 @@ async fn run_once(
 ///
 /// So a full channel parks the update in `backlog`, keyed by account, where a newer one
 /// replaces it. The backlog is flushed, oldest-first by nothing but map order, before
-/// each new update is offered, so the consumer catches up with the latest state of
-/// everything the moment it has room.
+/// each new update is offered (and on every quiet read timeout), so the consumer catches
+/// up with the latest state of everything the moment it has room. The backlog outlives
+/// the connection, because a fresh `accountSubscribe` does not resend current state.
 fn deliver(
     tx: &mpsc::Sender<AccountUpdate>,
     backlog: &mut std::collections::HashMap<Pubkey32, AccountUpdate>,
     update: AccountUpdate,
     stats: &FeedStats,
 ) {
-    if !backlog.is_empty() {
-        let keys: Vec<Pubkey32> = backlog.keys().copied().collect();
-        for k in keys {
-            let Some(parked) = backlog.remove(&k) else { continue };
-            if let Err(mpsc::error::TrySendError::Full(back)) = tx.try_send(parked) {
-                backlog.insert(k, back);
-                break;
-            }
-        }
-    }
+    flush(tx, backlog);
     let key = update.pubkey;
     let result = if backlog.is_empty() { tx.try_send(update) } else { Err(mpsc::error::TrySendError::Full(update)) };
     if let Err(mpsc::error::TrySendError::Full(update)) = result {
         if backlog.insert(key, update).is_some() {
             stats.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Offer parked updates to the consumer until it is full again. See [`deliver`].
+fn flush(tx: &mpsc::Sender<AccountUpdate>, backlog: &mut std::collections::HashMap<Pubkey32, AccountUpdate>) {
+    if backlog.is_empty() {
+        return;
+    }
+    let keys: Vec<Pubkey32> = backlog.keys().copied().collect();
+    for k in keys {
+        let Some(parked) = backlog.remove(&k) else { continue };
+        if let Err(mpsc::error::TrySendError::Full(back)) = tx.try_send(parked) {
+            backlog.insert(k, back);
+            break;
         }
     }
 }
@@ -503,6 +529,26 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().slot, 12, "the newest state of account 1 arrives");
         deliver(&tx, &mut backlog, up(3, 14), &stats);
         assert_eq!(rx.try_recv().unwrap().pubkey, [2; 32], "account 2 was parked, not lost");
+    }
+
+    #[test]
+    fn a_connection_that_delivered_data_resets_the_backoff() {
+        assert_eq!(reconnect_wait(MAX_BACKOFF_MS, true), MIN_BACKOFF_MS);
+        assert_eq!(reconnect_wait(4_000, false), 4_000, "a dead-on-arrival connection keeps escalating");
+    }
+
+    #[test]
+    fn an_idle_flush_delivers_parked_updates_without_a_new_one() {
+        let (tx, mut rx) = mpsc::channel::<AccountUpdate>(1);
+        let stats = FeedStats::default();
+        let mut backlog = std::collections::HashMap::new();
+        let up = |k: u8, slot: u64| AccountUpdate { pubkey: [k; 32], data: vec![k], slot, received_ms: 0 };
+        deliver(&tx, &mut backlog, up(1, 10), &stats);
+        deliver(&tx, &mut backlog, up(2, 11), &stats); // parked
+        assert_eq!(rx.try_recv().unwrap().slot, 10);
+        flush(&tx, &mut backlog);
+        assert!(backlog.is_empty());
+        assert_eq!(rx.try_recv().unwrap().slot, 11);
     }
 
     #[test]

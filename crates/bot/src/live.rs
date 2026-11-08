@@ -27,7 +27,7 @@ use cb_dex::{meteora_damm_v2, meteora_dlmm, orca_whirlpool, pumpswap, raydium_cl
 use cb_executor::encode::{to_pubkey, to_raw};
 use cb_executor::pda::meteora_bin_array;
 use cb_feed::AccountUpdate;
-use cb_scanner::multi::{survey_and_find, SurveyedCycle};
+use cb_scanner::multi::{survey_and_find, SurveyedCycle, MAX_PLAUSIBLE_EDGE_BPS};
 use cb_scanner::store::PoolStore;
 use cb_server::{Event, EventBus, RouteRow};
 use std::collections::HashMap;
@@ -407,6 +407,8 @@ pub struct LiveMarket {
     pub subscriptions: Vec<Pubkey32>,
     /// USD per *whole* token, rebuilt from live pools rather than assumed.
     usd: HashMap<Pubkey32, f64>,
+    /// Pools already named in a refusal for an implausible edge, so each is logged once.
+    implausible_named: std::sync::Mutex<std::collections::HashSet<PoolId>>,
 }
 
 fn now_ms() -> u64 {
@@ -449,6 +451,8 @@ impl LiveMarket {
         let wsol_raw = pk("So11111111111111111111111111111111111111112")?;
         let store = PoolStore::new();
         let mut failures: Vec<String> = Vec::new();
+        // Pools that decode but do not price yet: watched, so `apply` brings them in.
+        let mut waiting: Vec<String> = Vec::new();
 
         for (entry, account) in registry.pools.iter().zip(accounts.iter()) {
             let Some(data) = account else {
@@ -460,10 +464,12 @@ impl LiveMarket {
             match entry.dex {
                 // Priced once it is known whether its oracle exists: see below.
                 Dex::OrcaWhirlpool => orca_pending.push((addr, entry.label.clone(), data.clone())),
-                Dex::MeteoraDammV2 => match meteora_damm_v2::to_pool_state(addr, data, boot_slot, earliest_landing())
-                {
-                    Ok(ps) => {
-                        store.upsert(ps);
+                Dex::MeteoraDammV2 => match damm_v2_at_boot(addr, data, boot_slot) {
+                    Ok(priced) => {
+                        match priced {
+                            Ok(ps) => store.upsert(ps),
+                            Err(e) => waiting.push(format!("{}: {e:#}", entry.label)),
+                        }
                         watches.insert(
                             addr,
                             Watch {
@@ -648,18 +654,17 @@ impl LiveMarket {
                 failures.push(format!("{}: fee config unresolved", bs58::encode(addr).into_string()));
                 continue;
             };
+            // The account decoded, so the pool stays watched even when it does not price
+            // yet (not open, swaps disabled): its first update that prices brings it in.
+            if let Some(w) = watches.get_mut(&addr) {
+                w.venue = Venue::RaydiumClmm { trade_fee_ppm: fee };
+            }
             match raydium_clmm::to_pool_state(addr, &data, fee, boot_slot, now_ms() / 1_000) {
-                Ok(ps) => {
-                    store.upsert(ps);
-                    if let Some(w) = watches.get_mut(&addr) {
-                        w.venue = Venue::RaydiumClmm { trade_fee_ppm: fee };
-                    }
-                }
+                Ok(ps) => store.upsert(ps),
                 Err(e) => {
                     let label =
                         watches.get(&addr).map_or_else(String::new, |w| w.label.clone());
-                    watches.remove(&addr);
-                    failures.push(format!("{label}: {e:#}"));
+                    waiting.push(format!("{label}: {e:#}"));
                 }
             }
         }
@@ -864,6 +869,9 @@ impl LiveMarket {
         for f in &failures {
             tracing::warn!("registry pool dropped — {f}");
         }
+        for f in &waiting {
+            tracing::info!("registry pool watched but not priced yet — {f}");
+        }
 
         let mut subscriptions: Vec<Pubkey32> = watches.keys().copied().collect();
         subscriptions.extend(vault_index.keys().copied());
@@ -881,6 +889,7 @@ impl LiveMarket {
             store,
             subscriptions,
             usd: HashMap::new(),
+            implausible_named: std::sync::Mutex::default(),
         };
         market.rebuild_usd_index();
 
@@ -902,61 +911,20 @@ impl LiveMarket {
     }
 
     /// Apply one account update. Returns the pool whose state changed, if any.
+    ///
+    /// An update after which its pool no longer prices — not open yet, swaps disabled,
+    /// an account that no longer decodes — takes the pool out of the store, keeping its
+    /// watch, so no cycle quotes the old price and the next update that prices brings
+    /// it back. An auxiliary account that does not decode changes nothing.
     pub fn apply(&mut self, u: &AccountUpdate, bus: &EventBus) -> Option<PoolState> {
-        let state = if let Some(w) = self.watches.get_mut(&u.pubkey) {
-            w.slot = w.slot.max(u.slot);
-            match &mut w.venue {
-                Venue::Whirlpool => orca_whirlpool::to_pool_state(u.pubkey, &u.data, u.slot).ok()?,
-                Venue::WhirlpoolAdaptive { pool, .. } => {
-                    pool.clone_from(&u.data);
-                    self.watches.get(&u.pubkey)?.vault_state(u.pubkey)?
-                }
-                Venue::MeteoraDammV2 { pool } => {
-                    pool.clone_from(&u.data);
-                    meteora_damm_v2::to_pool_state(u.pubkey, &u.data, u.slot, earliest_landing()).ok()?
-                }
-                Venue::RaydiumClmm { trade_fee_ppm } => {
-                    raydium_clmm::to_pool_state(
-                        u.pubkey,
-                        &u.data,
-                        *trade_fee_ppm,
-                        u.slot,
-                        now_ms() / 1_000,
-                    )
-                    .ok()?
-                }
-                Venue::MeteoraDlmm { pair, pair_slot, .. } => {
-                    // The active bin lives in this account and decides which of the
-                    // arrays already held is the one that prices the pool, so a stale
-                    // copy would price it from the wrong bin.
-                    **pair = meteora_dlmm::decode(&u.data).ok()?;
-                    *pair_slot = u.slot;
-                    self.watches.get(&u.pubkey)?.vault_state(u.pubkey)?
-                }
-                Venue::RaydiumV4 { info, .. } => {
-                    // The pool account itself moved: fees and uncollected amounts
-                    // change, and a stale copy corrupts the reserve calculation.
-                    **info = raydium_v4::decode_amm_info(&u.data).ok()?;
-                    self.watches.get(&u.pubkey)?.vault_state(u.pubkey)?
-                }
-                Venue::RaydiumCpmm { pool, .. } => {
-                    // Same reasoning: the accrued-fee counters live in this account and
-                    // are subtracted from the vault balances to get the real reserve.
-                    **pool = raydium_cpmm::decode(&u.data).ok()?;
-                    self.watches.get(&u.pubkey)?.vault_state(u.pubkey)?
-                }
-                Venue::PumpSwap { pool, .. } => {
-                    // The virtual quote reserve lives in this account.
-                    **pool = pumpswap::decode_pool(&u.data).ok()?;
-                    self.watches.get(&u.pubkey)?.vault_state(u.pubkey)?
-                }
-            }
+        let (pool, state) = if self.watches.contains_key(&u.pubkey) {
+            (u.pubkey, self.decode_at(u.pubkey, &u.data, u.slot))
         } else if let Some(&(pool, first)) = self.vault_index.get(&u.pubkey) {
             let amount = raydium_v4::decode_token_amount(&u.data).ok()?;
             let w = self.watches.get_mut(&pool)?;
             w.slot = w.slot.max(u.slot);
             w.set_vault(first, amount);
-            self.watches.get(&pool)?.vault_state(pool)?
+            (pool, self.watches.get(&pool)?.vault_state(pool))
         } else if let Some(&(pool, ix)) = self.bin_index.get(&u.pubkey) {
             let array = meteora_dlmm::decode_bin_array(&u.data).ok()?;
             let w = self.watches.get_mut(&pool)?;
@@ -964,7 +932,7 @@ impl LiveMarket {
             if let Venue::MeteoraDlmm { arrays, .. } = &mut w.venue {
                 arrays.insert(ix, (u.slot, array));
             }
-            self.watches.get(&pool)?.vault_state(pool)?
+            (pool, self.watches.get(&pool)?.vault_state(pool))
         } else if let Some(&pool) = self.oracle_index.get(&u.pubkey) {
             // Every swap on the pool writes its oracle: the accumulator, the reference
             // and their timestamps all move, and with them the fee.
@@ -974,8 +942,12 @@ impl LiveMarket {
             if let Venue::WhirlpoolAdaptive { oracle, .. } = &mut w.venue {
                 **oracle = decoded;
             }
-            self.watches.get(&pool)?.vault_state(pool)?
+            (pool, self.watches.get(&pool)?.vault_state(pool))
         } else {
+            return None;
+        };
+        let Some(state) = state else {
+            self.unprice(pool);
             return None;
         };
 
@@ -1006,10 +978,10 @@ impl LiveMarket {
     ///
     /// # Two searches, two different questions
     ///
-    /// `survey_from_base` prices every cycle at infinitesimal size: that is a *rate*,
-    /// and it is what the leaderboard and the ledger's edge statistics are built from.
-    /// `find_from_base` sizes cycles against real capital and real tick depth, and
-    /// only its results ever become fills.
+    /// `survey_and_find` returns two lists from one `enumerate_from_base` pass. The survey
+    /// prices every cycle at infinitesimal size: that is a *rate*, and it is what the
+    /// leaderboard and the ledger's edge statistics are built from. The found list sizes cycles against real capital and real tick depth,
+    /// and only its results ever become fills.
     ///
     /// These disagree far more than they look like they should, which is why
     /// [`Sweep::tradeable`] exists beside [`Sweep::best`]. A cycle whose downstream leg
@@ -1044,7 +1016,8 @@ impl LiveMarket {
                 continue;
             }
             let max_in = (tradable_usd / usd_per_unit) as u128;
-            let (cycles, found) = survey_and_find(&snap, base, max_hops, max_in);
+            let (cycles, found, refused) = survey_and_find(&snap, base, max_hops, max_in);
+            self.note_implausible(&refused);
             let b = surveyed.len();
             for (i, sc) in cycles.iter().enumerate() {
                 evaluated += 1;
@@ -1323,6 +1296,7 @@ impl LiveMarket {
             let before = self.store.get(&PoolId(addr));
             let Some(state) = self.decode_at(addr, data, slot) else {
                 report.undecodable += 1;
+                self.unprice(addr);
                 continue;
             };
             // Compare the priced state, not the slot: only a changed price matters.
@@ -1355,23 +1329,47 @@ impl LiveMarket {
                 raydium_clmm::to_pool_state(addr, data, *trade_fee_ppm, slot, now_ms() / 1_000).ok()
             }
             Venue::MeteoraDlmm { pair, pair_slot, .. } => {
+                // The active bin lives in this account and decides which of the arrays
+                // already held is the one that prices the pool, so a stale copy would
+                // price it from the wrong bin.
                 **pair = meteora_dlmm::decode(data).ok()?;
                 *pair_slot = slot;
                 self.watches.get(&addr)?.vault_state(addr)
             }
             Venue::RaydiumV4 { info, .. } => {
+                // The pool account itself moved: fees and uncollected amounts change,
+                // and a stale copy corrupts the reserve calculation.
                 **info = raydium_v4::decode_amm_info(data).ok()?;
                 self.watches.get(&addr)?.vault_state(addr)
             }
             Venue::RaydiumCpmm { pool, .. } => {
+                // Same reasoning: the accrued-fee counters live in this account and are
+                // subtracted from the vault balances to get the real reserve.
                 **pool = raydium_cpmm::decode(data).ok()?;
                 self.watches.get(&addr)?.vault_state(addr)
             }
             Venue::PumpSwap { pool, .. } => {
+                // The virtual quote reserve lives in this account.
                 **pool = pumpswap::decode_pool(data).ok()?;
                 self.watches.get(&addr)?.vault_state(addr)
             }
         }
+    }
+
+    /// Take a watched pool that no longer prices out of the store, and out of the USD
+    /// index built from it, keeping its watch so the next update that prices brings it
+    /// back. Logged once, when it leaves; a pool with no state is left alone.
+    fn unprice(&mut self, pool: Pubkey32) {
+        if self.store.get(&PoolId(pool)).is_none() {
+            return;
+        }
+        self.store.remove(&PoolId(pool));
+        self.rebuild_usd_index();
+        let label = self.watches.get(&pool).map_or("", |w| w.label.as_str());
+        tracing::info!(
+            "{label} ({}) no longer prices — out of the sweep until an update prices it again",
+            bs58::encode(pool).into_string()
+        );
     }
 
     /// Rebuild USD-per-whole-token by walking out from the stablecoin anchors.
@@ -1615,6 +1613,39 @@ impl LiveMarket {
             .join(" · ")
     }
 
+    /// Log a cycle refused for an implausible edge when it names a pool no refusal has
+    /// named yet. A wrong decode refuses thousands of cycles a sweep; the pools are the news.
+    fn note_implausible(&self, refused: &[SurveyedCycle]) {
+        if refused.is_empty() {
+            return;
+        }
+        let Ok(mut named) = self.implausible_named.lock() else { return };
+        for sc in refused {
+            let new: Vec<String> = sc
+                .cycle
+                .pools
+                .iter()
+                .filter(|p| named.insert(**p))
+                .map(|p| {
+                    let label = self.watches.get(&p.0).map_or("?", |w| w.label.as_str());
+                    format!("{label} {}", bs58::encode(p.0).into_string())
+                })
+                .collect();
+            if new.is_empty() {
+                continue;
+            }
+            tracing::info!(
+                "refused {} over {}: a {:.0} bps marginal edge is past the {MAX_PLAUSIBLE_EDGE_BPS} bps \
+                 no measured cycle has come near, so a pool on it is mispriced — not counted, recorded \
+                 or attempted. First named here: {}",
+                self.route_label(&sc.cycle.mints),
+                self.venue_label(&sc.cycle.pools),
+                sc.edge_bps,
+                new.join(", ")
+            );
+        }
+    }
+
     /// One probe per pool per direction, sized at roughly `usd` of the input token.
     ///
     /// Each carries what *we* say the pool will pay, so an outside quote for the same
@@ -1749,6 +1780,15 @@ async fn get_multiple_accounts(
     Ok((out, context_slot))
 }
 
+/// A DAMM v2 pool at bootstrap: `Err` only if its account does not decode, which drops
+/// it; otherwise it is watched, with its state if it prices now. One that does not price
+/// yet — not open, swaps disabled — is still watched, so its first update that prices
+/// brings it into the sweep.
+fn damm_v2_at_boot(addr: Pubkey32, data: &[u8], slot: u64) -> Result<Result<PoolState>> {
+    meteora_damm_v2::decode_layout(data)?;
+    Ok(meteora_damm_v2::to_pool_state(addr, data, slot, earliest_landing()))
+}
+
 fn decode_b64(s: &str) -> Option<Vec<u8>> {
     let val = |c: u8| -> Option<u32> {
         Some(match c {
@@ -1797,6 +1837,7 @@ mod tests {
             store,
             subscriptions: Vec::new(),
             usd: HashMap::new(),
+            implausible_named: std::sync::Mutex::default(),
         };
         m.rebuild_usd_index();
         m
@@ -1831,6 +1872,39 @@ mod tests {
         assert!(!m.subscriptions.contains(&[101; 32]));
         assert!(m.store.get(&PoolId([2; 32])).is_some(), "the other stays");
         assert!(m.remove_pool(&[1; 32]).is_empty(), "letting go twice is a no-op");
+    }
+
+    /// A watched pool whose update no longer prices leaves the store and the USD index
+    /// built from it, so no cycle quotes its old price, but it stays watched.
+    #[test]
+    fn an_update_that_no_longer_prices_takes_the_pool_out_of_the_sweep() {
+        let mut m = market_with(vec![sol_usdc(1, 5_569_625_019_338_410_820, 400)]);
+        m.watches.insert([1; 32], Watch { label: "SOL/USDC".into(), dex: Dex::OrcaWhirlpool, venue: Venue::Whirlpool, slot: 100 });
+        assert!(m.sol_price_usd().is_some());
+
+        let bus = EventBus::new();
+        let u = AccountUpdate { pubkey: [1; 32], data: vec![0; 8], slot: 101, received_ms: 0 };
+        assert!(m.apply(&u, &bus).is_none());
+        assert!(m.store.get(&PoolId([1; 32])).is_none(), "the old price must not stay quotable");
+        assert!(m.sol_price_usd().is_none(), "nor value SOL");
+        assert_eq!(m.watch_count(), 1, "still watched, to come back when it prices");
+
+        // An unrelated account changes nothing.
+        let other = AccountUpdate { pubkey: [9; 32], ..u };
+        assert!(m.apply(&other, &bus).is_none());
+        assert_eq!(m.watch_count(), 1);
+    }
+
+    /// A DAMM v2 pool that decodes but is not open yet is watched without a state; one
+    /// that does not decode is dropped.
+    #[test]
+    fn a_pool_not_open_at_bootstrap_is_still_watched() {
+        let mut d = vec![0u8; meteora_damm_v2::POOL_LEN];
+        d[472..480].copy_from_slice(&u64::MAX.to_le_bytes()); // activation slot
+        let priced = damm_v2_at_boot([1; 32], &d, 100).expect("the account decodes, so it is watched");
+        let e = priced.expect_err("not open, so not priced").to_string();
+        assert!(e.contains("not open"), "{e}");
+        assert!(damm_v2_at_boot([1; 32], &d[..100], 100).is_err(), "a short account is dropped");
     }
 
     /// Real Orca SOL/USDC state: 758.6e12 liquidity at tick -23953, spacing 4.
@@ -2164,6 +2238,27 @@ mod tests {
         assert_eq!(sweep.stale_excluded, 1, "the lagging pool must be counted, not hidden");
         assert_eq!(sweep.evaluated, 0, "one venue alone makes no round trip");
         assert!(sweep.best().is_none());
+    }
+
+    /// A pool whose quote reserve decoded as u64::MAX, as PumpSwap's did on 2026-11-07:
+    /// every cycle through it is refused, so none reaches the board, the headline, the
+    /// clearing count or the opportunities, and the pool is named for the log.
+    #[test]
+    fn a_cycle_with_an_impossible_edge_never_reaches_the_board_or_the_trader() {
+        let x = [42u8; 32];
+        let phantom = PoolState::constant_product(
+            PoolId([9; 32]), Dex::PumpSwap, x, mint(USDC), 91_000_000_000, u128::from(u64::MAX), 3_000, 100,
+        );
+        let m = market_with(vec![
+            sol_usdc(1, 5_569_625_019_338_410_820, 100),
+            PoolState::constant_product(PoolId([8; 32]), Dex::RaydiumAmmV4, x, mint(WSOL), 91_000_000_000, 1_000_000_000, 2_500, 100),
+            phantom,
+        ]);
+        let sweep = m.sweep(4.80, 0.0, 3);
+        assert!(sweep.rows.iter().all(|r| r.edge_bps <= MAX_PLAUSIBLE_EDGE_BPS), "{:?}", sweep.rows);
+        assert!(sweep.opportunities.is_empty());
+        assert_eq!(sweep.clearing, 0);
+        assert!(m.implausible_named.lock().unwrap().contains(&phantom.id));
     }
 
     #[test]

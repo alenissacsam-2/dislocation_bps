@@ -25,13 +25,20 @@
 //! # The quote reserve has a virtual part
 //!
 //! A pump.fun pool prices against its quote vault **plus** a virtual quote reserve held
-//! in the pool account (a `u64` at byte 245, newer than the published IDL): about
-//! 17.58 SOL on every pump pool read on 2026-09-26, zero on other pools. Purchases get
-//! fewer tokens and sales more SOL than the vault alone would give. Without it the
-//! quote was 6-9% off on a live pool; with it, a simulated sale matched the program's
-//! own event to the lamport and a purchase to a thousandth of a basis point. The market
-//! cap that picks the fee tier is measured on the same effective reserve — the one
-//! data point the vault-only market cap put in the wrong tier moved into the right one.
+//! in the pool account (a **signed** `i64` at byte 245, newer than the published IDL):
+//! about 17.58 SOL on every pump pool read on 2026-09-26. Purchases get fewer tokens and
+//! sales more SOL than the vault alone would give. Without it the quote was 6-9% off on
+//! a live pool; with it, a simulated sale matched the program's own event to the
+//! lamport and a purchase to a thousandth of a basis point. The market cap that picks
+//! the fee tier is measured on the same effective reserve — the one data point the
+//! vault-only market cap put in the wrong tier moved into the right one.
+//!
+//! On a pool pump.fun did not create the field is a small **negative** number (the
+//! eight bytes after it are its sign extension): the vault holds that much more than
+//! the curve prices against. Read unsigned it wrapped to about 1.8e19, which priced the
+//! $10.8M PUMP/USDC pool `2uF4Xh61…` 1.7 million times too high and put a
+//! 17,000,086,981 bp "edge" on the desk on 2026-11-07. Two sales on that pool matched
+//! vault + the signed value to the unit; vault alone was off by 1 and 7.
 //!
 //! Layouts are the on-chain Anchor IDLs of both programs, read from chain on 2026-09-26.
 
@@ -100,9 +107,9 @@ pub struct PumpPool {
     pub coin_creator: Pubkey32,
     pub is_mayhem_mode: bool,
     pub is_cashback_coin: bool,
-    /// Added to the quote vault's balance wherever the program prices. Zero when the
-    /// account predates the field.
-    pub virtual_quote: u64,
+    /// Added to the quote vault's balance wherever the program prices. Signed: negative
+    /// on pools pump.fun did not create. Zero when the account predates the field.
+    pub virtual_quote: i64,
 }
 
 impl PumpPool {
@@ -110,7 +117,7 @@ impl PumpPool {
     /// pool's virtual quote.
     #[must_use]
     pub fn effective_quote(&self, quote_vault_balance: u64) -> u64 {
-        quote_vault_balance.saturating_add(self.virtual_quote)
+        quote_vault_balance.saturating_add_signed(self.virtual_quote)
     }
 }
 
@@ -134,7 +141,11 @@ pub fn decode_pool(data: &[u8]) -> Result<PumpPool> {
         coin_creator: pubkey_at(data, OFF_COIN_CREATOR),
         is_mayhem_mode: data[OFF_MAYHEM] != 0,
         is_cashback_coin: data[OFF_CASHBACK] != 0,
-        virtual_quote: if data.len() >= OFF_VIRTUAL_QUOTE + 8 { u64_at(data, OFF_VIRTUAL_QUOTE) } else { 0 },
+        virtual_quote: if data.len() >= OFF_VIRTUAL_QUOTE + 8 {
+            i64::from_le_bytes(data[OFF_VIRTUAL_QUOTE..OFF_VIRTUAL_QUOTE + 8].try_into().expect("8 bytes"))
+        } else {
+            0
+        },
     })
 }
 
@@ -380,6 +391,87 @@ mod tests {
         // program's gross output matched to the lamport; the margin takes a hair off.
         let gross = s.leg_for_input(&p.base_mint).unwrap().quote(6_809_878_393).unwrap();
         assert!((17_749_442 - 40..=17_749_442).contains(&gross), "got {gross}");
+    }
+
+    /// The PUMP/USDC pool `2uF4Xh61rDwxnG9woyxsVQP7zuA6kLFpb3NvnRQeoiSd` as read from
+    /// chain on 2026-11-08: not a pump pool, virtual quote -1,633,261.
+    fn pump_usdc_account() -> Vec<u8> {
+        let hex = concat!(
+            "f19a6d0411b16dbcfe000018297a191d2a929540d322ce36d3c31954c8737306e4e9abaf5065ee1785e8a30c45f7df8d",
+            "9e72956284933f6d98b757032e83df84604fb5e117fff61d5b12f9c6fa7af3bedbad3a3d65f36aabc97431b1bbe4c2d2",
+            "f6e0e47ca60203452f5d611ab0f37131762c07711409422e7c3a9f0246d77a1af89eb3d198caff0a610fc36ee1890bfd",
+            "9f6e2d44da178cec6ff13e79b2c89a4e23ac2ad70bb756f1a8c3534c35e06b861e6923b1038ab10987085c4215eb9e49",
+            "c917bfd2b9c5e639ed7ded6d7c8a21ae7900000000000000000000000000000000000000000000000000000000000000",
+            "00000000001314e7ffffffffffffffffffffffffff00000000000000000000edeb180000000000000000000000000000",
+            "000000000000000000000000",
+        );
+        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// Read unsigned, this pool's virtual quote wrapped to 1.8e19, its quote reserve
+    /// saturated, and PUMP priced 1.7 million times too high: the 17,000,086,981 bp edge
+    /// on the desk on 2026-11-07. Signed, two real sales price to the program's own events.
+    #[test]
+    fn a_negative_virtual_quote_prices_real_sales_to_the_unit() {
+        let acct = pump_usdc_account();
+        let p = decode_pool(&acct).unwrap();
+        assert_eq!(p.virtual_quote, -1_633_261);
+        let unsigned = u64::from_le_bytes(acct[OFF_VIRTUAL_QUOTE..OFF_VIRTUAL_QUOTE + 8].try_into().unwrap());
+        assert_eq!(10_827_267_412_646u64.saturating_add(unsigned), u64::MAX, "the old reading");
+
+        // SellEvents at slots 466629380 and 466629415: base in, the pool's reserves as the
+        // event reports them (the vault balances), and the gross quote the program paid.
+        for (base_in, base_reserve, vault, paid) in [
+            (1_008_810_033u64, 2_920_567_507_563_040u64, 10_827_267_412_646u64, 3_739_906u128),
+            (12_846_832_429, 2_920_568_516_373_073, 10_827_263_682_090, 47_626_141),
+        ] {
+            assert_eq!(p.effective_quote(vault), vault - 1_633_261);
+            let s = to_pool_state([1u8; 32], &p, base_reserve, vault, 0, 0).unwrap();
+            let out = s.leg_for_input(&p.base_mint).unwrap().quote(u128::from(base_in)).unwrap();
+            // A floor: never over what the program paid, and under it only by the margin.
+            assert!(out <= paid && paid - out <= paid / 300_000, "quoted {out}, the program paid {paid}");
+        }
+        let floor = PumpPool { virtual_quote: -5, ..p };
+        assert_eq!(floor.effective_quote(3), 0, "a deficit past the vault prices nothing");
+    }
+
+    /// The SOL → ZACK → SOL "edge" of 54,361,175 bps refused at start-up on 2026-11-08 is
+    /// the market, not a decode: DAMM v2 `DXPwyj…` and PumpSwap `EQmXSx…` read at slot
+    /// 466642187 reproduce it to the basis point. The PumpSwap pool's creator withdrew
+    /// all of its liquidity on 2026-09-26 (138.49 SOL out, LP burned), leaving 4 lamports
+    /// and 3,354 ZACK units at that day's price, while ZACK fell ~5,000x on the DAMM pool.
+    /// No size of input gets more than 3 lamports back.
+    #[test]
+    fn a_drained_pool_shows_a_real_edge_with_three_lamports_behind_it() {
+        let hex = |s: &str| -> Vec<u8> {
+            let s = s.trim();
+            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        };
+        let damm_acct = hex(include_str!("../tests/fixtures/meteora_damm_v2_zack_sol_466642187.hex"));
+        let pump = decode_pool(&hex(include_str!("../tests/fixtures/pumpswap_sol_zack_466642187.hex"))).unwrap();
+        assert_eq!(pump.virtual_quote, 0);
+        // Vault balances in the same read: base (WSOL) 4, quote (ZACK) 3,354.
+        let pump = to_pool_state([1; 32], &pump, 4, 3_354, 30, 0).unwrap();
+        let damm = crate::meteora_damm_v2::to_pool_state([2; 32], &damm_acct, 466_642_187, 1_794_100_000).unwrap();
+        let (sol, zack) = (pump.mint_a, pump.mint_b);
+        assert_eq!((damm.mint_a, damm.mint_b), (zack, sol));
+
+        let legs = [damm.leg_for_input(&sol).unwrap(), pump.leg_for_input(&zack).unwrap()];
+        let edge = cb_core::path::marginal_edge_bps(&legs).unwrap();
+        assert!((edge - 54_361_175.0).abs() < 1.0, "the logged edge: {edge}");
+        for x in [1u128, 1_000, 100_000, 10_000_000] {
+            let back = legs[0].quote(x).and_then(|z| legs[1].quote(z)).unwrap();
+            assert!(back <= 3, "{x} lamports came back as {back}");
+        }
+
+        // The DAMM side against the program: its last swap (2026-11-04, 5MAAq9…) sold
+        // 98,618,982,062 ZACK for 135,746 lamports. Undoing it on the decoded curve:
+        let p = crate::meteora_damm_v2::decode_layout(&damm_acct).unwrap();
+        let (l, sold) = (p.liquidity, 98_618_982_062u128);
+        let a_after = (l << 64) / p.sqrt_price_x64;
+        let gross = l * l / (a_after - sold) - l * l / a_after;
+        let net = gross - gross.div_ceil(1_000); // 10 bp from the output
+        assert!(net.abs_diff(135_746) <= 2, "the program paid 135,746; the curve gives {net}");
     }
 
     #[test]

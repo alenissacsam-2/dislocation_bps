@@ -178,6 +178,29 @@ impl Ledger {
         Ok(())
     }
 
+    /// Net of every live send that landed at or after `since`, losses included — what
+    /// the daily loss breaker had spent before a restart.
+    ///
+    /// `since` is UTC in any form SQLite's `datetime()` reads (`2026-11-07`,
+    /// `2026-11-07 00:00:00`, `2026-11-07T00:00:00Z`), matching how `at` is written.
+    /// Paper rows are excluded: their "taken" is an assumption, and counting assumed
+    /// gains would let a paper run earlier in the day pay for live losses.
+    ///
+    /// # Errors
+    /// If `since` is not a time SQLite can read, or the query fails.
+    pub fn realised_since(&self, since: &str) -> Result<f64> {
+        let (valid, sum): (bool, f64) = self.conn.query_row(
+            "SELECT datetime(?1) IS NOT NULL,
+                    COALESCE((SELECT SUM(net_usd) FROM paper_fills
+                              WHERE taken = 1 AND skipped_reason LIKE 'submitted%'
+                                AND at >= datetime(?1)), 0)",
+            [since],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        anyhow::ensure!(valid, "not a time SQLite can read: {since:?}");
+        Ok(sum)
+    }
+
     /// Everything the run has learned so far, in one struct.
     ///
     /// Reads inside a deferred transaction so every figure describes the same instant.
@@ -408,10 +431,10 @@ impl Ledger {
             st.total_pie_usd += e.pie_usd;
             st.longest_detections = st.longest_detections.max(e.detections);
             st.longest_slots = st.longest_slots.max(e.lifetime_slots);
-            if e.taken && e.best_net_usd > 0.0 {
+            if e.taken {
                 st.taken += 1;
-                st.total_net_usd += e.best_net_usd;
-                nets.push(e.best_net_usd);
+                st.total_net_usd += e.realised_usd;
+                nets.push(e.realised_usd);
             }
         }
         nets.sort_by(f64::total_cmp);
@@ -463,6 +486,10 @@ impl Ledger {
 
     /// One row per episode. The single definition of what an episode *is* — both
     /// [`Self::episodes`] and [`Self::survival`] read it, so they cannot disagree.
+    ///
+    /// `realised_usd` reads only taken rows, so a not-taken row's zero cannot mask a
+    /// landed loss. Live sends (`submitted…`) are each real money and are summed; paper
+    /// rows are re-sightings of one opportunity and count once, at their best.
     fn episode_rows(&self, gap_slots: u64) -> Result<Vec<EpisodeRow>> {
         let _guard = self.conn.unchecked_transaction()?;
         let mut stmt = self.conn.prepare(
@@ -485,7 +512,13 @@ impl Ledger {
              SELECT MAX(profit_at_optimal_usd), MAX(net_usd), MAX(taken), COUNT(*),
                     MAX(slot) - MIN(slot), MAX(optimal_size_usd), MIN(at),
                     MAX(profit_at_100_usd), MAX(profit_at_1k_usd), MAX(profit_at_10k_usd),
-                    MAX(skipped_reason LIKE 'contested%')
+                    MAX(skipped_reason LIKE 'contested%'),
+                    COALESCE(SUM(CASE WHEN taken = 1 AND skipped_reason LIKE 'submitted%'
+                                      THEN net_usd END), 0)
+                    + COALESCE(MAX(CASE WHEN taken = 1
+                                         AND (skipped_reason IS NULL
+                                              OR skipped_reason NOT LIKE 'submitted%')
+                                        THEN net_usd END), 0)
              FROM e GROUP BY ck, ep ORDER BY MIN(id)",
         )?;
         let rows = stmt.query_map([gap_slots as i64], |r| {
@@ -510,6 +543,7 @@ impl Ledger {
                 first_at: r.get(6)?,
                 ladder,
                 contested: r.get::<_, Option<i64>>(10)?.unwrap_or(0) == 1,
+                realised_usd: r.get(11)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -586,8 +620,8 @@ impl Ledger {
         for e in &episodes {
             acc.episodes += 1;
             acc.at_optimal_usd += e.pie_usd.max(0.0);
-            if e.taken && e.best_net_usd > 0.0 {
-                acc.realised_usd += e.best_net_usd;
+            if e.taken {
+                acc.realised_usd += e.realised_usd;
                 acc.taken += 1;
             }
             match e.ladder {
@@ -632,7 +666,7 @@ impl Ledger {
             .into_iter()
             .map(|e| EpisodePoint {
                 pie_usd: e.pie_usd.max(0.0),
-                net_usd: if e.taken { e.best_net_usd } else { 0.0 },
+                net_usd: e.realised_usd,
                 lifetime_slots: e.lifetime_slots,
                 optimal_size_usd: e.optimal_size_usd,
                 detections: e.detections,
@@ -676,7 +710,7 @@ impl Ledger {
         let mut declined_unprofitable = 0u64;
         for r in &rows {
             if r.taken {
-                realised += r.best_net_usd;
+                realised += r.realised_usd;
             } else if r.contested {
                 if r.best_net_usd > 0.0 {
                     declined_net += r.best_net_usd;
@@ -971,7 +1005,10 @@ struct EpisodeRow {
     /// What it was worth at the size that maximises it, at any capital.
     pie_usd: f64,
     best_net_usd: f64,
+    /// Whether any row in the episode was taken.
     taken: bool,
+    /// What the taken rows actually made, losses included. See [`Ledger::episode_rows`].
+    realised_usd: f64,
     detections: u64,
     /// Slots between first and last sighting. Zero means it did not survive to the
     /// next slot.
@@ -1867,6 +1904,54 @@ mod tests {
         assert!((curve[0].realised_usd - 0.004).abs() < 1e-9);
         assert_eq!(curve[0].episodes, 1);
         assert_eq!(curve[0].taken, 1);
+    }
+
+    /// A landed loss must pull realised down, and a not-taken zero beside it must not
+    /// hide it.
+    #[test]
+    fn a_landed_loss_reduces_realised() {
+        let l = Ledger::open_in_memory().unwrap();
+        let mut lost = fill(-0.01, true);
+        lost.skipped_reason = Some("submitted, landed, reverted".into());
+        l.record_fill(&lost).unwrap();
+        l.record_fill(&fill(0.0, false)).unwrap();
+        let curve = l.equity_curve(5, 0).unwrap();
+        assert_eq!(curve.len(), 1, "one episode");
+        assert!((curve[0].realised_usd + 0.01).abs() < 1e-12, "got {}", curve[0].realised_usd);
+        assert!((l.race_ladder(5).unwrap().realised_usd + 0.01).abs() < 1e-12);
+    }
+
+    /// Two live sends in one episode are two trades; paper re-sightings are one.
+    #[test]
+    fn live_sends_in_one_episode_are_summed() {
+        let l = Ledger::open_in_memory().unwrap();
+        for net in [0.002, -0.001] {
+            let mut f = fill(net, true);
+            f.skipped_reason = Some("submitted and landed".into());
+            l.record_fill(&f).unwrap();
+        }
+        let curve = l.equity_curve(5, 0).unwrap();
+        assert!((curve[0].realised_usd - 0.001).abs() < 1e-12);
+    }
+
+    #[test]
+    fn realised_since_counts_only_live_sends_after_the_cutoff() {
+        let l = Ledger::open_in_memory().unwrap();
+        for (net, reason, at) in [
+            (-0.30, "submitted, landed, reverted", "2026-11-06 23:59:59"),
+            (-0.25, "submitted, landed, reverted", "2026-11-07 00:00:00"),
+            (0.10, "submitted and landed", "2026-11-07 12:00:00"),
+            (5.00, "paper — uncontested, assumed landed", "2026-11-07 12:00:00"),
+        ] {
+            let mut f = fill(net, true);
+            f.skipped_reason = Some(reason.into());
+            let id = l.record_fill(&f).unwrap();
+            l.conn.execute("UPDATE paper_fills SET at = ?1 WHERE id = ?2", rusqlite::params![at, id]).unwrap();
+        }
+        assert!((l.realised_since("2026-11-07").unwrap() + 0.15).abs() < 1e-12);
+        assert!((l.realised_since("2026-11-07T00:00:00Z").unwrap() + 0.15).abs() < 1e-12);
+        assert_eq!(l.realised_since("2026-11-08").unwrap(), 0.0);
+        assert!(l.realised_since("yesterday").is_err());
     }
 
     #[test]

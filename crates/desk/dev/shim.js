@@ -13,7 +13,7 @@
       rpcWsUrl: "wss://mainnet.helius-rpc.com/?api-key=***",
     },
     read_limits: {
-      maxPositionUsd: 13, maxDailyLossUsd: 1, minNetProfitUsd: 0.0002, maxSlippageBps: 30,
+      maxPositionUsd: 13, maxDailyLossUsd: 1, minNetProfitUsd: 0.0002,
       maxConsecutiveFailures: 6, maxDailyTrades: 500, haltCooldownSecs: 600,
     },
     read_mode: { mode: "live", effective: "live", envOverride: null, allowLiveSet: true, executionImplemented: true },
@@ -136,13 +136,15 @@
     }
     window.WebSocket = FakeSocket;
 
-    // History: a plausible 30-hour paper ledger.
+    // History: a plausible 30-hour paper ledger. #demo&loss drifts it below zero, as a
+    // live run whose landed trades reverted would.
+    const LOSS = new URLSearchParams(location.hash.slice(1)).has("loss") ? 0.0022 : 0;
     const curve = [], episodes = [];
     let net = 0, eps = 0, taken = 0;
     for (let i = 0; i < 400; i++) {
       eps += 3 + (Math.random() * 6 | 0);
       const t = Math.random() < 0.3;
-      if (t) { taken += 1; net += Math.random() * 0.004 - 0.0006; }
+      if (t) { taken += 1; net += Math.random() * 0.004 - 0.0006 - LOSS; }
       curve.push({ at: new Date(started - 27 * 3600e3 + i * 270e3).toISOString(), realisedUsd: net,
         atCapitalUsd: [net * 3, net * 9, net * 14], atOptimalUsd: net * 20, episodes: eps, taken });
     }
@@ -153,8 +155,9 @@
     }
     FIX.read_history = {
       available: true, hoursObserved: 30.1, firstAt: curve[0].at, lastAt: curve[curve.length - 1].at, curve, episodes,
-      ladder: { rungs: [[100, net * 3], [1000, net * 9], [10000, net * 14]], atOptimalUsd: net * 20, realisedUsd: net },
-      race: { rungs: [[0, 0], [0.1, 0.004], [0.25, 0.011], [0.5, 0.022]], declinedEpisodes: 61, declinedNetUsd: 0.031, declinedUnprofitableEpisodes: 12 },
+      // Rungs and the ceiling never go negative in the ledger; realised and the race's "now" can.
+      ladder: { rungs: [[100, Math.abs(net) * 3], [1000, Math.abs(net) * 9], [10000, Math.abs(net) * 14]], atOptimalUsd: Math.abs(net) * 20, realisedUsd: net },
+      race: { rungs: [[0, net], [0.1, net + 0.0031], [0.25, net + 0.0078], [0.5, net + 0.0155]], declinedEpisodes: 61, declinedNetUsd: 0.031, declinedUnprofitableEpisodes: 12 },
       contest: { contestedEpisodes: 61, uncontestedEpisodes: 840, declinedUsd: 0.031 }, contestHasEvidence: true,
       contestSurvivalRate: 0.279, uncontestedSurvivalRate: 0.153,
     };

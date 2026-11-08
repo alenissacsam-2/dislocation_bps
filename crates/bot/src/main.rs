@@ -183,6 +183,13 @@ fn too_expensive_to_trade(fee_bps: f64) -> bool {
     fee_bps > EXECUTABLE_FEE_CEILING_BPS
 }
 
+/// Whether a candidate the claim gates held back is attempted as a trade instead of
+/// only probed. See the comment where `consider` uses it.
+#[must_use]
+fn promotes_held_back(submit: execute::Submit) -> bool {
+    !matches!(submit, execute::Submit::Rpc)
+}
+
 /// How far behind the feed's own newest slot a cycle's stalest leg may sit.
 ///
 /// [`MAX_EXECUTABLE_SLOT_SPREAD`] bounds the gap *between* two legs. It says nothing
@@ -357,11 +364,30 @@ const DEMAND_SAVE_INTERVAL: Duration = Duration::from_secs(300);
 /// into a burst of opens.
 const MAX_ACCOUNT_OPENS_PER_HOUR: usize = 6;
 /// At most this many idle accounts closed per save tick, so one tick cannot block the
-/// sweep for long.
+/// sweep for long. Accounts over the slot cap are not limited; see [`closes_due`].
 const MAX_ACCOUNT_CLOSES_PER_TICK: usize = 2;
-/// How long an idle account that could not be closed — it holds a balance, or the close
-/// did not confirm — is left before it is tried again.
+/// How long an idle account that could not be closed because it holds a balance is
+/// left before it is tried again. A close that did not land is retried next tick.
 const KEPT_OPEN_RECHECK: Duration = Duration::from_secs(6 * 3_600);
+
+/// The accounts a save tick closes: every one over the slot cap, whatever the window
+/// says, then at most [`MAX_ACCOUNT_CLOSES_PER_TICK`] idle ones. None in `unclosable`.
+fn closes_due(
+    demand: &demand::Demand,
+    managed: &std::collections::HashSet<cb_core::types::Pubkey32>,
+    slots: usize,
+    unclosable: &std::collections::HashSet<cb_core::types::Pubkey32>,
+    now: u64,
+) -> Vec<cb_core::types::Pubkey32> {
+    let mut due = demand::excess(demand, managed, slots, unclosable, now);
+    let idle: Vec<_> = demand::idle(demand, managed, now)
+        .into_iter()
+        .filter(|m| !unclosable.contains(m) && !due.contains(m))
+        .take(MAX_ACCOUNT_CLOSES_PER_TICK)
+        .collect();
+    due.extend(idle);
+    due
+}
 
 /// Record that an attempt needed each intermediate mint of `plan` that is not a base
 /// or pinned one. See `demand`.
@@ -389,7 +415,7 @@ fn note_demand(
 async fn rotate_for(
     t: &mut execute::Trader,
     plan: &execute::CyclePlan,
-    demand: &demand::Demand,
+    demand: &mut demand::Demand,
     protected: &std::collections::HashSet<cb_core::types::Pubkey32>,
     slots: usize,
     opens: &mut std::collections::VecDeque<std::time::Instant>,
@@ -403,6 +429,8 @@ async fn rotate_for(
         return;
     }
     let managed = t.managed_accounts(protected);
+    // A trade in flight opening its own account already holds a slot.
+    let slots = slots.saturating_sub(t.opens_in_flight());
     let Some(mv) = demand::on_missing(demand, &managed, slots, &mint) else { return };
     opens.push_back(std::time::Instant::now());
     let (open, close) = match mv {
@@ -427,15 +455,43 @@ async fn rotate_for(
     }
     let score = demand.scores().get(&open).copied().unwrap_or_default();
     match t.open_account(&open).await {
-        Ok(true) => tracing::warn!(
-            "opened a token account for {}: asked for {} times in the last day, ${:.4} \
-             expected between them. The deposit comes back when the account is closed.",
-            name(&open),
-            score.asks,
-            score.usd
-        ),
+        Ok(true) => {
+            tracing::warn!(
+                "opened a token account for {}: asked for {} times in the last day, ${:.4} \
+                 expected between them. The deposit comes back when the account is closed.",
+                name(&open),
+                score.asks,
+                score.usd
+            );
+            // Saved now, not at the next tick: a restart in between lost the asks that
+            // paid for this open, and the closer took it back 36 s later (2026-11-07).
+            let now = now_ms() / 1_000;
+            demand.note_opened(now, &open);
+            if let Err(e) = demand.save(std::path::Path::new(DEMAND_PATH), now) {
+                tracing::warn!("could not save {DEMAND_PATH}: {e}");
+            }
+        }
         Ok(false) => tracing::info!("the account for {} was not opened (dry run)", name(&open)),
         Err(e) => tracing::warn!("could not open an account for {}: {e:#}", name(&open)),
+    }
+}
+
+/// Grow the lookup table by what the last attempt named when it cleared its floor and
+/// did not fit a packet: at most `MAX_LOOKUP_GROWS_PER_HOUR` times in any hour.
+async fn grow_lookup_table(
+    t: &mut execute::Trader,
+    lookup_grows: &mut std::collections::VecDeque<std::time::Instant>,
+) {
+    if let Some(wanted) = t.take_oversize() {
+        lookup_grows.retain(|at| at.elapsed() < Duration::from_secs(3_600));
+        if lookup_grows.len() < MAX_LOOKUP_GROWS_PER_HOUR && !wanted.is_empty() {
+            lookup_grows.push_back(std::time::Instant::now());
+            match t.grow_lookup(wanted, LOOKUP_TABLE_CAP).await {
+                Ok(Some(key)) => write_lookup_path(&key),
+                Ok(None) => {}
+                Err(e) => tracing::warn!("could not grow the lookup table: {e:#}"),
+            }
+        }
     }
 }
 /// The encrypted key, beside the ledger and the config. Never read without a
@@ -586,6 +642,126 @@ fn on_refusal_cooldown(
     recent.get(cycle_key).is_some_and(|(at, window)| at.elapsed() < *window)
 }
 
+/// What the live loop holds off after a refusal, and keeps quiet about, and for how
+/// long. How often a thing is *retried* and how often it is *said* are separate
+/// questions — see `refusal_cooldown_for` and `LOG_COOLDOWN` — so they are separate
+/// maps, pruned together once a sweep.
+#[derive(Default)]
+struct Cooldowns {
+    // A cycle whose execution attempt was refused very recently, keyed by the
+    // identity of the loop rather than by which mint it was entered at — the same
+    // cycle re-detected a moment later is the same refusal, not a new question.
+    //
+    // Without this, a cycle whose sizing cannot fit the wallet's real balance (see
+    // `execute::wrap_shortfall`) gets re-fetched, re-built and re-refused on every
+    // sweep for as long as it keeps being the best thing on the board — a fresh
+    // round trip to three RPC providers and an identical log line roughly once a
+    // second, forever, learning nothing the first refusal did not already
+    // establish. A live run did exactly this for over an hour before the cooldown
+    // below existed.
+    recent_refusals: std::collections::HashMap<String, (std::time::Instant, Duration)>,
+    recent_logged: std::collections::HashMap<String, std::time::Instant>,
+    // Cycles refused on price, and the edge they were refused at. See
+    // `UNCHANGED_REFUSAL_HOLD`.
+    refused_at_edge: std::collections::HashMap<String, (u64, std::time::Instant)>,
+    // Mints the wallet has just been shown it cannot start a trade in. Held here
+    // rather than in `recent_refusals` because the fact is about the mint: the
+    // cycle key it arrived under covers the rotation that *can* be funded too.
+    // See `refused_for_entry_mint` and `UNFUNDABLE_ENTRY_WINDOW`.
+    unfundable_entries: std::collections::HashMap<cb_core::types::Pubkey32, std::time::Instant>,
+    // The gate being halted, separately throttled from the per-cycle map above: it is
+    // one fact about the whole run, not one fact per cycle, so it gets one shared
+    // timestamp rather than a fresh cooldown entry for every distinct cycle that
+    // happens to ask while it is true.
+    last_halt_announced: Option<std::time::Instant>,
+}
+
+impl Cooldowns {
+    /// Whether `cycle_key` is held off: refused within the window it earned, or refused
+    /// on price and back with exactly the edge it was refused at.
+    fn holds(&self, cycle_key: &str, edge_bps: f64) -> bool {
+        on_refusal_cooldown(&self.recent_refusals, cycle_key)
+            || self.refused_at_edge.get(cycle_key).is_some_and(|(edge, at)| {
+                *edge == edge_bps.to_bits() && at.elapsed() < UNCHANGED_REFUSAL_HOLD
+            })
+    }
+
+    /// Whether `mint` was just shown to be one the wallet cannot start a trade in.
+    fn unfundable(&self, mint: &cb_core::types::Pubkey32) -> bool {
+        self.unfundable_entries.get(mint).is_some_and(|at| at.elapsed() < UNFUNDABLE_ENTRY_WINDOW)
+    }
+
+    /// Hold `cycle_key` off for `window` from now.
+    fn hold(&mut self, cycle_key: &str, window: Duration) {
+        self.recent_refusals.insert(cycle_key.to_string(), (std::time::Instant::now(), window));
+    }
+
+    /// Hold `cycle_key` off for as long as a refusal for `why` earns, and when that is
+    /// the price window, for as long as it comes back at `edge_bps` too.
+    fn hold_after_refusal(&mut self, cycle_key: &str, edge_bps: f64, why: &str) {
+        if let Some(window) = refusal_cooldown_for(why) {
+            self.hold(cycle_key, window);
+            if window == PRICE_MOVED_COOLDOWN {
+                self.refused_at_edge
+                    .insert(cycle_key.to_string(), (edge_bps.to_bits(), std::time::Instant::now()));
+            }
+        }
+    }
+
+    /// Hold every cycle entered at `mint` off. See `UNFUNDABLE_ENTRY_WINDOW`.
+    fn hold_entry(&mut self, mint: cb_core::types::Pubkey32) {
+        self.unfundable_entries.insert(mint, std::time::Instant::now());
+    }
+
+    /// Whether a line about `cycle_key` may reach the log now: at most once per
+    /// `LOG_COOLDOWN`. A yes counts as having said it.
+    fn should_log(&mut self, cycle_key: &str) -> bool {
+        let quiet = self
+            .recent_logged
+            .get(cycle_key)
+            .is_some_and(|at: &std::time::Instant| at.elapsed() < LOG_COOLDOWN);
+        if !quiet {
+            self.recent_logged.insert(cycle_key.to_string(), std::time::Instant::now());
+        }
+        !quiet
+    }
+
+    /// Whether a refusal for `why` on `cycle_key` may reach the log now.
+    fn should_log_refusal(&mut self, cycle_key: &str, why: &str) -> bool {
+        // "Halted" is the one exception: it is a
+        // fact about the gate, not about this
+        // cycle, so a *different* cycle found next
+        // sweep would otherwise re-announce it under
+        // its own, separate cooldown entry. Shared
+        // with the ERROR-level announce
+        // (`should_announce_halt`) so both move together.
+        if why.starts_with("trading is halted") {
+            self.last_halt_announced.is_none_or(|at: std::time::Instant| at.elapsed() >= LOG_COOLDOWN)
+        } else {
+            self.should_log(cycle_key)
+        }
+    }
+
+    /// Whether the halt may be announced now: once, then at most once per
+    /// `LOG_COOLDOWN` however many different cycles ask. A yes counts as having said it.
+    fn should_announce_halt(&mut self) -> bool {
+        let due = self.last_halt_announced.is_none_or(|at: std::time::Instant| at.elapsed() >= LOG_COOLDOWN);
+        if due {
+            self.last_halt_announced = Some(std::time::Instant::now());
+        }
+        due
+    }
+
+    /// Forget what no longer holds anything off. Five times a window is generous
+    /// headroom for a cycle still being retried; older than that is history, not state.
+    fn prune(&mut self) {
+        self.recent_refusals.retain(|_, (at, window)| at.elapsed() < *window * 5);
+        self.recent_logged.retain(|_, at| at.elapsed() < LOG_COOLDOWN * 5);
+        self.refused_at_edge.retain(|_, (_, at)| at.elapsed() < UNCHANGED_REFUSAL_HOLD);
+        self.unfundable_entries.retain(|_, at| at.elapsed() < UNFUNDABLE_ENTRY_WINDOW);
+    }
+}
+
 #[cfg(test)]
 mod refusal_cooldown_tests {
     use super::*;
@@ -710,8 +886,204 @@ mod refusal_cooldown_tests {
     fn a_halt_holds_no_individual_cycle_off() {
         assert_eq!(refusal_cooldown_for("trading is halted: 6 trades failed in a row"), None);
     }
+
+    /// The ledger and the risk-day file can count the same trades, so the worse one is
+    /// taken, never their sum; either alone stands in when the other is unreadable.
+    #[test]
+    fn todays_loss_takes_the_worse_source_and_never_adds_them() {
+        // An archive emptied the ledger: the file remembers the loss.
+        assert_eq!(todays_loss(Some(0.0), Some(-2.0)), Some((-2.0, execute::RISK_DAY_PATH)));
+        // Both saw the same -1.5: not -3.0.
+        assert_eq!(todays_loss(Some(-1.5), Some(-1.5)), Some((-1.5, LEDGER_PATH)));
+        assert_eq!(todays_loss(Some(-3.0), Some(-1.0)), Some((-3.0, LEDGER_PATH)));
+        assert_eq!(todays_loss(Some(-0.4), None), Some((-0.4, LEDGER_PATH)));
+        assert_eq!(todays_loss(None, Some(-0.7)), Some((-0.7, execute::RISK_DAY_PATH)));
+        assert_eq!(todays_loss(None, None), None);
+    }
 }
 
+#[cfg(test)]
+mod cooldowns_tests {
+    use super::*;
+    use std::time::Instant;
+
+    const HALT: &str = "trading is halted: 6 trades failed in a row";
+    const PRICE: &str = "expected net $0.000073 is below the $0.000100 floor";
+
+    /// A halt is one fact about the gate. However many different cycles are refused
+    /// for it, it reaches the log once per `LOG_COOLDOWN`, not once per cycle.
+    #[test]
+    fn a_halt_is_said_at_most_once_per_log_cooldown_across_cycles() {
+        let mut c = Cooldowns::default();
+        assert!(c.should_log_refusal("A", HALT));
+        assert!(c.should_announce_halt());
+        assert!(!c.should_log_refusal("B", HALT), "a different cycle, the same halt");
+        assert!(!c.should_announce_halt());
+        // And the halt held no cycle off: they are all retried the moment it lifts.
+        c.hold_after_refusal("A", 1.0, HALT);
+        assert!(!c.holds("A", 1.0));
+
+        c.last_halt_announced = Some(Instant::now() - LOG_COOLDOWN);
+        assert!(c.should_log_refusal("C", HALT), "a window later it is said again");
+        assert!(c.should_announce_halt());
+        assert!(!c.should_announce_halt());
+    }
+
+    /// Any other refusal is throttled per cycle: one cycle's line does not silence
+    /// another's, and the same cycle is heard again once the window has passed.
+    #[test]
+    fn a_refusal_is_said_once_per_log_cooldown_per_cycle() {
+        let mut c = Cooldowns::default();
+        assert!(c.should_log_refusal("A", PRICE));
+        assert!(!c.should_log_refusal("A", PRICE));
+        assert!(c.should_log_refusal("B", PRICE));
+        assert!(!c.should_log("A"), "simulation rejections share the same throttle");
+        c.recent_logged.insert("A".into(), Instant::now() - LOG_COOLDOWN);
+        assert!(c.should_log_refusal("A", PRICE));
+    }
+
+    /// A per-cycle refusal is held for the window it earned, let go after, and only
+    /// forgotten once five windows have passed.
+    #[test]
+    fn a_refusal_is_held_for_its_window_then_pruned() {
+        let mut c = Cooldowns::default();
+        c.hold("K", PRICE_MOVED_COOLDOWN);
+        assert!(c.holds("K", 1.0));
+        assert!(!c.holds("other", 1.0));
+
+        let window_ago = Instant::now() - PRICE_MOVED_COOLDOWN;
+        c.recent_refusals.insert("K".into(), (window_ago, PRICE_MOVED_COOLDOWN));
+        assert!(!c.holds("K", 1.0));
+        c.prune();
+        assert!(c.recent_refusals.contains_key("K"), "still inside five windows");
+
+        let five_windows_ago = Instant::now() - PRICE_MOVED_COOLDOWN * 5;
+        c.recent_refusals.insert("K".into(), (five_windows_ago, PRICE_MOVED_COOLDOWN));
+        c.prune();
+        assert!(!c.recent_refusals.contains_key("K"));
+    }
+
+    /// A price refusal outlives its short window while the cycle comes back with the
+    /// very edge it was refused at: same edge, same pool state, same answer.
+    #[test]
+    fn a_price_refusal_holds_while_the_edge_is_unchanged() {
+        let mut c = Cooldowns::default();
+        c.hold_after_refusal("K", 2.5, PRICE);
+        let past_window = Instant::now() - PRICE_MOVED_COOLDOWN;
+        c.recent_refusals.insert("K".into(), (past_window, PRICE_MOVED_COOLDOWN));
+        assert!(c.holds("K", 2.5), "the same edge to the last bit");
+        assert!(!c.holds("K", 2.6), "a different edge is a different market");
+
+        c.refused_at_edge.insert("K".into(), (2.5f64.to_bits(), Instant::now() - UNCHANGED_REFUSAL_HOLD));
+        assert!(!c.holds("K", 2.5), "capped at UNCHANGED_REFUSAL_HOLD");
+        c.prune();
+        assert!(!c.refused_at_edge.contains_key("K"));
+    }
+
+    /// An unfundable entry holds the mint, not the cycle, and lets go after its window.
+    #[test]
+    fn an_unfundable_entry_holds_the_mint_for_its_window() {
+        let mut c = Cooldowns::default();
+        let usdc = [7u8; 32];
+        c.hold_entry(usdc);
+        assert!(c.unfundable(&usdc));
+        assert!(!c.unfundable(&[8u8; 32]));
+        c.unfundable_entries.insert(usdc, Instant::now() - UNFUNDABLE_ENTRY_WINDOW);
+        assert!(!c.unfundable(&usdc));
+        c.prune();
+        assert!(c.unfundable_entries.is_empty());
+    }
+}
+
+
+/// Start the risk gate from what live sends have already realised since local midnight.
+///
+/// The daily loss limit is per day, not per process: without this a restart grants a
+/// fresh `max_daily_loss_usd`. The ledger alone is not enough: the desk archives it on
+/// every parameter save or mode switch, so [`execute::RISK_DAY_PATH`] is read too and
+/// the worse of the two is used (see [`todays_loss`]). A failure to read does not block
+/// start-up, but it says loudly that the limit is starting from zero.
+fn seed_todays_loss(trader: &mut execute::Trader) {
+    let today = chrono::Local::now().date_naive();
+    let risk_day = std::path::Path::new(execute::RISK_DAY_PATH);
+    let file = if risk_day.exists() {
+        match execute::read_risk_day(risk_day) {
+            Ok((date, usd)) if date == today => Some(usd),
+            Ok((date, _)) => {
+                tracing::info!("{} is for {date}, not today; ignoring it", execute::RISK_DAY_PATH);
+                None
+            }
+            Err(e) => {
+                tracing::error!("could not read {}: {e:#}; ignoring it", execute::RISK_DAY_PATH);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let ledger = ledger_realised_today();
+    let Some((net, source)) = todays_loss(ledger, file) else {
+        tracing::error!(
+            "neither {LEDGER_PATH} nor {} could be read — the daily loss limit starts from \
+             zero for this run, whatever was lost earlier today",
+            execute::RISK_DAY_PATH
+        );
+        return;
+    };
+    trader.settle(net);
+    match trader.halted() {
+        Some(why) => tracing::error!(
+            "today's live sends realised ${net:.4} (from {source}); trading starts halted: {why}"
+        ),
+        None => tracing::info!(
+            "today's live sends realised ${net:.4} (from {source}); the daily loss limit \
+             counts from there"
+        ),
+    }
+}
+
+/// The day's realised figure from the two places it is kept, `None` where one could not
+/// be read. Both can hold the same trades, so they are never added: the more negative
+/// one wins, and the source it came from is named for the log.
+fn todays_loss(ledger: Option<f64>, file: Option<f64>) -> Option<(f64, &'static str)> {
+    match (ledger, file) {
+        (Some(l), Some(f)) if f < l => Some((f, execute::RISK_DAY_PATH)),
+        (Some(l), _) => Some((l, LEDGER_PATH)),
+        (None, Some(f)) => Some((f, execute::RISK_DAY_PATH)),
+        (None, None) => None,
+    }
+}
+
+/// What live sends since local midnight realised, per the ledger. `Some(0.0)` when
+/// there is no ledger yet; `None` when one exists and cannot be read.
+fn ledger_realised_today() -> Option<f64> {
+    if !std::path::Path::new(LEDGER_PATH).exists() {
+        tracing::info!("no ledger at {LEDGER_PATH} yet, so it shows nothing realised today");
+        return Some(0.0);
+    }
+    let read = || -> anyhow::Result<(String, f64)> {
+        let midnight = chrono::Local::now().date_naive().and_time(chrono::NaiveTime::MIN);
+        let since = midnight
+            .and_local_timezone(chrono::Local)
+            .earliest()
+            .ok_or_else(|| anyhow::anyhow!("local midnight {midnight} does not exist in this time zone"))?
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let net = cb_ledger::Ledger::open_read_only(LEDGER_PATH)?.realised_since(&since)?;
+        Ok((since, net))
+    };
+    match read() {
+        Ok((since, net)) => {
+            tracing::info!("{LEDGER_PATH}: live sends since local midnight ({since} UTC) realised ${net:.4}");
+            Some(net)
+        }
+        Err(e) => {
+            tracing::error!("COULD NOT READ TODAY'S REALISED P&L from {LEDGER_PATH}: {e:#}");
+            None
+        }
+    }
+}
 
 /// Load the key and build the executor. Only ever called with both switches set.
 ///
@@ -768,15 +1140,17 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
             endpoints.len()
         );
     }
+    // Sender takes the Helius RPC key; none configured sends keyless (one a second).
+    let sender_key = cb_executor::sender::api_key_in(&endpoints);
     let mut rpc = cb_executor::rpc::Rpc::with_fallbacks(endpoints)?;
     rpc.set_jito_auth(&cfg.jito_auth_uuid);
+    rpc.set_sender_key(sender_key.as_deref());
     // From the file, not from Default. The application's Risk Limits panel writes these
     // and the operator expects them to bind.
     let limits = cb_executor::risk::Limits {
         max_position_usd: cfg.max_position_usd,
         max_daily_loss_usd: cfg.max_daily_loss_usd,
         min_net_profit_usd: cfg.min_net_profit_usd,
-        max_slippage_bps: cfg.max_slippage_bps,
         max_consecutive_failures: cfg.max_consecutive_failures,
         max_daily_trades: cfg.max_daily_trades,
         halt_cooldown_secs: cfg.halt_cooldown_secs,
@@ -820,6 +1194,7 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
                 tip_max_lamports: cfg.jito_tip_max_lamports,
                 simulate_first: cfg.jito_simulate_first,
             },
+            SubmitVia::Sender => execute::Submit::Sender { tip_max_lamports: cfg.jito_tip_max_lamports },
         },
     };
     let exec = cb_executor::Executor::new(wallet, rpc, limits, cfg.dry_run)?;
@@ -856,6 +1231,7 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
 
     let mut trader = execute::Trader::new(exec, opts);
     trader.set_jito_url(&cfg.jito_url);
+    seed_todays_loss(&mut trader);
     match opts.submit {
         execute::Submit::Jito { tip_max_lamports, simulate_first } => tracing::info!(
             "trades go to Jito as bundles of one, sent to {} block engine regions at once: a \
@@ -870,21 +1246,30 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
                 "sent without our own simulation, one round trip sooner"
             }
         ),
+        execute::Submit::Sender { tip_max_lamports } => tracing::info!(
+            "trades go to Helius Sender (SWQOS-only, {}): each is simulated first, tips half \
+             the gross, {} to {} lamports, to a Helius tip account, and bids a priority fee; \
+             every floor guarantees the base fee, priority fee and tip on chain. There is no \
+             revert protection: a floor missed after the simulation lands, reverts and pays \
+             the base and priority fees",
+            if sender_key.is_some() { "with the Helius RPC api key" } else { "keyless, one send a second" },
+            cb_executor::sender::MIN_TIP_LAMPORTS,
+            tip_max_lamports.max(cb_executor::sender::MIN_TIP_LAMPORTS)
+        ),
         execute::Submit::Rpc => tracing::warn!(
             "trades go through sendTransaction on the RPC: a floor missed by the time one \
-             lands reverts it on chain and pays the whole fee (submit_via = \"jito\" \
-             makes that free)"
+             lands reverts it on chain and pays the whole fee"
         ),
     }
     if trader.sends_via_jito() {
         let uuid = cfg.jito_auth_uuid.trim();
         if uuid.is_empty() {
-            tracing::error!(
-                "Jito sends are unauthenticated (jito_auth_uuid is empty). On 2026-09-27 the \
-                 block engines dropped every unauthenticated send before their auction — 104 \
-                 of 104, probes with a 27,000 lamport tip included — so expect nothing to \
-                 land. A UUID comes from a ticket in Jito's Discord; put it in config.toml as \
-                 jito_auth_uuid and restart"
+            tracing::warn!(
+                "Jito sends are unauthenticated (jito_auth_uuid is empty). Jito documents auth \
+                 as optional for default sends, limited to one request a second per IP per \
+                 region; set jito_auth_uuid if Jito granted one. Each send logs one \"Jito \
+                 send …: N of M block engines made a bundle\" line saying what every region \
+                 answered — that, not this, is where to read why a bundle was not made"
             );
         } else if !cb_executor::jito::looks_like_uuid(uuid) {
             tracing::error!(
@@ -1018,6 +1403,11 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
             );
         }
     }
+    // And every account the wallet holds beyond this run's book, so earlier runs'
+    // accounts count against the slots and can be closed.
+    if let Err(e) = trader.learn_all_token_accounts().await {
+        tracing::warn!("could not list the wallet's token accounts ({e:#}); only this book's are counted");
+    }
     Ok(trader)
 }
 
@@ -1112,7 +1502,10 @@ struct PendingSend {
     /// The ledger row written when it was sent, updated with the outcome.
     row: Option<i64>,
     via_jito: bool,
-    /// `Some(tip)` for a landing probe rather than a trade. See `Trader::jito_probe`.
+    /// The bundle id the block engine named in `x-bundle-id`, if it named one: what
+    /// `bundle_verdict` asks about, ahead of the id derived from the signature.
+    bundle_id: Option<String>,
+    /// `Some(tip)` for a landing probe rather than a trade. See `Trader::landing_probe`.
     probe_tip: Option<u64>,
     /// The trade's pools and the feed's slot when it went, for `post_mortem`.
     pools: Vec<cb_core::types::Pubkey32>,
@@ -1215,26 +1608,66 @@ static JITO_SEEN_OTHER: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 ///
 /// Runs as its own task: the answer is a diagnosis, and nothing on the trading loop
 /// waits for it.
-async fn bundle_verdict(status: cb_executor::rpc::JitoStatus, url: String, sig: String, authenticated: bool) {
-    use std::sync::atomic::Ordering as O;
-    let id = cb_executor::jito::bundle_id(&sig);
-    let mut answer = status.status(&url, &id).await;
-    if answer.is_err() {
-        // One request a second per region unauthenticated: a send in the same second
-        // takes the allowance, so ask once more after it.
-        tokio::time::sleep(Duration::from_millis(1_200)).await;
-        answer = status.status(&url, &id).await;
+///
+/// `asks` is `(signature, bundle id)`, at most `MAX_STATUS_IDS` of them, asked in one
+/// request. The id is the one the send's `x-bundle-id` named where there was one, and
+/// `jito::bundle_id(signature)` only where there was not. The region asked rotates
+/// across `urls`, the query waits out the send gap since `last_send` like a send, and
+/// a failure is retried once on the next region.
+async fn bundle_verdict(
+    status: cb_executor::rpc::JitoStatus,
+    urls: Vec<String>,
+    last_send: Option<std::time::Instant>,
+    asks: Vec<(String, String)>,
+    authenticated: bool,
+) {
+    if urls.is_empty() || asks.is_empty() {
+        return;
     }
-    let s = match answer {
-        Ok(Some(s)) => s,
-        Ok(None) => return tracing::debug!("Jito gave no status for {sig}"),
-        Err(e) => return tracing::debug!("could not ask Jito about {sig}: {e:#}"),
-    };
-    match s.as_str() {
+    let gap = Duration::from_millis(cb_executor::jito::MIN_SEND_GAP_MS);
+    if let Some(wait) = last_send.and_then(|at| gap.checked_sub(at.elapsed())) {
+        tokio::time::sleep(wait).await;
+    }
+    let ids: Vec<String> = asks.iter().map(|(_, id)| id.clone()).collect();
+    let turn = JITO_STATUS_TURN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let first = &urls[turn % urls.len()];
+    let mut answer = status.statuses(first, &ids).await;
+    if let Err(e) = &answer {
+        tracing::warn!(
+            "Jito getInflightBundleStatuses at {} failed: {e:#}",
+            cb_core::redact::redact_endpoint(first)
+        );
+        // One request a second per region: another region, after the gap.
+        tokio::time::sleep(gap).await;
+        let next = &urls[(turn + 1) % urls.len()];
+        answer = status.statuses(next, &ids).await;
+        if let Err(e) = &answer {
+            tracing::warn!(
+                "Jito getInflightBundleStatuses at {} failed too: {e:#}",
+                cb_core::redact::redact_endpoint(next)
+            );
+        }
+    }
+    let Ok(answers) = answer else { return };
+    for ((sig, id), s) in asks.iter().zip(answers) {
+        match s {
+            Some(s) => say_verdict(sig, id, &s, authenticated),
+            None => tracing::debug!("Jito gave no status for {sig} (bundle {id})"),
+        }
+    }
+}
+
+/// Which region the next status query goes to. See `bundle_verdict`.
+static JITO_STATUS_TURN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Log what the block engine said of one send. See `bundle_verdict`.
+fn say_verdict(sig: &str, id: &str, s: &str, authenticated: bool) {
+    use std::sync::atomic::Ordering as O;
+    match s {
         "Invalid" => {
             tracing::warn!(
-                "Jito on {sig}: Invalid — the block engine has no record of it, so it never \
-                 entered an auction"
+                "Jito on {sig} (bundle {id}): Invalid — the block engine has no record of it, \
+                 so it never entered an auction"
             );
             let n = JITO_INVALID.fetch_add(1, O::Relaxed) + 1;
             if n >= JITO_INVALID_CONCLUSIVE
@@ -1250,9 +1683,9 @@ async fn bundle_verdict(status: cb_executor::rpc::JitoStatus, url: String, sig: 
                 } else {
                     tracing::error!(
                         "every Jito send this run is Invalid at the block engine: it is \
-                         dropping them before its auction, and no tip changes that. Nothing \
-                         can land through Jito until jito_auth_uuid is set (a ticket in \
-                         Jito's Discord issues one)"
+                         dropping them before its auction, and no tip changes that. The \
+                         \"Jito send …: N of M block engines made a bundle\" line for each \
+                         send says what every region answered"
                     );
                 }
             }
@@ -1260,45 +1693,54 @@ async fn bundle_verdict(status: cb_executor::rpc::JitoStatus, url: String, sig: 
         "Failed" => {
             JITO_SEEN_OTHER.store(true, O::Relaxed);
             tracing::warn!(
-                "Jito on {sig}: Failed — the block engine simulated it and it failed, so its \
-                 floor had gone before a leader could take it"
+                "Jito on {sig} (bundle {id}): Failed — the block engine simulated it and it \
+                 failed, so its floor had gone before a leader could take it"
             );
         }
         "Pending" => {
             JITO_SEEN_OTHER.store(true, O::Relaxed);
             tracing::warn!(
-                "Jito on {sig}: Pending — it reached the auction and no leader took it: \
-                 outbid, or no Jito leader in time"
+                "Jito on {sig} (bundle {id}): Pending — it reached the auction and no leader \
+                 took it: outbid, or no Jito leader in time"
             );
         }
         other => {
             JITO_SEEN_OTHER.store(true, O::Relaxed);
-            tracing::warn!("Jito on {sig}: {other}");
+            tracing::warn!("Jito on {sig} (bundle {id}): {other}");
         }
     }
 }
 
-/// Ask what became of a missed Jito send, off the loop. See `bundle_verdict`.
-fn ask_verdict(t: &execute::Trader, sig: &str) {
-    if let Some((status, url)) = t.jito_status() {
-        tokio::spawn(bundle_verdict(status, url, sig.to_string(), t.jito_authenticated()));
+/// The id to ask the block engine about for a send: the one its `x-bundle-id` named,
+/// or, only when it named none, the one derived from the signature.
+fn verdict_id(sig: &str, header_id: Option<&str>) -> String {
+    header_id.map_or_else(|| cb_executor::jito::bundle_id(sig), String::from)
+}
+
+/// Ask what became of missed Jito sends, off the loop, up to `MAX_STATUS_IDS` per
+/// request. See `bundle_verdict`.
+fn ask_verdicts(t: &execute::Trader, asks: Vec<(String, String)>) {
+    let Some((status, urls, last_send)) = t.jito_status() else { return };
+    for chunk in asks.chunks(cb_executor::jito::MAX_STATUS_IDS) {
+        tokio::spawn(bundle_verdict(status.clone(), urls.clone(), last_send, chunk.to_vec(), t.jito_authenticated()));
     }
 }
 
 /// Send a landing probe of `tip` lamports and follow it like a trade.
 async fn send_probe(t: &mut execute::Trader, pending: &mut Vec<PendingSend>, tip: u64) {
-    match t.jito_probe(tip).await {
-        Ok(Some(sig)) => pending.push(PendingSend {
-            sig,
+    match t.landing_probe(tip).await {
+        Ok(Some(receipt)) => pending.push(PendingSend {
+            sig: receipt.signature,
+            bundle_id: receipt.bundle_id,
             sent_at: std::time::Instant::now(),
             row: None,
-            via_jito: true,
+            via_jito: t.sends_via_jito(),
             probe_tip: Some(tip),
             pools: Vec::new(),
             sent_slot: 0,
         }),
         Ok(None) => {}
-        Err(e) => tracing::warn!("Jito probe of {tip} lamports could not be sent: {e:#}"),
+        Err(e) => tracing::warn!("{} probe of {tip} lamports could not be sent: {e:#}", t.send_path()),
     }
 }
 
@@ -1319,6 +1761,8 @@ async fn settle_pending(
     const GIVE_UP: Duration = Duration::from_secs(20);
     let mut keep = Vec::new();
     let mut settled = Vec::new();
+    // Missed Jito sends to ask the block engine about, batched once the pass is done.
+    let mut verdicts = Vec::new();
     // One status call for every send old enough to ask about: asked one at a time,
     // a burst of sends held the main loop for a round trip each, every second.
     let due: Vec<String> =
@@ -1337,28 +1781,38 @@ async fn settle_pending(
                 Some(landed) => {
                     t.note_probe(tip, true);
                     tracing::warn!(
-                        "Jito probe LANDED with a {tip} lamport tip ({}): the send path works, \
+                        "{} probe LANDED with a {tip} lamport tip ({}): the send path works, \
                          and no trade will tip less than this",
+                        t.send_path(),
                         if landed { "executed cleanly" } else { "included but failed, which a transfer should not" }
                     );
                 }
                 None if p.sent_at.elapsed() < GIVE_UP => keep.push(p),
                 None => {
                     t.note_probe(tip, false);
-                    ask_verdict(t, sig);
-                    match execute::PROBE_TIPS.iter().find(|&&next| next > tip) {
+                    // Only a block engine has a bundle status to ask about.
+                    if p.via_jito {
+                        verdicts.push((sig.clone(), verdict_id(sig, p.bundle_id.as_deref())));
+                    }
+                    let path = t.send_path();
+                    match t.probe_tips().iter().find(|&&next| next > tip) {
                         Some(&next) => {
                             tracing::warn!(
-                                "Jito probe of {tip} lamports did not land in {} s; trying {next}",
+                                "{path} probe of {tip} lamports did not land in {} s; trying {next}",
                                 GIVE_UP.as_secs()
                             );
                             send_probe(t, &mut keep, next).await;
                         }
-                        None => tracing::error!(
+                        None if p.via_jito => tracing::error!(
                             "no Jito probe landed, up to a {tip} lamport tip sent to every \
                              region: bundles from here are not reaching leaders at all, so no \
                              trade can land until that is found. The block engine's own answer \
                              for each send is logged as \"Jito on <signature>\""
+                        ),
+                        None => tracing::error!(
+                            "no {path} probe landed, up to a {tip} lamport tip: transactions \
+                             from here are not reaching leaders, so no trade can land until \
+                             that is found"
                         ),
                     }
                 }
@@ -1396,7 +1850,7 @@ async fn settle_pending(
             }
             None if p.via_jito => {
                 t.settle_open(sig, false);
-                ask_verdict(t, sig);
+                verdicts.push((sig.clone(), verdict_id(sig, p.bundle_id.as_deref())));
                 if !p.pools.is_empty() && p.sent_slot > 0 {
                     tokio::spawn(post_mortem(rpc_url.to_string(), sig.clone(), p.pools.clone(), p.sent_slot));
                 }
@@ -1420,6 +1874,7 @@ async fn settle_pending(
         }
     }
     *pending = keep;
+    ask_verdicts(t, verdicts);
     settled
 }
 
@@ -1568,7 +2023,7 @@ async fn main() -> anyhow::Result<()> {
             max_hops: 3,
             slippage_tenth_bps: 300,
             priority_micro_lamports: 0,
-            submit_via: SubmitVia::Jito,
+            submit_via: SubmitVia::Sender,
             jito_url: String::new(),
             jito_auth_uuid: String::new(),
             jito_tip_max_lamports: 20_000,
@@ -1577,7 +2032,6 @@ async fn main() -> anyhow::Result<()> {
             max_position_usd: 25.0,
             max_daily_loss_usd: 5.0,
             min_net_profit_usd: 0.01,
-            max_slippage_bps: 30.0,
             max_consecutive_failures: 3,
             max_daily_trades: 500,
             halt_cooldown_secs: 600,
@@ -1668,6 +2122,11 @@ async fn main() -> anyhow::Result<()> {
                     "each goes to Jito unsimulated, with its profit floor guaranteed on chain; \
                      a bundle that misses it is dropped"
                 }
+                SubmitVia::Sender => {
+                    "every one is simulated first, then sent to Helius Sender with its profit \
+                     floor guaranteed on chain; one that misses it after that lands, reverts \
+                     and pays the base and priority fees"
+                }
             };
             tracing::error!(
                 "mode: LIVE, dry_run = false — transactions will be SUBMITTED: {checked}. \
@@ -1732,7 +2191,7 @@ async fn spawn_live(
     }
     tracing::info!("feed: LIVE mainnet via {}", cb_core::redact::redact_endpoint(&cfg.rpc_ws_url));
 
-    let mut market = live::LiveMarket::bootstrap(&cfg.rpc_http_url, registry).await?;
+    let market = live::LiveMarket::bootstrap(&cfg.rpc_http_url, registry).await?;
     tracing::info!(
         "watching {} pools across {} venues; {} priceable at start",
         market.pool_count(),
@@ -1742,76 +2201,27 @@ async fn spawn_live(
 
     let feed = WsFeed::new(cfg.rpc_ws_url.clone());
     let stats = std::sync::Arc::clone(&feed.stats);
-    let (mut rx, feed_ctl) = feed.spawn_controlled(market.subscriptions.clone());
+    let (rx, feed_ctl) = feed.spawn_controlled(market.subscriptions.clone());
     // Pools arbitrage is running through now, bootstrapped off the main loop and
     // merged into it. See `spawn_discovery`.
-    let (found_tx, mut found_rx) = tokio::sync::mpsc::channel::<live::LiveMarket>(4);
+    let (found_tx, found_rx) = tokio::sync::mpsc::channel::<live::LiveMarket>(4);
     if cfg.discovery {
         spawn_discovery(cfg.rpc_http_url.clone(), market.registry.clone(), found_tx);
     }
-    // Discovered pools, oldest first: the ones to let go of when new ones arrive at the
-    // cap. Pools rotate within hours, so the oldest discovery is the likeliest cold.
-    let mut discovered: std::collections::VecDeque<cb_core::types::Pubkey32> =
-        std::collections::VecDeque::new();
 
     // What the scanner last saw, for the status heartbeat to report. A plain mutex is
     // fine: nothing holds it across an await.
     let shared = std::sync::Arc::new(std::sync::Mutex::new(SweepSummary::default()));
-    let shared_for_status = std::sync::Arc::clone(&shared);
-
-    let status_bus = bus.clone();
-    let status_stats = std::sync::Arc::clone(&stats);
-    let started = std::time::Instant::now();
-    // Captured before the task takes ownership. `&'static str` so this costs nothing.
-    let status_mode = mode_label(cfg);
-    tokio::spawn(async move {
-        let mut t = tokio::time::interval(Duration::from_secs(2));
-        loop {
-            t.tick().await;
-            let (updates, reconnects, dropped, last_slot, _) = status_stats.snapshot();
-            let last_ms = status_stats.last_update_ms.load(Ordering::Relaxed);
-            let stale_for = if last_ms == 0 { u64::MAX } else { now_ms().saturating_sub(last_ms) };
-            let s = shared_for_status.lock().map(|g| g.clone()).unwrap_or_default();
-            let best = s.best.as_ref();
-            let tradeable = s.tradeable.as_ref();
-
-            status_bus.publish(Event::Status {
-                mode: format!("{status_mode} · live mainnet"),
-                // Consider the feed live only if something arrived in the last 30s.
-                connected: stale_for < 30_000,
-                slot: last_slot.max(s.slot),
-                slot_lag: 0,
-                pools_tracked: s.pools_ready,
-                sol_price_usd: s.sol_price_usd,
-                uptime_secs: started.elapsed().as_secs(),
-                updates,
-                dropped,
-                reconnects,
-                stalls: status_stats.stalls.load(Ordering::Relaxed),
-                data_age_secs: if stale_for == u64::MAX { 0 } else { stale_for / 1000 },
-                best_edge_bps: best.map_or(0.0, |b| b.edge_bps),
-                best_route: best.map_or_else(String::new, |b| b.route.clone()),
-                best_hops: best.map_or(0, |b| b.hops),
-                best_fee_bps: best.map_or(0.0, |b| b.fee_bps),
-                // Deliberately `None`, not `0.0`, when nothing qualifies: a zero here
-                // would read as a market sitting exactly at break-even.
-                tradeable_edge_bps: tradeable.map(|t| t.edge_bps),
-                tradeable_route: tradeable.map_or_else(String::new, |t| t.route.clone()),
-                tradeable_min_usd: s.tradeable_min_usd,
-                stale_excluded: s.stale_excluded,
-                feed_stalled: s.feed_stalled,
-                cycles_evaluated: s.evaluated_total,
-                venues: s.venues,
-                duplicate_pairs: dupe_count,
-                cheapest_round_trip_bps: if cheapest_bps.is_finite() { cheapest_bps } else { 0.0 },
-                sweep_us: s.sweep_us,
-                subscribed: status_stats.subscribed.load(Ordering::Relaxed),
-                subscribe_errors: status_stats.subscribe_errors.load(Ordering::Relaxed),
-                reconcile_drift: s.reconcile_drift,
-                reconcile_checked: s.reconcile_checked,
-            });
-        }
-    });
+    // The mode is captured before the task takes ownership. `&'static str` so this
+    // costs nothing.
+    spawn_status(
+        bus.clone(),
+        std::sync::Arc::clone(&stats),
+        std::sync::Arc::clone(&shared),
+        mode_label(cfg),
+        dupe_count,
+        cheapest_bps,
+    );
 
     let tradable_usd = cfg.tradable_usd();
     let min_depth_usd = cfg.tradeable_depth_usd();
@@ -1870,50 +2280,195 @@ async fn spawn_live(
         if let Some(t) = trader.as_mut() {
             let n = t.learn_vaults(market.vault_pairs());
             tracing::info!("the trader knows where {n} vault-backed pools keep their reserves");
+            t.set_account_slots(token_slots, protected.clone());
         }
-        let mut next_id: u64 = 1;
-        // A cycle whose execution attempt was refused very recently, keyed by the
-        // identity of the loop rather than by which mint it was entered at — the same
-        // cycle re-detected a moment later is the same refusal, not a new question.
-        //
-        // Without this, a cycle whose sizing cannot fit the wallet's real balance (see
-        // `execute::wrap_shortfall`) gets re-fetched, re-built and re-refused on every
-        // sweep for as long as it keeps being the best thing on the board — a fresh
-        // round trip to three RPC providers and an identical log line roughly once a
-        // second, forever, learning nothing the first refusal did not already
-        // establish. A live run did exactly this for over an hour before the cooldown
-        // below existed.
-        let mut recent_refusals: std::collections::HashMap<
-            String,
-            (std::time::Instant, Duration),
-        > = std::collections::HashMap::new();
-        let mut recent_logged: std::collections::HashMap<String, std::time::Instant> =
-            std::collections::HashMap::new();
-        // Cycles refused on price, and the edge they were refused at. See
-        // `UNCHANGED_REFUSAL_HOLD`.
-        let mut refused_at_edge: std::collections::HashMap<String, (u64, std::time::Instant)> =
-            std::collections::HashMap::new();
-        // The last row written per cycle, as (edge bits, outcome, when). See
-        // `UNCHANGED_RECORD_EVERY`.
-        let mut last_recorded: std::collections::HashMap<
-            String,
-            (u64, Option<String>, std::time::Instant),
-        > = std::collections::HashMap::new();
-        // Mints the wallet has just been shown it cannot start a trade in. Held here
-        // rather than in `recent_refusals` because the fact is about the mint: the
-        // cycle key it arrived under covers the rotation that *can* be funded too.
-        // See `refused_for_entry_mint` and `UNFUNDABLE_ENTRY_WINDOW`.
-        let mut unfundable_entries: std::collections::HashMap<
-            cb_core::types::Pubkey32,
-            std::time::Instant,
-        > = std::collections::HashMap::new();
-        // The gate being halted, separately throttled from the per-cycle map above: it is
-        // one fact about the whole run, not one fact per cycle, so it gets one shared
-        // timestamp rather than a fresh cooldown entry for every distinct cycle that
-        // happens to ask while it is true.
-        let mut last_halt_announced: Option<std::time::Instant> = None;
-        let mut evaluated_total: u64 = 0;
-        let mut sweep_n: u32 = 0;
+        let mut live_loop = LiveLoop {
+            bus,
+            market,
+            stats,
+            feed_ctl,
+            discovered: std::collections::VecDeque::new(),
+            shared,
+            ledger,
+            paper_run,
+            tradable_usd,
+            min_depth_usd,
+            max_hops,
+            protected,
+            token_slots,
+            post_mortem_rpc: rpc_url_for_loop,
+            next_id: 1,
+            cooldowns: Cooldowns::default(),
+            last_recorded: std::collections::HashMap::new(),
+            evaluated_total: 0,
+            sweep_n: 0,
+            pending_sends: Vec::new(),
+            drift: (0, 0),
+            was_stalled: false,
+            last_stale_excluded: 0,
+            demand: demand::Demand::load(std::path::Path::new(DEMAND_PATH), now_ms() / 1_000),
+            account_opens: std::collections::VecDeque::new(),
+            kept_open: std::collections::HashMap::new(),
+            lookup_grows: std::collections::VecDeque::new(),
+        };
+        if let Some(t) = trader.as_ref() {
+            // Accounts holding tokens cannot be closed; recheck them later, not every tick.
+            let now = std::time::Instant::now();
+            live_loop.kept_open.extend(t.funded_accounts().iter().map(|m| (*m, now)));
+            let managed = t.managed_accounts(&live_loop.protected);
+            let unclosable = live_loop.kept_open.keys().copied().collect();
+            let k = demand::excess(&live_loop.demand, &managed, token_slots, &unclosable, now_ms() / 1_000).len();
+            tracing::warn!(
+                "{} token accounts held, {} managed, cap {token_slots}; closing {k} excess",
+                t.held_count(),
+                managed.len()
+            );
+        }
+        live_loop.run(trader, rx, found_rx).await;
+    });
+
+    Ok(())
+}
+
+/// Publish what the scanner last saw, every two seconds, as the window's status.
+fn spawn_status(
+    status_bus: EventBus,
+    status_stats: std::sync::Arc<cb_feed::FeedStats>,
+    shared_for_status: std::sync::Arc<std::sync::Mutex<SweepSummary>>,
+    status_mode: &'static str,
+    dupe_count: usize,
+    cheapest_bps: f64,
+) {
+    let started = std::time::Instant::now();
+    tokio::spawn(async move {
+        let mut t = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            t.tick().await;
+            let (updates, reconnects, dropped, last_slot, _) = status_stats.snapshot();
+            let last_ms = status_stats.last_update_ms.load(Ordering::Relaxed);
+            let stale_for = if last_ms == 0 { u64::MAX } else { now_ms().saturating_sub(last_ms) };
+            let s = shared_for_status.lock().map(|g| g.clone()).unwrap_or_default();
+            let best = s.best.as_ref();
+            let tradeable = s.tradeable.as_ref();
+
+            status_bus.publish(Event::Status {
+                mode: format!("{status_mode} · live mainnet"),
+                // Consider the feed live only if something arrived in the last 30s.
+                connected: stale_for < 30_000,
+                slot: last_slot.max(s.slot),
+                slot_lag: 0,
+                pools_tracked: s.pools_ready,
+                sol_price_usd: s.sol_price_usd,
+                uptime_secs: started.elapsed().as_secs(),
+                updates,
+                dropped,
+                reconnects,
+                stalls: status_stats.stalls.load(Ordering::Relaxed),
+                data_age_secs: if stale_for == u64::MAX { 0 } else { stale_for / 1000 },
+                best_edge_bps: best.map_or(0.0, |b| b.edge_bps),
+                best_route: best.map_or_else(String::new, |b| b.route.clone()),
+                best_hops: best.map_or(0, |b| b.hops),
+                best_fee_bps: best.map_or(0.0, |b| b.fee_bps),
+                // Deliberately `None`, not `0.0`, when nothing qualifies: a zero here
+                // would read as a market sitting exactly at break-even.
+                tradeable_edge_bps: tradeable.map(|t| t.edge_bps),
+                tradeable_route: tradeable.map_or_else(String::new, |t| t.route.clone()),
+                tradeable_min_usd: s.tradeable_min_usd,
+                stale_excluded: s.stale_excluded,
+                feed_stalled: s.feed_stalled,
+                cycles_evaluated: s.evaluated_total,
+                venues: s.venues,
+                duplicate_pairs: dupe_count,
+                cheapest_round_trip_bps: if cheapest_bps.is_finite() { cheapest_bps } else { 0.0 },
+                sweep_us: s.sweep_us,
+                subscribed: status_stats.subscribed.load(Ordering::Relaxed),
+                subscribe_errors: status_stats.subscribe_errors.load(Ordering::Relaxed),
+                reconcile_drift: s.reconcile_drift,
+                reconcile_checked: s.reconcile_checked,
+            });
+        }
+    });
+}
+
+/// The live sweep task's state, and one method for each job its loop does.
+///
+/// The trader is not in here. It is passed in beside the rest, so that the attempt path
+/// can hold the trader and the market, the cooldowns and the ledger at the same time.
+struct LiveLoop {
+    bus: EventBus,
+    market: live::LiveMarket,
+    stats: std::sync::Arc<cb_feed::FeedStats>,
+    feed_ctl: tokio::sync::mpsc::UnboundedSender<cb_feed::ws::Watch>,
+    // Discovered pools, oldest first: the ones to let go of when new ones arrive at the
+    // cap. Pools rotate within hours, so the oldest discovery is the likeliest cold.
+    discovered: std::collections::VecDeque<cb_core::types::Pubkey32>,
+    /// What the scanner last saw, for the status heartbeat. See `spawn_status`.
+    shared: std::sync::Arc<std::sync::Mutex<SweepSummary>>,
+    ledger: Option<cb_ledger::Ledger>,
+    paper_run: bool,
+    tradable_usd: f64,
+    min_depth_usd: f64,
+    max_hops: usize,
+    /// Accounts the rotation in `demand` must never close.
+    protected: std::collections::HashSet<cb_core::types::Pubkey32>,
+    token_slots: usize,
+    // Where a missed send's post-mortem reads from. See `post_mortem`.
+    post_mortem_rpc: String,
+    next_id: u64,
+    /// What refusals hold off and keep quiet. See `Cooldowns`.
+    cooldowns: Cooldowns,
+    // The last row written per cycle, as (edge bits, outcome, when). See
+    // `UNCHANGED_RECORD_EVERY`.
+    last_recorded: std::collections::HashMap<
+        String,
+        (u64, Option<String>, std::time::Instant),
+    >,
+    evaluated_total: u64,
+    sweep_n: u32,
+    // Sends whose fate is not known yet, asked after by the confirm timer. See
+    // `PendingSend`.
+    pending_sends: Vec<PendingSend>,
+    drift: (usize, usize),
+    // Both are edge-triggered: logged when they change, not every sweep. A warning
+    // that fires five times a second is a warning nobody reads.
+    was_stalled: bool,
+    last_stale_excluded: usize,
+    // Which intermediate mints attempts have needed over the last day. See `demand`.
+    demand: demand::Demand,
+    account_opens: std::collections::VecDeque<std::time::Instant>,
+    kept_open: std::collections::HashMap<cb_core::types::Pubkey32, std::time::Instant>,
+    lookup_grows: std::collections::VecDeque<std::time::Instant>,
+}
+
+/// What one sweep may still spend on attempts and probes.
+#[derive(Default)]
+struct SweepBudget {
+    attempts: usize,
+    probes: usize,
+    submitted: bool,
+}
+
+/// What became of one opportunity, for its ledger row and its execution event.
+#[derive(Default)]
+struct Fate {
+    landed: bool,
+    realised: f64,
+    signature: Option<String>,
+    latency_ms: u64,
+    reason: Option<String>,
+    /// A send for the confirm timer, pushed once its ledger row is known.
+    pending: Option<PendingSend>,
+}
+
+impl LiveLoop {
+    /// React to every timer and channel the live run listens to until the feed closes,
+    /// handing each to the method that does that job.
+    async fn run(
+        mut self,
+        mut trader: Option<execute::Trader>,
+        mut rx: tokio::sync::mpsc::Receiver<cb_feed::AccountUpdate>,
+        mut found_rx: tokio::sync::mpsc::Receiver<live::LiveMarket>,
+    ) {
         // The sweep is a full pass over the cycle graph, not a reaction to one pool.
         // At this graph size it costs well under a millisecond, so running it on a
         // timer is cheaper than reasoning about which updates could matter — and it
@@ -1931,120 +2486,32 @@ async fn spawn_live(
         // Keeps the RPC and Jito connections a trade uses open, so a send does not
         // start with a handshake. See `Trader::keep_warm`.
         let mut warm_timer = tokio::time::interval(execute::KEEP_WARM_EVERY);
-        // Sends whose fate is not known yet, and the timer that asks. See `PendingSend`.
-        let mut pending_sends: Vec<PendingSend> = Vec::new();
+        // Asks after sends whose fate is not known yet. See `PendingSend`.
         let mut confirm_timer = tokio::time::interval(Duration::from_secs(1));
-        // Where a missed send's post-mortem reads from. See `post_mortem`.
-        let post_mortem_rpc = rpc_url_for_loop.clone();
         // Landing probes: the first tick is immediate, so a run starts by finding out
-        // whether its bundles can land at all. See `Trader::jito_probe`.
+        // whether its bundles can land at all. See `Trader::landing_probe`.
         let mut probe_timer = tokio::time::interval(execute::PROBE_EVERY);
         // Fees that fall on a schedule, re-priced on the clock. See
         // `LiveMarket::reprice_timed_fees`.
         let mut timed_fee_timer = tokio::time::interval(Duration::from_secs(1));
-        let mut drift = (0usize, 0usize);
-        // Both are edge-triggered: logged when they change, not every sweep. A warning
-        // that fires five times a second is a warning nobody reads.
-        let mut was_stalled = false;
-        let mut last_stale_excluded = 0usize;
-        // Which intermediate mints attempts have needed over the last day. See `demand`.
-        let demand_path = std::path::Path::new(DEMAND_PATH);
-        let mut demand = demand::Demand::load(demand_path, now_ms() / 1_000);
         let mut demand_timer = tokio::time::interval(DEMAND_SAVE_INTERVAL);
-        let mut account_opens: std::collections::VecDeque<std::time::Instant> =
-            std::collections::VecDeque::new();
-        let mut kept_open: std::collections::HashMap<cb_core::types::Pubkey32, std::time::Instant> =
-            std::collections::HashMap::new();
-        let mut lookup_grows: std::collections::VecDeque<std::time::Instant> =
-            std::collections::VecDeque::new();
 
         loop {
             tokio::select! {
-                _ = demand_timer.tick() => {
-                    if let Err(e) = demand.save(demand_path, now_ms() / 1_000) {
-                        tracing::warn!("could not save {DEMAND_PATH}: {e}");
-                    }
-                    // The priority order the rotation works from, on the record: which
-                    // mints attempts asked for over the last day, most valuable first.
-                    let ranking = demand.ranking();
-                    if !ranking.is_empty() {
-                        let held = trader.as_ref().map(|t| t.managed_accounts(&protected));
-                        let line: Vec<String> = ranking
-                            .iter()
-                            .take(10)
-                            .map(|(m, s)| {
-                                let b = bs58::encode(m).into_string();
-                                let mark = if held.as_ref().is_some_and(|h| h.contains(m)) {
-                                    "held"
-                                } else {
-                                    "no account"
-                                };
-                                format!("{}… {} asks ${:.4} ({mark})", &b[..6], s.asks, s.usd)
-                            })
-                            .collect();
-                        tracing::info!("token demand, last day: {}", line.join(" · "));
-                    }
-                    if let Some(t) = trader.as_mut() {
-                        let managed = t.managed_accounts(&protected);
-                        let idle = demand::idle(&demand, &managed, now_ms() / 1_000);
-                        // An account left open for a balance is not retried every tick.
-                        kept_open.retain(|_, at: &mut std::time::Instant| at.elapsed() < KEPT_OPEN_RECHECK);
-                        let due: Vec<_> = idle.into_iter().filter(|m| !kept_open.contains_key(m)).collect();
-                        for mint in due.into_iter().take(MAX_ACCOUNT_CLOSES_PER_TICK) {
-                            match t.close_account(&mint).await {
-                                Ok(true) => tracing::warn!(
-                                    "closed an account no attempt asked for in a day, to trade its deposit instead"
-                                ),
-                                Ok(false) => { kept_open.insert(mint, std::time::Instant::now()); }
-                                Err(e) => tracing::warn!("could not close an idle account: {e:#}"),
-                            }
-                        }
-                    }
-                }
+                _ = demand_timer.tick() => self.save_demand_and_close_idle(trader.as_mut()).await,
                 received = rx.recv() => {
                     match received {
-                        Some(update) => { market.apply(&update, &bus); }
+                        Some(update) => { self.market.apply(&update, &self.bus); }
                         None => {
                             tracing::error!("feed channel closed — no further updates");
                             break;
                         }
                     }
                 }
-                Some(found) = found_rx.recv() => {
-                    let (subscribe, added) = market.absorb(found);
-                    discovered.extend(added.iter().copied());
-                    // Over the cap, the oldest discoveries go. Never the pools the run
-                    // started with: those are the registry and the census watchlist.
-                    let mut dropped: Vec<cb_core::types::Pubkey32> = Vec::new();
-                    let mut evicted = 0usize;
-                    while market.watch_count() > MAX_WATCHED_POOLS {
-                        let Some(old) = discovered.pop_front() else { break };
-                        dropped.extend(market.remove_pool(&old));
-                        evicted += 1;
-                    }
-                    if !dropped.is_empty() {
-                        let _ = feed_ctl.send(cb_feed::ws::Watch::Drop(dropped));
-                    }
-                    if !added.is_empty() {
-                        let _ = feed_ctl.send(cb_feed::ws::Watch::Add(subscribe));
-                        if let Some(t) = trader.as_mut() {
-                            t.learn_vaults(market.vault_pairs());
-                            t.add_token_2022_mints(
-                                market.registry.mints.iter().filter(|(_, m)| m.token_2022).map(|(k, _)| *k),
-                            );
-                        }
-                        tracing::info!(
-                            "discovery: now watching {} pools, {} just added where arbitrage is \
-                             running{}",
-                            market.watch_count(),
-                            added.len(),
-                            if evicted > 0 { format!(", {evicted} of the oldest found let go") } else { String::new() }
-                        );
-                    }
-                }
-                _ = usd_timer.tick() => market.rebuild_usd_index(),
+                Some(found) = found_rx.recv() => self.absorb_discovered(found, trader.as_mut()),
+                _ = usd_timer.tick() => self.market.rebuild_usd_index(),
                 _ = timed_fee_timer.tick() => {
-                    market.reprice_timed_fees();
+                    self.market.reprice_timed_fees();
                 }
                 _ = warm_timer.tick() => {
                     if let Some(t) = trader.as_mut() {
@@ -2053,910 +2520,1009 @@ async fn spawn_live(
                 }
                 _ = probe_timer.tick() => {
                     if let Some(t) = trader.as_mut() {
-                        let probing = pending_sends.iter().any(|p| p.probe_tip.is_some());
+                        let probing = self.pending_sends.iter().any(|p| p.probe_tip.is_some());
                         if !probing && !t.landed_within(execute::PROBE_EVERY) {
-                            send_probe(t, &mut pending_sends, execute::PROBE_TIPS[0]).await;
+                            let first = t.probe_tips()[0];
+                            send_probe(t, &mut self.pending_sends, first).await;
                         }
                     }
                 }
-                _ = confirm_timer.tick(), if !pending_sends.is_empty() => {
+                _ = confirm_timer.tick(), if !self.pending_sends.is_empty() => {
                     if let Some(t) = trader.as_mut() {
-                        let sol_price = market.sol_price_usd().unwrap_or(0.0);
-                        let outcomes = settle_pending(t, &mut pending_sends, sol_price, &post_mortem_rpc).await;
-                        if let Some(l) = ledger.as_ref() {
-                            for (row, taken, reason, net) in outcomes {
-                                if let Err(e) = l.update_fill_outcome(row, taken, &reason, net) {
-                                    tracing::warn!("could not record a send's outcome: {e}");
-                                }
-                            }
-                        }
+                        self.confirm_pending(t).await;
                     }
                 }
-                _ = reconcile_timer.tick() => {
-                    // Blocks the other branches for a second or so. That is fine: the
-                    // update channel is bounded at 4096 and buffers far more than a
-                    // second of traffic, and trading on an unverified book is worse
-                    // than trading on a book that is one second late.
-                    match market.reconcile().await {
-                        Ok(r) => {
-                            drift = (r.drifted, r.checked);
-                            if r.drifted > 0 || r.missing > 0 || r.undecodable > 0 {
-                                tracing::warn!(
-                                    "reconcile at slot {}: {}/{} pools drifted from the feed, \
-                                     {} missing, {} undecodable",
-                                    r.slot, r.drifted, r.checked, r.missing, r.undecodable
-                                );
-                            } else {
-                                tracing::info!(
-                                    "reconcile at slot {}: all {} pools matched the feed",
-                                    r.slot, r.checked
-                                );
-                            }
-                        }
-                        Err(e) => tracing::warn!("reconcile failed: {e:#}"),
-                    }
-                }
-                _ = sweep_timer.tick() => {
-                    // Ahead of anything else this sweep does: a halt clears itself on
-                    // its own cooldown, and a sweep that finds no candidate to attempt
-                    // must not be the reason that takes longer to notice.
-                    if let Some(t) = trader.as_mut() {
-                        t.tick_auto_resume();
-                    }
-                    let sweep = market.sweep(tradable_usd, min_depth_usd, max_hops);
-                    evaluated_total = evaluated_total.saturating_add(sweep.evaluated);
+                _ = reconcile_timer.tick() => self.reconcile().await,
+                _ = sweep_timer.tick() => self.sweep(trader.as_mut()).await,
+            }
+        }
+    }
 
-                    // The one thing the per-pool staleness guard structurally cannot
-                    // see: a feed that has stopped entirely, where every pool ages
-                    // together and nothing looks stale relative to anything else.
-                    let last_ms = stats.last_update_ms.load(Ordering::Relaxed);
-                    let feed_age_ms =
-                        if last_ms == 0 { u64::MAX } else { now_ms().saturating_sub(last_ms) };
-                    let feed_stalled = feed_age_ms >= FEED_STALL_SECS * 1_000;
-                    if feed_stalled != was_stalled {
-                        if feed_stalled {
-                            tracing::warn!(
-                                "feed silent for over {FEED_STALL_SECS}s — pausing the ledger; \
-                                 sweeps continue but nothing is recorded"
-                            );
-                        } else {
-                            tracing::info!("feed recovered — recording resumed");
-                        }
-                        was_stalled = feed_stalled;
-                    }
-                    if sweep.stale_excluded != last_stale_excluded {
-                        if sweep.stale_excluded > 0 {
-                            tracing::warn!(
-                                "{} pool(s) excluded from the sweep for lagging over {} slots",
-                                sweep.stale_excluded,
-                                live::MAX_STALE_LAG_SLOTS,
-                            );
-                        }
-                        last_stale_excluded = sweep.stale_excluded;
-                    }
-
-                    if let Ok(mut g) = shared.lock() {
-                        *g = SweepSummary {
-                            // Report the *current* best, not an all-time high-water
-                            // mark: a record from ten minutes ago describes nothing.
-                            best: sweep.best().cloned(),
-                            tradeable: sweep.tradeable().cloned(),
-                            tradeable_min_usd: sweep.tradeable_min_usd,
-                            stale_excluded: sweep.stale_excluded,
-                            feed_stalled,
-                            evaluated_total,
-                            sweep_us: sweep.duration_us,
-                            pools_ready: market.ready_count(),
-                            venues: market.venue_count(),
-                            sol_price_usd: market.sol_price_usd().unwrap_or(0.0),
-                            slot: sweep.slot,
-                            reconcile_drift: drift.0,
-                            reconcile_checked: drift.1,
-                        };
-                    }
-
-                    sweep_n = sweep_n.wrapping_add(1);
-                    // Nothing is recorded while the feed is stalled: the numbers would
-                    // describe a market that has stopped being observed, and they would
-                    // be indistinguishable afterwards from ones that had.
-                    if let (Some(l), Some(best), false) =
-                        (ledger.as_ref(), sweep.best(), feed_stalled)
-                    {
-                        if sweep_n % LEDGER_EVERY_N_SWEEPS == 0 {
-                            let tradeable = sweep.tradeable();
-                            let sample = cb_ledger::SweepSample {
-                                slot: sweep.slot,
-                                evaluated: sweep.evaluated,
-                                clearing: sweep.clearing,
-                                best_edge_bps: best.edge_bps,
-                                best_dislocation_bps: best.dislocation_bps,
-                                best_fee_bps: best.fee_bps,
-                                best_route: best.route.clone(),
-                                best_venues: best.venues.clone(),
-                                best_hops: best.hops,
-                                best_depth_usd: best.depth_usd,
-                                sol_price_usd: market.sol_price_usd().unwrap_or(0.0),
-                                pools_ready: market.ready_count(),
-                                sweep_us: sweep.duration_us,
-                                tradeable_edge_bps: tradeable.map(|t| t.edge_bps),
-                                tradeable_dislocation_bps: tradeable.map(|t| t.dislocation_bps),
-                                tradeable_fee_bps: tradeable.map(|t| t.fee_bps),
-                                tradeable_depth_usd: tradeable.map(|t| t.depth_usd),
-                                tradeable_route: tradeable
-                                    .map_or_else(String::new, |t| t.route.clone()),
-                                stale_excluded: sweep.stale_excluded,
-                                depth_measured: true,
-                            };
-                            if let Err(e) = l.record_sweep(&sample) {
-                                tracing::warn!("could not record sweep: {e:#}");
-                            }
-                        }
-                    }
-
-                    if !sweep.rows.is_empty() && sweep_n % PUBLISH_EVERY_N_SWEEPS == 0 {
-                        bus.publish(Event::Routes {
-                            rows: sweep.rows.iter().map(RouteRow::from).collect(),
-                            tradeable_min_usd: sweep.tradeable_min_usd,
-                            evaluated: sweep.evaluated,
-                            sweep_us: sweep.duration_us,
-                            slot: sweep.slot,
-                            ts_ms: now_ms(),
-                        });
-                    }
-
-                    let sol_price = market.sol_price_usd().unwrap_or(0.0);
-                    // Both reset every sweep: this is a budget per pass, not per run.
-                    //
-                    // Two counters rather than one flag, because attempting and
-                    // submitting are different acts with different hazards. See
-                    // [`MAX_ATTEMPTS_PER_SWEEP`].
-                    let mut attempts_this_sweep: usize = 0;
-                    let mut probes_this_sweep: usize = 0;
-                    let mut submitted_this_sweep = false;
-                    // Left in the order the scanner produced: best gross profit first.
-                    //
-                    // Re-examined against every attempt the ledger can label, because the
-                    // obvious improvement here is wrong and the next reader should not
-                    // have to rediscover that. 2,362 attempts split cleanly: 254 built a
-                    // route whose floor beat its input and reached simulation, 2,108 died
-                    // at the re-price. Scoring each candidate ordering by how well it puts
-                    // the survivors first — AUC, 0.5 being a coin flip:
-                    //
-                    // | ordering                                   | AUC   |
-                    // |--------------------------------------------|-------|
-                    // | gross profit — what the scanner already does| 0.729 |
-                    // | gross, net edge over 10 bps pushed to back  | 0.700 |
-                    // | same, thresholds at 5 / 8 / 15 / 25 bps     | 0.673-0.705 |
-                    // | detected net edge alone                     | 0.461 |
-                    // | cheapest fee first                          | 0.517 |
-                    //
-                    // A seven-feature logistic regression on the same labels, fitted on
-                    // the first 70% and scored on the last 30%, reaches 0.788 held out and
-                    // still loses to plain gross.
-                    //
-                    // The tempting story was that a very large detected edge is an
-                    // artefact — a concentrated pool quoting a price no size can trade at.
-                    // It is not: attempts above 10 bps of net edge reach simulation 9.2%
-                    // of the time against 11.0% below it. The apparent cliff came from
-                    // counting *submissions*, of which there have only ever been twelve;
-                    // at that base rate the high-edge group would be expected to yield
-                    // about 1.3, so observing none says nothing.
-                    //
-                    // Rank by gross. Do not rank by edge — that is worse than a coin flip.
-                    //
-                    // Read before the move, because `too_stale_to_trade` needs the head
-                    // the sweep was taken against and the sweep is about to be consumed.
-                    let sweep_slot = sweep.slot;
-                    let opportunities = sweep.opportunities;
-                    // Bounded, the same way the event bus is: a cycle refused once and
-                    // never seen again must not sit in this map for the life of the
-                    // process. Five times the cooldown is generous headroom for a cycle
-                    // that is still actively being retried; anything older than that is
-                    // history, not state.
-                    recent_refusals.retain(|_, (at, window)| at.elapsed() < *window * 5);
-                    recent_logged.retain(|_, at| at.elapsed() < LOG_COOLDOWN * 5);
-                    refused_at_edge.retain(|_, (_, at)| at.elapsed() < UNCHANGED_REFUSAL_HOLD);
-                    last_recorded.retain(|_, (_, _, at)| at.elapsed() < UNCHANGED_RECORD_EVERY);
-                    unfundable_entries.retain(|_, at| at.elapsed() < UNFUNDABLE_ENTRY_WINDOW);
-                    for opp in opportunities {
-                        let id = next_id;
-                        next_id += 1;
-
-                        // Uncontested cycles pay the tip floor; contested ones get bid
-                        // up to most of the profit. A cycle worth more than a cent on
-                        // a major pair will have been seen by faster searchers too.
-                        // Still recorded, because "big enough that somebody faster has
-                        // seen this too" remains a true and useful fact about a cycle.
-                        // It is no longer charged as a cost — see `tip_cost_usd`.
-                        let contested = opp.gross_profit_usd > CONTESTED_USD;
-                        let est_tip_usd = tip_cost_usd(opp.gross_profit_usd, sol_price);
-                        let base_fee_usd = BASE_FEE_SOL * sol_price;
-                        let net = opp.gross_profit_usd - est_tip_usd - base_fee_usd;
-
-                        // Competition is charged once, in the tip, and not again here.
-                        //
-                        // This used to also decline every contested cycle outright,
-                        // *after* pricing in a tip sized to win it — paying to win the
-                        // race and then refusing to enter. The ledger says the flag was
-                        // not detecting races anyway: cycles declined as contested were
-                        // still quotable a slot later 27.9% of the time against 15.3%
-                        // for everything else, so they survived *better*, which is what
-                        // it looks like when nobody took them. A $0.01 threshold sorts
-                        // by size and calls the big ones a race.
-                        //
-                        // What remains is the honest question: a bundle that loses does
-                        // not land, so a lost race costs the base fee or nothing at all.
-                        // Anything still positive after the tip it would have to pay is
-                        // worth attempting. See `race_ladder` for what the assumption is
-                        // worth at each win rate.
-                        let skipped = if net <= 0.0 {
-                            Some("net negative after tip".to_string())
-                        } else {
-                            None
-                        };
-
-                        // Decide what actually happened BEFORE anything is recorded.
-                        //
-                        // This used to write the fill first, with `taken: skipped.is_none()`,
-                        // and only then try to execute. In paper mode that is exactly right:
-                        // "taken" means "would have been taken" and there is nothing else it
-                        // could mean. In live mode it was a lie — a row saying `taken` with a
-                        // realised P&L, written before a single byte had left the machine.
-                        //
-                        // It showed up as the History panel reporting 9 trades and $0.0251
-                        // realised against a wallet whose balance had not moved and whose
-                        // explorer showed no transactions. The instrument was reporting money
-                        // it had not made, while live. That is the §4 failure mode, in the
-                        // one place where believing it costs real money.
-                        let mut landed = false;
-                        let mut realised = 0.0f64;
-                        let mut signature: Option<String> = None;
-                        let mut latency_ms: u64 = 0;
-                        let mut outcome_reason = skipped.clone();
-                        let mut pending_new: Option<PendingSend> = None;
-
-                        if skipped.is_none() {
-                            match trader.as_mut() {
-                                // Paper: nothing is submitted and nothing pretends to be.
-                                // `landed` stays what it has always been for the paper
-                                // measurement — the assumption the whole archive rests on.
-                                None => {
-                                    landed = true;
-                                    realised = net;
-                                    outcome_reason =
-                                        Some("paper — uncontested, assumed landed".into());
-                                }
-                                Some(t) => {
-                                    // One attempt per sweep, on the first encodable survivor
-                                    // of a list already sorted by gross profit. Submitting a
-                                    // dozen transactions against overlapping pools in one slot
-                                    // would have each invalidate the next. And not a cycle
-                                    // that was already refused within the cooldown window —
-                                    // see `recent_refusals`'s own comment for why.
-                                    let on_cooldown =
-                                        on_refusal_cooldown(&recent_refusals, &opp.cycle_key)
-                                            || refused_at_edge.get(&opp.cycle_key).is_some_and(
-                                                |(edge, at)| {
-                                                    *edge == opp.edge_bps.to_bits()
-                                                        && at.elapsed() < UNCHANGED_REFUSAL_HOLD
-                                                },
-                                            );
-                                    // Legs priced too far apart in time are not an
-                                    // opportunity, they are the clock.
-                                    //
-                                    // `slot_spread` has been measured on every cycle
-                                    // since the artifact was first found, and `--report`
-                                    // has a whole section arguing that an edge which
-                                    // grows with the gap between two observations was
-                                    // never simultaneously on offer. It was never wired
-                                    // to execution, and the omission was worse than
-                                    // neutral: candidates are taken best-gross-first, and
-                                    // gross grows with skew, so the selection walked
-                                    // straight up the artifact every sweep. One live run
-                                    // measured it — mean detected edge by spread band,
-                                    // 1.27 bps at 0-1 slots against 3.42 bps at 21+ — and
-                                    // all 26 of that run's attempts came from the skewed
-                                    // bands, none from the simultaneous one. Every one was
-                                    // refused for a loss once re-priced against fresh
-                                    // state, by 0.3 to 4.7 bps.
-                                    let too_skewed = too_skewed_to_trade(opp.slot_spread);
-                                    // A route whose own fee is larger than any
-                                    // disagreement that survives the trip to the chain.
-                                    // See `EXECUTABLE_FEE_CEILING_BPS` for the measured
-                                    // table this comes from.
-                                    let too_expensive = too_expensive_to_trade(opp.fee_bps);
-                                    // Priced from state the feed had already moved past.
-                                    // `too_skewed` cannot see this: both legs can be
-                                    // equally old, which is a spread of zero and a price
-                                    // from minutes ago. See `MAX_EXECUTABLE_LEG_LAG_SLOTS`
-                                    // for the eleven-hour measurement that says three
-                                    // quarters of this instrument's detections are this,
-                                    // and that what they are worth on fresh state is
-                                    // 0.37 bps against a 3.00 bps fee.
-                                    let too_stale = too_stale_to_trade(sweep_slot, opp.slot);
-                                    // Read before the filter so the refusal can say
-                                    // *which* venue is missing an encoder, instead of
-                                    // leaving it pooled with "somebody else went first".
-                                    let blocked_by = opp.plan.as_ref().and_then(
-                                        execute::CyclePlan::blocking_venue,
-                                    );
-                                    // A mint the wallet was just shown it cannot start a
-                                    // trade in. Cheap here, and the alternative is two
-                                    // RPC round trips to be told the same thing by the
-                                    // balance the executor fetches.
-                                    let unfundable_entry = opp
-                                        .plan
-                                        .as_ref()
-                                        .and_then(|pl| pl.mints.first())
-                                        .is_some_and(|m| {
-                                            unfundable_entries.get(m).is_some_and(|at| {
-                                                at.elapsed() < UNFUNDABLE_ENTRY_WINDOW
-                                            })
-                                        });
-                                    // Everything that disqualifies a candidate for
-                                    // reasons that have nothing to do with its fee.
-                                    // A shape this trader can never send, whatever its price —
-                                    // a USDC-start cycle under Jito, a venue it cannot re-price.
-                                    // Refused inside the attempt too, but only after it had taken
-                                    // one of the sweep's few attempt slots: 363 times in one run,
-                                    // each crowding out a cycle that could have been sent.
-                                    let unsendable =
-                                        opp.plan.as_ref().is_some_and(|pl| !t.could_execute(pl));
-                                    let barred = submitted_this_sweep
-                                        || attempts_this_sweep >= MAX_ATTEMPTS_PER_SWEEP
-                                        || on_cooldown
-                                        || unfundable_entry
-                                        || unsendable;
-                                    // The two filters that reject a candidate by making a
-                                    // claim about what would have happened to it, rather
-                                    // than by observing something that already has. Both
-                                    // were calibrated on samples of a few dozen, both
-                                    // reject thousands of candidates an hour, and neither
-                                    // has been rechecked since. An unchecked claim is an
-                                    // assumption wearing a measurement's clothes.
-                                    let held_back_by_a_claim =
-                                        too_expensive || too_skewed || too_stale;
-                                    // A candidate the fee ceiling is the *only* thing
-                                    // standing between and an attempt. This is the class
-                                    // the ceiling has been rejecting sight-unseen — 30,262
-                                    // of them in one seven-hour run, 7,659 of those showing
-                                    // a detected gross over two cents — and the ceiling's
-                                    // own evidence is thin: it rests on 47 attempts in the
-                                    // 4-7 bps band, which is consistent with a survival
-                                    // rate anywhere up to about 6%. At the grosses this
-                                    // band carries, 6% would be worth having. Measure it.
-                                    let worth_measuring = !barred
-                                        && held_back_by_a_claim
-                                        && probes_this_sweep < MAX_PROBES_PER_SWEEP;
-                                    // Under Jito the measurement *is* the trade. A probe
-                                    // re-prices on fresh state and simulates, then stops;
-                                    // an attempt does exactly the same and then sends a
-                                    // bundle whose floor guarantees the fee and the tip on
-                                    // chain, and which costs nothing if it misses. The
-                                    // claims above were written to save the fee a failed
-                                    // RPC send paid — under Jito there is no such fee left
-                                    // to save, and holding them to a probe only means a
-                                    // route that simulates profitably is written down
-                                    // instead of taken. That happened on 2026-09-23 at
-                                    // 13:09: a probe cleared its floor by 8,958 lamports
-                                    // and was logged, not sent.
-                                    //
-                                    // Same budget as the probe it replaces, so the RPC load
-                                    // does not change.
-                                    let promoted = worth_measuring
-                                        && t.sends_via_jito()
-                                        && opp.plan.as_ref().is_some_and(execute::CyclePlan::encodable);
-                                    if promoted {
-                                        probes_this_sweep += 1;
-                                    }
-                                    let candidate = if barred || (held_back_by_a_claim && !promoted) {
-                                        None
-                                    } else {
-                                        opp.plan.as_ref().filter(|pl| pl.encodable())
-                                    };
-                                    let to_measure = if worth_measuring && !promoted {
-                                        opp.plan.as_ref().filter(|pl| pl.encodable())
-                                    } else {
-                                        None
-                                    };
-                                    match candidate {
-                                        None => {
-                                            if let Some(probe_plan) = to_measure {
-                                                probes_this_sweep += 1;
-                                                if t.could_execute(probe_plan) {
-                                                    note_demand(&mut demand, probe_plan, net, &protected);
-                                                }
-                                                let started = std::time::Instant::now();
-                                                let r = t
-                                                    .attempt(
-                                                        probe_plan,
-                                                        opp.size_usd,
-                                                        net,
-                                                        execute::Intent::Measure,
-                                                    )
-                                                    .await;
-                                                latency_ms =
-                                                    started.elapsed().as_millis() as u64;
-                                                outcome_reason = Some(match r {
-                                                    Ok(cb_executor::Attempt::Probed(found)) => {
-                                                        // A filter being wrong is the most
-                                                        // valuable thing this run can find,
-                                                        // and it is invisible in a file that
-                                                        // is otherwise all refusals. Logged
-                                                        // at ERROR for the same reason a
-                                                        // submission is.
-                                                        if found.would_have_profited() {
-                                                            tracing::error!(
-                                                                fee_bps = opp.fee_bps,
-                                                                slot_spread = opp.slot_spread,
-                                                                gross_usd = opp.gross_profit_usd,
-                                                                "a filter held back a \
-                                                                 route that simulated \
-                                                                 profitably — {found}"
-                                                            );
-                                                        }
-                                                        found.to_string()
-                                                    }
-                                                    // `Measure` cannot come back any other
-                                                    // way, but the refusals on the way in —
-                                                    // no encoder, unfundable entry — are
-                                                    // still worth keeping verbatim.
-                                                    Ok(cb_executor::Attempt::Refused(why)) => {
-                                                        format!("probe not run: {why}")
-                                                    }
-                                                    Ok(other) => {
-                                                        format!("probe returned {other:?}")
-                                                    }
-                                                    Err(e) => format!("probe failed: {e}"),
-                                                });
-                                                // One measurement of a cycle is enough for a
-                                                // while; the budget is better spent on the
-                                                // next distinct loop than on this one again
-                                                // next sweep.
-                                                recent_refusals.insert(
-                                                    opp.cycle_key.clone(),
-                                                    (std::time::Instant::now(), STRUCTURAL_COOLDOWN),
-                                                );
-                                            } else {
-                                            outcome_reason = Some(if on_cooldown {
-                                                "not attempted — refused recently and \
-                                                 nothing has changed"
-                                                    .to_string()
-                                            } else if too_stale {
-                                                format!(
-                                                    "not attempted — the stalest leg is {} \
-                                                     slots behind the feed's own head, over \
-                                                     the {MAX_EXECUTABLE_LEG_LAG_SLOTS} this \
-                                                     will trade on; on fresh state this class \
-                                                     is worth 0.37 bps against a 3.00 bps fee",
-                                                    sweep_slot.saturating_sub(opp.slot)
-                                                )
-                                            } else if too_skewed {
-                                                format!(
-                                                    "not attempted — legs priced {} slots \
-                                                     apart, over the {MAX_EXECUTABLE_SLOT_SPREAD} \
-                                                     this will trade on; the gap is the clock, \
-                                                     not a disagreement between venues",
-                                                    opp.slot_spread
-                                                )
-                                            } else if too_expensive {
-                                                format!(
-                                                    "not attempted — the round trip costs \
-                                                     {:.2} bps, over the \
-                                                     {EXECUTABLE_FEE_CEILING_BPS} bps that have \
-                                                     produced every survivor so far; this sweep \
-                                                     had no probe budget left to check whether \
-                                                     that still holds",
-                                                    opp.fee_bps
-                                                )
-                                            } else if unfundable_entry {
-                                                "not attempted — the wallet cannot start a \
-                                                 trade in this cycle's entry mint; the same \
-                                                 loop entered from SOL is not held by this"
-                                                    .to_string()
-                                            } else if unsendable && blocked_by.is_none() {
-                                                "not attempted — this shape cannot be sent: under Jito only a \
-                                                 cycle that starts and ends in SOL has its fee guaranteed on \
-                                                 chain, and a binned pool leaves room for two hops"
-                                                    .to_string()
-                                            } else if let Some(dex) = blocked_by {
-                                                // Its own message. Pooled with the
-                                                // sweep budget these were unreadable,
-                                                // and the two ask for opposite things:
-                                                // one is a queue, the other is an
-                                                // encoder somebody has to write.
-                                                format!(
-                                                    "not attempted — {} has no encoder",
-                                                    dex.name()
-                                                )
-                                            } else {
-                                                format!(
-                                                    "not attempted — this sweep's {} attempts \
-                                                     went to other cycles",
-                                                    MAX_ATTEMPTS_PER_SWEEP
-                                                )
-                                            });
-                                            }
-                                        }
-                                        Some(plan) => {
-                                            attempts_this_sweep += 1;
-                                            if t.could_execute(plan) {
-                                                note_demand(&mut demand, plan, net, &protected);
-                                            }
-                                            let started = std::time::Instant::now();
-                                            let r = t
-                                                .attempt(
-                                                    plan,
-                                                    opp.size_usd,
-                                                    net,
-                                                    execute::Intent::Trade,
-                                                )
-                                                .await;
-                                            // A loss on the fresh read means the feed's copy of at
-                                            // least one of these pools is behind the chain. Re-read
-                                            // them now, so the next sweep does not detect the same
-                                            // phantom through a different partner venue.
-                                            if let Ok(cb_executor::Attempt::Refused(why)) = &r {
-                                                if why.contains("guarantees only")
-                                                    || why.contains("the floor would let through")
-                                                {
-                                                    let ids: Vec<_> =
-                                                        plan.pools.iter().map(|(p, _)| *p).collect();
-                                                    if let Err(e) = market.refresh(&ids).await {
-                                                        tracing::debug!("could not re-read a stale cycle: {e:#}");
-                                                    }
-                                                }
-                                            }
-                                            // Cleared its floor and did not fit a packet: put what it
-                                            // names into the lookup table, so the next attempt fits.
-                                            if let Some(wanted) = t.take_oversize() {
-                                                lookup_grows.retain(|at| at.elapsed() < Duration::from_secs(3_600));
-                                                if lookup_grows.len() < MAX_LOOKUP_GROWS_PER_HOUR && !wanted.is_empty() {
-                                                    lookup_grows.push_back(std::time::Instant::now());
-                                                    match t.grow_lookup(wanted, LOOKUP_TABLE_CAP).await {
-                                                        Ok(Some(key)) => write_lookup_path(&key),
-                                                        Ok(None) => {}
-                                                        Err(e) => tracing::warn!("could not grow the lookup table: {e:#}"),
-                                                    }
-                                                }
-                                            }
-                                            if matches!(r, Ok(cb_executor::Attempt::Refused(_))) {
-                                                rotate_for(
-                                                    t,
-                                                    plan,
-                                                    &demand,
-                                                    &protected,
-                                                    token_slots,
-                                                    &mut account_opens,
-                                                )
-                                                .await;
-                                            }
-                                            latency_ms = started.elapsed().as_millis() as u64;
-                                            match r {
-                                                Ok(cb_executor::Attempt::Submitted {
-                                                    signature: sig,
-                                                    bundle_id,
-                                                    ..
-                                                }) => {
-                                                    // Submitted is not confirmed. The signature
-                                                    // is a receipt for having asked, so the
-                                                    // realised figure stays zero until a
-                                                    // confirmation path fills it in — a P&L
-                                                    // nobody has confirmed is not a P&L.
-                                                    t.record(
-                                                        cb_executor::risk::Outcome::Landed {
-                                                            net_usd: 0.0,
-                                                        },
-                                                    );
-                                                    // The sweep is finished here whatever
-                                                    // its attempt budget had left. This is
-                                                    // the hazard the old one-attempt rule
-                                                    // existed for: a second transaction
-                                                    // against an overlapping pool in the
-                                                    // same slot invalidates the first.
-                                                    submitted_this_sweep = true;
-                                                    tracing::error!("submitted {sig}");
-                                                    signature = Some(sig.clone());
-                                                    // What became of it is asked by the
-                                                    // confirm timer, off this loop: waiting
-                                                    // here left the bot blind to the market
-                                                    // for five seconds after every send. See
-                                                    // `PendingSend`.
-                                                    let _ = bundle_id;
-                                                    outcome_reason = Some(if t.sends_via_jito() {
-                                                        "sent to Jito; awaiting inclusion".to_string()
-                                                    } else {
-                                                        "submitted; awaiting confirmation".to_string()
-                                                    });
-                                                    pending_new = Some(PendingSend {
-                                                        sig: sig.clone(),
-                                                        sent_at: std::time::Instant::now(),
-                                                        row: None,
-                                                        via_jito: t.sends_via_jito(),
-                                                        probe_tip: None,
-                                                        pools: plan.pools.iter().map(|(k, _)| *k).collect(),
-                                                        sent_slot: stats.last_slot.load(Ordering::Relaxed),
-                                                    });
-                                                }
-                                                Ok(cb_executor::Attempt::SimulationRejected {
-                                                    reason,
-                                                    ..
-                                                }) => {
-                                                    // A rejection here is the chain saying the
-                                                    // price moved between the quote and the
-                                                    // simulation — the most transient fact
-                                                    // there is, and no reason to stop watching
-                                                    // this cycle for fifty slots. Held off
-                                                    // briefly so another cycle gets this
-                                                    // sweep's one attempt, and logged on the
-                                                    // long window so a cycle failing all
-                                                    // minute does not fill the log.
-                                                    let quiet = recent_logged
-                                                        .get(&opp.cycle_key)
-                                                        .is_some_and(|at: &std::time::Instant| {
-                                                            at.elapsed() < LOG_COOLDOWN
-                                                        });
-                                                    if !quiet {
-                                                        tracing::warn!(
-                                                            "simulation rejected: {reason}"
-                                                        );
-                                                        recent_logged.insert(
-                                                            opp.cycle_key.clone(),
-                                                            std::time::Instant::now(),
-                                                        );
-                                                    }
-                                                    outcome_reason =
-                                                        Some(format!("simulation: {reason}"));
-                                                    recent_refusals.insert(
-                                                        opp.cycle_key.clone(),
-                                                        (
-                                                            std::time::Instant::now(),
-                                                            PRICE_MOVED_COOLDOWN,
-                                                        ),
-                                                    );
-                                                }
-                                                Ok(cb_executor::Attempt::Refused(why)) => {
-                                                    // Logged at info, not debug. A live run
-                                                    // that refuses everything must say so in
-                                                    // the log the operator actually reads;
-                                                    // at debug this was invisible and looked
-                                                    // like nothing happening at all. Logged
-                                                    // once per cooldown window rather than
-                                                    // once per sweep — see `recent_refusals`.
-                                                    //
-                                                    // "Halted" is the one exception: it is a
-                                                    // fact about the gate, not about this
-                                                    // cycle, so a *different* cycle found next
-                                                    // sweep would otherwise re-announce it under
-                                                    // its own, separate cooldown entry. Shared
-                                                    // with the ERROR-level announce below so
-                                                    // both move together.
-                                                    let is_halt_refusal =
-                                                        why.starts_with("trading is halted");
-                                                    let quiet = recent_logged
-                                                        .get(&opp.cycle_key)
-                                                        .is_some_and(|at: &std::time::Instant| {
-                                                            at.elapsed() < LOG_COOLDOWN
-                                                        });
-                                                    let should_log = if is_halt_refusal {
-                                                        last_halt_announced.is_none_or(
-                                                            |at: std::time::Instant| {
-                                                                at.elapsed() >= LOG_COOLDOWN
-                                                            },
-                                                        )
-                                                    } else {
-                                                        !quiet
-                                                    };
-                                                    if should_log {
-                                                        tracing::info!("refused: {why}");
-                                                        if !is_halt_refusal {
-                                                            recent_logged.insert(
-                                                                opp.cycle_key.clone(),
-                                                                std::time::Instant::now(),
-                                                            );
-                                                        }
-                                                    }
-                                                    outcome_reason =
-                                                        Some(format!("refused: {why}"));
-                                                    // Nothing was signed and nothing was sent:
-                                                    // the executor read a balance and stopped.
-                                                    // Charging the sweep's single attempt for
-                                                    // that hands the slot to nobody, when the
-                                                    // rotation of this very loop that *can* be
-                                                    // funded is further down the same list.
-                                                    // The mint is held instead, so the round
-                                                    // trip is not repeated either.
-                                                    if refused_for_entry_mint(&why) {
-                                                        if let Some(m) = plan.mints.first() {
-                                                            unfundable_entries.insert(
-                                                                *m,
-                                                                std::time::Instant::now(),
-                                                            );
-                                                        }
-                                                        attempts_this_sweep =
-                                                            attempts_this_sweep.saturating_sub(1);
-                                                    }
-                                                    // A halt earns no per-cycle hold: it is one
-                                                    // fact about the gate, and holding every
-                                                    // cycle seen during it would leave them all
-                                                    // still held for the window *after* the halt
-                                                    // lifts — precisely when they should be
-                                                    // retried.
-                                                    if let Some(window) = refusal_cooldown_for(&why)
-                                                    {
-                                                        recent_refusals.insert(
-                                                            opp.cycle_key.clone(),
-                                                            (std::time::Instant::now(), window),
-                                                        );
-                                                        if window == PRICE_MOVED_COOLDOWN {
-                                                            refused_at_edge.insert(
-                                                                opp.cycle_key.clone(),
-                                                                (
-                                                                    opp.edge_bps.to_bits(),
-                                                                    std::time::Instant::now(),
-                                                                ),
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                // `Intent::Trade` has no path that
-                                                // produces one, and the day it does the
-                                                // right answer is not to pretend a
-                                                // measurement was a trade.
-                                                Ok(cb_executor::Attempt::Probed(found)) => {
-                                                    tracing::error!(
-                                                        "a trade attempt came back as a \
-                                                         measurement, which should be \
-                                                         impossible: {found}"
-                                                    );
-                                                    outcome_reason =
-                                                        Some(format!("unexpected {found}"));
-                                                }
-                                                Err(e) => {
-                                                    // An RPC failure is not a defect in what
-                                                    // was built, so it must not trip the
-                                                    // breaker that exists to catch defects.
-                                                    t.record(cb_executor::risk::Outcome::Missed);
-                                                    tracing::warn!(
-                                                        "execution could not reach the chain: {e:#}"
-                                                    );
-                                                    outcome_reason =
-                                                        Some(format!("rpc error: {e}"));
-                                                }
-                                            }
-                                            // The gate being halted is a global state, not
-                                            // a fact about this one cycle, so it does not
-                                            // fit the per-cycle-key cooldown above — every
-                                            // distinct cycle the sweep finds would otherwise
-                                            // re-announce the same halt once each. Throttled
-                                            // on its own timer instead: announced once, then
-                                            // at most once more per cooldown window for as
-                                            // long as it stays true, however many different
-                                            // cycles keep asking in between.
-                                            if let Some(why) = t.halted() {
-                                                let should_announce = last_halt_announced
-                                                    .is_none_or(|at: std::time::Instant| {
-                                                        at.elapsed() >= LOG_COOLDOWN
-                                                    });
-                                                if should_announce {
-                                                    tracing::error!("trading halted: {why}");
-                                                    last_halt_announced =
-                                                        Some(std::time::Instant::now());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Nothing attempted and nothing different since the last row for
-                        // this cycle: not written again until a minute has passed. See
-                        // `UNCHANGED_RECORD_EVERY`.
-                        let unchanged_row = latency_ms == 0
-                            && !landed
-                            && pending_new.is_none()
-                            && last_recorded.get(&opp.cycle_key).is_some_and(|(edge, reason, at)| {
-                                *edge == opp.edge_bps.to_bits()
-                                    && *reason == outcome_reason
-                                    && at.elapsed() < UNCHANGED_RECORD_EVERY
-                            });
-                        if !unchanged_row {
-                            last_recorded.insert(
-                                opp.cycle_key.clone(),
-                                (opp.edge_bps.to_bits(), outcome_reason.clone(), std::time::Instant::now()),
-                            );
-                        }
-                        if let (Some(l), false, false) = (ledger.as_ref(), feed_stalled, unchanged_row) {
-                            let rec = cb_ledger::FillRecord {
-                                slot: opp.slot,
-                                route: opp.route.clone(),
-                                venues: opp.venues.clone(),
-                                hops: opp.hops,
-                                edge_bps: opp.edge_bps,
-                                dislocation_bps: opp.edge_bps + opp.fee_bps,
-                                fee_bps: opp.fee_bps,
-                                size_usd: opp.size_usd,
-                                optimal_size_usd: opp.optimal_size_usd,
-                                gross_usd: opp.gross_profit_usd,
-                                profit_at_optimal_usd: opp.profit_at_optimal_usd,
-                                tip_usd: est_tip_usd,
-                                // The realised figure, not the hoped-for one. In paper these
-                                // are the same number; in live they are not, and the whole
-                                // point of the run is the difference.
-                                net_usd: realised,
-                                taken: landed,
-                                skipped_reason: outcome_reason.clone(),
-                                cycle_key: opp.cycle_key.clone(),
-                                profit_at_capital_usd: Some(opp.profit_at_capital_usd),
-                                slot_spread: Some(opp.slot_spread),
-                                leg_lag_slots: Some(sweep_slot.saturating_sub(opp.slot)),
-                                // Zero means nothing was attempted, and that is a
-                                // different fact from a fast attempt — so it is
-                                // recorded as "not measured" rather than as speed.
-                                latency_ms: (latency_ms > 0).then_some(latency_ms),
-                            };
-                            match l.record_fill(&rec) {
-                                Ok(id) => {
-                                    if let Some(p) = pending_new.as_mut() {
-                                        p.row = Some(id);
-                                    }
-                                }
-                                Err(e) => tracing::warn!("could not record fill: {e}"),
-                            }
-                        }
-                        if let Some(p) = pending_new.take() {
-                            pending_sends.push(p);
-                        }
-
-                        bus.publish(Event::Opportunity {
-                            id,
-                            route: opp.route.clone(),
-                            venues: opp.venues.clone(),
-                            hops: opp.hops,
-                            edge_bps: opp.edge_bps,
-                            dislocation_bps: opp.edge_bps + opp.fee_bps,
-                            fee_bps: opp.fee_bps,
-                            optimal_size_usd: opp.optimal_size_usd,
-                            capped_size_usd: opp.size_usd,
-                            capital_reach_pct: if opp.optimal_size_usd > 0.0 {
-                                100.0 * opp.size_usd / opp.optimal_size_usd
-                            } else {
-                                100.0
-                            },
-                            gross_profit_usd: opp.gross_profit_usd,
-                            profit_at_optimal_usd: opp.profit_at_optimal_usd,
-                            est_tip_usd,
-                            net_profit_usd: net,
-                            contested,
-                            skipped_reason: skipped.clone(),
-                            slot: opp.slot,
-                            ts_ms: now_ms(),
-                        });
-
-                        if skipped.is_some() {
-                            continue;
-                        }
-
-                        bus.publish(Event::Execution {
-                            id,
-                            opportunity_id: id,
-                            paper: paper_run,
-                            landed,
-                            realised_usd: realised,
-                            tip_paid_usd: est_tip_usd,
-                            latency_ms,
-                            signature,
-                            reason: outcome_reason,
-                            ts_ms: now_ms(),
-                        });
+    /// Save which mints attempts have needed, put the ranking on the record, and close
+    /// accounts no attempt has asked for in a day.
+    async fn save_demand_and_close_idle(&mut self, trader: Option<&mut execute::Trader>) {
+        if let Err(e) = self.demand.save(std::path::Path::new(DEMAND_PATH), now_ms() / 1_000) {
+            tracing::warn!("could not save {DEMAND_PATH}: {e}");
+        }
+        // The priority order the rotation works from, on the record: which
+        // mints attempts asked for over the last day, most valuable first.
+        let ranking = self.demand.ranking();
+        if !ranking.is_empty() {
+            let held = trader.as_ref().map(|t| t.managed_accounts(&self.protected));
+            let line: Vec<String> = ranking
+                .iter()
+                .take(10)
+                .map(|(m, s)| {
+                    let b = bs58::encode(m).into_string();
+                    let mark = if held.as_ref().is_some_and(|h| h.contains(m)) {
+                        "held"
+                    } else {
+                        "no account"
+                    };
+                    format!("{}… {} asks ${:.4} ({mark})", &b[..6], s.asks, s.usd)
+                })
+                .collect();
+            tracing::info!("token demand, last day: {}", line.join(" · "));
+        }
+        if let Some(t) = trader {
+            let now = now_ms() / 1_000;
+            let managed = t.managed_accounts(&self.protected);
+            // An account left open for a balance is not retried every tick.
+            self.kept_open.retain(|_, at: &mut std::time::Instant| at.elapsed() < KEPT_OPEN_RECHECK);
+            let unclosable = self.kept_open.keys().copied().collect();
+            for mint in closes_due(&self.demand, &managed, self.token_slots, &unclosable, now) {
+                match t.close_account(&mint).await {
+                    Ok(true) => tracing::warn!(
+                        "closed the account for {}, over the slot cap or asked for by nothing in a day, \
+                         to trade its deposit instead",
+                        bs58::encode(mint).into_string()
+                    ),
+                    Ok(false) => { self.kept_open.insert(mint, std::time::Instant::now()); }
+                    // Still held, so due again next tick; stop here so a failing send
+                    // path cannot hold the sweep for every account in turn.
+                    Err(e) => {
+                        tracing::warn!("could not close an idle account: {e:#}");
+                        break;
                     }
                 }
             }
         }
-    });
+    }
 
-    Ok(())
+    /// Merge the pools discovery found into the watched set, letting the oldest
+    /// discoveries go at the cap.
+    fn absorb_discovered(&mut self, found: live::LiveMarket, trader: Option<&mut execute::Trader>) {
+        let (subscribe, added) = self.market.absorb(found);
+        self.discovered.extend(added.iter().copied());
+        // Over the cap, the oldest discoveries go. Never the pools the run
+        // started with: those are the registry and the census watchlist.
+        let mut dropped: Vec<cb_core::types::Pubkey32> = Vec::new();
+        let mut evicted = 0usize;
+        while self.market.watch_count() > MAX_WATCHED_POOLS {
+            let Some(old) = self.discovered.pop_front() else { break };
+            dropped.extend(self.market.remove_pool(&old));
+            evicted += 1;
+        }
+        if !dropped.is_empty() {
+            let _ = self.feed_ctl.send(cb_feed::ws::Watch::Drop(dropped));
+        }
+        if !added.is_empty() {
+            let _ = self.feed_ctl.send(cb_feed::ws::Watch::Add(subscribe));
+            if let Some(t) = trader {
+                t.learn_vaults(self.market.vault_pairs());
+                t.add_token_2022_mints(
+                    self.market.registry.mints.iter().filter(|(_, m)| m.token_2022).map(|(k, _)| *k),
+                );
+            }
+            tracing::info!(
+                "discovery: now watching {} pools, {} just added where arbitrage is \
+                 running{}",
+                self.market.watch_count(),
+                added.len(),
+                if evicted > 0 { format!(", {evicted} of the oldest found let go") } else { String::new() }
+            );
+        }
+    }
+
+    /// Ask once after every pending send old enough to have an answer, and write what
+    /// became of each one settled onto its ledger row. See `settle_pending`.
+    async fn confirm_pending(&mut self, t: &mut execute::Trader) {
+        let sol_price = self.market.sol_price_usd().unwrap_or(0.0);
+        let outcomes = settle_pending(t, &mut self.pending_sends, sol_price, &self.post_mortem_rpc).await;
+        if let Some(l) = self.ledger.as_ref() {
+            for (row, taken, reason, net) in outcomes {
+                if let Err(e) = l.update_fill_outcome(row, taken, &reason, net) {
+                    tracing::warn!("could not record a send's outcome: {e}");
+                }
+            }
+        }
+    }
+
+    /// Re-read every watched account and say how far the feed had drifted from it.
+    async fn reconcile(&mut self) {
+        // Blocks the other branches for a second or so. That is fine: the
+        // update channel is bounded at 4096 and buffers far more than a
+        // second of traffic, and trading on an unverified book is worse
+        // than trading on a book that is one second late.
+        match self.market.reconcile().await {
+            Ok(r) => {
+                self.drift = (r.drifted, r.checked);
+                if r.drifted > 0 || r.missing > 0 || r.undecodable > 0 {
+                    tracing::warn!(
+                        "reconcile at slot {}: {}/{} pools drifted from the feed, \
+                         {} missing, {} undecodable",
+                        r.slot, r.drifted, r.checked, r.missing, r.undecodable
+                    );
+                } else {
+                    tracing::info!(
+                        "reconcile at slot {}: all {} pools matched the feed",
+                        r.slot, r.checked
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("reconcile failed: {e:#}"),
+        }
+    }
+
+    /// One full pass over the cycle graph: check the feed is alive, publish and record
+    /// what the pass saw, then take each opportunity it found in turn.
+    async fn sweep(&mut self, mut trader: Option<&mut execute::Trader>) {
+        // Ahead of anything else this sweep does: a halt clears itself on
+        // its own cooldown, and a sweep that finds no candidate to attempt
+        // must not be the reason that takes longer to notice.
+        if let Some(t) = trader.as_deref_mut() {
+            t.tick_auto_resume();
+        }
+        let sweep = self.market.sweep(self.tradable_usd, self.min_depth_usd, self.max_hops);
+        self.evaluated_total = self.evaluated_total.saturating_add(sweep.evaluated);
+
+        // The one thing the per-pool staleness guard structurally cannot
+        // see: a feed that has stopped entirely, where every pool ages
+        // together and nothing looks stale relative to anything else.
+        let last_ms = self.stats.last_update_ms.load(Ordering::Relaxed);
+        let feed_age_ms =
+            if last_ms == 0 { u64::MAX } else { now_ms().saturating_sub(last_ms) };
+        let feed_stalled = feed_age_ms >= FEED_STALL_SECS * 1_000;
+        if feed_stalled != self.was_stalled {
+            if feed_stalled {
+                tracing::warn!(
+                    "feed silent for over {FEED_STALL_SECS}s — pausing the ledger; \
+                     sweeps continue but nothing is recorded"
+                );
+            } else {
+                tracing::info!("feed recovered — recording resumed");
+            }
+            self.was_stalled = feed_stalled;
+        }
+        if sweep.stale_excluded != self.last_stale_excluded {
+            if sweep.stale_excluded > 0 {
+                tracing::warn!(
+                    "{} pool(s) excluded from the sweep for lagging over {} slots",
+                    sweep.stale_excluded,
+                    live::MAX_STALE_LAG_SLOTS,
+                );
+            }
+            self.last_stale_excluded = sweep.stale_excluded;
+        }
+
+        if let Ok(mut g) = self.shared.lock() {
+            *g = SweepSummary {
+                // Report the *current* best, not an all-time high-water
+                // mark: a record from ten minutes ago describes nothing.
+                best: sweep.best().cloned(),
+                tradeable: sweep.tradeable().cloned(),
+                tradeable_min_usd: sweep.tradeable_min_usd,
+                stale_excluded: sweep.stale_excluded,
+                feed_stalled,
+                evaluated_total: self.evaluated_total,
+                sweep_us: sweep.duration_us,
+                pools_ready: self.market.ready_count(),
+                venues: self.market.venue_count(),
+                sol_price_usd: self.market.sol_price_usd().unwrap_or(0.0),
+                slot: sweep.slot,
+                reconcile_drift: self.drift.0,
+                reconcile_checked: self.drift.1,
+            };
+        }
+
+        self.sweep_n = self.sweep_n.wrapping_add(1);
+        self.record_sweep(&sweep, feed_stalled);
+
+        if !sweep.rows.is_empty() && self.sweep_n % PUBLISH_EVERY_N_SWEEPS == 0 {
+            self.bus.publish(Event::Routes {
+                rows: sweep.rows.iter().map(RouteRow::from).collect(),
+                tradeable_min_usd: sweep.tradeable_min_usd,
+                evaluated: sweep.evaluated,
+                sweep_us: sweep.duration_us,
+                slot: sweep.slot,
+                ts_ms: now_ms(),
+            });
+        }
+
+        let sol_price = self.market.sol_price_usd().unwrap_or(0.0);
+        // Reset every sweep: this is a budget per pass, not per run.
+        //
+        // Two counters rather than one flag, because attempting and
+        // submitting are different acts with different hazards. See
+        // [`MAX_ATTEMPTS_PER_SWEEP`].
+        let mut budget = SweepBudget::default();
+        // Left in the order the scanner produced: best gross profit first.
+        //
+        // Re-examined against every attempt the ledger can label, because the
+        // obvious improvement here is wrong and the next reader should not
+        // have to rediscover that. 2,362 attempts split cleanly: 254 built a
+        // route whose floor beat its input and reached simulation, 2,108 died
+        // at the re-price. Scoring each candidate ordering by how well it puts
+        // the survivors first — AUC, 0.5 being a coin flip:
+        //
+        // | ordering                                   | AUC   |
+        // |--------------------------------------------|-------|
+        // | gross profit — what the scanner already does| 0.729 |
+        // | gross, net edge over 10 bps pushed to back  | 0.700 |
+        // | same, thresholds at 5 / 8 / 15 / 25 bps     | 0.673-0.705 |
+        // | detected net edge alone                     | 0.461 |
+        // | cheapest fee first                          | 0.517 |
+        //
+        // A seven-feature logistic regression on the same labels, fitted on
+        // the first 70% and scored on the last 30%, reaches 0.788 held out and
+        // still loses to plain gross.
+        //
+        // The tempting story was that a very large detected edge is an
+        // artefact — a concentrated pool quoting a price no size can trade at.
+        // It is not: attempts above 10 bps of net edge reach simulation 9.2%
+        // of the time against 11.0% below it. The apparent cliff came from
+        // counting *submissions*, of which there have only ever been twelve;
+        // at that base rate the high-edge group would be expected to yield
+        // about 1.3, so observing none says nothing.
+        //
+        // Rank by gross. Do not rank by edge — that is worse than a coin flip.
+        //
+        // Read before the move, because `too_stale_to_trade` needs the head
+        // the sweep was taken against and the sweep is about to be consumed.
+        let sweep_slot = sweep.slot;
+        let opportunities = sweep.opportunities;
+        // Bounded, the same way the event bus is: a cycle refused once and
+        // never seen again must not sit in this map for the life of the
+        // process. Five times the cooldown is generous headroom for a cycle
+        // that is still actively being retried; anything older than that is
+        // history, not state.
+        self.cooldowns.prune();
+        self.last_recorded.retain(|_, (_, _, at)| at.elapsed() < UNCHANGED_RECORD_EVERY);
+        for opp in opportunities {
+            self.on_opportunity(trader.as_deref_mut(), opp, sweep_slot, sol_price, feed_stalled, &mut budget)
+                .await;
+        }
+    }
+
+    /// Write one sweep in `LEDGER_EVERY_N_SWEEPS` to the ledger.
+    fn record_sweep(&self, sweep: &live::Sweep, feed_stalled: bool) {
+        // Nothing is recorded while the feed is stalled: the numbers would
+        // describe a market that has stopped being observed, and they would
+        // be indistinguishable afterwards from ones that had.
+        if let (Some(l), Some(best), false) =
+            (self.ledger.as_ref(), sweep.best(), feed_stalled)
+        {
+            if self.sweep_n % LEDGER_EVERY_N_SWEEPS == 0 {
+                let tradeable = sweep.tradeable();
+                let sample = cb_ledger::SweepSample {
+                    slot: sweep.slot,
+                    evaluated: sweep.evaluated,
+                    clearing: sweep.clearing,
+                    best_edge_bps: best.edge_bps,
+                    best_dislocation_bps: best.dislocation_bps,
+                    best_fee_bps: best.fee_bps,
+                    best_route: best.route.clone(),
+                    best_venues: best.venues.clone(),
+                    best_hops: best.hops,
+                    best_depth_usd: best.depth_usd,
+                    sol_price_usd: self.market.sol_price_usd().unwrap_or(0.0),
+                    pools_ready: self.market.ready_count(),
+                    sweep_us: sweep.duration_us,
+                    tradeable_edge_bps: tradeable.map(|t| t.edge_bps),
+                    tradeable_dislocation_bps: tradeable.map(|t| t.dislocation_bps),
+                    tradeable_fee_bps: tradeable.map(|t| t.fee_bps),
+                    tradeable_depth_usd: tradeable.map(|t| t.depth_usd),
+                    tradeable_route: tradeable
+                        .map_or_else(String::new, |t| t.route.clone()),
+                    stale_excluded: sweep.stale_excluded,
+                    depth_measured: true,
+                };
+                if let Err(e) = l.record_sweep(&sample) {
+                    tracing::warn!("could not record sweep: {e:#}");
+                }
+            }
+        }
+    }
+
+    /// Everything that happens to one detected cycle: price its tip, decide what to do
+    /// with it and do it, write its row, and tell the window.
+    async fn on_opportunity(
+        &mut self,
+        trader: Option<&mut execute::Trader>,
+        opp: live::LiveOpportunity,
+        sweep_slot: u64,
+        sol_price: f64,
+        feed_stalled: bool,
+        budget: &mut SweepBudget,
+    ) {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        // Uncontested cycles pay the tip floor; contested ones get bid
+        // up to most of the profit. A cycle worth more than a cent on
+        // a major pair will have been seen by faster searchers too.
+        // Still recorded, because "big enough that somebody faster has
+        // seen this too" remains a true and useful fact about a cycle.
+        // It is no longer charged as a cost — see `tip_cost_usd`.
+        let contested = opp.gross_profit_usd > CONTESTED_USD;
+        let est_tip_usd = tip_cost_usd(opp.gross_profit_usd, sol_price);
+        let base_fee_usd = BASE_FEE_SOL * sol_price;
+        let net = opp.gross_profit_usd - est_tip_usd - base_fee_usd;
+
+        // Competition is charged once, in the tip, and not again here.
+        //
+        // This used to also decline every contested cycle outright,
+        // *after* pricing in a tip sized to win it — paying to win the
+        // race and then refusing to enter. The ledger says the flag was
+        // not detecting races anyway: cycles declined as contested were
+        // still quotable a slot later 27.9% of the time against 15.3%
+        // for everything else, so they survived *better*, which is what
+        // it looks like when nobody took them. A $0.01 threshold sorts
+        // by size and calls the big ones a race.
+        //
+        // What remains is the honest question: a bundle that loses does
+        // not land, so a lost race costs the base fee or nothing at all.
+        // Anything still positive after the tip it would have to pay is
+        // worth attempting. See `race_ladder` for what the assumption is
+        // worth at each win rate.
+        let skipped = if net <= 0.0 {
+            Some("net negative after tip".to_string())
+        } else {
+            None
+        };
+
+        // Decide what actually happened BEFORE anything is recorded.
+        //
+        // This used to write the fill first, with `taken: skipped.is_none()`,
+        // and only then try to execute. In paper mode that is exactly right:
+        // "taken" means "would have been taken" and there is nothing else it
+        // could mean. In live mode it was a lie — a row saying `taken` with a
+        // realised P&L, written before a single byte had left the machine.
+        //
+        // It showed up as the History panel reporting 9 trades and $0.0251
+        // realised against a wallet whose balance had not moved and whose
+        // explorer showed no transactions. The instrument was reporting money
+        // it had not made, while live. That is the §4 failure mode, in the
+        // one place where believing it costs real money.
+        let mut fate = Fate { reason: skipped.clone(), ..Fate::default() };
+
+        if skipped.is_none() {
+            match trader {
+                // Paper: nothing is submitted and nothing pretends to be.
+                // `landed` stays what it has always been for the paper
+                // measurement — the assumption the whole archive rests on.
+                None => {
+                    fate.landed = true;
+                    fate.realised = net;
+                    fate.reason = Some("paper — uncontested, assumed landed".into());
+                }
+                Some(t) => self.consider(t, &opp, net, sweep_slot, budget, &mut fate).await,
+            }
+        }
+
+        self.record_fill(&opp, est_tip_usd, sweep_slot, feed_stalled, &mut fate);
+        if let Some(p) = fate.pending.take() {
+            self.pending_sends.push(p);
+        }
+
+        self.bus.publish(Event::Opportunity {
+            id,
+            route: opp.route.clone(),
+            venues: opp.venues.clone(),
+            hops: opp.hops,
+            edge_bps: opp.edge_bps,
+            dislocation_bps: opp.edge_bps + opp.fee_bps,
+            fee_bps: opp.fee_bps,
+            optimal_size_usd: opp.optimal_size_usd,
+            capped_size_usd: opp.size_usd,
+            capital_reach_pct: if opp.optimal_size_usd > 0.0 {
+                100.0 * opp.size_usd / opp.optimal_size_usd
+            } else {
+                100.0
+            },
+            gross_profit_usd: opp.gross_profit_usd,
+            profit_at_optimal_usd: opp.profit_at_optimal_usd,
+            est_tip_usd,
+            net_profit_usd: net,
+            contested,
+            skipped_reason: skipped.clone(),
+            slot: opp.slot,
+            ts_ms: now_ms(),
+        });
+
+        if skipped.is_some() {
+            return;
+        }
+
+        self.bus.publish(Event::Execution {
+            id,
+            opportunity_id: id,
+            paper: self.paper_run,
+            landed: fate.landed,
+            realised_usd: fate.realised,
+            tip_paid_usd: est_tip_usd,
+            latency_ms: fate.latency_ms,
+            signature: fate.signature,
+            reason: fate.reason,
+            ts_ms: now_ms(),
+        });
+    }
+
+    /// Decide whether a live candidate is attempted, measured, or passed over — and why —
+    /// and do it.
+    async fn consider(
+        &mut self,
+        t: &mut execute::Trader,
+        opp: &live::LiveOpportunity,
+        net: f64,
+        sweep_slot: u64,
+        budget: &mut SweepBudget,
+        fate: &mut Fate,
+    ) {
+        // One attempt per sweep, on the first encodable survivor
+        // of a list already sorted by gross profit. Submitting a
+        // dozen transactions against overlapping pools in one slot
+        // would have each invalidate the next. And not a cycle
+        // that was already refused within the cooldown window —
+        // see `recent_refusals`'s own comment for why.
+        let on_cooldown = self.cooldowns.holds(&opp.cycle_key, opp.edge_bps);
+        // Legs priced too far apart in time are not an
+        // opportunity, they are the clock.
+        //
+        // `slot_spread` has been measured on every cycle
+        // since the artifact was first found, and `--report`
+        // has a whole section arguing that an edge which
+        // grows with the gap between two observations was
+        // never simultaneously on offer. It was never wired
+        // to execution, and the omission was worse than
+        // neutral: candidates are taken best-gross-first, and
+        // gross grows with skew, so the selection walked
+        // straight up the artifact every sweep. One live run
+        // measured it — mean detected edge by spread band,
+        // 1.27 bps at 0-1 slots against 3.42 bps at 21+ — and
+        // all 26 of that run's attempts came from the skewed
+        // bands, none from the simultaneous one. Every one was
+        // refused for a loss once re-priced against fresh
+        // state, by 0.3 to 4.7 bps.
+        let too_skewed = too_skewed_to_trade(opp.slot_spread);
+        // A route whose own fee is larger than any
+        // disagreement that survives the trip to the chain.
+        // See `EXECUTABLE_FEE_CEILING_BPS` for the measured
+        // table this comes from.
+        let too_expensive = too_expensive_to_trade(opp.fee_bps);
+        // Priced from state the feed had already moved past.
+        // `too_skewed` cannot see this: both legs can be
+        // equally old, which is a spread of zero and a price
+        // from minutes ago. See `MAX_EXECUTABLE_LEG_LAG_SLOTS`
+        // for the eleven-hour measurement that says three
+        // quarters of this instrument's detections are this,
+        // and that what they are worth on fresh state is
+        // 0.37 bps against a 3.00 bps fee.
+        let too_stale = too_stale_to_trade(sweep_slot, opp.slot);
+        // Read before the filter so the refusal can say
+        // *which* venue is missing an encoder, instead of
+        // leaving it pooled with "somebody else went first".
+        let blocked_by = opp.plan.as_ref().and_then(
+            execute::CyclePlan::blocking_venue,
+        );
+        // A mint the wallet was just shown it cannot start a
+        // trade in. Cheap here, and the alternative is two
+        // RPC round trips to be told the same thing by the
+        // balance the executor fetches.
+        let unfundable_entry = opp
+            .plan
+            .as_ref()
+            .and_then(|pl| pl.mints.first())
+            .is_some_and(|m| self.cooldowns.unfundable(m));
+        // Everything that disqualifies a candidate for
+        // reasons that have nothing to do with its fee.
+        // A shape this trader can never send, whatever its price —
+        // a USDC-start cycle under Jito or Sender, a venue it cannot re-price.
+        // Refused inside the attempt too, but only after it had taken
+        // one of the sweep's few attempt slots: 363 times in one run,
+        // each crowding out a cycle that could have been sent.
+        let unsendable =
+            opp.plan.as_ref().is_some_and(|pl| !t.could_execute(pl));
+        let barred = budget.submitted
+            || budget.attempts >= MAX_ATTEMPTS_PER_SWEEP
+            || on_cooldown
+            || unfundable_entry
+            || unsendable;
+        // The two filters that reject a candidate by making a
+        // claim about what would have happened to it, rather
+        // than by observing something that already has. Both
+        // were calibrated on samples of a few dozen, both
+        // reject thousands of candidates an hour, and neither
+        // has been rechecked since. An unchecked claim is an
+        // assumption wearing a measurement's clothes.
+        let held_back_by_a_claim =
+            too_expensive || too_skewed || too_stale;
+        // A candidate the fee ceiling is the *only* thing
+        // standing between and an attempt. This is the class
+        // the ceiling has been rejecting sight-unseen — 30,262
+        // of them in one seven-hour run, 7,659 of those showing
+        // a detected gross over two cents — and the ceiling's
+        // own evidence is thin: it rests on 47 attempts in the
+        // 4-7 bps band, which is consistent with a survival
+        // rate anywhere up to about 6%. At the grosses this
+        // band carries, 6% would be worth having. Measure it.
+        let worth_measuring = !barred
+            && held_back_by_a_claim
+            && budget.probes < MAX_PROBES_PER_SWEEP;
+        // Under Jito the measurement *is* the trade. A probe
+        // re-prices on fresh state and simulates, then stops;
+        // an attempt does exactly the same and then sends a
+        // bundle whose floor guarantees the fee and the tip on
+        // chain, and which costs nothing if it misses. The
+        // claims above were written to save the fee a failed
+        // RPC send paid — under Jito there is no such fee left
+        // to save, and holding them to a probe only means a
+        // route that simulates profitably is written down
+        // instead of taken. That happened on 2026-09-23 at
+        // 13:09: a probe cleared its floor by 8,958 lamports
+        // and was logged, not sent.
+        //
+        // Under Sender too. A miss after the send costs the
+        // base and priority fees there, but a Sender trade is
+        // always simulated first, against the same transaction
+        // and floor a probe would build — a post-balance net of
+        // the base fee, the priority fee and the tip — and is
+        // sent only if it clears. So the attempt *is* the probe
+        // plus a send its own simulation has proven, and the
+        // risk gate still judges it. Probe-only cost two routes
+        // that simulated past their floor on 2026-11-07
+        // (23.93 and 29.94 bps, both over the fee ceiling).
+        //
+        // Same budget as the probe it replaces, so the RPC load
+        // does not change.
+        let promoted = worth_measuring
+            && promotes_held_back(t.submit())
+            && opp.plan.as_ref().is_some_and(execute::CyclePlan::encodable);
+        if promoted {
+            budget.probes += 1;
+        }
+        let candidate = if barred || (held_back_by_a_claim && !promoted) {
+            None
+        } else {
+            opp.plan.as_ref().filter(|pl| pl.encodable())
+        };
+        let to_measure = if worth_measuring && !promoted {
+            opp.plan.as_ref().filter(|pl| pl.encodable())
+        } else {
+            None
+        };
+        match candidate {
+            None => {
+                if let Some(probe_plan) = to_measure {
+                    budget.probes += 1;
+                    self.measure(t, opp, probe_plan, net, fate).await;
+                } else {
+                    fate.reason = Some(if on_cooldown {
+                        "not attempted — refused recently and \
+                         nothing has changed"
+                            .to_string()
+                    } else if too_stale {
+                        format!(
+                            "not attempted — the stalest leg is {} \
+                             slots behind the feed's own head, over \
+                             the {MAX_EXECUTABLE_LEG_LAG_SLOTS} this \
+                             will trade on; on fresh state this class \
+                             is worth 0.37 bps against a 3.00 bps fee",
+                            sweep_slot.saturating_sub(opp.slot)
+                        )
+                    } else if too_skewed {
+                        format!(
+                            "not attempted — legs priced {} slots \
+                             apart, over the {MAX_EXECUTABLE_SLOT_SPREAD} \
+                             this will trade on; the gap is the clock, \
+                             not a disagreement between venues",
+                            opp.slot_spread
+                        )
+                    } else if too_expensive {
+                        format!(
+                            "not attempted — the round trip costs \
+                             {:.2} bps, over the \
+                             {EXECUTABLE_FEE_CEILING_BPS} bps that have \
+                             produced every survivor so far; this sweep \
+                             had no probe budget left to check whether \
+                             that still holds",
+                            opp.fee_bps
+                        )
+                    } else if unfundable_entry {
+                        "not attempted — the wallet cannot start a \
+                         trade in this cycle's entry mint; the same \
+                         loop entered from SOL is not held by this"
+                            .to_string()
+                    } else if unsendable && blocked_by.is_none() {
+                        format!(
+                            "not attempted — this shape cannot be sent: through {} only \
+                             a cycle that starts and ends in SOL has its fee guaranteed \
+                             on chain, and a binned pool leaves room for two hops",
+                            t.send_path()
+                        )
+                    } else if let Some(dex) = blocked_by {
+                        // Its own message. Pooled with the
+                        // sweep budget these were unreadable,
+                        // and the two ask for opposite things:
+                        // one is a queue, the other is an
+                        // encoder somebody has to write.
+                        format!(
+                            "not attempted — {} has no encoder",
+                            dex.name()
+                        )
+                    } else {
+                        format!(
+                            "not attempted — this sweep's {} attempts \
+                             went to other cycles",
+                            MAX_ATTEMPTS_PER_SWEEP
+                        )
+                    });
+                }
+            }
+            Some(plan) => self.attempt(t, opp, plan, net, budget, fate).await,
+        }
+    }
+
+    /// Simulate a candidate one of the claims held back, without trading it, and keep
+    /// what the simulation said.
+    async fn measure(
+        &mut self,
+        t: &mut execute::Trader,
+        opp: &live::LiveOpportunity,
+        probe_plan: &execute::CyclePlan,
+        net: f64,
+        fate: &mut Fate,
+    ) {
+        if t.could_execute(probe_plan) {
+            note_demand(&mut self.demand, probe_plan, net, &self.protected);
+        }
+        let started = std::time::Instant::now();
+        let r = t
+            .attempt(
+                probe_plan,
+                opp.size_usd,
+                net,
+                execute::Intent::Measure,
+            )
+            .await;
+        fate.latency_ms =
+            started.elapsed().as_millis() as u64;
+        fate.reason = Some(match r {
+            Ok(cb_executor::Attempt::Probed(found)) => {
+                // A filter being wrong is the most
+                // valuable thing this run can find,
+                // and it is invisible in a file that
+                // is otherwise all refusals. Logged
+                // at ERROR for the same reason a
+                // submission is.
+                if found.would_have_profited() {
+                    tracing::error!(
+                        fee_bps = opp.fee_bps,
+                        slot_spread = opp.slot_spread,
+                        gross_usd = opp.gross_profit_usd,
+                        "a filter held back a \
+                         route that simulated \
+                         profitably — {found}"
+                    );
+                }
+                found.to_string()
+            }
+            // `Measure` cannot come back any other
+            // way, but the refusals on the way in —
+            // no encoder, unfundable entry — are
+            // still worth keeping verbatim.
+            Ok(cb_executor::Attempt::Refused(why)) => {
+                format!("probe not run: {why}")
+            }
+            Ok(other) => {
+                format!("probe returned {other:?}")
+            }
+            Err(e) => format!("probe failed: {e}"),
+        });
+        // One measurement of a cycle is enough for a
+        // while; the budget is better spent on the
+        // next distinct loop than on this one again
+        // next sweep.
+        self.cooldowns.hold(&opp.cycle_key, STRUCTURAL_COOLDOWN);
+    }
+
+    /// Attempt to trade `plan`; bring the market, the lookup table and the wallet's
+    /// accounts up to what the attempt found; then account for its answer.
+    async fn attempt(
+        &mut self,
+        t: &mut execute::Trader,
+        opp: &live::LiveOpportunity,
+        plan: &execute::CyclePlan,
+        net: f64,
+        budget: &mut SweepBudget,
+        fate: &mut Fate,
+    ) {
+        budget.attempts += 1;
+        if t.could_execute(plan) {
+            note_demand(&mut self.demand, plan, net, &self.protected);
+        }
+        let started = std::time::Instant::now();
+        let r = t
+            .attempt(
+                plan,
+                opp.size_usd,
+                net,
+                execute::Intent::Trade,
+            )
+            .await;
+        // A loss on the fresh read means the feed's copy of at
+        // least one of these pools is behind the chain. Re-read
+        // them now, so the next sweep does not detect the same
+        // phantom through a different partner venue.
+        if let Ok(cb_executor::Attempt::Refused(why)) = &r {
+            if why.contains("guarantees only")
+                || why.contains("the floor would let through")
+            {
+                let ids: Vec<_> =
+                    plan.pools.iter().map(|(p, _)| *p).collect();
+                if let Err(e) = self.market.refresh(&ids).await {
+                    tracing::debug!("could not re-read a stale cycle: {e:#}");
+                }
+            }
+        }
+        // Cleared its floor and did not fit a packet: put what it
+        // names into the lookup table, so the next attempt fits.
+        grow_lookup_table(t, &mut self.lookup_grows).await;
+        if matches!(r, Ok(cb_executor::Attempt::Refused(_))) {
+            rotate_for(
+                t,
+                plan,
+                &mut self.demand,
+                &self.protected,
+                self.token_slots,
+                &mut self.account_opens,
+            )
+            .await;
+        }
+        fate.latency_ms = started.elapsed().as_millis() as u64;
+        self.on_attempt_outcome(t, r, opp, plan, budget, fate);
+        // The gate being halted is a global state, not
+        // a fact about this one cycle, so it does not
+        // fit the per-cycle-key cooldown above — every
+        // distinct cycle the sweep finds would otherwise
+        // re-announce the same halt once each. Throttled
+        // on its own timer instead: announced once, then
+        // at most once more per cooldown window for as
+        // long as it stays true, however many different
+        // cycles keep asking in between.
+        if let Some(why) = t.halted() {
+            if self.cooldowns.should_announce_halt() {
+                tracing::error!("trading halted: {why}");
+            }
+        }
+    }
+
+    /// What a trade attempt's answer means for the risk gate, for how long its cycle is
+    /// held off and kept quiet about, for this sweep's budget, and for its row. A
+    /// submission becomes a `PendingSend` for the confirm timer to follow.
+    fn on_attempt_outcome(
+        &mut self,
+        t: &mut execute::Trader,
+        r: anyhow::Result<cb_executor::Attempt>,
+        opp: &live::LiveOpportunity,
+        plan: &execute::CyclePlan,
+        budget: &mut SweepBudget,
+        fate: &mut Fate,
+    ) {
+        match r {
+            Ok(cb_executor::Attempt::Submitted {
+                signature: sig,
+                bundle_id,
+                ..
+            }) => {
+                // Submitted is not confirmed. The signature
+                // is a receipt for having asked, so the
+                // realised figure stays zero until a
+                // confirmation path fills it in — a P&L
+                // nobody has confirmed is not a P&L.
+                t.record(
+                    cb_executor::risk::Outcome::Landed {
+                        net_usd: 0.0,
+                    },
+                );
+                // The sweep is finished here whatever
+                // its attempt budget had left. This is
+                // the hazard the old one-attempt rule
+                // existed for: a second transaction
+                // against an overlapping pool in the
+                // same slot invalidates the first.
+                budget.submitted = true;
+                if t.sends_via_jito() {
+                    tracing::error!(
+                        "submitted {sig} (bundle {})",
+                        bundle_id.as_deref().unwrap_or("none — Jito made no bundle")
+                    );
+                } else {
+                    tracing::error!("submitted {sig}");
+                }
+                fate.signature = Some(sig.clone());
+                // What became of it is asked by the
+                // confirm timer, off this loop: waiting
+                // here left the bot blind to the market
+                // for five seconds after every send. See
+                // `PendingSend`.
+                fate.reason = Some(if t.sends_via_jito() {
+                    "sent to Jito; awaiting inclusion".to_string()
+                } else {
+                    "submitted; awaiting confirmation".to_string()
+                });
+                fate.pending = Some(PendingSend {
+                    sig: sig.clone(),
+                    bundle_id,
+                    sent_at: std::time::Instant::now(),
+                    row: None,
+                    via_jito: t.sends_via_jito(),
+                    probe_tip: None,
+                    pools: plan.pools.iter().map(|(k, _)| *k).collect(),
+                    sent_slot: self.stats.last_slot.load(Ordering::Relaxed),
+                });
+            }
+            Ok(cb_executor::Attempt::SimulationRejected {
+                reason,
+                ..
+            }) => {
+                // A rejection here is the chain saying the
+                // price moved between the quote and the
+                // simulation — the most transient fact
+                // there is, and no reason to stop watching
+                // this cycle for fifty slots. Held off
+                // briefly so another cycle gets this
+                // sweep's one attempt, and logged on the
+                // long window so a cycle failing all
+                // minute does not fill the log.
+                if self.cooldowns.should_log(&opp.cycle_key) {
+                    tracing::warn!(
+                        "simulation rejected: {reason}"
+                    );
+                }
+                fate.reason =
+                    Some(format!("simulation: {reason}"));
+                self.cooldowns.hold(&opp.cycle_key, PRICE_MOVED_COOLDOWN);
+            }
+            Ok(cb_executor::Attempt::Refused(why)) => {
+                // Logged at info, not debug. A live run
+                // that refuses everything must say so in
+                // the log the operator actually reads;
+                // at debug this was invisible and looked
+                // like nothing happening at all. Logged
+                // once per cooldown window rather than
+                // once per sweep — see `recent_refusals`.
+                if self.cooldowns.should_log_refusal(&opp.cycle_key, &why) {
+                    tracing::info!("refused: {why}");
+                }
+                fate.reason =
+                    Some(format!("refused: {why}"));
+                // Nothing was signed and nothing was sent:
+                // the executor read a balance and stopped.
+                // Charging the sweep's single attempt for
+                // that hands the slot to nobody, when the
+                // rotation of this very loop that *can* be
+                // funded is further down the same list.
+                // The mint is held instead, so the round
+                // trip is not repeated either.
+                if refused_for_entry_mint(&why) {
+                    if let Some(m) = plan.mints.first() {
+                        self.cooldowns.hold_entry(*m);
+                    }
+                    budget.attempts =
+                        budget.attempts.saturating_sub(1);
+                }
+                // A halt earns no per-cycle hold: it is one
+                // fact about the gate, and holding every
+                // cycle seen during it would leave them all
+                // still held for the window *after* the halt
+                // lifts — precisely when they should be
+                // retried.
+                self.cooldowns.hold_after_refusal(&opp.cycle_key, opp.edge_bps, &why);
+            }
+            // `Intent::Trade` has no path that
+            // produces one, and the day it does the
+            // right answer is not to pretend a
+            // measurement was a trade.
+            Ok(cb_executor::Attempt::Probed(found)) => {
+                tracing::error!(
+                    "a trade attempt came back as a \
+                     measurement, which should be \
+                     impossible: {found}"
+                );
+                fate.reason =
+                    Some(format!("unexpected {found}"));
+            }
+            Err(e) => {
+                // An RPC failure is not a defect in what
+                // was built, so it must not trip the
+                // breaker that exists to catch defects.
+                t.record(cb_executor::risk::Outcome::Missed);
+                tracing::warn!(
+                    "execution could not reach the chain: {e:#}"
+                );
+                fate.reason =
+                    Some(format!("rpc error: {e}"));
+            }
+        }
+    }
+
+    /// Write an opportunity's row to the ledger — unless nothing was attempted and
+    /// nothing about it has changed since its last row — and give a send its row number.
+    fn record_fill(
+        &mut self,
+        opp: &live::LiveOpportunity,
+        est_tip_usd: f64,
+        sweep_slot: u64,
+        feed_stalled: bool,
+        fate: &mut Fate,
+    ) {
+        // Nothing attempted and nothing different since the last row for
+        // this cycle: not written again until a minute has passed. See
+        // `UNCHANGED_RECORD_EVERY`.
+        let unchanged_row = fate.latency_ms == 0
+            && !fate.landed
+            && fate.pending.is_none()
+            && self.last_recorded.get(&opp.cycle_key).is_some_and(|(edge, reason, at)| {
+                *edge == opp.edge_bps.to_bits()
+                    && *reason == fate.reason
+                    && at.elapsed() < UNCHANGED_RECORD_EVERY
+            });
+        if !unchanged_row {
+            self.last_recorded.insert(
+                opp.cycle_key.clone(),
+                (opp.edge_bps.to_bits(), fate.reason.clone(), std::time::Instant::now()),
+            );
+        }
+        if let (Some(l), false, false) = (self.ledger.as_ref(), feed_stalled, unchanged_row) {
+            let rec = cb_ledger::FillRecord {
+                slot: opp.slot,
+                route: opp.route.clone(),
+                venues: opp.venues.clone(),
+                hops: opp.hops,
+                edge_bps: opp.edge_bps,
+                dislocation_bps: opp.edge_bps + opp.fee_bps,
+                fee_bps: opp.fee_bps,
+                size_usd: opp.size_usd,
+                optimal_size_usd: opp.optimal_size_usd,
+                gross_usd: opp.gross_profit_usd,
+                profit_at_optimal_usd: opp.profit_at_optimal_usd,
+                tip_usd: est_tip_usd,
+                // The realised figure, not the hoped-for one. In paper these
+                // are the same number; in live they are not, and the whole
+                // point of the run is the difference.
+                net_usd: fate.realised,
+                taken: fate.landed,
+                skipped_reason: fate.reason.clone(),
+                cycle_key: opp.cycle_key.clone(),
+                profit_at_capital_usd: Some(opp.profit_at_capital_usd),
+                slot_spread: Some(opp.slot_spread),
+                leg_lag_slots: Some(sweep_slot.saturating_sub(opp.slot)),
+                // Zero means nothing was attempted, and that is a
+                // different fact from a fast attempt — so it is
+                // recorded as "not measured" rather than as speed.
+                latency_ms: (fate.latency_ms > 0).then_some(fate.latency_ms),
+            };
+            match l.record_fill(&rec) {
+                Ok(id) => {
+                    if let Some(p) = fate.pending.as_mut() {
+                        p.row = Some(id);
+                    }
+                }
+                Err(e) => tracing::warn!("could not record fill: {e}"),
+            }
+        }
+    }
 }
 
 /// Buckets for the distance-to-profitable histogram, in bps.
@@ -3675,6 +4241,34 @@ async fn jupiter_quote(
 mod tests {
     use super::*;
 
+    /// 2026-11-07: 13 managed, cap 6, two closes a tick, and every close that did not
+    /// confirm was forgotten as if it had: 15 accounts still open ten hours later. Over
+    /// the cap, every excess account is due each tick, and one whose close failed is
+    /// due again the next, until the wallet is at the cap. One holding a balance never is.
+    #[test]
+    fn the_excess_closer_keeps_selecting_until_the_wallet_is_at_the_cap() {
+        let d = demand::Demand::new(0);
+        let mut managed: std::collections::HashSet<cb_core::types::Pubkey32> =
+            (1..=13u8).map(|b| [b; 32]).collect();
+        let funded: std::collections::HashSet<_> = [[1u8; 32]].into_iter().collect();
+        assert_eq!(closes_due(&d, &managed, 6, &funded, 10).len(), 7, "all seven excess, not two");
+        let mut flaky = Some([2u8; 32]);
+        for _tick in 0..3 {
+            for m in closes_due(&d, &managed, 6, &funded, 10) {
+                assert!(!funded.contains(&m), "an account holding a balance is never closed");
+                // The first close of mint 2 does not land; it stays held.
+                if flaky == Some(m) {
+                    flaky = None;
+                    continue;
+                }
+                managed.remove(&m);
+            }
+        }
+        assert_eq!(managed.len(), 6);
+        assert!(managed.contains(&[1u8; 32]));
+        assert!(closes_due(&d, &managed, 6, &funded, 10).is_empty(), "at the cap");
+    }
+
     fn quote(out: u128, legs: &[(&str, &str)]) -> RouterQuote {
         RouterQuote {
             out,
@@ -3736,6 +4330,53 @@ mod tests {
         assert_eq!(q.venues(), "Orca (Whirlpools)", "a repeated venue reads once");
         let q = quote(1, &[("Orca (Whirlpools)", "a"), ("Raydium CLMM", "b")]);
         assert_eq!(q.venues(), "Orca (Whirlpools)+Raydium CLMM");
+    }
+
+    /// The status query asks about the bundle the block engine named, and derives an id
+    /// from the signature only when it named none. Against a local server: nothing is
+    /// sent anywhere real.
+    #[tokio::test]
+    async fn the_verdict_asks_about_the_header_id_when_there_is_one() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let sig = "3D9KSDtv242JrQh7TV1mv7KfihmqnurSP8vtWjCQ1sSWv8U7zTsvvZhPGa6Ri7tcKYTPDBw9uyy5KhBN8TVeUUFC";
+        assert_eq!(verdict_id(sig, Some("from-header")), "from-header");
+        assert_eq!(verdict_id(sig, None), cb_executor::jito::bundle_id(sig));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                // Until the JSON body has arrived, however the request was split.
+                while !String::from_utf8_lossy(&req).trim_end().ends_with('}') {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = tx.send(String::from_utf8_lossy(&req).into_owned());
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n\
+                          {\"jsonrpc\":\"2.0\",\"result\":{\"value\":[]},\"id\":1}",
+                    )
+                    .await;
+            }
+        });
+        let url = format!("http://{addr}/api/v1/transactions?bundleOnly=true");
+        let status = cb_executor::rpc::Rpc::new(url.clone()).unwrap().jito_status();
+        let asks = vec![
+            (sig.to_string(), verdict_id(sig, Some("from-header"))),
+            ("other".to_string(), verdict_id("other", None)),
+        ];
+        bundle_verdict(status, vec![url], None, asks, false).await;
+        let req = rx.recv().await.unwrap();
+        assert!(req.contains("/api/v1/getInflightBundleStatuses"), "{req}");
+        assert!(req.contains("\"from-header\""), "the header id is asked about: {req}");
+        assert!(!req.contains(&cb_executor::jito::bundle_id(sig)), "not the derived one: {req}");
+        assert!(req.contains(&cb_executor::jito::bundle_id("other")), "both ids in one request: {req}");
     }
 }
 
@@ -3831,6 +4472,30 @@ mod slot_spread_gate_tests {
                  not the clock"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod promotion_tests {
+    use super::{promotes_held_back, too_expensive_to_trade};
+    use crate::execute::Submit;
+
+    /// 2026-11-07: two routes the fee ceiling held back (23.93 and 29.94 bps) simulated
+    /// past their whole floor under Sender and were only logged. Under Sender a trade is
+    /// the probe plus a send gated on that same simulation (see the executor's
+    /// `a_trade_via_sender_*` tests), so a held-back route is attempted as a trade.
+    #[test]
+    fn under_sender_a_route_the_fee_ceiling_held_back_is_attempted_as_a_trade() {
+        assert!(too_expensive_to_trade(23.93));
+        assert!(promotes_held_back(Submit::Sender { tip_max_lamports: 20_000 }));
+    }
+
+    /// Jito keeps promoting; plain RPC keeps probing.
+    #[test]
+    fn jito_still_promotes_and_rpc_still_only_probes() {
+        assert!(promotes_held_back(Submit::Jito { tip_max_lamports: 20_000, simulate_first: true }));
+        assert!(promotes_held_back(Submit::Jito { tip_max_lamports: 20_000, simulate_first: false }));
+        assert!(!promotes_held_back(Submit::Rpc));
     }
 }
 

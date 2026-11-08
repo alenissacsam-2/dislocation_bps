@@ -275,6 +275,19 @@ pub fn measure_with(
     Ok(bincode::serialize(&tx)?.len())
 }
 
+/// The signature a signed transaction will be known by on chain: its first one, the
+/// fee payer's. Readable before sending, so a send that errors can still be followed.
+///
+/// # Errors
+/// If the text is not base64 of a transaction carrying at least one signature.
+pub fn signature_of(tx_base64: &str) -> Result<String> {
+    let raw = crate::rpc::base64_decode(tx_base64)
+        .ok_or_else(|| anyhow::anyhow!("the transaction is not valid base64"))?;
+    let tx: VersionedTransaction = bincode::deserialize(&raw)?;
+    let first = tx.signatures.first().ok_or_else(|| anyhow::anyhow!("the transaction carries no signature"))?;
+    Ok(first.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +430,21 @@ mod tests {
         assert_eq!(signed.account_count, unsigned.account_count);
         // But not the same bytes: one carries a real signature and one carries zeroes.
         assert_ne!(signed.tx_base64, unsigned.tx_base64);
+    }
+
+    /// The signature read back is the 64 bytes after the one-byte signature count,
+    /// which is the payer's signature as it goes on the wire.
+    #[test]
+    fn the_signature_of_a_signed_transaction_is_its_first_signature() {
+        let w = wallet();
+        let a = assemble(&w, &[noop(Pubkey::new_unique(), 3)], Hash::default()).unwrap();
+        let raw = crate::rpc::base64_decode_for_test(&a.tx_base64).expect("own output decodes");
+        assert_eq!(raw[0], 1);
+        let on_wire = bs58::encode(&raw[1..65]).into_string();
+        let read = signature_of(&a.tx_base64).unwrap();
+        assert_eq!(read, on_wire);
+        assert_ne!(read, Signature::default().to_string(), "a real signature, not a placeholder");
+        assert!(signature_of("not base64!").is_err());
     }
 
     /// A placeholder-signed transaction must not be mistakable for a sendable one.

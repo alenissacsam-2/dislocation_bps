@@ -5,7 +5,7 @@
 //! readers mostly touch disjoint keys.
 
 use crate::snapshot::Snapshot;
-use cb_core::types::{PoolId, PoolState, Pubkey32};
+use cb_core::types::{PoolId, PoolState};
 use dashmap::DashMap;
 
 #[derive(Default)]
@@ -91,16 +91,6 @@ impl PoolStore {
         (Snapshot::new(kept), excluded)
     }
 
-    /// Every pool that trades `mint`, in either position.
-    #[must_use]
-    pub fn pools_trading(&self, mint: &Pubkey32) -> Vec<PoolState> {
-        self.pools
-            .iter()
-            .filter(|r| r.mint_a == *mint || r.mint_b == *mint)
-            .map(|r| *r.value())
-            .collect()
-    }
-
     #[must_use]
     pub fn len(&self) -> usize {
         self.pools.len()
@@ -163,16 +153,6 @@ mod tests {
         s.upsert(pool(1, 10, 20, 200));
         s.upsert(pool(1, 10, 20, 100));
         assert_eq!(s.get(&PoolId([1; 32])).unwrap().slot, 200, "stale update must be dropped");
-    }
-
-    #[test]
-    fn pools_trading_finds_both_orientations() {
-        let s = PoolStore::new();
-        s.upsert(pool(1, 10, 20, 1));
-        s.upsert(pool(2, 20, 10, 1)); // reversed
-        s.upsert(pool(3, 30, 40, 1)); // unrelated
-        let found = s.pools_trading(&[10; 32]);
-        assert_eq!(found.len(), 2, "must match mint in either position");
     }
 
     #[test]

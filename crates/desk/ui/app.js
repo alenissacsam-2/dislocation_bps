@@ -1023,7 +1023,7 @@ function paintHistory() {
     $("btnBackLive").onclick = () => { S.viewingArchive = null; loadHistory(null); };
   }
   if (!H || !H.available) {
-    for (const c of cells) { $(c).textContent = "—"; $(c).classList.add("dim"); }
+    for (const c of cells) { $(c).textContent = "—"; $(c).classList.add("dim"); $(c).classList.remove("bad"); }
     $("hWindow").textContent = H ? (H.reason || "") : "";
     $("pnlNote").textContent = "no ledger yet — start the bot to begin one";
     return;
@@ -1040,6 +1040,7 @@ function paintHistory() {
   $("hTaken").textContent = last ? int(last.taken) : "—";
   $("hTakenSub").textContent = last && last.episodes ? ((last.taken / last.episodes) * 100).toFixed(1) + "% of what was seen" : "";
   $("hNet").textContent = money(L.realisedUsd ?? 0);
+  $("hNet").classList.toggle("bad", (L.realisedUsd ?? 0) < 0);
   const pies = eps.map((e) => e.pieUsd).filter((v) => v > 0).sort((a, b) => a - b);
   $("hMedian").textContent = pies.length ? money(pies[Math.floor(pies.length / 2)]) : "—";
 
@@ -1112,17 +1113,23 @@ function drawPnl(curve) {
   const pad = { l: 58, r: 14, t: 12, b: 16 };
   if (curve.length < 2) return empty(g, w, h, "no history yet");
   const vals = curve.map((c) => c.realisedUsd);
-  const lo = Math.min(0, ...vals), hi = Math.max(...vals, 1e-6);
+  const vmin = Math.min(0, ...vals), hi = Math.max(...vals, 1e-6);
+  // A loss gets the same headroom below zero that the top gets above the peak.
+  const lo = vmin < 0 ? vmin - (hi - vmin) * 0.12 : 0;
   const span = (hi - lo) * 1.12 || 1e-6;
   const X = (i) => pad.l + ((w - pad.l - pad.r) * i) / (curve.length - 1);
   const Y = (v) => h - pad.b - ((v - lo) / span) * (h - pad.t - pad.b);
-  const ticks = [0, 1, 2, 3].map((k) => lo + (span * k) / 3);
+  // With a loss on the chart, zero is a tick so the break-even line is always drawn.
+  // The extremes get a tick only when far enough from zero for the labels not to collide.
+  const far = (v) => Math.abs(v) > (hi - lo) * 0.2;
+  const ticks = lo < 0 ? [lo, 0, hi].filter((v) => v === 0 || far(v)) : [0, 1, 2, 3].map((k) => (span * k) / 3);
   grid(g, w, h, pad, ticks.map(Y));
   for (const v of ticks) label(g, money(v), pad.l - 8, Y(v));
 
+  // The area fills between the line and zero, so a loss shades below break-even.
   g.beginPath();
   vals.forEach((v, i) => (i ? g.lineTo(X(i), Y(v)) : g.moveTo(X(i), Y(v))));
-  g.lineTo(X(vals.length - 1), Y(lo)); g.lineTo(X(0), Y(lo)); g.closePath();
+  g.lineTo(X(vals.length - 1), Y(0)); g.lineTo(X(0), Y(0)); g.closePath();
   const grad = g.createLinearGradient(0, pad.t, 0, h - pad.b);
   grad.addColorStop(0, css("--teal-soft")); grad.addColorStop(1, "transparent");
   g.fillStyle = grad; g.fill();
@@ -1286,12 +1293,18 @@ async function paintDryRun() {
   paintBotWell();
 }
 
+// The bot reads dry_run once at start, so a running one is restarted to pick it up.
+function dryRestartNote(r) {
+  if (r.restartError) return ` The bot was stopped and could not be restarted: ${r.restartError}`;
+  return r.restarted ? " The bot was restarted to pick this up." : "";
+}
+
 $("btnAllowSpend").onclick = async () => {
   $("dryResult").textContent = "Applying…";
   try {
-    await invoke("set_dry_run", { dryRun: false, confirm: $("fSpendConfirm").value });
+    const r = await invoke("set_dry_run", { dryRun: false, confirm: $("fSpendConfirm").value });
     $("fSpendConfirm").value = "";
-    $("dryResult").textContent = "Real transactions are now allowed.";
+    $("dryResult").textContent = "Real transactions are now allowed." + dryRestartNote(r);
   } catch (e) {
     $("dryResult").textContent = "" + e;
   }
@@ -1302,8 +1315,8 @@ $("btnAllowSpend").onclick = async () => {
 $("btnDryRun").onclick = async () => {
   $("dryResult").textContent = "Applying…";
   try {
-    await invoke("set_dry_run", { dryRun: true, confirm: "" });
-    $("dryResult").textContent = "Back to dry run. Nothing will be submitted.";
+    const r = await invoke("set_dry_run", { dryRun: true, confirm: "" });
+    $("dryResult").textContent = "Back to dry run. Nothing will be submitted." + dryRestartNote(r);
   } catch (e) {
     $("dryResult").textContent = "" + e;
   }

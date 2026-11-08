@@ -72,3 +72,8 @@ lookup-table.json
 
 # Pools the on-chain census found (scripts/watchlist.cjs); regenerated between runs.
 watchlist.json
+
+# The day's realised P&L, kept outside the ledger so an archive cannot reset it.
+risk-day.json
+risk-day.json.tmp
+config.live-backup.toml

@@ -761,7 +761,7 @@ Design: `docs/superpowers/specs/2026-08-22-reporting-integrity-design.md`.
 The old run reported `best edge 1156.44 bps` on `SOL → TRUMP → USDC → SOL`, held for
 7+ seconds. It never became a fill — the largest TRUMP entry in `paper_fills` is
 12.7 bps — because two different searches ran each sweep and the report read the wrong
-one. `survey_from_base` prices *every* cycle at infinitesimal size; `find_from_base`
+one. `survey_and_find` returns two lists: the survey prices *every* cycle at infinitesimal size; the find
 returns only cycles with a feasible size, and only those ever become fills. A cycle
 with a downstream leg parked at its tick boundary has an enormous marginal rate and
 almost no capacity, so it topped a board ranked on rate alone. The signature was in

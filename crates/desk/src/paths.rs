@@ -148,17 +148,6 @@ impl Paths {
         let text = std::fs::read_to_string(Self::settings_file()).ok()?;
         serde_json::from_str(&text).ok()
     }
-
-    /// # Errors
-    /// If the settings directory cannot be created or the file cannot be written.
-    pub fn save(&self) -> anyhow::Result<()> {
-        let f = Self::settings_file();
-        if let Some(dir) = f.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(f, serde_json::to_string_pretty(self)?)?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]

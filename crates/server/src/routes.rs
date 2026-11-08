@@ -67,8 +67,30 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| push_events(socket, state.bus))
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    // Browsers skip CORS for WebSockets, so any open website could read this stream.
+    let origin = headers.get(axum::http::header::ORIGIN).map(|v| v.to_str().unwrap_or(""));
+    if !origin_allowed(origin) {
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    }
+    ws.on_upgrade(move |socket| push_events(socket, state.bus)).into_response()
+}
+
+/// No Origin = not a browser. Otherwise only loopback pages and the desk webview
+/// (`http://tauri.localhost` on Windows, `tauri://localhost` elsewhere).
+fn origin_allowed(origin: Option<&str>) -> bool {
+    let Some(origin) = origin else { return true };
+    let Some((scheme, rest)) = origin.split_once("://") else { return false };
+    let host = rest.strip_prefix("[::1]").map_or_else(
+        || rest.split(':').next().unwrap_or(""),
+        |_| "[::1]",
+    );
+    matches!(scheme, "http" | "https" | "tauri")
+        && matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "tauri.localhost")
 }
 
 /// The run's cumulative P&L, and what the same opportunities would have paid larger
@@ -157,13 +179,7 @@ async fn push_events(mut socket: WebSocket, bus: EventBus) {
     }
 }
 
-/// Convenience for wiring a bus into a server without a full bot.
-#[must_use]
-pub fn state(bus: EventBus, mode: impl Into<String>) -> AppState {
-    AppState { bus, mode: mode.into(), ledger_path: None }
-}
-
-/// The same, for a run that is recording — so the dashboard can show its history.
+/// Wire a bus into a server for a run that is recording — so the dashboard can show its history.
 #[must_use]
 pub fn state_with_ledger(
     bus: EventBus,
@@ -175,3 +191,22 @@ pub fn state_with_ledger(
 
 #[allow(unused_imports)]
 use Event as _EventInDocs;
+
+#[cfg(test)]
+mod tests {
+    use super::origin_allowed;
+
+    #[test]
+    fn only_local_origins_may_open_the_stream() {
+        for ok in [None, Some("http://tauri.localhost"), Some("tauri://localhost"),
+            Some("http://127.0.0.1:5178"), Some("http://localhost:8787"), Some("http://[::1]:80")]
+        {
+            assert!(origin_allowed(ok), "{ok:?}");
+        }
+        for bad in [Some("https://evil.com"), Some("http://localhost.evil.com"),
+            Some("http://127.0.0.1.evil.com"), Some("null"), Some("")]
+        {
+            assert!(!origin_allowed(bad), "{bad:?}");
+        }
+    }
+}

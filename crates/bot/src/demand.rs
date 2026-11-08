@@ -61,6 +61,27 @@ pub const DOMINANT_VALUE_MARGIN: f64 = 10.0;
 /// twice at $0.0000 expected, because every ask had cleared the base fee by a hair.
 pub const MIN_USD_TO_OPEN: f64 = 0.001;
 
+/// How long an account the bot opened is kept, at least, whatever the asks say.
+///
+/// A whole window, because idle means "nobody asked for a day", and an account opened
+/// less than a day ago was opened on asks from within that day: it cannot honestly have
+/// gone a day unasked. On 2026-11-07 the bot restarted 17 s after opening 6GmAF…, lost
+/// the asks it had not saved yet, closed the account 36 s after opening it, and opened
+/// it again a minute later: three transactions and three fees for nothing.
+pub const MIN_HOLD_SECS: u64 = WINDOW_SECS;
+
+/// The most one ask may claim to expect, in USD, and still count as evidence of value.
+///
+/// Real opportunities in this book are cents: the busiest mint on record averaged
+/// $0.054 an ask (412 asks, $22.14) and the richest $0.13 (2026-09-26), on a trade no
+/// larger than the max position ($13 live). On 2026-11-07 mispriced pump pools claimed
+/// $2,927,483,845 and $730,203,762, and the second bought an account. An ask above this
+/// still counts as asked for — opener and closer read the same events — but its value
+/// counts as nothing.
+/// shortcut: a fixed dollar figure, not a share of the trade; raise it if the book grows
+/// past a few hundred dollars.
+pub const MAX_CREDIBLE_ASK_USD: f64 = 1.0;
+
 /// How much one mint has been asked for over the window.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Score {
@@ -81,6 +102,10 @@ pub struct Demand {
     #[serde(default)]
     saved: u64,
     events: VecDeque<(u64, String, f64)>,
+    /// When the bot opened an account for each mint, in unix seconds, kept for
+    /// `MIN_HOLD_SECS`. Persisted with the asks, so a restart cannot forget it.
+    #[serde(default)]
+    opened: HashMap<String, u64>,
 }
 
 /// A save older than this at load time means the bot was stopped in between. The save
@@ -90,7 +115,7 @@ pub const DOWNTIME_GRACE_SECS: u64 = 15 * 60;
 impl Demand {
     #[must_use]
     pub fn new(now: u64) -> Self {
-        Self { since: now, saved: now, events: VecDeque::new() }
+        Self { since: now, saved: now, events: VecDeque::new(), opened: HashMap::new() }
     }
 
     /// Load the persisted window, or start a fresh one if there is none or it cannot be
@@ -110,6 +135,12 @@ impl Demand {
             d.since = d.since.saturating_add(now - d.saved).min(now);
         }
         d.saved = now;
+        // Asks saved before the credibility limit existed still carry their phantoms.
+        for e in &mut d.events {
+            if !(e.2.is_finite() && e.2 <= MAX_CREDIBLE_ASK_USD) {
+                e.2 = 0.0;
+            }
+        }
         d.prune(now);
         d
     }
@@ -128,12 +159,26 @@ impl Demand {
 
     /// Note that an attempt needed `mint`, expecting `usd` net.
     pub fn record(&mut self, now: u64, mint: &Pubkey32, usd: f64) {
-        let usd = if usd.is_finite() { usd.max(0.0) } else { 0.0 };
+        let usd = if usd.is_finite() && usd <= MAX_CREDIBLE_ASK_USD { usd.max(0.0) } else { 0.0 };
         self.events.push_back((now, bs58::encode(mint).into_string(), usd));
         self.prune(now);
     }
 
+    /// Note that the bot just opened an account for `mint`. The caller saves right
+    /// after: this record is what keeps the closer off the account across a restart.
+    pub fn note_opened(&mut self, now: u64, mint: &Pubkey32) {
+        self.opened.insert(bs58::encode(mint).into_string(), now);
+    }
+
+    /// Whether the bot opened `mint`'s account less than `MIN_HOLD_SECS` ago.
+    fn in_hold(&self, mint: &Pubkey32, now: u64) -> bool {
+        self.opened
+            .get(&bs58::encode(mint).into_string())
+            .is_some_and(|at| now < at.saturating_add(MIN_HOLD_SECS))
+    }
+
     fn prune(&mut self, now: u64) {
+        self.opened.retain(|_, at| now < at.saturating_add(MIN_HOLD_SECS));
         let cutoff = now.saturating_sub(WINDOW_SECS);
         while self.events.front().is_some_and(|(at, _, _)| *at < cutoff) {
             self.events.pop_front();
@@ -217,16 +262,55 @@ pub fn on_missing(
     (clearly_better || far_more_valuable).then_some(Move::Replace { open: *wanted, close: *weakest })
 }
 
-/// Accounts nothing has asked for in a whole watched day. Their deposit is capital the
-/// wallet can trade with instead.
+/// Accounts nothing has asked for in a whole watched day, and that the bot did not open
+/// in the last `MIN_HOLD_SECS`. Their deposit is capital the wallet can trade with.
+///
+/// "Asked for" is any ask in the window: the same events `on_missing` counts.
 #[must_use]
 pub fn idle(demand: &Demand, managed: &HashSet<Pubkey32>, now: u64) -> Vec<Pubkey32> {
     if !demand.covers_window(now) {
         return Vec::new();
     }
     let scores = demand.scores();
-    let mut v: Vec<_> = managed.iter().filter(|m| !scores.contains_key(*m)).copied().collect();
+    let mut v: Vec<_> = managed
+        .iter()
+        .filter(|m| !scores.contains_key(*m) && !demand.in_hold(m, now))
+        .copied()
+        .collect();
     v.sort_unstable();
+    v
+}
+
+/// The accounts to close to bring `managed` back down to `slots`, weakest demand first.
+///
+/// Unlike [`idle`] this does not wait for a watched day: being over the cap is a fact
+/// about the wallet, not a judgement about demand. Accounts in `unclosable` (holding a
+/// balance, or recently refused) keep their slot, and others are chosen in their place.
+/// One the bot opened within `MIN_HOLD_SECS` goes last.
+#[must_use]
+pub fn excess(
+    demand: &Demand,
+    managed: &HashSet<Pubkey32>,
+    slots: usize,
+    unclosable: &HashSet<Pubkey32>,
+    now: u64,
+) -> Vec<Pubkey32> {
+    let over = managed.len().saturating_sub(slots);
+    if over == 0 {
+        return Vec::new();
+    }
+    let scores = demand.scores();
+    let mut v: Vec<_> = managed.iter().filter(|m| !unclosable.contains(*m)).copied().collect();
+    v.sort_by(|a, b| {
+        let (sa, sb) = (scores.get(a).copied().unwrap_or_default(), scores.get(b).copied().unwrap_or_default());
+        demand
+            .in_hold(a, now)
+            .cmp(&demand.in_hold(b, now))
+            .then(sa.usd.total_cmp(&sb.usd))
+            .then(sa.asks.cmp(&sb.asks))
+            .then(a.cmp(b))
+    });
+    v.truncate(over);
     v
 }
 
@@ -316,6 +400,27 @@ mod tests {
     }
 
     #[test]
+    fn excess_accounts_close_lowest_demand_first_without_waiting_a_day() {
+        let mut d = Demand::new(0);
+        d.record(1, &m(2), 0.05);
+        d.record(2, &m(3), 0.01);
+        // Five held, two slots: the three unasked go; the asked-for two stay.
+        let got = excess(&d, &set(&[1, 2, 3, 4, 5]), 2, &set(&[]), 10);
+        assert_eq!(got, vec![m(1), m(4), m(5)]);
+        assert_eq!(excess(&d, &set(&[1, 2, 3, 4, 5]), 1, &set(&[]), 10), vec![m(1), m(4), m(5), m(3)]);
+        assert!(excess(&d, &set(&[2, 3]), 2, &set(&[]), 10).is_empty(), "at the cap");
+    }
+
+    #[test]
+    fn an_account_holding_tokens_is_never_selected_as_excess() {
+        let d = Demand::new(0);
+        let got = excess(&d, &set(&[1, 2, 3]), 1, &set(&[1]), 10);
+        // Still two over: the funded one keeps its slot, two empty ones go instead.
+        assert_eq!(got, vec![m(2), m(3)]);
+        assert!(excess(&d, &set(&[1, 2]), 0, &set(&[1, 2]), 10).is_empty());
+    }
+
+    #[test]
     fn the_ranking_orders_by_value_then_asks() {
         let mut d = Demand::new(0);
         d.record(1, &m(1), 0.001);
@@ -339,6 +444,82 @@ mod tests {
         assert!(!back.covers_window(back_at), "only two hours were watched");
         assert!(idle(&back, &set(&[7, 8]), back_at).is_empty(), "nothing is closed on restart");
         assert!(back.covers_window(back_at + WINDOW_SECS - 7_200), "a full day of watching counts");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 2026-11-07, 6GmAF…: opened on two asks, the bot restarted before the next save,
+    /// the closer found the account unasked-for and closed it 36 s after it was opened,
+    /// and the opener paid for it again a minute later.
+    #[test]
+    fn an_account_opened_then_restarted_over_is_not_closed() {
+        let dir = std::env::temp_dir().join(format!("cb-demand-reopen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token-demand.json");
+        let t0 = WINDOW_SECS + 1_000; // a full day already watched
+        let mut d = Demand::new(0);
+        d.save(&path, t0).unwrap(); // the last periodic save, before the asks
+        d.record(t0 + 10, &m(6), 0.006);
+        d.record(t0 + 20, &m(6), 0.006);
+        assert_eq!(on_missing(&d, &set(&[]), 4, &m(6)), Some(Move::Open(m(6))));
+        // What `rotate_for` does on a confirmed open.
+        d.note_opened(t0 + 21, &m(6));
+        d.save(&path, t0 + 21).unwrap();
+        // Restarted 17 s later; the closer's first tick runs 36 s after the open.
+        let back = Demand::load(&path, t0 + 38);
+        assert!(back.covers_window(t0 + 57));
+        assert!(idle(&back, &set(&[6]), t0 + 57).is_empty(), "closed 36 s after opening");
+        // And nothing asks to open it again: it is still held.
+        assert_eq!(on_missing(&back, &set(&[6]), 4, &m(6)), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_opened_account_is_held_a_full_window_even_with_its_asks_lost() {
+        let t0 = WINDOW_SECS + 1_000;
+        let mut d = Demand::new(0);
+        d.note_opened(t0, &m(6)); // opened, with no ask on record at all
+        assert!(idle(&d, &set(&[6]), t0 + MIN_HOLD_SECS - 1).is_empty());
+        assert_eq!(idle(&d, &set(&[6]), t0 + MIN_HOLD_SECS), vec![m(6)]);
+        // The hold is the floor, not the ceiling: an ask still keeps it past the hold.
+        d.record(t0 + MIN_HOLD_SECS - 10, &m(6), 0.0);
+        assert!(idle(&d, &set(&[6]), t0 + MIN_HOLD_SECS + 10).is_empty());
+        // Pruned once the hold is over, so the file does not grow.
+        d.prune(t0 + MIN_HOLD_SECS);
+        assert!(d.opened.is_empty());
+    }
+
+    #[test]
+    fn an_absurd_expectation_buys_no_account_but_still_counts_as_asked() {
+        let mut d = Demand::new(0);
+        d.record(10, &m(5), 2_927_483_845.892_3);
+        d.record(20, &m(5), 730_203_762.220_4);
+        assert_eq!(on_missing(&d, &set(&[]), 4, &m(5)), None, "phantom value opens nothing");
+        let s = d.scores()[&m(5)];
+        assert_eq!((s.asks, s.usd), (2, 0.0));
+        // Nor can phantoms displace a held account on value.
+        let mut e = Demand::new(0);
+        e.record(1, &m(2), 0.000_7);
+        e.record(2, &m(9), 1e9);
+        e.record(3, &m(9), 1e9);
+        assert_eq!(on_missing(&e, &set(&[2]), 1, &m(9)), None);
+        // The same asks keep a held account from looking idle: one definition of asked.
+        assert!(idle(&d, &set(&[5]), WINDOW_SECS + 5).is_empty());
+        // An ask at the bound keeps its value.
+        d.record(30, &m(5), MAX_CREDIBLE_ASK_USD);
+        assert_eq!(on_missing(&d, &set(&[]), 4, &m(5)), Some(Move::Open(m(5))));
+    }
+
+    #[test]
+    fn an_absurd_ask_saved_by_an_older_build_is_cleared_on_load() {
+        let dir = std::env::temp_dir().join(format!("cb-demand-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token-demand.json");
+        let mut d = Demand::new(0);
+        d.events.push_back((10, bs58::encode(m(5)).into_string(), 2.9e12));
+        d.events.push_back((11, bs58::encode(m(5)).into_string(), 0.5));
+        d.save(&path, 12).unwrap();
+        let s = Demand::load(&path, 20).scores()[&m(5)];
+        assert_eq!((s.asks, s.usd), (2, 0.5));
         let _ = std::fs::remove_dir_all(dir);
     }
 

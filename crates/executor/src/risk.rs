@@ -37,8 +37,6 @@ pub struct Limits {
     /// from noise in the estimate that produced it, and the estimate is what is being
     /// trusted when the transaction is signed.
     pub min_net_profit_usd: f64,
-    /// How far the simulated result may fall short of the quote before it is refused.
-    pub max_slippage_bps: f64,
     /// Upper bound on trades per day, whatever they are worth.
     pub max_daily_trades: u32,
     /// How long a breaker trip stands before the gate clears it on its own.
@@ -62,7 +60,6 @@ impl Default for Limits {
             max_daily_loss_usd: 5.0,
             max_consecutive_failures: 3,
             min_net_profit_usd: 0.01,
-            max_slippage_bps: 30.0,
             max_daily_trades: 500,
             halt_cooldown_secs: 600,
         }
@@ -84,7 +81,6 @@ impl Limits {
         finite(self.max_position_usd, "Maximum position")?;
         finite(self.max_daily_loss_usd, "Maximum daily loss")?;
         finite(self.min_net_profit_usd, "Minimum net profit")?;
-        finite(self.max_slippage_bps, "Maximum slippage")?;
         if self.max_position_usd <= 0.0 {
             return Err("Maximum position must be greater than zero.".into());
         }
@@ -401,7 +397,6 @@ mod tests {
             max_daily_loss_usd: 10.0,
             max_consecutive_failures: 3,
             min_net_profit_usd: 0.01,
-            max_slippage_bps: 30.0,
             max_daily_trades: 5,
             // Disabled here so the existing "stays halted until resume()" tests keep
             // meaning exactly what they say. Auto-resume gets its own gate below.

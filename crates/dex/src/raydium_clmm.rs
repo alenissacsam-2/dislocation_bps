@@ -61,6 +61,16 @@ const OFF_TICK_SPACING: usize = 235;
 const OFF_LIQUIDITY: usize = 237;
 const OFF_SQRT_PRICE: usize = 253;
 const OFF_TICK_CURRENT: usize = 269;
+// From the program's own `PoolState` (raydium-clmm `states/pool.rs`): `status` follows
+// the protocol-fee pair and 64 bytes of padding (325 + 64); `open_time` follows
+// `fund_fees_token_1`, eight bytes before `recent_epoch` and sixteen before the
+// `DynamicFeeInfo` at 1096 below. On 87 live pools read on 2026-11-07, the u64 at 1088
+// was the current epoch (1080) or one just before it, and the one here zero or a past
+// unix time.
+const OFF_STATUS: usize = 389;
+const OFF_OPEN_TIME: usize = 1080;
+/// `PoolStatusBitIndex::Swap`: set means the program refuses every swap (`NotApproved`).
+const STATUS_SWAP_DISABLED: u8 = 1 << 4;
 
 // The pool's `DynamicFeeInfo`. Read off live accounts on 2026-09-26 and checked
 // against the program: a SOL/VIDAx swap simulated 0.36 bps short of the config-fee
@@ -242,6 +252,10 @@ pub fn dynamic_fee_ppm(data: &[u8], tick_current: i32, tick_spacing: u16, now_un
 /// the whole fee a swap made at `now_unix` pays. The config fee is a parameter rather
 /// than something fetched here, so this stays a pure function and the caller is forced
 /// to have actually resolved the config.
+///
+/// Refuses a pool the program will not swap in: swap bit set in `status`, or block time
+/// not yet past `open_time` (the swap does `require_gt!(block_timestamp, open_time)`),
+/// counted from [`CLOCK_MARGIN_SECS`] before `now_unix` in case the chain's clock lags.
 pub fn to_pool_state(
     address: Pubkey32,
     data: &[u8],
@@ -250,6 +264,16 @@ pub fn to_pool_state(
     now_unix: u64,
 ) -> Result<PoolState> {
     let p = decode(data)?;
+    let status = data[OFF_STATUS];
+    ensure!(
+        status & STATUS_SWAP_DISABLED == 0,
+        "clmm pool has swaps disabled (status {status:#04x}) — it would quote and then revert"
+    );
+    let open_time = u64::from_le_bytes(data[OFF_OPEN_TIME..OFF_OPEN_TIME + 8].try_into().expect("8 bytes"));
+    ensure!(
+        now_unix.saturating_sub(CLOCK_MARGIN_SECS) > open_time,
+        "clmm pool does not open to swaps until unix time {open_time}"
+    );
     ensure!(p.liquidity > 0, "clmm pool has no liquidity at the current price");
     ensure!(trade_fee_ppm < 1_000_000, "clmm trade fee {trade_fee_ppm}ppm is not a fee");
     let dynamic = dynamic_fee_ppm(data, p.tick_current, p.tick_spacing, now_unix);
@@ -344,7 +368,7 @@ mod tests {
 
     #[test]
     fn pool_state_prices_sol_at_about_ninety_one_dollars() {
-        let p = to_pool_state([9u8; 32], &sol_usdc(), 400, 77, 0).unwrap();
+        let p = to_pool_state([9u8; 32], &sol_usdc(), 400, 77, AT).unwrap();
         assert_eq!(p.dex, Dex::RaydiumClmm);
         assert_eq!(p.fee_ppm, 400);
         assert_eq!(p.slot, 77);
@@ -362,7 +386,7 @@ mod tests {
     /// instead. Any future sizing that ignores `max_in` will silently over-quote.
     #[test]
     fn the_tightest_tick_holds_far_more_than_our_capital_and_far_less_than_a_flash_loan() {
-        let p = to_pool_state([9u8; 32], &sol_usdc(), 400, 1, 0).unwrap();
+        let p = to_pool_state([9u8; 32], &sol_usdc(), 400, 1, AT).unwrap();
         let sol_in = p.leg_for_input(&[1u8; 32]).expect("must quote SOL in");
 
         let five_dollars_of_sol = 55_000_000u128; // 0.055 SOL at ~$91
@@ -382,20 +406,20 @@ mod tests {
     #[test]
     fn a_pool_with_no_liquidity_is_not_a_pool() {
         let d = account(1, 0, 5_572_826_470_351_845_177, -23941, (9, 6), (1, 2));
-        assert!(to_pool_state([9u8; 32], &d, 400, 1, 0).is_err());
+        assert!(to_pool_state([9u8; 32], &d, 400, 1, AT).is_err());
     }
 
     #[test]
     fn price_inconsistent_with_its_own_tick_is_rejected() {
         let d = account(1, 1_000_000_000, 5_572_826_470_351_845_177, 0, (9, 6), (1, 2));
-        let err = to_pool_state([9u8; 32], &d, 400, 1, 0).unwrap_err().to_string();
+        let err = to_pool_state([9u8; 32], &d, 400, 1, AT).unwrap_err().to_string();
         assert!(err.contains("does not belong to tick"), "unexpected error: {err}");
     }
 
     #[test]
     fn a_hundred_percent_fee_is_rejected_rather_than_underflowing_gamma() {
         assert!(decode_trade_fee_ppm(&config(1_000_000)).is_err());
-        assert!(to_pool_state([9u8; 32], &sol_usdc(), 1_000_000, 1, 0).is_err());
+        assert!(to_pool_state([9u8; 32], &sol_usdc(), 1_000_000, 1, AT).is_err());
     }
 
     #[test]
@@ -521,5 +545,30 @@ mod tests {
         let p = to_pool_state([9u8; 32], &d, 400, 1, AT + 10).unwrap();
         // (30000 x 1)^2 x 15000 / 10^13 = 1.35, rounded up.
         assert_eq!(p.fee_ppm, 402);
+    }
+
+    /// Bit 4 of `status` stops every swap; the other bits gate liquidity and fees and
+    /// leave swapping alone.
+    #[test]
+    fn a_pool_with_swaps_disabled_is_refused() {
+        let mut d = sol_usdc();
+        d[OFF_STATUS] = STATUS_SWAP_DISABLED;
+        let e = to_pool_state([9u8; 32], &d, 400, 1, AT).unwrap_err().to_string();
+        assert!(e.contains("swaps disabled"), "{e}");
+        d[OFF_STATUS] = 0b0010_1111;
+        assert!(to_pool_state([9u8; 32], &d, 400, 1, AT).is_ok(), "other bits are not ours");
+    }
+
+    /// The program swaps only once block time is past `open_time`, and the chain's
+    /// clock may lag this one by the margin.
+    #[test]
+    fn a_pool_before_its_open_time_is_refused() {
+        assert_eq!(OFF_OPEN_TIME + 16, OFF_DYN_FILTER_PERIOD, "open_time, recent_epoch, then the measured fee info");
+        let mut d = sol_usdc();
+        let open = AT - CLOCK_MARGIN_SECS;
+        d[OFF_OPEN_TIME..OFF_OPEN_TIME + 8].copy_from_slice(&open.to_le_bytes());
+        let e = to_pool_state([9u8; 32], &d, 400, 1, AT).unwrap_err().to_string();
+        assert!(e.contains("does not open"), "{e}");
+        assert!(to_pool_state([9u8; 32], &d, 400, 1, AT + 1).is_ok(), "one second past it");
     }
 }

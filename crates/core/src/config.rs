@@ -48,11 +48,16 @@ pub enum FeedSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SubmitVia {
+    /// Helius Sender (`sender.helius-rpc.com/fast?swqos_only=true`), tipping a Helius
+    /// tip account and bidding a priority fee. The default, because it lands: Jito drops
+    /// unauthenticated sends before its auction. No revert protection, so every trade
+    /// is simulated first, and a missed floor lands, reverts and pays the base fee and
+    /// the priority fee (not the tip, which reverts with it).
+    #[default]
+    Sender,
     /// Jito's block engine, as a bundle of one. A trade whose floor is missed by the
     /// time a leader reaches it is dropped and costs nothing, and the floors guarantee
-    /// the fee and tip on chain. The default, because it is the one where losing a
-    /// race is free.
-    #[default]
+    /// the fee and tip on chain — but unauthenticated sends were never included.
     Jito,
     /// Ordinary `sendTransaction` through `rpc_http_url`, with a priority bid. A missed
     /// floor lands, reverts, and pays the whole fee.
@@ -141,7 +146,8 @@ pub struct Config {
 
     /// Priority bid, in micro-lamports per compute unit. Zero pays the base fee only.
     ///
-    /// Only used with `submit_via = "rpc"`. Through Jito the tip does this job.
+    /// Used with `submit_via = "rpc"` and `"sender"` (as a ceiling; Sender always bids at
+    /// least 1). Through Jito the tip does this job.
     #[serde(default)]
     pub priority_micro_lamports: u64,
 
@@ -170,10 +176,10 @@ pub struct Config {
     #[serde(default)]
     pub jito_auth_uuid: String,
 
-    /// The most one Jito tip may be, in lamports.
+    /// The most one Jito or Helius Sender tip may be, in lamports.
     ///
-    /// The tip is a quarter of the trade's own gross, never under Jito's 1,000-lamport
-    /// minimum, and never over this. It is only paid when the trade lands, and the
+    /// The tip is half the trade's own gross, never under the path's minimum (Jito
+    /// 1,000, Sender 5,000), and never over this. It is only paid when the trade lands, and the
     /// floors make any trade that lands cover it.
     #[serde(default = "default_jito_tip_max_lamports")]
     pub jito_tip_max_lamports: u64,
@@ -244,8 +250,6 @@ pub struct Config {
     pub max_daily_loss_usd: f64,
     #[serde(default = "default_min_net_profit_usd")]
     pub min_net_profit_usd: f64,
-    #[serde(default = "default_max_slippage_bps")]
-    pub max_slippage_bps: f64,
     #[serde(default = "default_max_consecutive_failures")]
     pub max_consecutive_failures: u32,
     #[serde(default = "default_max_daily_trades")]
@@ -306,9 +310,6 @@ fn default_max_daily_loss_usd() -> f64 {
 }
 fn default_min_net_profit_usd() -> f64 {
     0.01
-}
-fn default_max_slippage_bps() -> f64 {
-    30.0
 }
 fn default_max_consecutive_failures() -> u32 {
     3
@@ -409,7 +410,6 @@ mod tests {
             max_position_usd: 25.0,
             max_daily_loss_usd: 5.0,
             min_net_profit_usd: 0.01,
-            max_slippage_bps: 30.0,
             max_consecutive_failures: 3,
             max_daily_trades: 500,
             halt_cooldown_secs: 600,
@@ -578,6 +578,18 @@ max_position_lamports = 1
         )
         .unwrap();
         assert!(dry.dry_run);
+    }
+
+    /// Sender is the default, and each path can still be named.
+    #[test]
+    fn submit_via_defaults_to_sender_and_parses_every_path() {
+        let base = "rpc_ws_url = \"wss://x\"\nmin_profit_lamports = 0\nmax_position_lamports = 1\n";
+        let parse = |extra: &str| toml::from_str::<Config>(&format!("{base}{extra}")).unwrap().submit_via;
+        assert_eq!(parse(""), SubmitVia::Sender);
+        assert_eq!(parse("submit_via = \"sender\"\n"), SubmitVia::Sender);
+        assert_eq!(parse("submit_via = \"jito\"\n"), SubmitVia::Jito);
+        assert_eq!(parse("submit_via = \"rpc\"\n"), SubmitVia::Rpc);
+        assert!(toml::from_str::<Config>(&format!("{base}submit_via = \"helius\"\n")).is_err());
     }
 
     /// The file a fresh install is seeded from must load.
