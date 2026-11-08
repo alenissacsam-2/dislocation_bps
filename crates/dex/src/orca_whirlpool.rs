@@ -121,8 +121,6 @@ pub fn decode(data: &[u8]) -> Result<Whirlpool> {
     ensure!(tick_spacing > 0, "whirlpool with zero tick spacing");
 
     let fee_rate_ppm = u32::from(u16_at(data, OFF_FEE_RATE));
-    ensure!(fee_rate_ppm < 1_000_000, "whirlpool fee rate {fee_rate_ppm}ppm is not a fee");
-
     let tick_current = i32_at(data, OFF_TICK_CURRENT);
     ensure!(
         (clmm::MIN_TICK..=clmm::MAX_TICK).contains(&tick_current),

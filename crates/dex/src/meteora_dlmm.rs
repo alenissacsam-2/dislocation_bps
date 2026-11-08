@@ -355,12 +355,6 @@ impl LbPair {
         let step = i32::from(self.bin_step).max(1);
         (MAX_QUOTE_SPAN_BPS / step + 1).clamp(1, MAX_QUOTE_BINS)
     }
-
-    /// The bin the price currently sits in, from arrays already decoded.
-    #[must_use]
-    pub fn active_bin<'a>(&self, arrays: &'a [BinArray]) -> Option<&'a Bin> {
-        find_bin(arrays, self.active_id)
-    }
 }
 
 /// Decode an `LbPair` account.
@@ -1077,7 +1071,7 @@ mod tests {
         let (pool, array) = coherent();
         let p = decode(&pool).unwrap();
         let arrays = vec![decode_bin_array(&array).unwrap()];
-        let active = *p.active_bin(&arrays).expect("the fixture holds the active bin");
+        let active = *find_bin(&arrays, p.active_id).expect("the fixture holds the active bin");
 
         // A fifth of what the active bin holds on the Y side, bought with X.
         let want_out = u128::from(active.amount_y) / 5;
@@ -1232,7 +1226,7 @@ mod tests {
         let p = decode(&pool).unwrap();
         let arrays = vec![decode_bin_array(&array).unwrap()];
 
-        let sell_x = state.quotable_depth(&p.token_x_mint).unwrap();
+        let sell_x = state.leg_for_input(&p.token_x_mint).unwrap().max_in;
         let fill = quote_exact_in(&p, &arrays, sell_x, true).unwrap();
         assert_eq!(fill.amount_in_used, sell_x, "the bound must be a size the bins can take");
         assert_eq!(state.reserve_a(), sell_x);

@@ -1825,12 +1825,18 @@ fn decode_b64(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// An empty market, for tests of the loop around it.
+#[cfg(test)]
+pub(crate) fn empty_market_for_tests() -> LiveMarket {
+    tests::market_with(Vec::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cb_core::types::PoolState;
 
-    fn market_with(pools: Vec<PoolState>) -> LiveMarket {
+    pub(super) fn market_with(pools: Vec<PoolState>) -> LiveMarket {
         let store = PoolStore::new();
         for p in pools {
             store.upsert(p);

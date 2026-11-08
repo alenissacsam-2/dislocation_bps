@@ -127,6 +127,7 @@ mod tests {
     /// A synthetic `AmmInfo` laid out at the offsets the decoder reads.
     fn amm_info(base_mint: Pubkey32, quote_mint: Pubkey32, bv: Pubkey32, qv: Pubkey32) -> Vec<u8> {
         let mut d = vec![0u8; cb_dex::raydium_v4::AMM_INFO_LEN];
+        d[0..8].copy_from_slice(&6u64.to_le_bytes()); // status: SwapOnly
         d[32..40].copy_from_slice(&9u64.to_le_bytes()); // base decimals
         d[40..48].copy_from_slice(&6u64.to_le_bytes()); // quote decimals
         d[176..184].copy_from_slice(&25u64.to_le_bytes());

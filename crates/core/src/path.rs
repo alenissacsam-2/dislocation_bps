@@ -260,6 +260,26 @@ pub fn largest_feasible(legs: &[Leg], hi: u128) -> u128 {
     lo
 }
 
+/// Bracket for the most profitable of 64 log-spaced sizes in `lo..=hi`, or `None` when
+/// none of them profits.
+fn positive_window(legs: &[Leg], lo: u128, hi: u128) -> Option<(u128, u128)> {
+    const N: usize = 64;
+    let ratio = (hi as f64 / lo as f64).ln();
+    let mut pts: Vec<u128> = (0..=N)
+        .map(|i| ((lo as f64) * (ratio * i as f64 / N as f64).exp()) as u128)
+        .map(|x| x.clamp(lo, hi))
+        .collect();
+    pts[0] = lo;
+    pts[N] = hi;
+    pts.dedup();
+    let (best, p) = pts
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| (i, cycle_profit(legs, x).unwrap_or(0)))
+        .max_by_key(|&(_, p)| p)?;
+    (p > 0).then(|| (pts[best.saturating_sub(1)], pts[(best + 1).min(pts.len() - 1)]))
+}
+
 /// Find the input size that maximises cycle profit, by ternary search.
 ///
 /// `max_in` caps the search — pass your available capital to get the best size you
@@ -289,7 +309,15 @@ pub fn optimal_input(legs: &[Leg], max_in: u128) -> Option<u128> {
         let m2 = hi - third;
         let p1 = cycle_profit(legs, m1).unwrap_or(0);
         let p2 = cycle_profit(legs, m2).unwrap_or(0);
-        if p1 < p2 {
+        if p1 == 0 && p2 == 0 {
+            // Integer rounding can zero the profit on either side of a narrow positive
+            // window, so a tie at zero says nothing about which way the peak lies. Look
+            // across the whole interval instead of discarding the right part.
+            match positive_window(legs, lo, hi) {
+                Some((a, b)) => (lo, hi) = (a, b),
+                None => break,
+            }
+        } else if p1 < p2 {
             lo = m1 + 1;
         } else {
             hi = m2 - 1;
@@ -407,6 +435,15 @@ mod tests {
                 assert!(other <= p + 2, "size at {pct}% beat the optimum ({other} > {p})");
             }
         }
+    }
+
+    #[test]
+    fn a_thin_edge_on_deep_pools_is_still_sized() {
+        // ~3 bp of edge on huge reserves: most probes of the search sit past the peak and
+        // return zero profit, which must not discard the part of the range holding it.
+        let legs = [Leg::cp(1u128 << 70, (1u128 << 70) * 10_005 / 10_000, 100), Leg::cp(1u128 << 70, 1u128 << 70, 100)];
+        let x = optimal_input(&legs, u128::MAX).expect("a 3 bp edge over 2 bp of fees");
+        assert!(cycle_profit(&legs, x).unwrap() > 0);
     }
 
     #[test]

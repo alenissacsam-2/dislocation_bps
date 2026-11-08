@@ -32,11 +32,11 @@
 //! transaction the programs let through has paid for itself. Until then the simulation
 //! was the only thing standing there, and a simulation is a prediction.
 
-use crate::encode::{pk, programs, to_pubkey};
+use crate::encode::{pk, programs};
 use crate::pda::associated_token_address;
 use crate::tx;
 use crate::venue::{build_swap, SwapContext, VenueExtra};
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use cb_core::types::Dex;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
@@ -131,8 +131,13 @@ pub struct RouteOptions {
     /// failed bundle is dropped.
     pub others_exist: bool,
     /// One mint whose account does not exist yet and is created in this transaction
-    /// even when `others_exist` says the rest do: a trade opening the account it needs.
-    pub create_also: Option<Pubkey>,
+    /// even when `others_exist` says the rest do: a trade opening the account it needs,
+    /// with the lamports of rent that account will hold.
+    ///
+    /// The rent leaves the owner's lamports and stays in the new account, so a trade
+    /// that opens one lands that much down in liquid SOL. [`build`] therefore demands
+    /// that `min_gain` covers it, and refuses the route otherwise.
+    pub create_also: Option<(Pubkey, u64)>,
     pub venue: VenueExtra,
     /// How much more than its input the last hop must guarantee, beyond the one base
     /// unit invariant 2 already demands.
@@ -240,13 +245,22 @@ pub fn build(owner: &Pubkey, hops: &[Hop], pre_balance: u64, opts: &RouteOptions
         guaranteed_out - amount_in,
         opts.min_gain
     );
-    if let Some((_, tip)) = opts.tip {
-        ensure!(
-            tip <= opts.min_gain,
-            "a tip of {tip} lamports is not covered by the {} this route must gain",
-            opts.min_gain
-        );
-    }
+    // A wSOL base account is closed at the end and its rent comes back; any other
+    // account the trade opens keeps its rent. Charged even for a mint the route might
+    // not create: over-charging only refuses, under-charging lands a loss.
+    let wsol = pk(programs::WSOL_MINT);
+    let wrapping = opts.wsol == WsolPolicy::WrapAndClose && base_mint == wsol;
+    let opened_rent = match opts.create_also {
+        Some((mint, rent)) if !(wrapping && mint == base_mint) => rent,
+        _ => 0,
+    };
+    let tip = opts.tip.map_or(0, |(_, t)| t);
+    ensure!(
+        tip.saturating_add(opened_rent) <= opts.min_gain,
+        "a tip of {tip} lamports plus {opened_rent} of rent for the account this trade opens \
+         is not covered by the {} this route must gain",
+        opts.min_gain
+    );
 
     // Each mint's own program, taken from the hops rather than from one route-wide
     // setting. `opts.venue.token_program` remains the fallback for a caller that has
@@ -263,9 +277,7 @@ pub fn build(owner: &Pubkey, hops: &[Hop], pre_balance: u64, opts: &RouteOptions
         opts.venue.token_program
     };
     let token_program = program_of(&base_mint);
-    let wsol = pk(programs::WSOL_MINT);
     let base_ata = associated_token_address(owner, &base_mint, &token_program);
-    let wrapping = opts.wsol == WsolPolicy::WrapAndClose && base_mint == wsol;
     // `min_gain` and the tip are lamports. On any other cycle the gain is counted in a
     // token and the tip leaves a balance the floors never see, so neither guarantee
     // would mean what it says.
@@ -293,7 +305,7 @@ pub fn build(owner: &Pubkey, hops: &[Hop], pre_balance: u64, opts: &RouteOptions
         for mint in seen {
             // wSOL is never "open" between trades: `WrapAndClose` closes it every time, so
             // a cycle that passes through SOL mid-route still has to create it.
-            if opts.others_exist && mint != base_mint && mint != wsol && opts.create_also != Some(mint) {
+            if opts.others_exist && mint != base_mint && mint != wsol && opts.create_also.map(|(m, _)| m) != Some(mint) {
                 continue;
             }
             let p = program_of(&mint);
@@ -346,21 +358,6 @@ pub fn build(owner: &Pubkey, hops: &[Hop], pre_balance: u64, opts: &RouteOptions
     }
 
     Ok(Route { instructions: ixs, profit, min_post_balance, base_mint, amount_in })
-}
-
-/// Convenience: the raw-key form the pure crates use.
-#[must_use]
-pub fn mint_key(raw: &cb_core::types::Pubkey32) -> Pubkey {
-    to_pubkey(raw)
-}
-
-/// Refuse a venue we cannot encode, with the count of pools it covers, so the caller
-/// can decide whether the cycle is worth skipping or the venue is worth building.
-///
-/// # Errors
-/// Always — this exists to produce a uniform message.
-pub fn unsupported(dex: Dex) -> Result<()> {
-    bail!("{} is not encodable; the cycle containing it cannot be executed", dex.name())
 }
 
 #[cfg(test)]
@@ -595,9 +592,41 @@ mod tests {
         let known = RouteOptions { create_token_accounts: true, others_exist: true, ..opts() };
         let r = build(&owner, &hops, 0, &known).unwrap();
         assert_eq!(r.instructions.len(), 5, "compute + the base's create + 3 swaps");
-        let opening = RouteOptions { create_also: Some(hops[1].input_mint), ..known };
+        let opening = RouteOptions { create_also: Some((hops[1].input_mint, 0)), ..known };
         let r = build(&owner, &hops, 0, &opening).unwrap();
         assert_eq!(r.instructions.len(), 6, "and the one being opened");
+    }
+
+    /// An account the trade opens keeps its rent, which leaves the very lamports the
+    /// profit is measured in: the floor must cover it, and the post-balance is net of it.
+    #[test]
+    fn the_rent_of_an_account_the_trade_opens_is_part_of_the_floor() {
+        let owner = Pubkey::new_unique();
+        let hops = wsol_cycle(1_706_000);
+        let opens = Some((hops[0].output_mint, 1_700_000));
+        let o = RouteOptions {
+            wsol: WsolPolicy::WrapAndClose,
+            create_token_accounts: true,
+            others_exist: true,
+            create_also: opens,
+            min_gain: 6_000,
+            tip: Some((crate::jito::tip_account(0), 1_000)),
+            ..opts()
+        };
+        let e = build(&owner, &hops, 500_000_000, &o).unwrap_err().to_string();
+        assert!(e.contains("1700000 of rent") && e.contains("is not covered"), "{e}");
+
+        let covered = RouteOptions { min_gain: 1_705_000, ..o };
+        let r = build(&owner, &hops, 500_000_000, &covered).expect("floor covers fee, tip and rent");
+        assert_eq!(r.min_post_balance, 500_001_000, "pre + (1,706,000 − 1,705,000)");
+
+        // The wSOL base is closed at the end, so opening it costs nothing to keep.
+        let base = RouteOptions { create_also: Some((hops[0].input_mint, 1_700_000)), ..o };
+        assert!(build(&owner, &hops, 500_000_000, &base).is_ok());
+
+        // A token cycle cannot guarantee lamports, so it cannot open an account at all.
+        let token = RouteOptions { create_also: Some((Pubkey::new_unique(), 1)), ..opts() };
+        assert!(build(&owner, &cycle(2), 0, &token).is_err());
     }
 
     /// The measurement `tx.rs` defers to. A real cycle shares the signer, the token

@@ -170,9 +170,24 @@ impl EncryptedKey {
             std::fs::create_dir_all(dir)?;
         }
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, text)
-            .with_context(|| format!("could not write key file at {}", path.display()))?;
-        restrict_permissions(path);
+        // Written beside it, then renamed over it: a crash mid-write leaves the old key
+        // file whole rather than a truncated one that can never unlock.
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+        let written = (|| {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("could not write key file at {}", tmp.display()));
+        }
+        restrict_permissions(&tmp);
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("could not move the new key file into place at {}", path.display()))?;
         Ok(())
     }
 }
@@ -220,12 +235,6 @@ impl Wallet {
     #[must_use]
     pub fn sign(&self, message: &[u8]) -> Signature {
         self.keypair.sign_message(message)
-    }
-
-    /// Exposed for transaction signing, which needs the `Signer` itself.
-    #[must_use]
-    pub fn signer(&self) -> &Keypair {
-        &self.keypair
     }
 }
 
@@ -312,6 +321,10 @@ mod hex_bytes {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
+        // Slicing below is by byte; a multi-byte character would panic it.
+        if !s.is_ascii() {
+            return Err(serde::de::Error::custom("non-ASCII in hex"));
+        }
         if s.len() % 2 != 0 {
             return Err(serde::de::Error::custom("odd-length hex"));
         }
@@ -440,7 +453,25 @@ mod tests {
         let loaded = EncryptedKey::load(&path).unwrap();
         assert_eq!(loaded.unseal("pass").unwrap().pubkey(), expected);
 
+        // Saving over an existing file replaces it whole and leaves no temp file.
+        let other = a_keypair();
+        let replaced = Keypair::try_from(other.as_slice()).unwrap().pubkey();
+        EncryptedKey::seal(other.as_slice(), "pass").unwrap().save(&path).unwrap();
+        assert_eq!(EncryptedKey::load(&path).unwrap().unseal("pass").unwrap().pubkey(), replaced);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "only the key file remains");
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hand-edited file with a multi-byte character in a hex field is an error, not a
+    /// panic in the byte slicing.
+    #[test]
+    fn non_ascii_hex_is_refused_without_panicking() {
+        let sealed = EncryptedKey::seal(a_keypair().as_slice(), "pass").unwrap();
+        let mut v = serde_json::to_value(&sealed).unwrap();
+        v["salt"] = serde_json::json!("aé");
+        let e = serde_json::from_value::<EncryptedKey>(v).err().expect("refused");
+        assert!(e.to_string().contains("non-ASCII"), "{e}");
     }
 
     #[test]

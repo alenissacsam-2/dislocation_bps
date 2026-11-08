@@ -56,13 +56,15 @@ const JITO_TIP_FLOOR_SOL: f64 = 0.000_007_5;
 /// Solana base transaction fee, in SOL.
 const BASE_FEE_SOL: f64 = 0.000_005;
 
-/// Whether the transactions this bot builds actually carry a Jito tip.
+/// Whether the detection-time *contested* tip model below is charged as a cost.
 ///
-/// They do not. [`cb_executor::route::build`] emits a compute-budget instruction, the
-/// wrap, the swaps and the close, and nothing else — there is no transfer to a tip
-/// account anywhere in the executor, and `priority_micro_lamports` defaults to zero.
+/// It is not. Trades sent through Jito or Helius Sender do carry a tip, but the executor
+/// prices it from the fresh re-quote at attempt time (`Trader::tip_for`) and has the
+/// last floor guarantee it on chain; at detection only the least a trade can cost to
+/// land is charged (`Trader::min_landing_cost_lamports`: under Sender the base fee, its
+/// minimum tip and the least priority bid). An RPC send carries no tip at all.
 ///
-/// Charging the tip anyway is not conservatism, it is a wrong number in the one place
+/// Charging the contested share anyway is not conservatism, it is a wrong number in the one place
 /// it does the most damage. The median believable opportunity here grosses $0.00044
 /// and the tip floor is $0.00077, so a cost that is never incurred was refusing trades
 /// at nearly twice the rate the real cost would have: 879 cycles over fifteen hours
@@ -75,7 +77,7 @@ const BASE_FEE_SOL: f64 = 0.000_005;
 /// trip, not money. Competition is priced where it belongs instead: see
 /// [`EXECUTABLE_FEE_CEILING_BPS`], which is measured rather than assumed.
 ///
-/// Flip this the moment a tip instruction exists, and the arithmetic below follows.
+/// Flip this only to charge the contested model, and the arithmetic below follows.
 const PAYS_A_TIP: bool = false;
 
 /// How far apart, in slots, a cycle's two legs may have been priced and still be worth
@@ -363,15 +365,49 @@ const DEMAND_SAVE_INTERVAL: Duration = Duration::from_secs(300);
 /// and a base fee; the cap is what stops a burst of one-off detections from turning
 /// into a burst of opens.
 const MAX_ACCOUNT_OPENS_PER_HOUR: usize = 6;
-/// At most this many idle accounts closed per save tick, so one tick cannot block the
-/// sweep for long. Accounts over the slot cap are not limited; see [`closes_due`].
+/// At most this many accounts closed per save tick, over the cap or idle, so one tick
+/// cannot block the sweep for long: each close can wait out four confirm rounds. The
+/// rest are due again next tick. See [`closes_due`].
 const MAX_ACCOUNT_CLOSES_PER_TICK: usize = 2;
+/// The most a token balance may be worth, in USD, and still be burned as dust so its
+/// account can close. A haircut floor leaves up to ~6 bps of an intermediate leg behind
+/// (under a cent on a $13 trade); the close returns a ~$0.30 deposit. Anything worth
+/// more, or in a mint with no price, is kept.
+const DUST_MAX_USD: f64 = 0.01;
 /// How long an idle account that could not be closed because it holds a balance is
 /// left before it is tried again. A close that did not land is retried next tick.
 const KEPT_OPEN_RECHECK: Duration = Duration::from_secs(6 * 3_600);
 
-/// The accounts a save tick closes: every one over the slot cap, whatever the window
-/// says, then at most [`MAX_ACCOUNT_CLOSES_PER_TICK`] idle ones. None in `unclosable`.
+/// How many base units of `mint` count as dust at `usd_per_unit`; zero when unpriced.
+fn dust_max(usd_per_unit: Option<f64>) -> u64 {
+    match usd_per_unit {
+        Some(p) if p.is_finite() && p > 0.0 => (DUST_MAX_USD / p).floor().min(u64::MAX as f64) as u64,
+        _ => 0,
+    }
+}
+
+/// The mints sends still in flight trade through: an account one of them needs must
+/// not be closed under it.
+fn pending_mints(pending: &[PendingSend]) -> std::collections::HashSet<cb_core::types::Pubkey32> {
+    pending.iter().flat_map(|p| p.mints.iter().copied()).collect()
+}
+
+/// Whether `plan` shares a pool with a send still in flight. A second send against the
+/// same pool before the first is settled races, and invalidates, the first.
+fn overlaps_pending(pending: &[PendingSend], plan: &execute::CyclePlan) -> bool {
+    pending.iter().any(|p| plan.pools.iter().any(|(k, _)| p.pools.contains(k)))
+}
+
+/// Follow `p` unless its signature is followed already.
+fn push_pending(pending: &mut Vec<PendingSend>, p: PendingSend) {
+    if !pending.iter().any(|q| q.sig == p.sig) {
+        pending.push(p);
+    }
+}
+
+/// The accounts a save tick closes: those over the slot cap first, whatever the window
+/// says, then idle ones; at most [`MAX_ACCOUNT_CLOSES_PER_TICK`] in all. None in
+/// `unclosable`.
 fn closes_due(
     demand: &demand::Demand,
     managed: &std::collections::HashSet<cb_core::types::Pubkey32>,
@@ -383,9 +419,9 @@ fn closes_due(
     let idle: Vec<_> = demand::idle(demand, managed, now)
         .into_iter()
         .filter(|m| !unclosable.contains(m) && !due.contains(m))
-        .take(MAX_ACCOUNT_CLOSES_PER_TICK)
         .collect();
     due.extend(idle);
+    due.truncate(MAX_ACCOUNT_CLOSES_PER_TICK);
     due
 }
 
@@ -412,6 +448,12 @@ fn note_demand(
 /// Blocks the sweep while the open confirms, usually a second or two. Rare by
 /// construction (`MAX_ACCOUNT_OPENS_PER_HOUR`), and the reconcile pass repairs any
 /// feed drift a long wait lets in.
+///
+/// A Replace never closes a mint in `busy` (one a send in flight trades through), and
+/// burns up to `dust(mint)` base units left in the account it closes.
+// Each argument is a separate piece of the loop's state; a struct would be built at the
+// one call site and taken apart here.
+#[allow(clippy::too_many_arguments)]
 async fn rotate_for(
     t: &mut execute::Trader,
     plan: &execute::CyclePlan,
@@ -419,6 +461,8 @@ async fn rotate_for(
     protected: &std::collections::HashSet<cb_core::types::Pubkey32>,
     slots: usize,
     opens: &mut std::collections::VecDeque<std::time::Instant>,
+    busy: &std::collections::HashSet<cb_core::types::Pubkey32>,
+    dust: impl Fn(&cb_core::types::Pubkey32) -> u64,
 ) {
     let Some(mint) = t.missing_account(plan) else { return };
     if protected.contains(&mint) {
@@ -432,14 +476,18 @@ async fn rotate_for(
     // A trade in flight opening its own account already holds a slot.
     let slots = slots.saturating_sub(t.opens_in_flight());
     let Some(mv) = demand::on_missing(demand, &managed, slots, &mint) else { return };
-    opens.push_back(std::time::Instant::now());
     let (open, close) = match mv {
         demand::Move::Open(o) => (o, None),
         demand::Move::Replace { open, close } => (open, Some(close)),
     };
+    // A trade in flight may still need the account a Replace would close.
+    if close.is_some_and(|c| busy.contains(&c)) {
+        return;
+    }
+    opens.push_back(std::time::Instant::now());
     let name = |m: &cb_core::types::Pubkey32| bs58::encode(m).into_string();
     if let Some(c) = close {
-        match t.close_account(&c).await {
+        match t.close_account(&c, dust(&c)).await {
             Ok(true) => tracing::warn!(
                 "closed the account for {} to make room for {}, which attempts ask for more",
                 name(&c),
@@ -625,6 +673,14 @@ fn refusal_cooldown_for(reason: &str) -> Option<Duration> {
 ///
 /// Measured over one 1h53m live run: 10 of 56 attempts were refused here. Each also
 /// spent that sweep's single attempt and put its fundable twin on a structural hold.
+/// Whether a refusal says nothing about the cycle's price: the send gap, a pool's
+/// vaults just learned, a pool gone from the read. The same edge back a moment later is
+/// then worth trying, so it earns no `UNCHANGED_REFUSAL_HOLD`.
+#[must_use]
+fn unrelated_to_price(reason: &str) -> bool {
+    reason.contains(" send was ") || reason.contains("learned where pool") || reason.contains("vanished")
+}
+
 #[must_use]
 fn refused_for_entry_mint(reason: &str) -> bool {
     reason.contains("of a mint the wallet holds")
@@ -701,7 +757,7 @@ impl Cooldowns {
     fn hold_after_refusal(&mut self, cycle_key: &str, edge_bps: f64, why: &str) {
         if let Some(window) = refusal_cooldown_for(why) {
             self.hold(cycle_key, window);
-            if window == PRICE_MOVED_COOLDOWN {
+            if window == PRICE_MOVED_COOLDOWN && !unrelated_to_price(why) {
                 self.refused_at_edge
                     .insert(cycle_key.to_string(), (edge_bps.to_bits(), std::time::Instant::now()));
             }
@@ -978,6 +1034,24 @@ mod cooldowns_tests {
         assert!(!c.holds("K", 2.5), "capped at UNCHANGED_REFUSAL_HOLD");
         c.prune();
         assert!(!c.refused_at_edge.contains_key("K"));
+    }
+
+    /// A refusal that says nothing about the price gets the short window only: the
+    /// same edge back after it is a fresh question, not the same answer.
+    #[test]
+    fn a_refusal_unrelated_to_price_earns_no_same_edge_hold() {
+        for why in [
+            "the last Helius Sender send was 40 ms ago and it allows one a second",
+            "learned where pool P keeps its reserves; the next sweep can price it without a second round trip",
+            "pool P vanished between sweep and build",
+        ] {
+            let mut c = Cooldowns::default();
+            c.hold_after_refusal("K", 2.5, why);
+            assert!(c.holds("K", 2.5), "the short window still holds: {why}");
+            let past_window = Instant::now() - PRICE_MOVED_COOLDOWN;
+            c.recent_refusals.insert("K".into(), (past_window, PRICE_MOVED_COOLDOWN));
+            assert!(!c.holds("K", 2.5), "no 30 s hold for: {why}");
+        }
     }
 
     /// An unfundable entry holds the mint, not the cycle, and lets go after its window.
@@ -1514,6 +1588,8 @@ struct PendingSend {
     /// The trade's pools and the feed's slot when it went, for `post_mortem`.
     pools: Vec<cb_core::types::Pubkey32>,
     sent_slot: u64,
+    /// The trade's mints: their accounts are not closed while it is in flight.
+    mints: Vec<cb_core::types::Pubkey32>,
 }
 
 /// How many slots after a missed send `post_mortem` looks for someone else's trade.
@@ -1733,16 +1809,20 @@ fn ask_verdicts(t: &execute::Trader, asks: Vec<(String, String)>) {
 /// Send a landing probe of `tip` lamports and follow it like a trade.
 async fn send_probe(t: &mut execute::Trader, pending: &mut Vec<PendingSend>, tip: u64) {
     match t.landing_probe(tip).await {
-        Ok(Some(receipt)) => pending.push(PendingSend {
-            sig: receipt.signature,
-            bundle_id: receipt.bundle_id,
-            sent_at: std::time::Instant::now(),
-            row: None,
-            via_jito: t.sends_via_jito(),
-            probe_tip: Some(tip),
-            pools: Vec::new(),
-            sent_slot: 0,
-        }),
+        Ok(Some(receipt)) => push_pending(
+            pending,
+            PendingSend {
+                sig: receipt.signature,
+                bundle_id: receipt.bundle_id,
+                sent_at: std::time::Instant::now(),
+                row: None,
+                via_jito: t.sends_via_jito(),
+                probe_tip: Some(tip),
+                pools: Vec::new(),
+                sent_slot: 0,
+                mints: Vec::new(),
+            },
+        ),
         Ok(None) => {}
         Err(e) => tracing::warn!("{} probe of {tip} lamports could not be sent: {e:#}", t.send_path()),
     }
@@ -1762,7 +1842,12 @@ async fn settle_pending(
     const FIRST_LOOK: Duration = Duration::from_secs(2);
     /// Long enough for a bundle sent to every region to meet a leader connected to
     /// one of them; after this it is not coming.
-    const GIVE_UP: Duration = Duration::from_secs(20);
+    const JITO_GIVE_UP: Duration = Duration::from_secs(20);
+    /// A plain or Sender transaction can land until its blockhash expires, 150 blocks
+    /// (60-90 s) after it was read: followed that long, so a late revert is charged and
+    /// a late landing is noted, rather than called a miss at 20 s.
+    const BLOCKHASH_LIFETIME: Duration = Duration::from_secs(90);
+    let give_up = |p: &PendingSend| if p.via_jito { JITO_GIVE_UP } else { BLOCKHASH_LIFETIME };
     let mut keep = Vec::new();
     let mut settled = Vec::new();
     // Missed Jito sends to ask the block engine about, batched once the pass is done.
@@ -1784,6 +1869,8 @@ async fn settle_pending(
             match status {
                 Some(landed) => {
                     t.note_probe(tip, true);
+                    // It paid its fees and, if it ran, its tip: the day's loss sees them.
+                    t.settle(-(t.probe_cost_lamports(tip, landed) as f64) / 1e9 * sol_price);
                     tracing::warn!(
                         "{} probe LANDED with a {tip} lamport tip ({}): the send path works, \
                          and no trade will tip less than this",
@@ -1791,7 +1878,7 @@ async fn settle_pending(
                         if landed { "executed cleanly" } else { "included but failed, which a transfer should not" }
                     );
                 }
-                None if p.sent_at.elapsed() < GIVE_UP => keep.push(p),
+                None if p.sent_at.elapsed() < give_up(&p) => keep.push(p),
                 None => {
                     t.note_probe(tip, false);
                     // Only a block engine has a bundle status to ask about.
@@ -1803,7 +1890,7 @@ async fn settle_pending(
                         Some(&next) => {
                             tracing::warn!(
                                 "{path} probe of {tip} lamports did not land in {} s; trying {next}",
-                                GIVE_UP.as_secs()
+                                give_up(&p).as_secs()
                             );
                             send_probe(t, &mut keep, next).await;
                         }
@@ -1826,6 +1913,7 @@ async fn settle_pending(
         let (taken, reason, net) = match status {
             Some(true) => {
                 t.note_landed();
+                t.confirm_outcome(0.0, false);
                 tracing::error!("LANDED {sig} — the transaction confirmed on chain");
                 if let Some(mint) = t.settle_open(sig, true) {
                     tracing::warn!(
@@ -1839,16 +1927,16 @@ async fn settle_pending(
             Some(false) => {
                 t.settle_open(sig, false);
                 // A revert pays the whole fee and returns nothing; the daily budget has
-                // to see it.
+                // to see it, and the breaker counts it as a strike.
                 let cost_usd = t.submission_cost_lamports() as f64 / 1e9 * sol_price;
-                t.settle(-cost_usd);
+                t.confirm_outcome(-cost_usd, true);
                 tracing::warn!(
                     "{sig} landed and reverted — the floor was not met by the time it was \
                      included; this cost ${cost_usd:.6} and returned nothing"
                 );
                 (true, "submitted, landed, reverted".to_string(), -cost_usd)
             }
-            None if p.sent_at.elapsed() < GIVE_UP => {
+            None if p.sent_at.elapsed() < give_up(&p) => {
                 keep.push(p);
                 continue;
             }
@@ -1869,8 +1957,12 @@ async fn settle_pending(
                 (false, "sent to Jito; not included, cost nothing".to_string(), 0.0)
             }
             None => {
-                tracing::warn!("{sig} has not confirmed yet — not the same as failed; check it in an explorer");
-                (false, "submitted; not yet confirmed".to_string(), 0.0)
+                t.settle_open(sig, false);
+                tracing::warn!(
+                    "{sig} was not included before its blockhash expired — it can no longer \
+                     land, and a send that never lands costs nothing"
+                );
+                (false, "submitted; not included before its blockhash expired, cost nothing".to_string(), 0.0)
             }
         };
         if let Some(row) = p.row {
@@ -2479,6 +2571,9 @@ struct Fate {
     reason: Option<String>,
     /// A send for the confirm timer, pushed once its ledger row is known.
     pending: Option<PendingSend>,
+    /// The tip a sent trade carried, in USD, for its row in place of the detection
+    /// estimate.
+    tip_usd: Option<f64>,
 }
 
 impl LiveLoop {
@@ -2588,11 +2683,13 @@ impl LiveLoop {
         if let Some(t) = trader {
             let now = now_ms() / 1_000;
             let managed = t.managed_accounts(&self.protected);
-            // An account left open for a balance is not retried every tick.
+            // An account left open for a balance is not retried every tick, and one a
+            // send in flight trades through is not closed under it.
             self.kept_open.retain(|_, at: &mut std::time::Instant| at.elapsed() < KEPT_OPEN_RECHECK);
-            let unclosable = self.kept_open.keys().copied().collect();
+            let mut unclosable: std::collections::HashSet<_> = self.kept_open.keys().copied().collect();
+            unclosable.extend(pending_mints(&self.pending_sends));
             for mint in closes_due(&self.demand, &managed, self.token_slots, &unclosable, now) {
-                match t.close_account(&mint).await {
+                match t.close_account(&mint, dust_max(self.market.usd_per_base_unit(&mint))).await {
                     Ok(true) => tracing::warn!(
                         "closed the account for {}, over the slot cap or asked for by nothing in a day, \
                          to trade its deposit instead",
@@ -2700,6 +2797,13 @@ impl LiveLoop {
         // must not be the reason that takes longer to notice.
         if let Some(t) = trader.as_deref_mut() {
             t.tick_auto_resume();
+            // Opens, closes and table grows paid fees; the day's loss has to see them.
+            if let Some(sol) = self.market.sol_price_usd() {
+                let lamports = t.take_setup_lamports();
+                if lamports > 0 {
+                    t.settle(-(lamports as f64) / 1e9 * sol);
+                }
+            }
             self.announce_halt(t);
         }
         let sweep = self.market.sweep(self.tradable_usd, self.min_depth_usd, self.max_hops);
@@ -2885,8 +2989,13 @@ impl LiveLoop {
         // It is no longer charged as a cost — see `tip_cost_usd`.
         let contested = opp.gross_profit_usd > CONTESTED_USD;
         let est_tip_usd = tip_cost_usd(opp.gross_profit_usd, sol_price);
-        let base_fee_usd = BASE_FEE_SOL * sol_price;
-        let net = opp.gross_profit_usd - est_tip_usd - base_fee_usd;
+        // The least it can cost to land: under Sender the base fee, its minimum tip and
+        // the least bid it sends, which every trade pays if it lands.
+        let landing_cost_usd = trader
+            .as_ref()
+            .map_or(BASE_FEE_SOL, |t| t.min_landing_cost_lamports() as f64 / 1e9)
+            * sol_price;
+        let net = opp.gross_profit_usd - est_tip_usd - landing_cost_usd;
 
         // Competition is charged once, in the tip, and not again here.
         //
@@ -2905,7 +3014,7 @@ impl LiveLoop {
         // worth attempting. See `race_ladder` for what the assumption is
         // worth at each win rate.
         let skipped = if net <= 0.0 {
-            Some("net negative after tip".to_string())
+            Some("gross below landing cost".to_string())
         } else {
             None
         };
@@ -2941,7 +3050,7 @@ impl LiveLoop {
 
         self.record_fill(&opp, est_tip_usd, sweep_slot, feed_stalled, &mut fate);
         if let Some(p) = fate.pending.take() {
-            self.pending_sends.push(p);
+            push_pending(&mut self.pending_sends, p);
         }
 
         self.bus.publish(Event::Opportunity {
@@ -3062,11 +3171,19 @@ impl LiveLoop {
         // each crowding out a cycle that could have been sent.
         let unsendable =
             opp.plan.as_ref().is_some_and(|pl| !t.could_execute(pl));
+        // A pool a send still in flight trades through. Under Sender
+        // there is no gap between sends, so the next sweep could send
+        // an overlapping trade before the first has landed.
+        let in_flight = opp
+            .plan
+            .as_ref()
+            .is_some_and(|pl| overlaps_pending(&self.pending_sends, pl));
         let barred = budget.submitted
             || budget.attempts >= MAX_ATTEMPTS_PER_SWEEP
             || on_cooldown
             || unfundable_entry
-            || unsendable;
+            || unsendable
+            || in_flight;
         // The two filters that reject a candidate by making a
         // claim about what would have happened to it, rather
         // than by observing something that already has. Both
@@ -3136,7 +3253,11 @@ impl LiveLoop {
                     budget.probes += 1;
                     self.measure(t, opp, probe_plan, net, fate).await;
                 } else {
-                    fate.reason = Some(if on_cooldown {
+                    fate.reason = Some(if in_flight {
+                        "not attempted — a send still in flight \
+                         trades through one of its pools"
+                            .to_string()
+                    } else if on_cooldown {
                         "not attempted — refused recently and \
                          nothing has changed"
                             .to_string()
@@ -3189,6 +3310,10 @@ impl LiveLoop {
                             "not attempted — {} has no encoder",
                             dex.name()
                         )
+                    } else if budget.submitted {
+                        "not attempted — this sweep already sent a \
+                         trade"
+                            .to_string()
                     } else {
                         format!(
                             "not attempted — this sweep's {} attempts \
@@ -3308,6 +3433,7 @@ impl LiveLoop {
         // names into the lookup table, so the next attempt fits.
         grow_lookup_table(t, &mut self.lookup_grows).await;
         if matches!(r, Ok(cb_executor::Attempt::Refused(_))) {
+            let market = &self.market;
             rotate_for(
                 t,
                 plan,
@@ -3315,6 +3441,8 @@ impl LiveLoop {
                 &self.protected,
                 self.token_slots,
                 &mut self.account_opens,
+                &pending_mints(&self.pending_sends),
+                |m| dust_max(market.usd_per_base_unit(m)),
             )
             .await;
         }
@@ -3362,11 +3490,13 @@ impl LiveLoop {
                 // realised figure stays zero until a
                 // confirmation path fills it in — a P&L
                 // nobody has confirmed is not a P&L.
-                t.record(
-                    cb_executor::risk::Outcome::Landed {
-                        net_usd: 0.0,
-                    },
-                );
+                // Counted toward the day now; whether it was a strike or cleared the
+                // streak is settled when the chain answers. See `settle_pending`.
+                t.record(cb_executor::risk::Outcome::Sent);
+                if t.tips_in_trade() {
+                    let sol = self.market.sol_price_usd().unwrap_or(0.0);
+                    fate.tip_usd = Some(t.last_trade_tip() as f64 / 1e9 * sol);
+                }
                 // The sweep is finished here whatever
                 // its attempt budget had left. This is
                 // the hazard the old one-attempt rule
@@ -3402,6 +3532,7 @@ impl LiveLoop {
                     probe_tip: None,
                     pools: plan.pools.iter().map(|(k, _)| *k).collect(),
                     sent_slot: self.stats.last_slot.load(Ordering::Relaxed),
+                    mints: plan.mints.clone(),
                 });
             }
             Ok(cb_executor::Attempt::SimulationRejected {
@@ -3478,8 +3609,8 @@ impl LiveLoop {
             Err(e) => {
                 // An RPC failure is not a defect in what
                 // was built, so it must not trip the
-                // breaker that exists to catch defects.
-                t.record(cb_executor::risk::Outcome::Missed);
+                // breaker — nor clear a streak of reverts
+                // it says nothing about. Nothing is recorded.
                 tracing::warn!(
                     "execution could not reach the chain: {e:#}"
                 );
@@ -3530,7 +3661,7 @@ impl LiveLoop {
                 optimal_size_usd: opp.optimal_size_usd,
                 gross_usd: opp.gross_profit_usd,
                 profit_at_optimal_usd: opp.profit_at_optimal_usd,
-                tip_usd: est_tip_usd,
+                tip_usd: fate.tip_usd.unwrap_or(est_tip_usd),
                 // The realised figure, not the hoped-for one. In paper these
                 // are the same number; in live they are not, and the whole
                 // point of the run is the difference.
@@ -4276,17 +4407,18 @@ mod tests {
 
     /// 2026-11-07: 13 managed, cap 6, two closes a tick, and every close that did not
     /// confirm was forgotten as if it had: 15 accounts still open ten hours later. Over
-    /// the cap, every excess account is due each tick, and one whose close failed is
-    /// due again the next, until the wallet is at the cap. One holding a balance never is.
+    /// the cap, excess accounts are due each tick, two at a time, and one whose close
+    /// failed is due again, until the wallet is at the cap. One holding a balance never is.
     #[test]
     fn the_excess_closer_keeps_selecting_until_the_wallet_is_at_the_cap() {
         let d = demand::Demand::new(0);
         let mut managed: std::collections::HashSet<cb_core::types::Pubkey32> =
             (1..=13u8).map(|b| [b; 32]).collect();
         let funded: std::collections::HashSet<_> = [[1u8; 32]].into_iter().collect();
-        assert_eq!(closes_due(&d, &managed, 6, &funded, 10).len(), 7, "all seven excess, not two");
+        // Two a tick, so one tick cannot hold the loop for minutes; the rest next tick.
+        assert_eq!(closes_due(&d, &managed, 6, &funded, 10).len(), MAX_ACCOUNT_CLOSES_PER_TICK);
         let mut flaky = Some([2u8; 32]);
-        for _tick in 0..3 {
+        for _tick in 0..5 {
             for m in closes_due(&d, &managed, 6, &funded, 10) {
                 assert!(!funded.contains(&m), "an account holding a balance is never closed");
                 // The first close of mint 2 does not land; it stays held.
@@ -4576,5 +4708,222 @@ mod fee_ceiling_tests {
             "and neither does a contested cycle, for the same reason: there is no \
              instruction for the tip to ride in"
         );
+    }
+}
+
+/// The live loop's own decisions, driven against an unreachable RPC: every round trip
+/// fails fast, so what is asserted is what the loop decided before and after it.
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+    use cb_core::types::{Dex, Pubkey32};
+    use std::collections::HashSet;
+
+    fn wsol() -> Pubkey32 {
+        *cb_executor::encode::pk(cb_executor::encode::programs::WSOL_MINT).as_array()
+    }
+
+    fn sender_trader(held: &[Pubkey32]) -> execute::Trader {
+        let opts = execute::TradeOptions {
+            submit: execute::Submit::Sender { tip_max_lamports: 20_000 },
+            wsol: cb_executor::route::WsolPolicy::WrapAndClose,
+            ..Default::default()
+        };
+        execute::trader_for_tests(opts, held)
+    }
+
+    fn sol_plan() -> execute::CyclePlan {
+        execute::CyclePlan {
+            pools: vec![([1; 32], Dex::OrcaWhirlpool), ([2; 32], Dex::OrcaWhirlpool)],
+            mints: vec![wsol(), [9; 32], wsol()],
+            amount_in: 1_000_000,
+            leg_out: vec![5_000, 1_010_000],
+            fee_ppm: vec![3_000, 3_000],
+            extra_fee_ppm: Vec::new(),
+        }
+    }
+
+    fn opp(plan: execute::CyclePlan, fee_bps: f64) -> live::LiveOpportunity {
+        live::LiveOpportunity {
+            route: "SOL-X-SOL".into(),
+            cycle_key: "K".into(),
+            venues: "orca/orca".into(),
+            hops: 2,
+            size_usd: 1.0,
+            optimal_size_usd: 1.0,
+            gross_profit_usd: 0.05,
+            profit_at_optimal_usd: 0.05,
+            profit_at_capital_usd: [0.0; 3],
+            edge_bps: 10.0,
+            fee_bps,
+            plan: Some(plan),
+            slot: 100,
+            slot_spread: 0,
+        }
+    }
+
+    fn pending(sig: &str, age: Duration, plan: &execute::CyclePlan) -> PendingSend {
+        PendingSend {
+            sig: sig.into(),
+            sent_at: std::time::Instant::now() - age,
+            row: Some(7),
+            via_jito: false,
+            bundle_id: None,
+            probe_tip: None,
+            pools: plan.pools.iter().map(|(k, _)| *k).collect(),
+            sent_slot: 0,
+            mints: plan.mints.clone(),
+        }
+    }
+
+    fn live_loop() -> LiveLoop {
+        LiveLoop {
+            bus: EventBus::new(),
+            market: live::empty_market_for_tests(),
+            stats: std::sync::Arc::default(),
+            feed_ctl: tokio::sync::mpsc::unbounded_channel().0,
+            discovered: std::collections::VecDeque::new(),
+            shared: std::sync::Arc::default(),
+            ledger: None,
+            paper_run: false,
+            tradable_usd: 1.0,
+            min_depth_usd: 0.0,
+            max_hops: 3,
+            protected: HashSet::new(),
+            token_slots: 1,
+            post_mortem_rpc: String::new(),
+            next_id: 1,
+            cooldowns: Cooldowns::default(),
+            last_recorded: std::collections::HashMap::new(),
+            evaluated_total: 0,
+            sweep_n: 0,
+            pending_sends: Vec::new(),
+            drift: (0, 0),
+            was_stalled: false,
+            last_stale_excluded: 0,
+            demand: demand::Demand::new(0),
+            account_opens: std::collections::VecDeque::new(),
+            kept_open: std::collections::HashMap::new(),
+            lookup_grows: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// One send per signature, and nothing overlapping a send still in flight.
+    #[test]
+    fn a_send_in_flight_holds_its_pools_and_mints_and_is_followed_once() {
+        let p = sol_plan();
+        let mut v = Vec::new();
+        push_pending(&mut v, pending("S", Duration::ZERO, &p));
+        push_pending(&mut v, pending("S", Duration::ZERO, &p));
+        assert_eq!(v.len(), 1, "the same signature is followed once");
+        assert!(overlaps_pending(&v, &p));
+        let mut other = p.clone();
+        other.pools[0].0 = [5; 32];
+        assert!(overlaps_pending(&v, &other), "one shared pool is enough");
+        other.pools[1].0 = [6; 32];
+        assert!(!overlaps_pending(&v, &other));
+        assert!(pending_mints(&v).contains(&[9; 32]));
+        assert_eq!(dust_max(Some(DUST_MAX_USD / 50.0)), 50);
+        assert_eq!(dust_max(None), 0, "an unpriced mint has no dust");
+        assert_eq!(dust_max(Some(0.0)), 0);
+    }
+
+    /// A Sender send can land for as long as its blockhash lives: not abandoned at 20 s,
+    /// and called not included once it has expired.
+    #[tokio::test]
+    async fn a_sender_send_is_followed_until_its_blockhash_expires() {
+        let mut t = sender_trader(&[]);
+        let p = sol_plan();
+        let mut v = vec![pending("young", Duration::from_secs(30), &p), pending("old", Duration::from_secs(100), &p)];
+        let settled = settle_pending(&mut t, &mut v, 200.0, "").await;
+        assert_eq!(v.iter().map(|p| p.sig.as_str()).collect::<Vec<_>>(), ["young"], "30 s is still in flight");
+        assert_eq!(settled.len(), 1);
+        let (row, taken, reason, net) = &settled[0];
+        assert_eq!((*row, *taken, *net), (7, false, 0.0));
+        assert!(reason.contains("not included"), "{reason}");
+    }
+
+    /// A send is followed with its mints, its tip is the one it carried, and an RPC
+    /// failure is a reason on the row rather than a strike or a cleared streak.
+    #[test]
+    fn an_attempts_answer_sets_the_budget_the_hold_and_the_row() {
+        let mut l = live_loop();
+        let mut t = sender_trader(&[]);
+        let p = sol_plan();
+        let o = opp(p.clone(), 1.0);
+        let mut budget = SweepBudget::default();
+        let mut fate = Fate::default();
+        let sent = cb_executor::Attempt::Submitted { signature: "S".into(), expected_net_usd: 0.0, bundle_id: None };
+        l.on_attempt_outcome(&mut t, Ok(sent), &o, &p, &mut budget, &mut fate);
+        assert!(budget.submitted);
+        let ps = fate.pending.as_ref().expect("followed");
+        assert_eq!((ps.sig.as_str(), &ps.mints), ("S", &p.mints));
+        assert_eq!(fate.tip_usd, Some(0.0), "the tip the trade carried, not the detection estimate");
+        assert!(t.halted().is_none());
+
+        let mut fate = Fate::default();
+        l.on_attempt_outcome(&mut t, Err(anyhow::anyhow!("timed out")), &o, &p, &mut budget, &mut fate);
+        assert!(fate.reason.as_deref().is_some_and(|r| r.starts_with("rpc error")));
+
+        let mut fate = Fate::default();
+        let gap = cb_executor::Attempt::Refused("the last Helius Sender send was 40 ms ago and it allows one a second".into());
+        l.on_attempt_outcome(&mut t, Ok(gap), &o, &p, &mut budget, &mut fate);
+        assert!(fate.reason.as_deref().is_some_and(|r| r.starts_with("refused: the last")));
+        assert!(!l.cooldowns.refused_at_edge.contains_key("K"), "the send gap is not a price");
+    }
+
+    /// Under Sender a route only the fee ceiling held back is attempted as a trade (it
+    /// reaches the chain's read and fails there), not probed; under RPC it is probed.
+    /// One sharing a pool with a send in flight is neither.
+    #[tokio::test]
+    async fn the_promotion_branch_attempts_under_sender_and_probes_under_rpc() {
+        let mut l = live_loop();
+        let mut t = sender_trader(&[]);
+        let o = opp(sol_plan(), 10.0);
+        let (mut budget, mut fate) = (SweepBudget::default(), Fate::default());
+        l.consider(&mut t, &o, 0.05, 100, &mut budget, &mut fate).await;
+        assert_eq!((budget.attempts, budget.probes), (1, 1));
+        assert!(fate.reason.as_deref().is_some_and(|r| r.starts_with("rpc error")), "{:?}", fate.reason);
+
+        let mut l = live_loop();
+        let mut rpc = execute::trader_for_tests(
+            execute::TradeOptions { wsol: cb_executor::route::WsolPolicy::WrapAndClose, ..Default::default() },
+            &[],
+        );
+        let (mut budget, mut fate) = (SweepBudget::default(), Fate::default());
+        l.consider(&mut rpc, &o, 0.05, 100, &mut budget, &mut fate).await;
+        assert_eq!((budget.attempts, budget.probes), (0, 1));
+        assert!(fate.reason.as_deref().is_some_and(|r| r.starts_with("probe failed")), "{:?}", fate.reason);
+
+        let mut l = live_loop();
+        l.pending_sends.push(pending("S", Duration::ZERO, &sol_plan()));
+        let (mut budget, mut fate) = (SweepBudget::default(), Fate::default());
+        l.consider(&mut t, &o, 0.05, 100, &mut budget, &mut fate).await;
+        assert_eq!((budget.attempts, budget.probes), (0, 0));
+        assert!(fate.reason.as_deref().is_some_and(|r| r.contains("in flight")), "{:?}", fate.reason);
+
+        // A sweep that already sent says so, not that its attempts went elsewhere.
+        let mut l = live_loop();
+        let (mut budget, mut fate) = (SweepBudget { submitted: true, ..Default::default() }, Fate::default());
+        l.consider(&mut t, &opp(sol_plan(), 1.0), 0.05, 100, &mut budget, &mut fate).await;
+        assert_eq!(fate.reason.as_deref(), Some("not attempted — this sweep already sent a trade"));
+    }
+
+    /// A Replace never closes an account a send in flight trades through.
+    #[tokio::test]
+    async fn a_replace_leaves_an_account_a_pending_send_needs() {
+        let held = [wsol(), [3; 32]];
+        let mut d = demand::Demand::new(0);
+        let now = now_ms() / 1_000;
+        d.record(now, &[9; 32], 0.5);
+        d.record(now, &[9; 32], 0.5);
+        let mut opens = std::collections::VecDeque::new();
+        let busy: HashSet<Pubkey32> = [[3; 32]].into_iter().collect();
+        let mut t = sender_trader(&held);
+        rotate_for(&mut t, &sol_plan(), &mut d, &HashSet::new(), 1, &mut opens, &busy, |_| 0).await;
+        assert!(opens.is_empty(), "nothing opened or closed while [3] is in flight");
+        // Not busy: the Replace goes ahead (and fails at the unreachable RPC).
+        rotate_for(&mut t, &sol_plan(), &mut d, &HashSet::new(), 1, &mut opens, &HashSet::new(), |_| 0).await;
+        assert_eq!(opens.len(), 1);
     }
 }

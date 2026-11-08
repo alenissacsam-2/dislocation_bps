@@ -113,17 +113,17 @@ impl Cycle {
         // canonical either way, and n is at most 4 (a lollipop).
         (0..n)
             .map(|start| {
-                let mut out = String::with_capacity(n * 14);
+                let mut out = String::with_capacity(n * 130);
                 for k in 0..n {
                     let i = (start + k) % n;
                     if k > 0 {
                         out.push('>');
                     }
-                    for b in &self.pools[i].0[..4] {
+                    for b in &self.pools[i].0 {
                         let _ = write!(out, "{b:02x}");
                     }
                     out.push(':');
-                    for b in &self.mints[i][..2] {
+                    for b in &self.mints[i] {
                         let _ = write!(out, "{b:02x}");
                     }
                 }
@@ -224,8 +224,8 @@ pub const LOLLIPOP_ENTRY_POOLS: usize = 2;
 /// [`LOLLIPOP_ENTRY_POOLS`] on each end and by the round trips each hub actually has.
 fn lollipops(snap: &Snapshot, base_mint: &Pubkey32, out: &mut Vec<Cycle>) {
     // The cheapest pools on each base/hub pair, grouped by hub.
-    let mut by_hub: std::collections::HashMap<Pubkey32, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut by_hub: std::collections::BTreeMap<Pubkey32, Vec<usize>> =
+        std::collections::BTreeMap::new();
     for &i in snap.pools_trading(base_mint) {
         if let Some(hub) = snap.at(i).other_mint(base_mint) {
             by_hub.entry(hub).or_default().push(i);
@@ -238,6 +238,9 @@ fn lollipops(snap: &Snapshot, base_mint: &Pubkey32, out: &mut Vec<Cycle>) {
         }
         ends.sort_by_key(|&i| (snap.at(i).fee_ppm, snap.at(i).id.0));
         ends.truncate(LOLLIPOP_ENTRY_POOLS.max(2));
+        // Entry and exit legs of each end pool, built once per hub rather than per loop.
+        let ends: Vec<(usize, Option<Leg>, Option<Leg>)> =
+            ends.iter().map(|&i| (i, snap.leg(i, base_mint), snap.leg(i, &hub))).collect();
 
         for &j in snap.pools_trading(&hub) {
             let out_leg = snap.at(j);
@@ -245,30 +248,24 @@ fn lollipops(snap: &Snapshot, base_mint: &Pubkey32, out: &mut Vec<Cycle>) {
             if x == *base_mint || x == hub {
                 continue;
             }
+            let Some(leg_out) = snap.leg(j, &hub) else { continue };
             for &k in snap.pools_trading(&x) {
                 let back = snap.at(k);
                 if back.id == out_leg.id || back.other_mint(&x) != Some(hub) {
                     continue;
                 }
-                for &e in &ends {
-                    for &r in &ends {
+                let Some(leg_back) = snap.leg(k, &x) else { continue };
+                for &(e, enter_leg, _) in &ends {
+                    for &(r, _, exit_leg) in &ends {
                         let (enter, exit) = (snap.at(e), snap.at(r));
                         if enter.id == exit.id {
                             continue;
                         }
-                        let legs = [
-                            snap.leg(e, base_mint),
-                            snap.leg(j, &hub),
-                            snap.leg(k, &x),
-                            snap.leg(r, &hub),
-                        ];
-                        if legs.iter().any(Option::is_none) {
-                            continue;
-                        }
+                        let (Some(enter_leg), Some(exit_leg)) = (enter_leg, exit_leg) else { continue };
                         out.push(Cycle {
                             pools: vec![enter.id, out_leg.id, back.id, exit.id],
                             mints: vec![*base_mint, hub, x, hub, *base_mint],
-                            legs: legs.into_iter().flatten().collect(),
+                            legs: vec![enter_leg, leg_out, leg_back, exit_leg],
                         });
                     }
                 }
@@ -314,7 +311,27 @@ pub fn depth_probe_units(usd_per_unit: f64) -> u128 {
     }
 }
 
+/// Units of each intermediate mint the depth probe must carry: whole-unit fee and output
+/// floors cost up to a unit per leg, which at ten is a fifth of the probe at worst.
+const MIN_INTERMEDIATE_UNITS: f64 = 10.0;
+
+/// Whether the cycle hands back half of its probe.
+///
+/// The probe is raised until it is worth at least ten units of every intermediate mint:
+/// a cent of a high-value token (cbBTC) is a fraction of a unit, floors to zero in the
+/// first leg and would call a real route shallow. A cycle is shallow only when it
+/// returns under half of that.
 fn has_depth(legs: &[Leg], probe: u128) -> bool {
+    let mut rate = 1.0f64; // intermediate units per base unit
+    let mut size = probe as f64;
+    for leg in legs.split_last().map_or(&[][..], |(_, rest)| rest) {
+        rate *= (1_000_000.0 - f64::from(leg.fee_ppm)) / 1_000_000.0 * leg.reserve_out as f64
+            / leg.reserve_in.max(1) as f64;
+        if rate > 0.0 && rate.is_finite() {
+            size = size.max((MIN_INTERMEDIATE_UNITS / rate).ceil());
+        }
+    }
+    let probe = if size >= u128::MAX as f64 { u128::MAX } else { size as u128 };
     cb_core::path::chain_quote(legs, probe).is_some_and(|out| out >= probe / 2)
 }
 
@@ -342,7 +359,7 @@ pub fn survey_and_find(
     let mut found: Vec<PricedCycle> = if max_in == 0 {
         Vec::new()
     } else {
-        surveyed.iter().filter_map(|s| price(&s.cycle, max_in, depth_probe)).collect()
+        surveyed.iter().filter_map(|s| price(&s.cycle, s.edge_bps, max_in, depth_probe)).collect()
     };
     found.sort_by_key(|c| std::cmp::Reverse(c.profit));
     surveyed.sort_by(|a, b| b.edge_bps.total_cmp(&a.edge_bps));
@@ -399,12 +416,12 @@ impl Path {
     }
 }
 
-fn price(cycle: &Cycle, max_in: u128, depth_probe: u128) -> Option<PricedCycle> {
+fn price(cycle: &Cycle, edge_bps: f64, max_in: u128, depth_probe: u128) -> Option<PricedCycle> {
     // A float first, the exact rational only near break-even. The exact check is
     // 512-bit arithmetic per leg, and ran for every one of fourteen thousand cycles a pass
     // when almost all are tens of basis points under water; f64 is good to 1e-15 per
     // step, so a cycle it puts a whole basis point under is under.
-    if marginal_edge_bps(&cycle.legs).is_none_or(|e| e < -1.0) {
+    if edge_bps < -1.0 {
         return None;
     }
     if !is_profitable(&cycle.legs) || !has_depth(&cycle.legs, depth_probe) {
@@ -413,7 +430,8 @@ fn price(cycle: &Cycle, max_in: u128, depth_probe: u128) -> Option<PricedCycle> 
     let optimal_in = optimal_input(&cycle.legs, u128::MAX)?;
     let profit_at_optimal = cycle_profit(&cycle.legs, optimal_in).unwrap_or(0);
 
-    let capped_in = optimal_input(&cycle.legs, max_in)?;
+    // An affordable optimum is the capped optimum; only search again when capital binds.
+    let capped_in = if max_in >= optimal_in { optimal_in } else { optimal_input(&cycle.legs, max_in)? };
     let profit = cycle_profit(&cycle.legs, capped_in)?;
     if profit == 0 {
         return None;
@@ -765,6 +783,19 @@ mod tests {
         ]);
         assert!(survey_and_find(&dear, &WIF, 2, 5_000, DEPTH_PROBE_IN).1.is_empty());
         assert!(!survey_and_find(&dear, &WIF, 2, 5_000, depth_probe_units(1.0)).1.is_empty());
+    }
+
+    /// cbBTC-like intermediate: one base unit is worth about a dollar, so a cent of USDC
+    /// is a hundredth of a unit and floors to zero. The route is deep and real.
+    #[test]
+    fn a_high_value_intermediate_does_not_make_a_deep_route_look_shallow() {
+        let btc = [8u8; 32];
+        let snap = Snapshot::new(vec![
+            fee_pool(1, USDC, btc, 2_000_000_000_000, 2_000_000, 100),
+            fee_pool(2, USDC, btc, 2_000_000_000_000, 1_980_000, 100),
+        ]);
+        let found = survey_and_find(&snap, &USDC, 2, 1_000_000_000, depth_probe_units(1e-6)).1;
+               assert!(!found.is_empty(), "a 1% gap over $2M pools is not shallow");
     }
 
     #[test]

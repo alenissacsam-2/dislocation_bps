@@ -8,6 +8,12 @@ use crate::snapshot::Snapshot;
 use cb_core::types::{PoolId, PoolState};
 use dashmap::DashMap;
 
+/// How far past the rest of the book a slot may sit and still be believed: about 33 minutes.
+///
+/// A slot further ahead is a bad decode or a bogus clock, not a pool that is ahead of the
+/// chain, and one such pool must not make every other pool look stale.
+pub const MAX_SLOTS_AHEAD: u64 = 5_000;
+
 #[derive(Default)]
 pub struct PoolStore {
     pools: DashMap<PoolId, PoolState>,
@@ -28,7 +34,9 @@ impl PoolStore {
         self.pools
             .entry(p.id)
             .and_modify(|existing| {
-                if p.slot >= existing.slot {
+                // An existing slot implausibly past the newcomer is the bogus one: let a
+                // sane update heal it instead of being rejected forever.
+                if p.slot >= existing.slot || existing.slot - p.slot > MAX_SLOTS_AHEAD {
                     *existing = p;
                 }
             })
@@ -78,11 +86,16 @@ impl PoolStore {
     /// stale. Detecting *that* needs a wall clock, and belongs to the caller.
     #[must_use]
     pub fn snapshot_fresh(&self, max_lag: u64) -> (Snapshot, usize) {
-        let newest = self.pools.iter().map(|r| r.slot).max().unwrap_or(0);
+        // The head is the newest slot within [`MAX_SLOTS_AHEAD`] of the median, so one
+        // pool with a future slot neither ages the rest nor is itself trusted.
+        let mut slots: Vec<u64> = self.pools.iter().map(|r| r.slot).collect();
+        slots.sort_unstable();
+        let ceiling = slots.get(slots.len().saturating_sub(1) / 2).map_or(0, |m| m.saturating_add(MAX_SLOTS_AHEAD));
+        let newest = slots.iter().copied().filter(|&s| s <= ceiling).max().unwrap_or(0);
         let mut kept: Vec<PoolState> = Vec::with_capacity(self.pools.len());
         let mut excluded = 0usize;
         for r in self.pools.iter() {
-            if newest.saturating_sub(r.slot) > max_lag {
+            if r.slot > ceiling || newest.saturating_sub(r.slot) > max_lag {
                 excluded += 1;
             } else {
                 kept.push(*r.value());
@@ -187,6 +200,21 @@ mod tests {
         let (snap, excluded) = s.snapshot_fresh(10);
         assert_eq!(excluded, 0);
         assert_eq!(snap.len(), 2);
+    }
+
+    #[test]
+    fn one_future_slot_neither_freezes_the_book_nor_gets_through() {
+        let s = PoolStore::new();
+        s.upsert(pool(1, 10, 20, 1_000));
+        s.upsert(pool(2, 20, 30, 1_010));
+        s.upsert(pool(3, 30, 40, u64::MAX));
+        let (snap, excluded) = s.snapshot_fresh(300);
+        assert_eq!(excluded, 1, "only the bogus pool goes");
+        assert!(snap.get(&PoolId([3; 32])).is_none());
+        assert_eq!(snap.len(), 2);
+        // A sane update replaces a bogus stored slot.
+        s.upsert(pool(3, 30, 40, 1_020));
+        assert_eq!(s.get(&PoolId([3; 32])).unwrap().slot, 1_020);
     }
 
     #[test]

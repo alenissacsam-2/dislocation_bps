@@ -64,7 +64,7 @@ pub enum SubmitVia {
     Rpc,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub mode: Mode,
@@ -325,6 +325,47 @@ fn default_halt_cooldown_secs() -> u64 {
     600
 }
 
+
+/// Debug that never prints a credential: URLs lose their query values and the Jito
+/// auth UUID is replaced, so `{config:?}` is safe to log.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::redact::redact_endpoint as r;
+        let fallbacks: Vec<String> = self.rpc_http_fallbacks.iter().map(|u| r(u)).collect();
+        let uuid = if self.jito_auth_uuid.is_empty() { "" } else { "<redacted>" };
+        f.debug_struct("Config")
+            .field("mode", &self.mode)
+            .field("feed", &self.feed)
+            .field("rpc_http_url", &r(&self.rpc_http_url))
+            .field("rpc_http_fallbacks", &fallbacks)
+            .field("rpc_ws_url", &r(&self.rpc_ws_url))
+            .field("min_profit_lamports", &self.min_profit_lamports)
+            .field("max_position_lamports", &self.max_position_lamports)
+            .field("capital_usd", &self.capital_usd)
+            .field("fee_buffer_usd", &self.fee_buffer_usd)
+            .field("min_trade_usd", &self.min_trade_usd)
+            .field("max_hops", &self.max_hops)
+            .field("slippage_tenth_bps", &self.slippage_tenth_bps)
+            .field("priority_micro_lamports", &self.priority_micro_lamports)
+            .field("submit_via", &self.submit_via)
+            .field("jito_url", &r(&self.jito_url))
+            .field("jito_auth_uuid", &uuid)
+            .field("jito_tip_max_lamports", &self.jito_tip_max_lamports)
+            .field("jito_simulate_first", &self.jito_simulate_first)
+            .field("extra_token_mints", &self.extra_token_mints)
+            .field("token_account_slots", &self.token_account_slots)
+            .field("discovery", &self.discovery)
+            .field("dry_run", &self.dry_run)
+            .field("max_position_usd", &self.max_position_usd)
+            .field("max_daily_loss_usd", &self.max_daily_loss_usd)
+            .field("min_net_profit_usd", &self.min_net_profit_usd)
+            .field("max_consecutive_failures", &self.max_consecutive_failures)
+            .field("max_daily_trades", &self.max_daily_trades)
+            .field("halt_cooldown_secs", &self.halt_cooldown_secs)
+            .finish()
+    }
+}
+
 impl Config {
     /// Every HTTP endpoint, in preference order, primary first.
     #[must_use]
@@ -335,16 +376,43 @@ impl Config {
         all
     }
 
-    /// Load from a TOML file, with `CRYPTOBOT_` prefixed environment overrides.
+    /// Load from a TOML file, with `CRYPTOBOT_` prefixed environment overrides, and
+    /// refuse a configuration that [`validate`](Self::validate) rejects.
     pub fn load(path: &str) -> anyhow::Result<Self> {
         use figment::{
             providers::{Env, Format, Toml},
             Figment,
         };
-        Ok(Figment::new()
+        let cfg: Self = Figment::new()
             .merge(Toml::file(path))
             .merge(Env::prefixed("CRYPTOBOT_"))
-            .extract()?)
+            .extract()?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Reject values that cannot describe a run: a hop count the search does not
+    /// support, a negative or non-finite amount, or a slot count no wallet needs.
+    ///
+    /// # Errors
+    /// Names the first offending field.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        ensure!((2..=4).contains(&self.max_hops), "max_hops {} outside 2..=4", self.max_hops);
+        for (name, v) in [
+            ("capital_usd", self.capital_usd),
+            ("fee_buffer_usd", self.fee_buffer_usd),
+            ("min_trade_usd", self.min_trade_usd),
+            ("max_position_usd", self.max_position_usd),
+            ("max_daily_loss_usd", self.max_daily_loss_usd),
+            ("min_net_profit_usd", self.min_net_profit_usd),
+        ] {
+            ensure!(v.is_finite() && v >= 0.0, "{name} must be finite and >= 0, got {v}");
+        }
+        ensure!(self.token_account_slots <= 64, "token_account_slots {} is not sane (max 64)", self.token_account_slots);
+        // Tenths of a bp: 10,000 is a 10% floor, past any real tolerance.
+        ensure!(self.slippage_tenth_bps <= 10_000, "slippage_tenth_bps {} exceeds 10000", self.slippage_tenth_bps);
+        Ok(())
     }
 
     /// Capital actually available to trade, after the fee/rent buffer.
@@ -414,6 +482,30 @@ mod tests {
             max_daily_trades: 500,
             halt_cooldown_secs: 600,
         }
+    }
+
+    #[test]
+    fn validate_rejects_nonsense_and_debug_redacts_secrets() {
+        let mut c = cfg(Mode::Paper);
+        assert!(c.validate().is_ok());
+        c.max_hops = 5;
+        assert!(c.validate().is_err());
+        c.max_hops = 1;
+        assert!(c.validate().is_err());
+        c.max_hops = 3;
+        c.capital_usd = f64::NAN;
+        assert!(c.validate().is_err());
+        c.capital_usd = -1.0;
+        assert!(c.validate().is_err());
+        c.capital_usd = 5.0;
+        c.token_account_slots = 1_000;
+        assert!(c.validate().is_err());
+        c.token_account_slots = 6;
+
+        c.jito_auth_uuid = "uuid-secret".into();
+        c.rpc_http_url = "https://h.example/?api-key=KEYVALUE".into();
+        let s = format!("{c:?}");
+        assert!(!s.contains("uuid-secret") && !s.contains("KEYVALUE"), "{s}");
     }
 
     #[test]

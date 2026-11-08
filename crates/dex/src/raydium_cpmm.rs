@@ -256,9 +256,22 @@ pub fn to_pool_state(
     creator_fee_ppm: u32,
     slot: u64,
 ) -> Result<PoolState> {
-    // shortcut: reads this machine's clock because no caller passes a time; take `now` as a
-    // parameter when the bot's two call sites are next changed.
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    to_pool_state_at(address, pool, vault_0_amount, vault_1_amount, trade_fee_ppm, creator_fee_ppm, slot, now)
+}
+
+/// [`to_pool_state`] with the clock (unix seconds) passed in.
+#[allow(clippy::too_many_arguments)]
+pub fn to_pool_state_at(
+    address: Pubkey32,
+    pool: &CpmmPool,
+    vault_0_amount: u64,
+    vault_1_amount: u64,
+    trade_fee_ppm: u32,
+    creator_fee_ppm: u32,
+    slot: u64,
+    now: u64,
+) -> Result<PoolState> {
     ensure!(
         pool.open_time <= now.saturating_sub(CLOCK_MARGIN_SECS),
         "cpmm pool does not open to swaps until unix time {}",
@@ -437,15 +450,17 @@ mod tests {
     fn a_pool_before_its_open_time_is_refused() {
         assert_eq!(OFF_OPEN_TIME, OFF_FUND_FEES_1 + 8, "open_time follows fund_fees_token_1");
         let mut d = live();
-        // Year 2286: never open by this machine's clock.
-        d[OFF_OPEN_TIME..OFF_OPEN_TIME + 8].copy_from_slice(&10_000_000_000u64.to_le_bytes());
+                d[OFF_OPEN_TIME..OFF_OPEN_TIME + 8].copy_from_slice(&10_000_000_000u64.to_le_bytes());
         let p = decode(&d).unwrap();
         assert_eq!(p.open_time, 10_000_000_000);
-        let e = to_pool_state([9u8; 32], &p, 10_000_000_000, 20_000_000_000, 2500, 0, 1).unwrap_err().to_string();
+        let e = to_pool_state_at([9u8; 32], &p, 10_000_000_000, 20_000_000_000, 2500, 0, 1, 1_000)
+            .unwrap_err().to_string();
         assert!(e.contains("does not open"), "{e}");
         // WSOL/ALNOOR pool 8BELgBQ5... read on 2026-11-07 carried 1782844250: long past.
         d[OFF_OPEN_TIME..OFF_OPEN_TIME + 8].copy_from_slice(&1_782_844_250u64.to_le_bytes());
-        assert!(to_pool_state([9u8; 32], &decode(&d).unwrap(), 10_000_000_000, 20_000_000_000, 2500, 0, 1).is_ok());
+        let now = 1_782_844_250 + CLOCK_MARGIN_SECS;
+        assert!(to_pool_state_at([9u8; 32], &decode(&d).unwrap(), 10_000_000_000, 20_000_000_000, 2500, 0, 1, now).is_ok());
+        assert!(to_pool_state_at([9u8; 32], &decode(&d).unwrap(), 10_000_000_000, 20_000_000_000, 2500, 0, 1, now - 1).is_err());
     }
 
     /// This program, unlike Raydium v4, accepts Token-2022 mints. The pool cannot say

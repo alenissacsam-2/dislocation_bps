@@ -132,6 +132,25 @@ impl JitoStatus {
     }
 }
 
+/// The far end answered, and its answer was a definite no: a JSON-RPC `error`, or a
+/// refused credential. A send that fails this way was not taken, unlike one that timed
+/// out or lost its connection, which may still have been received.
+#[derive(Debug)]
+pub struct SendRefused(pub String);
+
+impl std::fmt::Display for SendRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SendRefused {}
+
+/// A [`SendRefused`] carrying `msg`.
+fn refused(msg: String) -> anyhow::Error {
+    SendRefused(msg).into()
+}
+
 /// At most this many characters of an answer go into a log line or an error.
 const CLIP_CHARS: usize = 120;
 
@@ -203,11 +222,33 @@ impl Simulation {
     /// - `whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc` — `AmountOutBelowMinimum`
     /// - `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK` — `TooLittleOutputReceived`
     ///
+    /// The rest were read from each program's published IDL or error source (2026-11-08):
+    ///
+    /// - Meteora DLMM `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo` —
+    ///   `ExceededAmountSlippageTolerance` (6003); MeteoraAg/dlmm-sdk `idls/dlmm.json`
+    /// - Raydium CPMM `CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C` — `ExceededSlippage`
+    ///   (6005); raydium-io/raydium-cp-swap `programs/cp-swap/src/error.rs`
+    /// - Meteora DAMM v2 `cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG` — `ExceededSlippage`
+    ///   (6002); MeteoraAg/damm-v2 `programs/cp-amm/src/error.rs`
+    /// - PumpSwap `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` — `ExceededSlippage` (6004,
+    ///   `sell`) and `BuySlippageBelowMinBaseAmountOut` (6040, `buy_exact_quote_in`);
+    ///   pump-fun/pump-public-docs `idl/pump_amm.json`
+    /// - Raydium v4 `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8` — `AmmError::ExceededSlippage`,
+    ///   variant 30 (0x1e); raydium-io/raydium-amm `program/src/error.rs`. Not Anchor, so it
+    ///   logs no name: matched on the runtime's own `failed:` line for that program and code.
+    ///
     /// Anything this does not recognise stays a defect. That is the safe direction: a
     /// new failure mode halts the run until somebody has looked at it.
     #[must_use]
     pub fn missed_its_floor(&self) -> bool {
-        const FLOOR_ERRORS: [&str; 2] = ["AmountOutBelowMinimum", "TooLittleOutputReceived"];
+        const FLOOR_ERRORS: [&str; 6] = [
+            "AmountOutBelowMinimum",
+            "TooLittleOutputReceived",
+            "ExceededAmountSlippageTolerance",
+            "Error Code: ExceededSlippage.",
+            "BuySlippageBelowMinBaseAmountOut",
+            "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 failed: custom program error: 0x1e",
+        ];
         self.err.is_some()
             && self.logs.iter().any(|l| FLOOR_ERRORS.iter().any(|name| l.contains(name)))
     }
@@ -253,7 +294,12 @@ impl Simulation {
         }
         let mut joined = kept.join(" | ");
         if joined.len() > MAX_CHARS {
-            joined.truncate(MAX_CHARS);
+            // `truncate` panics off a char boundary, and program logs are not all ASCII.
+            let mut cut = MAX_CHARS;
+            while !joined.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            joined.truncate(cut);
             joined.push('…');
         }
         Some(joined)
@@ -360,11 +406,11 @@ impl Rpc {
             // a 5xx, so stop paying a round trip to hear it again.
             if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
                 self.bench(idx);
-                bail!(
+                return Err(refused(format!(
                     "{method}: endpoint {} answered {status}; benched for {} minutes",
                     idx + 1,
                     BENCH_FOR.as_secs() / 60
-                );
+                )));
             }
             let text = match resp.text().await {
                 Ok(t) => t,
@@ -384,12 +430,13 @@ impl Rpc {
 
             if let Some(e) = parsed.get("error") {
                 let rate_limited = e.get("code").and_then(Value::as_i64) == Some(429);
-                if rate_limited && attempt < Self::RATE_LIMIT_RETRIES {
+                // Never a send: a retry half a second on trades a price that has moved.
+                if rate_limited && attempt < Self::RATE_LIMIT_RETRIES && method != "sendTransaction" {
                     tokio::time::sleep(backoff).await;
                     backoff *= 2;
                     continue;
                 }
-                bail!("{method} failed: {e}");
+                return Err(refused(format!("{method} failed: {e}")));
             }
             return parsed
                 .get("result")
@@ -577,7 +624,8 @@ impl Rpc {
             "commitment": "processed",
             "accounts": { "encoding": "base64", "addresses": addresses },
         });
-        let r = self.call("simulateTransaction", json!([tx_base64, cfg])).await?;
+        // The primary: the node the trade was just re-priced against, not a rotation.
+        let r = self.call_primary("simulateTransaction", json!([tx_base64, cfg])).await?;
         let v = &r["value"];
 
         let err = match &v["err"] {
@@ -679,7 +727,7 @@ impl Rpc {
     /// block engine takes none, and every message is passed through the redactor anyway.
     ///
     /// The block engine names the bundle it made in an `x-bundle-id` header. That id,
-    /// not the signature, is what [`Rpc::jito_bundle_status`] can say anything about.
+    /// not the signature, is what [`JitoStatus::status`] can say anything about.
     ///
     /// # Errors
     /// If the request fails or the block engine refuses the transaction.
@@ -707,7 +755,9 @@ impl Rpc {
         let mut rx = self.spawn_jito_sends(urls, tx_base64);
         let asked = urls.len();
         let mut answers = Vec::new();
-        while let Some(a) = rx.recv().await {
+        // Bounded by the same deadline: a region that never answers must not hold the
+        // trading loop for its full request timeout.
+        while let Ok(Some(a)) = tokio::time::timeout_at(deadline, rx.recv()).await {
             let accepted = a.result.as_ref().ok().cloned();
             answers.push(a);
             if let Some(receipt) = accepted {
@@ -723,7 +773,12 @@ impl Rpc {
         }
         let (_, line) = jito_summary(None, &answers, asked);
         tracing::warn!("{line}");
-        bail!("every block engine refused the transaction: {line}")
+        // Only a definite no from every region means it was not taken; a region that
+        // timed out or lost the connection may still forward it.
+        if answers.len() == asked && answers.iter().all(|a| a.result.as_ref().is_err_and(|e| e.is::<SendRefused>())) {
+            return Err(refused(format!("every block engine refused the transaction: {line}")));
+        }
+        bail!("no block engine accepted the transaction, and it may still have been received: {line}")
     }
 
     /// One send per URL, each answering on the returned channel as it finishes.
@@ -777,7 +832,10 @@ impl Rpc {
         let parsed: Value = serde_json::from_str(&text)
             .map_err(|_| anyhow!("Helius Sender answered {status} rather than JSON: {}", redact(&text)))?;
         if let Some(e) = parsed.get("error") {
-            bail!("Helius Sender refused the transaction ({status}): {}", redact(&e.to_string()));
+            return Err(refused(format!(
+                "Helius Sender refused the transaction ({status}): {}",
+                redact(&e.to_string())
+            )));
         }
         parsed["result"]
             .as_str()
@@ -858,14 +916,6 @@ impl Rpc {
     #[must_use]
     pub fn jito_status(&self) -> JitoStatus {
         JitoStatus { client: self.http_warm.clone(), auth: self.jito_auth.clone() }
-    }
-
-    /// [`JitoStatus::status`], asked in place.
-    ///
-    /// # Errors
-    /// As [`JitoStatus::status`].
-    pub async fn jito_bundle_status(&self, url: &str, bundle_id: &str) -> Result<Option<String>> {
-        self.jito_status().status(url, bundle_id).await
     }
 
     /// `Ok(None)` means the node has not seen it yet, which is not the same as failure.
@@ -1135,23 +1185,6 @@ impl Rpc {
             .collect())
     }
 
-    /// The owner program of an account, which is how a mint's token program is known.
-    ///
-    /// # Errors
-    /// If the call fails.
-    pub async fn owner_of(&self, key: &Pubkey) -> Result<Option<Pubkey>> {
-        let r = self
-            .call(
-                "getAccountInfo",
-                json!([key.to_string(), {"encoding": "base64", "commitment": "confirmed"}]),
-            )
-            .await?;
-        let Some(owner) = r["value"]["owner"].as_str() else {
-            return Ok(None);
-        };
-        Ok(Pubkey::from_str(owner).ok())
-    }
-
     /// # Errors
     /// If the call fails.
     pub async fn balance(&self, who: &Pubkey) -> Result<u64> {
@@ -1275,7 +1308,7 @@ async fn post_jito(client: &reqwest::Client, url: &str, body: &Value, auth: Opti
         let parsed: Value = serde_json::from_str(&text)
             .map_err(|_| anyhow!("Jito answered {status} rather than JSON: {}", clip(&text)))?;
         if let Some(e) = parsed.get("error") {
-            bail!("Jito refused the transaction ({status}): {}", clip(&e.to_string()));
+            return Err(refused(format!("Jito refused the transaction ({status}): {}", clip(&e.to_string()))));
         }
         let signature = parsed["result"]
             .as_str()
@@ -1563,6 +1596,8 @@ mod tests {
         assert!(body_of("pub async fn accounts_latest(").contains("\"processed\""));
         assert!(body_of("pub async fn accounts_latest_with_slot(").contains("\"processed\""));
         assert!(body_of("pub async fn simulate(").contains("\"commitment\": \"processed\""));
+        // And on the node it was re-priced against, not whichever the rotation drew.
+        assert!(body_of("pub async fn simulate(").contains("self.call_primary(\"simulateTransaction\""));
         // And the blockhash stays confirmed: one from a fork that is later dropped
         // would fail the transaction for a reason that has nothing to do with price.
         assert!(body_of("pub async fn latest_blockhash(").contains("\"confirmed\""));
@@ -1858,6 +1893,78 @@ mod tests {
         assert!(rpc.sender_keyed());
     }
 
+    /// A local server answering every request with `response`, counting them.
+    async fn counting_mock(response: &'static str) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let h = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}/api/v1/transactions?bundleOnly=true"), hits)
+    }
+
+    const JSON_429: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n\
+        {\"jsonrpc\":\"2.0\",\"error\":{\"code\":429,\"message\":\"rate limited\"},\"id\":1}";
+    const JSON_REFUSAL: &str = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n\
+        {\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32602,\"message\":\"bad tip\"},\"id\":1}";
+
+    /// A retried send trades a price that has moved; a 429 is a refusal, said once.
+    #[tokio::test]
+    async fn a_rate_limited_send_is_refused_once_and_never_retried() {
+        let (url, hits) = counting_mock(JSON_429).await;
+        let rpc = Rpc::new(url).unwrap();
+        let e = rpc.send("AA==", true).await.unwrap_err();
+        assert!(e.is::<SendRefused>(), "a JSON 429 is a definite no: {e:#}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "sent exactly once");
+    }
+
+    #[tokio::test]
+    async fn only_a_json_refusal_is_a_definite_no() {
+        let mut rpc = local_rpc();
+        rpc.set_sender_url_for_test(&counting_mock(JSON_REFUSAL).await.0);
+        assert!(rpc.send_sender("AA==").await.unwrap_err().is::<SendRefused>());
+        rpc.set_sender_url_for_test(&mock_jito(RATE_LIMITED).await);
+        assert!(!rpc.send_sender("AA==").await.unwrap_err().is::<SendRefused>(), "not JSON: may have been taken");
+        rpc.set_sender_url_for_test("http://127.0.0.1:1/fast");
+        assert!(!rpc.send_sender("AA==").await.unwrap_err().is::<SendRefused>(), "transport: may have been taken");
+
+        let refusing = vec![counting_mock(JSON_REFUSAL).await.0, counting_mock(JSON_REFUSAL).await.0];
+        assert!(rpc.send_jito_all(&refusing, "AA==").await.unwrap_err().is::<SendRefused>());
+        let mixed = vec![counting_mock(JSON_REFUSAL).await.0, "http://127.0.0.1:1/api/v1/transactions?bundleOnly=true".into()];
+        assert!(!rpc.send_jito_all(&mixed, "AA==").await.unwrap_err().is::<SendRefused>());
+    }
+
+    /// A region that accepts the connection and never answers must not hold the loop
+    /// for the request timeout.
+    #[tokio::test]
+    async fn a_silent_region_holds_the_send_no_longer_than_the_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let urls = vec![
+            counting_mock(JSON_REFUSAL).await.0,
+            format!("http://{addr}/api/v1/transactions?bundleOnly=true"),
+        ];
+        let started = std::time::Instant::now();
+        let e = local_rpc().send_jito_all(&urls, "AA==").await.unwrap_err();
+        assert!(started.elapsed() < JITO_SUMMARY_WAIT + Duration::from_millis(500), "{:?}", started.elapsed());
+        assert!(!e.is::<SendRefused>(), "the silent region may still forward it: {e:#}");
+        assert!(format!("{e:#}").contains("1 more did not answer"), "{e:#}");
+    }
+
     #[test]
     fn a_region_is_named_by_its_host_alone() {
         assert_eq!(host_of("https://ny.mainnet.block-engine.jito.wtf/api/v1/transactions?bundleOnly=true"), "ny.mainnet.block-engine.jito.wtf");
@@ -1965,6 +2072,32 @@ mod error_context_tests {
              Error Number: 6036.",
         ]);
         assert!(orca.missed_its_floor(), "same fact, other venue");
+    }
+
+    /// Every venue an encoder exists for, by the line its program actually logs.
+    #[test]
+    fn every_venues_floor_error_is_a_missed_floor() {
+        for line in [
+            "Program log: AnchorError occurred. Error Code: ExceededAmountSlippageTolerance. Error Number: 6003. Error Message: Exceeded amount slippage tolerance.",
+            "Program log: AnchorError occurred. Error Code: ExceededSlippage. Error Number: 6005. Error Message: Exceeds desired slippage limit.",
+            "Program log: AnchorError occurred. Error Code: ExceededSlippage. Error Number: 6002. Error Message: Exceeded slippage tolerance.",
+            "Program log: AnchorError occurred. Error Code: BuySlippageBelowMinBaseAmountOut. Error Number: 6040.",
+            "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 failed: custom program error: 0x1e",
+        ] {
+            assert!(sim(&[line]).missed_its_floor(), "{line}");
+        }
+        // Raydium v4's next error, and the same code from another program, are not.
+        assert!(!sim(&["Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 failed: custom program error: 0x1f"]).missed_its_floor());
+        assert!(!sim(&["Program 11111111111111111111111111111111 failed: custom program error: 0x1e"]).missed_its_floor());
+        assert!(!sim(&["Program log: AnchorError occurred. Error Code: ExceededBinSlippageTolerance. Error Number: 6004."]).missed_its_floor());
+    }
+
+    /// The cap must cut on a character, not wherever byte 400 falls.
+    #[test]
+    fn a_non_ascii_trace_is_capped_without_panicking() {
+        let line = format!("Program log: Error: {}", "é".repeat(300));
+        let ctx = sim(&[line.as_str()]).error_context().expect("an error line");
+        assert!(ctx.ends_with('…') && ctx.len() <= 403, "{}", ctx.len());
     }
 
     /// Everything else stays a defect, which is the safe direction: an unrecognised

@@ -101,7 +101,10 @@ pub struct Demand {
     /// the bot was not running, and is not counted as time nobody asked.
     #[serde(default)]
     saved: u64,
-    events: VecDeque<(u64, String, f64)>,
+    /// Stored decoded, saved as base58: `scores` runs on every refusal, and decoding
+    /// every event each time was the cost.
+    #[serde(with = "b58_events")]
+    events: VecDeque<(u64, Pubkey32, f64)>,
     /// When the bot opened an account for each mint, in unix seconds, kept for
     /// `MIN_HOLD_SECS`. Persisted with the asks, so a restart cannot forget it.
     #[serde(default)]
@@ -131,8 +134,17 @@ impl Demand {
         // Downtime is not evidence. On 2026-09-25 the bot started after a day switched
         // off, found every account 'idle for a day', and closed two of them within
         // five seconds. The watched time now excludes the gap.
+        // The asks and opens it watched shift with it, or a restart prunes the asks and
+        // ends the holds that kept live accounts open.
         if d.saved > 0 && now > d.saved + DOWNTIME_GRACE_SECS {
-            d.since = d.since.saturating_add(now - d.saved).min(now);
+            let gap = now - d.saved;
+            d.since = d.since.saturating_add(gap).min(now);
+            for e in &mut d.events {
+                e.0 = e.0.saturating_add(gap).min(now);
+            }
+            for at in d.opened.values_mut() {
+                *at = at.saturating_add(gap).min(now);
+            }
         }
         d.saved = now;
         // Asks saved before the credibility limit existed still carry their phantoms.
@@ -160,7 +172,7 @@ impl Demand {
     /// Note that an attempt needed `mint`, expecting `usd` net.
     pub fn record(&mut self, now: u64, mint: &Pubkey32, usd: f64) {
         let usd = if usd.is_finite() && usd <= MAX_CREDIBLE_ASK_USD { usd.max(0.0) } else { 0.0 };
-        self.events.push_back((now, bs58::encode(mint).into_string(), usd));
+        self.events.push_back((now, *mint, usd));
         self.prune(now);
     }
 
@@ -196,8 +208,7 @@ impl Demand {
     pub fn scores(&self) -> HashMap<Pubkey32, Score> {
         let mut out: HashMap<Pubkey32, Score> = HashMap::new();
         for (_, mint, usd) in &self.events {
-            let Some(k) = decode(mint) else { continue };
-            let s = out.entry(k).or_default();
+            let s = out.entry(*mint).or_default();
             s.asks += 1;
             s.usd += usd;
         }
@@ -217,6 +228,24 @@ impl Demand {
 
 fn decode(s: &str) -> Option<Pubkey32> {
     bs58::decode(s).into_vec().ok()?.try_into().ok()
+}
+
+/// The events as the file has always held them, `[at, "base58", usd]`. An entry that
+/// does not decode is dropped on load, as `scores` used to skip it.
+mod b58_events {
+    use super::{decode, Pubkey32, VecDeque};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &VecDeque<(u64, Pubkey32, f64)>, s: S) -> Result<S::Ok, S::Error> {
+        let raw: Vec<(u64, String, f64)> =
+            v.iter().map(|(at, m, usd)| (*at, bs58::encode(m).into_string(), *usd)).collect();
+        raw.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<VecDeque<(u64, Pubkey32, f64)>, D::Error> {
+        let raw = Vec::<(u64, String, f64)>::deserialize(d)?;
+        Ok(raw.into_iter().filter_map(|(at, m, usd)| Some((at, decode(&m)?, usd))).collect())
+    }
 }
 
 /// What to do about a mint an attempt was just refused for want of an account.
@@ -447,6 +476,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The watched clock skips the downtime, so the asks and opens it watched must skip
+    /// it too: otherwise asks made an hour before a 30 h stop are pruned on load, and a
+    /// day of watching later the accounts they kept look idle.
+    #[test]
+    fn asks_and_opens_shift_with_the_downtime() {
+        let dir = std::env::temp_dir().join(format!("cb-demand-shift-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token-demand.json");
+        let mut d = Demand::new(0);
+        d.record(3_600, &m(7), 0.02);
+        d.note_opened(3_700, &m(8));
+        d.save(&path, 7_200).unwrap();
+        let gap = 30 * 3_600;
+        let back = Demand::load(&path, 7_200 + gap);
+        assert_eq!(back.scores().get(&m(7)).map(|s| s.asks), Some(1), "the ask survives the stop");
+        // A day of watching after the restart: 3,600 s before the stop plus the rest after.
+        let day_on = 7_200 + gap + WINDOW_SECS - 7_200;
+        assert!(back.covers_window(day_on));
+        assert_eq!(idle(&back, &set(&[7, 8]), day_on), Vec::<Pubkey32>::new(), "asked, and held");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// 2026-11-07, 6GmAF…: opened on two asks, the bot restarted before the next save,
     /// the closer found the account unasked-for and closed it 36 s after it was opened,
     /// and the opener paid for it again a minute later.
@@ -515,8 +566,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("token-demand.json");
         let mut d = Demand::new(0);
-        d.events.push_back((10, bs58::encode(m(5)).into_string(), 2.9e12));
-        d.events.push_back((11, bs58::encode(m(5)).into_string(), 0.5));
+        d.events.push_back((10, m(5), 2.9e12));
+        d.events.push_back((11, m(5), 0.5));
         d.save(&path, 12).unwrap();
         let s = Demand::load(&path, 20).scores()[&m(5)];
         assert_eq!((s.asks, s.usd), (2, 0.5));
@@ -531,6 +582,8 @@ mod tests {
         let mut d = Demand::new(0);
         d.record(10, &m(7), 0.02);
         d.save(&path, 10).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(&bs58::encode(m(7)).into_string()), "the file keeps base58: {text}");
         let back = Demand::load(&path, 20);
         assert_eq!(back.scores().get(&m(7)).map(|s| s.asks), Some(1));
         assert!(!back.covers_window(20));

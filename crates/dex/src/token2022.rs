@@ -27,6 +27,7 @@ const TLV_START: usize = 166;
 const TRANSFER_FEE_CONFIG: u16 = 1;
 const DEFAULT_ACCOUNT_STATE: u16 = 6;
 const TRANSFER_HOOK: u16 = 14;
+const NON_TRANSFERABLE: u16 = 9;
 const PAUSABLE: u16 = 26;
 /// `AccountState::Frozen` in a `DefaultAccountState` extension.
 const FROZEN: u8 = 2;
@@ -41,6 +42,8 @@ pub struct TransferCosts {
     pub frozen_by_default: bool,
     /// Transfers are paused by the mint's authority.
     pub paused: bool,
+    /// The mint is soulbound: no transfer, so no swap, can move it.
+    pub non_transferable: bool,
 }
 
 impl TransferCosts {
@@ -48,7 +51,7 @@ impl TransferCosts {
     /// what was sent.
     #[must_use]
     pub fn is_free(&self) -> bool {
-        self.fee_bps == 0 && !self.hook && !self.frozen_by_default && !self.paused
+        self.fee_bps == 0 && !self.hook && !self.frozen_by_default && !self.paused && !self.non_transferable
     }
 }
 
@@ -73,7 +76,9 @@ pub fn transfer_costs(data: &[u8]) -> Result<TransferCosts> {
         ensure!(o + len <= data.len(), "extension {kind} runs past the end of the mint");
         let value = &data[o..o + len];
         match kind {
-            TRANSFER_FEE_CONFIG if len >= 108 => {
+            TRANSFER_FEE_CONFIG => {
+                // A short one cannot be read, so its fee is unknown, not zero.
+                ensure!(len >= 108, "TransferFeeConfig is {len} bytes, need 108");
                 // older fee at 72..90, newer at 90..108; basis points are each one's last u16.
                 let older = u16::from_le_bytes([value[88], value[89]]);
                 let newer = u16::from_le_bytes([value[106], value[107]]);
@@ -81,6 +86,7 @@ pub fn transfer_costs(data: &[u8]) -> Result<TransferCosts> {
             }
             TRANSFER_HOOK if len >= 64 => out.hook = value[32..64].iter().any(|&b| b != 0),
             DEFAULT_ACCOUNT_STATE if len >= 1 => out.frozen_by_default = value[0] == FROZEN,
+            NON_TRANSFERABLE => out.non_transferable = true,
             PAUSABLE if len >= 33 => out.paused = value[32] != 0,
             _ => {}
         }
@@ -141,6 +147,13 @@ mod tests {
         running.push(0);
         let c = transfer_costs(&mint_with(&[(PAUSABLE, running), (DEFAULT_ACCOUNT_STATE, vec![1])])).unwrap();
         assert!(c.is_free(), "a tokenised equity as it trades: pausable, not paused");
+    }
+
+    #[test]
+    fn a_short_fee_config_is_unknown_and_non_transferable_is_screened() {
+        assert!(transfer_costs(&mint_with(&[(TRANSFER_FEE_CONFIG, vec![0u8; 107])])).is_err());
+        let c = transfer_costs(&mint_with(&[(NON_TRANSFERABLE, vec![])])).unwrap();
+        assert!(c.non_transferable && !c.is_free());
     }
 
     #[test]

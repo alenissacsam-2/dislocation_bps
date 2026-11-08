@@ -27,12 +27,14 @@ pub const PROGRAM_ID: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 pub const AMM_INFO_LEN: usize = 752;
 
 // Verified byte offsets into AmmInfo.
+const OFF_STATUS: usize = 0;
 const OFF_BASE_DECIMALS: usize = 32;
 const OFF_QUOTE_DECIMALS: usize = 40;
 const OFF_SWAP_FEE_NUM: usize = 176;
 const OFF_SWAP_FEE_DEN: usize = 184;
 const OFF_BASE_NEED_TAKE_PNL: usize = 192;
 const OFF_QUOTE_NEED_TAKE_PNL: usize = 200;
+const OFF_POOL_OPEN_TIME: usize = 224;
 const OFF_BASE_VAULT: usize = 336;
 const OFF_QUOTE_VAULT: usize = 368;
 const OFF_BASE_MINT: usize = 400;
@@ -61,6 +63,10 @@ fn pubkey_at(data: &[u8], offset: usize) -> Pubkey32 {
 /// accounts to go and watch*, which it cannot know until the pool is decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AmmInfo {
+    /// `AmmInfo.status`. See [`status_allows_swap`].
+    pub status: u64,
+    /// Unix seconds before which the pool does not trade.
+    pub pool_open_time: u64,
     pub base_mint: Pubkey32,
     pub quote_mint: Pubkey32,
     pub base_vault: Pubkey32,
@@ -95,6 +101,16 @@ impl AmmInfo {
     }
 }
 
+/// Whether the program's `AmmStatus::swap_permission` lets a swap through.
+///
+/// `AmmStatus` (raydium-amm `state.rs`): 0 Uninitialized, 1 Initialized, 2 Disabled,
+/// 3 WithdrawOnly, 4 LiquidityOnly, 5 OrderBookOnly, 6 SwapOnly, 7 WaitingTrade. Swaps
+/// are permitted in 1, 5, 6 and 7; every other state refuses them.
+#[must_use]
+pub fn status_allows_swap(status: u64) -> bool {
+    matches!(status, 1 | 5 | 6 | 7)
+}
+
 /// Decode the pool account.
 pub fn decode_amm_info(data: &[u8]) -> Result<AmmInfo> {
     ensure!(
@@ -109,7 +125,14 @@ pub fn decode_amm_info(data: &[u8]) -> Result<AmmInfo> {
         "implausible decimals ({base_decimals}, {quote_decimals}) — wrong layout or wrong account"
     );
 
+    let status = u64_at(data, OFF_STATUS);
+    ensure!(status_allows_swap(status), "raydium v4 pool status {status} does not permit swaps");
+    let swap_fee_numerator = u64_at(data, OFF_SWAP_FEE_NUM);
+    ensure!(swap_fee_numerator > 0, "raydium v4 pool carries a zero swap fee — corrupt, not free");
+
     Ok(AmmInfo {
+        status,
+        pool_open_time: u64_at(data, OFF_POOL_OPEN_TIME),
         base_mint: pubkey_at(data, OFF_BASE_MINT),
         quote_mint: pubkey_at(data, OFF_QUOTE_MINT),
         base_vault: pubkey_at(data, OFF_BASE_VAULT),
@@ -118,7 +141,7 @@ pub fn decode_amm_info(data: &[u8]) -> Result<AmmInfo> {
         quote_decimals: quote_decimals as u8,
         base_need_take_pnl: u64_at(data, OFF_BASE_NEED_TAKE_PNL),
         quote_need_take_pnl: u64_at(data, OFF_QUOTE_NEED_TAKE_PNL),
-        swap_fee_numerator: u64_at(data, OFF_SWAP_FEE_NUM),
+        swap_fee_numerator,
         swap_fee_denominator: u64_at(data, OFF_SWAP_FEE_DEN),
     })
 }
@@ -147,6 +170,24 @@ pub fn to_pool_state(
     quote_vault_amount: u64,
     slot: u64,
 ) -> Result<PoolState> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    to_pool_state_at(address, info, base_vault_amount, quote_vault_amount, slot, now)
+}
+
+/// [`to_pool_state`] with the clock (unix seconds) passed in; refuses a pool that has not opened.
+pub fn to_pool_state_at(
+    address: Pubkey32,
+    info: &AmmInfo,
+    base_vault_amount: u64,
+    quote_vault_amount: u64,
+    slot: u64,
+    now_unix: u64,
+) -> Result<PoolState> {
+    ensure!(
+        info.pool_open_time <= now_unix,
+        "raydium v4 pool opens at {}, now is {now_unix}",
+        info.pool_open_time
+    );
     let base = base_vault_amount
         .checked_sub(info.base_need_take_pnl)
         .ok_or_else(|| anyhow::anyhow!("base vault below uncollected fees — torn read across slots"))?;
@@ -296,6 +337,25 @@ mod tests {
     }
 
     #[test]
+    fn disabled_unopened_and_feeless_pools_are_refused() {
+        let good = real_pool_account();
+        let info = decode_amm_info(&good).unwrap();
+        assert_eq!(info.status, 6, "SwapOnly");
+        let mut bad = good.clone();
+        bad[OFF_STATUS] = 2; // Disabled
+        assert!(decode_amm_info(&bad).is_err());
+        let mut bad = good.clone();
+        bad[OFF_SWAP_FEE_NUM..OFF_SWAP_FEE_NUM + 8].fill(0);
+        assert!(decode_amm_info(&bad).is_err());
+        let mut later = good.clone();
+        later[OFF_POOL_OPEN_TIME..OFF_POOL_OPEN_TIME + 8].copy_from_slice(&2_000u64.to_le_bytes());
+        let info = decode_amm_info(&later).unwrap();
+        assert_eq!(info.pool_open_time, 2_000);
+        assert!(to_pool_state_at([7u8; 32], &info, 1 << 50, 1 << 50, 1, 1_999).is_err());
+        assert!(to_pool_state_at([7u8; 32], &info, 1 << 50, 1 << 50, 1, 2_000).is_ok());
+    }
+
+    #[test]
     fn token_amount_decodes_at_the_right_offset() {
         let mut acct = vec![0u8; SPL_TOKEN_ACCOUNT_LEN];
         acct[SPL_AMOUNT_OFFSET..SPL_AMOUNT_OFFSET + 8].copy_from_slice(&12_345_678u64.to_le_bytes());
@@ -306,6 +366,7 @@ mod tests {
     #[test]
     fn fee_ppm_rounds_up_never_down() {
         let mk = |num, den| AmmInfo {
+            status: 6, pool_open_time: 0,
             base_mint: [0; 32], quote_mint: [0; 32], base_vault: [0; 32], quote_vault: [0; 32],
             base_decimals: 9, quote_decimals: 6,
             base_need_take_pnl: 0, quote_need_take_pnl: 0,

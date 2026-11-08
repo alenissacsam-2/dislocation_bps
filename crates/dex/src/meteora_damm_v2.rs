@@ -104,80 +104,6 @@ fn pubkey_at(d: &[u8], o: usize) -> Pubkey32 {
     k
 }
 
-/// A decoded DAMM v2 pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DammV2Pool {
-    pub mint_a: Pubkey32,
-    pub mint_b: Pubkey32,
-    /// Already unscaled: the stored field divided by 2⁶⁴.
-    pub liquidity: u128,
-    pub sqrt_price_x64: u128,
-    pub sqrt_min_price_x64: u128,
-    pub sqrt_max_price_x64: u128,
-    pub fee_ppm: u32,
-}
-
-/// Decode a DAMM v2 `Pool` account.
-///
-/// # Rejections
-///
-/// Every one of these is a pool whose true cost is higher than its stored base fee,
-/// or whose balance is not what the account says. Quoting any of them would overstate
-/// profit, which is the only direction of error that loses money rather than
-/// opportunities.
-///
-/// - **Dynamic-fee pools.** The effective fee carries a volatility surcharge derived
-///   from state this decoder does not track, so the base fee is a floor, not a price.
-/// - **Fee schedules.** A scheduled fee decays over time from a cliff. Reading the
-///   cliff alone would misprice it in whichever direction the schedule happens to run.
-/// - **Token-2022 mints.** Transfer fees and transfer hooks change what actually
-///   arrives, and the pool account does not say by how much.
-/// - **Disabled pools.** `pool_status` non-zero means swaps are off.
-pub fn decode(data: &[u8]) -> Result<DammV2Pool> {
-    ensure!(
-        data.len() >= POOL_LEN,
-        "damm v2 account too short: {} bytes, need {POOL_LEN}",
-        data.len()
-    );
-
-    ensure!(
-        data[OFF_DYNAMIC_FEE_INITIALIZED] == 0,
-        "dynamic-fee damm v2 pool: its true fee adds a volatility surcharge held in \
-         state we do not read, so the base fee would understate cost"
-    );
-    ensure!(
-        data[OFF_BASE_FEE_REST..OFF_BASE_FEE_REST_END].iter().all(|&b| b == 0),
-        "damm v2 pool has a fee schedule: the fee moves over time and the cliff value \
-         alone does not price it"
-    );
-    ensure!(data[OFF_POOL_STATUS] == 0, "damm v2 pool has swaps disabled");
-    ensure!(
-        data[OFF_TOKEN_A_FLAG] == 0 && data[OFF_TOKEN_B_FLAG] == 0,
-        "damm v2 pool holds a Token-2022 mint: transfer fees or hooks can change what \
-         actually arrives"
-    );
-
-    let cliff = u64_at(data, OFF_CLIFF_FEE);
-    // Round up: an exact tier divides evenly, and anything else is safer overstated.
-    let fee_ppm = u32::try_from(cliff.div_ceil(FEE_DENOM_PER_PPM))
-        .map_err(|_| anyhow::anyhow!("damm v2 fee numerator {cliff} is not a fee"))?;
-    ensure!(fee_ppm < 1_000_000, "damm v2 fee {fee_ppm}ppm is not a fee");
-
-    // The stored field is L · 2⁶⁴. The truncation discards a fraction of one unit of
-    // liquidity against a value in the trillions — around 1e-13 relative.
-    let liquidity = u128_at(data, OFF_LIQUIDITY) >> 64;
-
-    Ok(DammV2Pool {
-        mint_a: pubkey_at(data, OFF_MINT_A),
-        mint_b: pubkey_at(data, OFF_MINT_B),
-        liquidity,
-        sqrt_price_x64: u128_at(data, OFF_SQRT_PRICE),
-        sqrt_min_price_x64: u128_at(data, OFF_SQRT_MIN_PRICE),
-        sqrt_max_price_x64: u128_at(data, OFF_SQRT_MAX_PRICE),
-        fee_ppm,
-    })
-}
-
 /// The base fee over 10^9 the program charges a swap landing at unix time `t`, or later.
 ///
 /// A flat fee is the cliff. A time schedule (`FeeTimeScheduler` in cp-amm, modes 0
@@ -507,10 +433,10 @@ mod tests {
         let reported_a = 11_523_355_541_146u128;
         let reported_b = 350_179_453_609u128;
 
-        let p = decode(&account(liquidity_scaled, sqrt_price, sqrt_min, sqrt_max, 400_000))
+        let p = decode_layout(&account(liquidity_scaled, sqrt_price, sqrt_min, sqrt_max, 400_000))
             .expect("a real pool must decode");
 
-        assert_eq!(p.fee_ppm, 400, "4 bp, stated as 400_000 over 1e9");
+        assert_eq!(p.cliff_fee_numerator / FEE_DENOM_PER_PPM, 400, "4 bp, stated as 400_000 over 1e9");
 
         // The standard concentrated-liquidity holdings, in terms of unscaled L:
         //   a = L·2⁶⁴·(√Pu − √P) / (√P·√Pu)      b = L·(√P − √Pl) / 2⁶⁴
@@ -531,7 +457,7 @@ mod tests {
     #[test]
     fn liquidity_is_unscaled_by_two_to_the_sixty_four() {
         let scaled = 127_650_388_139_951_181_215_105_640_046_542u128;
-        let p = decode(&account(scaled, 5_761_959_368_792_461_300, 1, u128::MAX, 400_000)).unwrap();
+        let p = decode_layout(&account(scaled, 5_761_959_368_792_461_300, 1, u128::MAX, 400_000)).unwrap();
         assert_eq!(p.liquidity, scaled >> 64);
         assert_eq!(p.liquidity, 6_919_941_406_997);
     }
@@ -539,25 +465,9 @@ mod tests {
     #[test]
     fn fee_tiers_convert_to_parts_per_million() {
         for (numerator, ppm) in [(400_000u64, 400u32), (2_500_000, 2_500), (10_000_000, 10_000)] {
-            let p = decode(&account(Q64, 2, 1, 3, numerator)).unwrap();
+            let p = to_pool_state([1; 32], &account(Q64, 2, 1, 3, numerator), 7, 0).unwrap();
             assert_eq!(p.fee_ppm, ppm, "{numerator} over 1e9");
         }
-    }
-
-    #[test]
-    fn a_dynamic_fee_pool_is_refused() {
-        let mut d = account(Q64, 2, 1, 3, 400_000);
-        d[OFF_DYNAMIC_FEE_INITIALIZED] = 1;
-        let e = decode(&d).unwrap_err().to_string();
-        assert!(e.contains("dynamic-fee"), "{e}");
-    }
-
-    #[test]
-    fn a_scheduled_fee_pool_is_refused_by_the_flat_fee_decoder() {
-        let mut d = account(Q64, 2, 1, 3, 400_000);
-        d[OFF_BASE_FEE_REST] = 7; // any non-zero scheduler parameter
-        let e = decode(&d).unwrap_err().to_string();
-        assert!(e.contains("fee schedule"), "{e}");
     }
 
     fn scheduled(mode: u8, cliff: u64, periods: u16, every: u64, reduction: u64, activation: u64) -> DammV2Layout {
@@ -605,19 +515,10 @@ mod tests {
     }
 
     #[test]
-    fn a_token_2022_pool_is_refused() {
-        for off in [OFF_TOKEN_A_FLAG, OFF_TOKEN_B_FLAG] {
-            let mut d = account(Q64, 2, 1, 3, 400_000);
-            d[off] = 1;
-            assert!(decode(&d).unwrap_err().to_string().contains("Token-2022"));
-        }
-    }
-
-    #[test]
     fn a_disabled_pool_is_refused() {
         let mut d = account(Q64, 2, 1, 3, 400_000);
         d[OFF_POOL_STATUS] = 1;
-        assert!(decode(&d).unwrap_err().to_string().contains("disabled"));
+        assert!(to_pool_state([1; 32], &d, 7, 0).unwrap_err().to_string().contains("disabled"));
     }
 
     /// Mode 0 takes the fee from the output both ways; modes 1 and 2 from the output
@@ -690,7 +591,7 @@ mod tests {
 
     #[test]
     fn a_short_account_is_refused_rather_than_read_past_the_end() {
-        assert!(decode(&[0u8; POOL_LEN - 1]).is_err());
+        assert!(decode_layout(&[0u8; POOL_LEN - 1]).is_err());
     }
 
     /// The whole configured range is quotable, not one tick's worth — which is the

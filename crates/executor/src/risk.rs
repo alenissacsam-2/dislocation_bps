@@ -137,7 +137,12 @@ pub struct Proposal {
 pub enum Outcome {
     /// Landed on chain. `net_usd` may be negative — landing is not the same as winning.
     Landed { net_usd: f64 },
-    /// Did not land: lost the race, expired, or was dropped. Costs nothing but time.
+    /// Submitted, and the chain has not answered. Counts toward the day's trades — a
+    /// transaction in flight is already spending — and says nothing about the
+    /// machinery until [`RiskGate::confirm`] hears how it landed.
+    Sent,
+    /// Did not land: lost the race, expired, or was dropped. Costs nothing but time,
+    /// and neither adds a strike nor clears one: it says nothing about the machinery.
     Missed,
     /// Landed and reverted, or was rejected for a reason that suggests a defect
     /// rather than competition. These are what trip the breaker.
@@ -240,11 +245,6 @@ impl RiskGate {
     }
 
     #[must_use]
-    pub fn halt_reason(&self) -> Option<&str> {
-        self.halted.as_deref()
-    }
-
-    #[must_use]
     pub fn realised_usd(&self) -> f64 {
         self.realised_usd
     }
@@ -333,9 +333,9 @@ impl RiskGate {
                 self.trades_today += 1;
                 self.consecutive_failures = 0;
             }
-            Outcome::Missed => {
-                self.consecutive_failures = 0;
-            }
+            Outcome::Sent => self.trades_today += 1,
+            // Not a reset: a lost race between two reverts must not hide them.
+            Outcome::Missed => {}
             Outcome::Failed => {
                 self.trades_today += 1;
                 self.consecutive_failures += 1;
@@ -385,6 +385,21 @@ impl RiskGate {
         }
     }
 
+    /// Fold the chain's answer for a [`Outcome::Sent`] trade in: its confirmed net, and
+    /// a strike if it landed and reverted — a send whose floor was gone by inclusion
+    /// pays its fee for nothing — or a cleared streak if it landed cleanly. Not a new
+    /// trade: it was counted when sent.
+    pub fn confirm(&mut self, net_usd: f64, reverted: bool) {
+        if reverted {
+            self.consecutive_failures += 1;
+        } else {
+            self.consecutive_failures = 0;
+        }
+        self.settle(net_usd);
+        if self.consecutive_failures >= self.limits.max_consecutive_failures {
+            self.halt(format!("{} trades reverted in a row", self.consecutive_failures));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -509,6 +524,33 @@ mod tests {
         }
         assert!(!g.is_halted());
         assert_eq!(g.consecutive_failures(), 0);
+    }
+
+    /// A send counts toward the day when it goes and proves nothing until the chain
+    /// answers; a confirmed revert is a strike, and a race lost in simulation in between
+    /// neither adds one nor clears one.
+    #[test]
+    fn confirmed_reverts_trip_the_breaker_across_sends_and_missed_floors() {
+        let mut g = gate();
+        for _ in 0..2 {
+            g.record(Outcome::Sent);
+            g.record(Outcome::Missed);
+            g.confirm(-0.001, true);
+        }
+        assert_eq!((g.trades_today(), g.consecutive_failures()), (2, 2));
+        assert!(!g.is_halted());
+        g.record(Outcome::Sent);
+        g.confirm(-0.001, true);
+        assert!(g.is_halted(), "three reverts in a row");
+        assert!((g.realised_usd() + 0.003).abs() < 1e-12);
+        assert_eq!(g.trades_today(), 3, "confirming is not a new trade");
+
+        let mut g = gate();
+        g.record(Outcome::Sent);
+        g.confirm(-0.001, true);
+        g.record(Outcome::Sent);
+        g.confirm(0.0, false);
+        assert_eq!(g.consecutive_failures(), 0, "a clean landing clears the streak");
     }
 
     #[test]

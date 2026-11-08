@@ -283,7 +283,7 @@ impl PoolState {
                 }
                 // Spending A while the quote is B (or B while it is A) is a sale.
                 if a_to_b == quote_is_b {
-                    Some(Leg::cp(r_in, r_out * (1_000_000 - f) / 1_000_000, 0))
+                    Some(Leg::cp(r_in, r_out.checked_mul(1_000_000 - f)? / 1_000_000, 0))
                 } else {
                     let on_input = (f * 1_000_000).div_ceil(1_000_000 + f);
                     Some(Leg::cp(r_in, r_out, u32::try_from(on_input).ok()?))
@@ -308,7 +308,7 @@ impl PoolState {
                     if trade >= 1_000_000 || extra >= 1_000_000 {
                         return None;
                     }
-                    Some(Leg::cp(r_in, r_out * (1_000_000 - extra) / 1_000_000, u32::try_from(trade).ok()?))
+                    Some(Leg::cp(r_in, r_out.checked_mul(1_000_000 - extra)? / 1_000_000, u32::try_from(trade).ok()?))
                 } else {
                     let both = trade + extra;
                     if both >= 1_000_000 {
@@ -353,7 +353,7 @@ impl PoolState {
                     return None;
                 }
                 if on_output {
-                    Some(Leg::bounded(r_in, r_out * (1_000_000 - f) / 1_000_000, 0, max_in))
+                    Some(Leg::bounded(r_in, r_out.checked_mul(1_000_000 - f)? / 1_000_000, 0, max_in))
                 } else {
                     Some(Leg::bounded(r_in, r_out, in_fee, max_in))
                 }
@@ -461,16 +461,6 @@ impl PoolState {
             return None;
         }
         Some(b as f64 / a as f64)
-    }
-
-    /// Largest trade this pool can price exactly when spending `input_mint`.
-    ///
-    /// Unbounded for constant-product pools; the current tick's depth for
-    /// concentrated ones. Surfaced so "we declined to quote" shows up as a number on
-    /// the dashboard instead of a silently missing route.
-    #[must_use]
-    pub fn quotable_depth(&self, input_mint: &Pubkey32) -> Option<u128> {
-        self.leg_for_input(input_mint).map(|l| l.max_in)
     }
 }
 

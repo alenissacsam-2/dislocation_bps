@@ -50,14 +50,16 @@ use solana_sdk::pubkey::Pubkey;
 /// How the outcome of an attempt is reported back to the caller.
 #[derive(Debug, Clone)]
 pub enum Attempt {
-    /// Never left the machine. Carries the reason, which is always printable.
+    /// Never left the machine, or was sent and definitely refused (see
+    /// [`rpc::SendRefused`]). Carries the reason, which is always printable.
     Refused(String),
     /// Simulated, and the simulation said this would not profit.
     SimulationRejected { reason: String, observed_net_usd: Option<f64> },
-    /// Submitted. A signature is not yet a profit.
+    /// Submitted, or the send errored in a way that may still have been received. A
+    /// signature is not yet a profit.
     ///
     /// `bundle_id` is Jito's name for the bundle, when it went that way and the block
-    /// engine gave one; see [`rpc::Rpc::jito_bundle_status`].
+    /// engine gave one; see [`rpc::JitoStatus::status`].
     Submitted { signature: String, expected_net_usd: f64, bundle_id: Option<String> },
     /// Simulated deliberately and never submitted, to find out what would have
     /// happened. See [`Plan::probe`].
@@ -202,6 +204,16 @@ impl Plan {
             Decision::Allow => {}
             Decision::Refuse(r) | Decision::Halt(r) => return Ok(Attempt::Refused(r)),
         }
+        // Skipping our simulation is safe only because a bundle that would fail is
+        // dropped; a URL without `bundleOnly=true` would land it, revert, and pay.
+        if let SendVia::Jito { urls, simulate_first: false } = via {
+            if let Some(u) = urls.iter().find(|u| !jito::is_bundle_only(u)) {
+                return Ok(Attempt::Refused(format!(
+                    "Jito URL {} lacks bundleOnly=true, and this trade would be sent unsimulated",
+                    cb_core::redact::redact_urls_in(u)
+                )));
+            }
+        }
 
         // A dry run always simulates: reporting what the chain would have done is the
         // only thing a dry run is for.
@@ -248,13 +260,20 @@ impl Plan {
                 .map(|r| (r.signature, r.bundle_id)),
             SendVia::Sender => rpc.send_sender(tx_base64).await.map(|s| (s, None)),
         };
-        let (signature, bundle_id) = sent.unwrap_or_else(|e| {
-            tracing::warn!(
-                "send of {own_signature} errored and may still have been received; \
-                 treating it as submitted until its status is known: {e:#}"
-            );
-            (own_signature, None)
-        });
+        let (signature, bundle_id) = match sent {
+            Ok(s) => s,
+            // A definite answer that it was not taken: nothing to wait for.
+            Err(e) if e.downcast_ref::<rpc::SendRefused>().is_some() => {
+                return Ok(Attempt::Refused(format!("send of {own_signature} was refused: {e:#}")));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "send of {own_signature} errored and may still have been received; \
+                     treating it as submitted until its status is known: {e:#}"
+                );
+                (own_signature, None)
+            }
+        };
         Ok(Attempt::Submitted { signature, expected_net_usd: self.expected_net_usd, bundle_id })
     }
 
@@ -535,6 +554,38 @@ mod sender_tests {
         assert!(matches!(&a, Attempt::Submitted { .. }), "{a:?}");
         assert_eq!(limit_in(&log[2]), limit_from_simulation(450));
         assert_eq!(limit_from_simulation(127_523), 169_403);
+    }
+
+    /// A definite JSON no from where it was sent is a refusal, not a pending signature.
+    #[tokio::test]
+    async fn a_send_the_far_end_refuses_comes_back_refused() {
+        let (base, seen) = mock(SIM_OK).await;
+        let mut rpc = Rpc::new(format!("{base}/rpc")).unwrap();
+        // `mock` answers its first argument to any request naming simulateTransaction,
+        // so the query string makes this one answer the send with a JSON error.
+        let (bad, _) = mock(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"no"}}"#).await;
+        rpc.set_sender_url_for_test(&format!("{bad}/fast?simulateTransaction"));
+        let w = wallet();
+        let p = plan(w.pubkey(), signed_tx(&w, 1_000));
+        let mut gate = RiskGate::new(risk::Limits::default());
+        let a = p.execute(&mut gate, &rpc, &w, false, &SendVia::Sender).await.unwrap();
+        assert!(matches!(&a, Attempt::Refused(why) if why.contains("refused")), "{a:?}");
+        assert_eq!(seen.lock().unwrap()[0], "/rpc simulate");
+    }
+
+    /// Unsimulated is safe only as a bundle; a URL that would forward it plainly is
+    /// refused before anything leaves the machine.
+    #[tokio::test]
+    async fn an_unsimulated_jito_send_needs_bundle_only() {
+        let (base, seen) = mock(SIM_OK).await;
+        let rpc = Rpc::new(format!("{base}/rpc")).unwrap();
+        let w = wallet();
+        let p = plan(w.pubkey(), signed_tx(&w, 1_000));
+        let mut gate = RiskGate::new(risk::Limits::default());
+        let via = SendVia::Jito { urls: vec![format!("{base}/api/v1/transactions")], simulate_first: false };
+        let a = p.execute(&mut gate, &rpc, &w, false, &via).await.unwrap();
+        assert!(matches!(&a, Attempt::Refused(why) if why.contains("bundleOnly")), "{a:?}");
+        assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
     }
 
     #[tokio::test]

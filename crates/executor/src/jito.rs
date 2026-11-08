@@ -80,6 +80,15 @@ pub fn api_url(send_url: &str, method: &str) -> String {
     format!("{base}/api/v1/{method}")
 }
 
+/// Whether `url` asks for revert protection: a `bundleOnly=true` query parameter.
+/// Without it the block engine also forwards the transaction as an ordinary one, which
+/// can land, revert, and pay — so a send that skips our own simulation must not go there.
+#[must_use]
+pub fn is_bundle_only(url: &str) -> bool {
+    reqwest::Url::parse(url.trim())
+        .is_ok_and(|u| u.query_pairs().any(|(k, v)| k == "bundleOnly" && v == "true"))
+}
+
 /// Every block engine region Jito runs, by the host prefix each is served under.
 ///
 /// # Why a trade goes to all of them
@@ -183,7 +192,12 @@ mod tests {
     #[test]
     fn the_default_url_asks_for_revert_protection() {
         assert!(DEFAULT_URL.starts_with("https://"));
-        assert!(DEFAULT_URL.contains("bundleOnly=true"));
+        assert!(is_bundle_only(DEFAULT_URL));
+        assert!(fanout_urls(DEFAULT_URL).iter().all(|u| is_bundle_only(u)));
+        assert!(!is_bundle_only("https://mainnet.block-engine.jito.wtf/api/v1/transactions"));
+        assert!(!is_bundle_only("https://x.example/api/v1/transactions?bundleOnly=false"));
+        assert!(!is_bundle_only("https://x.example/api/v1/transactions?notbundleOnly=true"));
+        assert!(!is_bundle_only("not a url bundleOnly=true"));
     }
 
     #[test]

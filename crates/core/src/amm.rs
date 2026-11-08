@@ -157,9 +157,12 @@ pub fn is_profitable(r: &CycleReserves) -> bool {
     };
 
     // lhs = γa·γb·B·D, rhs = A·C·BPS²
-    let lhs = u256(ga) * u256(gb) * u256(r.a_out) * u256(r.b_out);
-    let rhs = u256(r.a_in) * u256(r.b_in) * u256(PPM_DENOM) * u256(PPM_DENOM);
-    lhs > rhs
+    // Four 128-bit reserves can exceed 256 bits; a cycle that cannot be proven is not profitable.
+    let lhs = [gb, r.a_out, r.b_out].into_iter().try_fold(u256(ga), |a, v| a.checked_mul(u256(v)));
+    let rhs = [r.b_in, PPM_DENOM, PPM_DENOM]
+        .into_iter()
+        .try_fold(u256(r.a_in), |a, v| a.checked_mul(u256(v)));
+    matches!((lhs, rhs), (Some(l), Some(h)) if l > h)
 }
 
 /// Closed-form optimal input size for a two-pool constant-product cycle.
@@ -183,13 +186,14 @@ pub fn optimal_input(r: &CycleReserves) -> Option<u128> {
     // quantities, which overflows u128 once reserves exceed roughly 4.3e7 base units
     // — i.e. about 43 USDC. Every real pool is far larger than that, so computing
     // this in u128 silently returns None for the entire live market.
-    let radicand =
-        u256(ga) * u256(gb) * u256(r.a_in) * u256(r.a_out) * u256(r.b_in) * u256(r.b_out);
+    let radicand = [gb, r.a_in, r.a_out, r.b_in, r.b_out]
+        .into_iter()
+        .try_fold(u256(ga), |a, v| a.checked_mul(u256(v)))?;
 
     // Integer square root, truncating downward.
     let root = radicand.root(2);
 
-    let ac_scaled = u256(r.a_in) * u256(r.b_in) * u256(PPM_DENOM);
+    let ac_scaled = u256(r.a_in).checked_mul(u256(r.b_in))?.checked_mul(u256(PPM_DENOM))?;
 
     // is_profitable implies root > ac_scaled up to sqrt truncation; guard anyway.
     if root <= ac_scaled {
@@ -201,12 +205,15 @@ pub fn optimal_input(r: &CycleReserves) -> Option<u128> {
     //   γa·(C + γb·B) = ga·(C·BPS + gb·B) / BPS²
     // and the surrounding expression multiplies by BPS, so we carry
     // ga·(C·BPS + gb·B) here and apply the single remaining BPS below.
-    let denominator = u256(ga) * (u256(r.b_in) * u256(PPM_DENOM) + u256(gb) * u256(r.a_out));
+    let denominator = u256(r.b_in)
+        .checked_mul(u256(PPM_DENOM))?
+        .checked_add(u256(gb).checked_mul(u256(r.a_out))?)?
+        .checked_mul(u256(ga))?;
 
     if denominator == U256::ZERO {
         return None;
     }
-    let x = numerator * u256(PPM_DENOM) / denominator;
+    let x = numerator.checked_mul(u256(PPM_DENOM))? / denominator;
 
     // A size that does not fit u128 is not a size we can put in a transaction.
     let x: u128 = x.try_into().ok()?;
@@ -243,6 +250,14 @@ mod tests {
         // den = 1_000_000*1_000_000 + 997_500_000 = 1_000_997_500_000
         // out = 9.975e14 / 1.0009975e12 = 996
         assert_eq!(cp_swap_out(1000, 1_000_000, 1_000_000, 2500), Some(996));
+    }
+
+    #[test]
+    fn reserves_too_big_for_256_bits_are_refused_not_wrapped() {
+        let big = u128::MAX;
+        let r = CycleReserves { a_in: 1, a_out: big, b_in: 1, b_out: big, fee_a_ppm: 2500, fee_b_ppm: 2500 };
+        assert!(!is_profitable(&r));
+        assert_eq!(optimal_input(&r), None);
     }
 
     #[test]

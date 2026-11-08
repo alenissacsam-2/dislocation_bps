@@ -389,6 +389,57 @@ pub fn wrap_cap(amount_in: u128, distinct_mints: usize, balance: u64, account_re
     }
 }
 
+/// Whether a trade attempt's send reached an endpoint, and so counts against the send
+/// gap: submitted, errored (it may have been received), or definitely refused there —
+/// `rpc::SendRefused`, which `Plan::execute` words as "send of …".
+#[must_use]
+pub fn reached_the_wire(r: &Result<Attempt>) -> bool {
+    matches!(r, Ok(Attempt::Submitted { .. }) | Err(_))
+        || matches!(r, Ok(Attempt::Refused(why)) if why.starts_with("send of "))
+}
+
+/// The instructions that close the token account `ata`, burning its `amount` first when
+/// that is dust; `None` when `amount` is over `dust_max` and the account must be kept.
+/// Burn is instruction 8 under both token programs: account, mint, owner.
+#[must_use]
+pub fn close_instructions(
+    ata: &Pubkey,
+    mint: &Pubkey,
+    owner: &Pubkey,
+    program: &Pubkey,
+    amount: u64,
+    dust_max: u64,
+) -> Option<Vec<Instruction>> {
+    use solana_sdk::instruction::AccountMeta;
+    if amount > dust_max {
+        return None;
+    }
+    let mut ixs = vec![tx::set_compute_limit(if amount > 0 { 40_000 } else { 20_000 })];
+    if amount > 0 {
+        let mut data = vec![8u8];
+        data.extend_from_slice(&amount.to_le_bytes());
+        ixs.push(Instruction {
+            program_id: *program,
+            accounts: vec![AccountMeta::new(*ata, false), AccountMeta::new(*mint, false), AccountMeta::new_readonly(*owner, true)],
+            data,
+        });
+    }
+    ixs.push(tx::close_token_account(ata, owner, owner, program));
+    Some(ixs)
+}
+
+/// `plan` cut to what the wallet can wrap (see [`wrap_cap`]), its quotes scaled with it;
+/// `None` when it already fits. Everything priced off the plan — the bid, the tip, the
+/// room the floor leaves — has to see the size actually traded. Linear scaling
+/// understates a concave gross, the safe side for a bid.
+#[must_use]
+pub fn wrap_sized(plan: &CyclePlan, balance: u64, account_rent: u64) -> Option<CyclePlan> {
+    let distinct = plan.mints.iter().collect::<std::collections::HashSet<_>>().len();
+    let cap = wrap_cap(plan.amount_in, distinct, balance, account_rent).filter(|c| *c < plan.amount_in)?;
+    let scale = |v: &u128| v.saturating_mul(cap) / plan.amount_in;
+    Some(CyclePlan { amount_in: cap, leg_out: plan.leg_out.iter().map(scale).collect(), ..plan.clone() })
+}
+
 /// The edge, in bps, of a cycle that turns `spent` into `out`, when it is past
 /// [`cb_scanner::multi::MAX_PLAUSIBLE_EDGE_BPS`]: a price no pool is really offering.
 #[must_use]
@@ -716,6 +767,11 @@ pub struct Trader {
     oversize: Option<Vec<Pubkey>>,
     /// The local date the gate's daily counters belong to. See [`Trader::roll_day_if`].
     day: chrono::NaiveDate,
+    /// The tip the last submitted trade carried, in lamports, for its ledger row.
+    last_trade_tip: u64,
+    /// Fees setup transactions have paid since the caller last took them, in lamports.
+    /// See [`Trader::take_setup_lamports`].
+    setup_lamports: std::sync::atomic::AtomicU64,
 }
 
 /// Move addresses whose warm-up has passed into the usable table. A free function so it
@@ -765,6 +821,8 @@ impl Trader {
             lookup_pending: Vec::new(),
             oversize: None,
             day: chrono::Local::now().date_naive(),
+            last_trade_tip: 0,
+            setup_lamports: Default::default(),
         }
     }
 
@@ -1322,7 +1380,7 @@ impl Trader {
         if let Some((quoted, _)) = Self::floor_chain(&legs, spend_total, 0) {
             if let Some(bps) = phantom_edge_bps(spend_total, quoted) {
                 bail!(
-                    "refused: a {bps:.0} bps edge at re-price is past the {} bps any real \
+                    "a {bps:.0} bps edge at re-price is past the {} bps any real \
                      pool offers",
                     cb_scanner::multi::MAX_PLAUSIBLE_EDGE_BPS
                 );
@@ -2051,25 +2109,35 @@ impl Trader {
         // guarantees all three costs — base fee, priority fee and tip — on chain, as
         // through Jito. A floor missed after the simulation reverts and pays the base
         // and priority fees; the tip reverts with it.
+        // Never size above what the wallet can wrap: a plan sized for more capital than
+        // the balance holds was refused after the whole build, 62% of attempts on 11-07.
+        // Sized before the costs: a tip, bid and room priced on the full plan were paid
+        // out of the smaller trade's floor.
+        let sized = if wrapping {
+            wrap_sized(plan, profit_account.map_or(0, |a| a.lamports), self.account_rent)
+        } else {
+            None
+        };
+        let sizing_plan = sized.as_ref().unwrap_or(plan);
         // What the last floor can guarantee past the spend: every landing cost is paid
         // out of it.
         let room = if tipped {
-            Self::fresh_floor_gain(plan, &pool_data, &vaults, &bins, read_slot, self.opts.slippage_tenth_bps)
+            Self::fresh_floor_gain(sizing_plan, &pool_data, &vaults, &bins, read_slot, self.opts.slippage_tenth_bps)
         } else {
             0
         };
         let bid = match self.opts.submit {
             Submit::Jito { .. } => 0,
             Submit::Sender { .. } => {
-                self.bid_for(plan, wrapping).min(sender_bid_cap(room, self.opts.compute_units)).max(1)
+                self.bid_for(sizing_plan, wrapping).min(sender_bid_cap(room, self.opts.compute_units)).max(1)
             }
-            Submit::Rpc => self.bid_for(plan, wrapping),
+            Submit::Rpc => self.bid_for(sizing_plan, wrapping),
         };
         let priority = priority_fee_lamports(bid, self.opts.compute_units);
         let tip = if tipped {
             let min = if sender { cb_executor::sender::MIN_TIP_LAMPORTS } else { cb_executor::jito::MIN_TIP_LAMPORTS };
             cap_tip_over(
-                self.tip_for(Self::fresh_gross(plan, &pool_data, &vaults, &bins, read_slot)),
+                self.tip_for(Self::fresh_gross(sizing_plan, &pool_data, &vaults, &bins, read_slot)),
                 room,
                 BASE_FEE_LAMPORTS + priority,
                 min,
@@ -2079,24 +2147,11 @@ impl Trader {
         };
         let fee_headroom =
             if wrapping && !tipped { (BASE_FEE_LAMPORTS + priority) * 5 / 4 } else { 0 };
-        // Through Jito the priority is zero, so this is the base fee plus the tip.
-        let required_gain = if tipped { BASE_FEE_LAMPORTS + priority + u128::from(tip) } else { 0 };
-        // Never size above what the wallet can wrap: a plan sized for more capital than
-        // the balance holds was refused after the whole build, 62% of attempts on 11-07.
-        let sized;
-        let sizing_plan = if wrapping {
-            let distinct = plan.mints.iter().collect::<std::collections::HashSet<_>>().len();
-            let bal = profit_account.map_or(0, |a| a.lamports);
-            match wrap_cap(plan.amount_in, distinct, bal, self.account_rent) {
-                Some(cap) if cap < plan.amount_in => {
-                    sized = CyclePlan { amount_in: cap, ..plan.clone() };
-                    &sized
-                }
-                _ => plan,
-            }
-        } else {
-            plan
-        };
+        // Through Jito the priority is zero, so this is the base fee plus the tip — plus
+        // the rent of an account this trade opens, which leaves the same lamports.
+        let open_rent = if open_in_trade.is_some() { u128::from(self.account_rent) } else { 0 };
+        let required_gain =
+            if tipped { BASE_FEE_LAMPORTS + priority + u128::from(tip) + open_rent } else { 0 };
         let (hops, spent) = match self.hops_for(
             sizing_plan,
             &pool_data,
@@ -2209,7 +2264,7 @@ impl Trader {
             wsol: self.opts.wsol,
             create_token_accounts: self.opts.create_token_accounts,
             others_exist: !self.accounts_held.is_empty(),
-            create_also: open_in_trade.map(|m| to_pubkey(&m)),
+            create_also: open_in_trade.map(|m| (to_pubkey(&m), self.account_rent)),
             venue: VenueExtra { token_program, bitmap_policy: BitmapPolicy::Auto, pump: self.pump_fees },
             min_gain: u64::try_from(required_gain).unwrap_or(u64::MAX),
             // Any of the eight accounts will do; spreading by the blockhash keeps
@@ -2271,8 +2326,11 @@ impl Trader {
                     .await;
                 // Counted from any send that reached the wire or failed trying: a send
                 // that errored may still have been received, and was a request either way.
-                if tipped && matches!(r, Ok(Attempt::Submitted { .. }) | Err(_)) {
+                if tipped && reached_the_wire(&r) {
                     self.last_jito_send = Some(std::time::Instant::now());
+                }
+                if matches!(r, Ok(Attempt::Submitted { .. })) {
+                    self.last_trade_tip = tip;
                 }
                 if let (Ok(Attempt::Submitted { signature, .. }), Some(mint)) = (&r, open_in_trade) {
                     self.opening_in_trade.insert(signature.clone(), mint);
@@ -2504,12 +2562,19 @@ impl Trader {
     /// a tick on 2026-11-07 was never included.
     async fn send_setup(&self, ixs: &[Instruction], what: &str) -> Result<Option<String>> {
         const ROUNDS: u32 = 4;
+        // An included setup transaction pays its fees, reverted or not; the caller
+        // charges them to the day. See `take_setup_lamports`.
+        let charge = |cleanly: bool| {
+            let cost = self.setup_cost_lamports(&self.setup_instructions(ixs, 0), cleanly);
+            self.setup_lamports.fetch_add(cost, std::sync::atomic::Ordering::Relaxed);
+        };
         let mut sent: Vec<String> = Vec::new();
         for round in 1..=ROUNDS {
             // An earlier round can land late; re-sending after it would not simulate.
             if !sent.is_empty() {
                 let statuses = self.confirm_many(&sent).await;
                 if let Some((s, ok)) = sent.iter().zip(statuses).find_map(|(s, st)| st.map(|ok| (s, ok))) {
+                    charge(ok);
                     anyhow::ensure!(ok, "{what} reverted on chain: {s}");
                     return Ok(Some(s.clone()));
                 }
@@ -2540,8 +2605,14 @@ impl Trader {
             // Fifteen tries at two seconds is thirty seconds of patience, which is
             // generous for inclusion and costs nothing: setup runs rarely.
             match self.confirm(&signature, 15).await {
-                Some(true) => return Ok(Some(signature)),
-                Some(false) => anyhow::bail!("{what} reverted on chain: {signature}"),
+                Some(true) => {
+                    charge(true);
+                    return Ok(Some(signature));
+                }
+                Some(false) => {
+                    charge(false);
+                    anyhow::bail!("{what} reverted on chain: {signature}")
+                }
                 None if round < ROUNDS => tracing::warn!(
                     "{signature} ({what}) has not been included; re-sending against a fresh blockhash ({round} of {ROUNDS})"
                 ),
@@ -2580,6 +2651,71 @@ impl Trader {
             cb_executor::sender::MIN_TIP_LAMPORTS,
         ));
         out
+    }
+
+    /// What an included transaction of `signed` instructions pays: the base fee, the
+    /// priority its compute budget asks for, and the Sender tip only if it ran cleanly
+    /// (a reverted transfer pays nothing).
+    #[must_use]
+    pub fn setup_cost_lamports(&self, signed: &[Instruction], cleanly: bool) -> u64 {
+        let budget = pk(programs::COMPUTE_BUDGET);
+        let arg = |tag: u8, len: usize| -> Option<u64> {
+            let d = &signed.iter().find(|i| i.program_id == budget && i.data.first() == Some(&tag))?.data;
+            let mut b = [0u8; 8];
+            b[..len].copy_from_slice(d.get(1..=len)?);
+            Some(u64::from_le_bytes(b))
+        };
+        let limit = u32::try_from(arg(2, 4).unwrap_or(200_000)).unwrap_or(u32::MAX);
+        let priority = priority_fee_lamports(arg(3, 8).unwrap_or(0), limit);
+        let tip = if cleanly && self.sends_via_sender() { cb_executor::sender::MIN_TIP_LAMPORTS } else { 0 };
+        u64::try_from(BASE_FEE_LAMPORTS + priority).unwrap_or(u64::MAX).saturating_add(tip)
+    }
+
+    /// The fees setup transactions have paid since this was last called, in lamports,
+    /// for the caller to charge to the day with [`Trader::settle`].
+    pub fn take_setup_lamports(&self) -> u64 {
+        self.setup_lamports.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// What a landing probe of `tip` lamports paid once included: the base fee, its
+    /// priority, and the tip if it ran cleanly.
+    #[must_use]
+    pub fn probe_cost_lamports(&self, tip: u64, cleanly: bool) -> u64 {
+        let tip = if cleanly { tip } else { 0 };
+        let priority = if self.sends_via_sender() {
+            priority_fee_lamports(self.opts.priority_micro_lamports.max(PROBE_MIN_CU_PRICE), PROBE_CU_LIMIT)
+        } else {
+            0
+        };
+        u64::try_from(BASE_FEE_LAMPORTS + priority + u128::from(tip)).unwrap_or(u64::MAX)
+    }
+
+    /// The least a trade can cost to land on this path, in lamports: the base fee, plus
+    /// under Sender its minimum tip and the smallest priority bid it sends (1
+    /// micro-lamport a unit). What a detection's gross has to clear to be worth an attempt.
+    #[must_use]
+    pub fn min_landing_cost_lamports(&self) -> u128 {
+        match self.opts.submit {
+            Submit::Sender { .. } => {
+                BASE_FEE_LAMPORTS
+                    + u128::from(cb_executor::sender::MIN_TIP_LAMPORTS)
+                    + priority_fee_lamports(1, self.opts.compute_units)
+            }
+            Submit::Rpc | Submit::Jito { .. } => BASE_FEE_LAMPORTS,
+        }
+    }
+
+    /// The tip the last submitted trade carried, in lamports.
+    #[must_use]
+    pub fn last_trade_tip(&self) -> u64 {
+        self.last_trade_tip
+    }
+
+    /// Fold a sent trade's confirmed outcome into the gate: its net, and a strike if it
+    /// reverted. See [`cb_executor::risk::RiskGate::confirm`].
+    pub fn confirm_outcome(&mut self, net_usd: f64, reverted: bool) {
+        self.exec.gate.confirm(net_usd, reverted);
+        self.persist_day();
     }
 
     /// The accounts [`crate::demand`] may close: held, and not in `protected` (the base
@@ -2645,16 +2781,20 @@ impl Trader {
         Ok(missing.is_empty())
     }
 
-    /// Close the wallet's account for `mint` and take its deposit back, if it is empty.
+    /// Close the wallet's account for `mint` and take its deposit back, if it is empty
+    /// or holds no more than `dust_max` base units, which are burned in the same
+    /// transaction first.
     ///
-    /// Returns whether the account is gone afterwards. An account that still holds a
-    /// balance is left alone and reported as `false`: closing one would fail on chain,
-    /// and emptying it is a trade, which is not this function's to make.
+    /// Returns whether the account is gone afterwards. An account holding more than
+    /// `dust_max` is left alone and reported as `false`: closing one would fail on chain,
+    /// and emptying it is a trade, which is not this function's to make. Haircut floors
+    /// leave a few base units behind, which is what made `close_account` refuse and kept
+    /// a Replace from ever freeing its slot. Zero burns nothing.
     ///
     /// # Errors
     /// If the chain cannot be reached, or the close does not simulate cleanly, reverts,
     /// or is never included.
-    pub async fn close_account(&mut self, mint: &Pubkey32) -> Result<bool> {
+    pub async fn close_account(&mut self, mint: &Pubkey32, dust_max: u64) -> Result<bool> {
         let program = self.token_program_of(mint);
         let ata = associated_token_address(&self.owner, &to_pubkey(mint), &program);
         let found = self.exec.rpc.accounts_full(std::slice::from_ref(&ata)).await?;
@@ -2668,18 +2808,17 @@ impl Trader {
             .get(64..72)
             .and_then(|b| <[u8; 8]>::try_from(b).ok())
             .map_or(u64::MAX, u64::from_le_bytes);
-        if amount != 0 {
+        let Some(ixs) = close_instructions(&ata, &to_pubkey(mint), &self.owner, &program, amount, dust_max) else {
             tracing::info!(
-                "kept the account for {}: it holds {amount} base units, and only an empty \
-                 account can be closed",
+                "kept the account for {}: it holds {amount} base units, over the {dust_max} \
+                 that count as dust, and only an empty account can be closed",
                 to_pubkey(mint)
             );
             return Ok(false);
+        };
+        if amount > 0 {
+            tracing::info!("burning {amount} base units of dust from the account for {} to close it", to_pubkey(mint));
         }
-        let ixs = vec![
-            tx::set_compute_limit(20_000),
-            tx::close_token_account(&ata, &self.owner, &self.owner, &program),
-        ];
         // Re-sent until it lands. One that never does stays held: forgetting it is what
         // left 15 accounts open on 2026-11-07, invisible to the cap. If a late copy does
         // land, the next call finds no account above and forgets it then.
@@ -2862,9 +3001,16 @@ impl Trader {
 
     /// Record what became of a probe of `tip` lamports. A landing sets the floor every
     /// trade's tip is held to; a miss leaves it where it was.
+    ///
+    /// Under Sender a probe above the first rung went only because a lower one missed,
+    /// and its tip is a fee for the route rather than a bid: it proves the path, not
+    /// that less would not land. So it does not raise the floor — otherwise one missed
+    /// 5,000 probe made every trade tip 15,000.
     pub fn note_probe(&mut self, tip: u64, landed: bool) {
         if landed {
-            self.landing_tip = Some(tip);
+            if !(self.sends_via_sender() && tip > SENDER_PROBE_TIPS[0]) {
+                self.landing_tip = Some(tip);
+            }
             self.last_landed = Some(std::time::Instant::now());
         }
     }
@@ -3222,6 +3368,15 @@ fn input_is_token_a(dex: Dex, data: &[u8], mint: &Pubkey32) -> Result<bool> {
     }
 }
 
+/// A trader whose RPC is unreachable, holding `held` (empty: never measured), for tests
+/// of the loop that drives it.
+#[cfg(test)]
+pub fn trader_for_tests(opts: TradeOptions, held: &[Pubkey32]) -> Trader {
+    let mut t = Trader::new(tests::unreachable_executor(), opts);
+    t.accounts_held.extend(held.iter().copied());
+    t
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3427,6 +3582,8 @@ mod tests {
             lookup_pending: Vec::new(),
             oversize: None,
             day: chrono::Local::now().date_naive(),
+            last_trade_tip: 0,
+            setup_lamports: Default::default(),
         };
         let p = plan(3);
         let data = pools_for(&p);
@@ -3472,6 +3629,8 @@ mod tests {
             lookup_pending: Vec::new(),
             oversize: None,
             day: chrono::Local::now().date_naive(),
+            last_trade_tip: 0,
+            setup_lamports: Default::default(),
         };
         let data = pools_for(&plan(3));
         let arrays = vec![[Pubkey::new_unique(); 3]; 3];
@@ -3515,6 +3674,8 @@ mod tests {
             lookup_pending: Vec::new(),
             oversize: None,
             day: chrono::Local::now().date_naive(),
+            last_trade_tip: 0,
+            setup_lamports: Default::default(),
         };
         let data = pools_for(&plan(2));
         let arrays = vec![[Pubkey::new_unique(); 3]; 2];
@@ -3873,6 +4034,8 @@ mod mainnet {
             lookup_pending: Vec::new(),
             oversize: None,
             day: chrono::Local::now().date_naive(),
+            last_trade_tip: 0,
+            setup_lamports: Default::default(),
         };
         let (hops, _) = t.hops_for(&plan, &pool_data, &arrays, &vec![None; plan.pools.len()], &[], 0, 0, 0).expect("hops");
 
@@ -4087,6 +4250,8 @@ mod fresh_quote_tests {
             lookup_pending: Vec::new(),
             oversize: None,
             day: chrono::Local::now().date_naive(),
+            last_trade_tip: 0,
+            setup_lamports: Default::default(),
         };
 
         let mut p = tests::plan(2);
@@ -4138,6 +4303,8 @@ mod fresh_quote_tests {
             lookup_pending: Vec::new(),
             oversize: None,
             day: chrono::Local::now().date_naive(),
+            last_trade_tip: 0,
+            setup_lamports: Default::default(),
         };
         let p = tests::plan(3);
         let (hops, spent) = t
@@ -4196,6 +4363,8 @@ mod fresh_quote_tests {
             lookup_pending: Vec::new(),
             oversize: None,
             day: chrono::Local::now().date_naive(),
+            last_trade_tip: 0,
+            setup_lamports: Default::default(),
         };
         let mut p = tests::plan(2);
         let data = tests::pools_for(&p);
@@ -4258,6 +4427,8 @@ mod fresh_quote_tests {
             lookup_pending: Vec::new(),
             oversize: None,
             day: chrono::Local::now().date_naive(),
+            last_trade_tip: 0,
+            setup_lamports: Default::default(),
             };
             let _ = &t;
             let p = tests::plan(2);
@@ -4323,6 +4494,8 @@ mod fresh_quote_tests {
             lookup_pending: Vec::new(),
             oversize: None,
             day: chrono::Local::now().date_naive(),
+            last_trade_tip: 0,
+            setup_lamports: Default::default(),
         }
     }
 
@@ -4529,8 +4702,14 @@ mod fresh_quote_tests {
         assert_eq!(t.tip_for(400), 5_000);
         assert_eq!(t.tip_for(30_000), 15_000);
         assert_eq!(t.tip_for(4_000_000), 20_000);
+        // The 15,000 rung is only sent after a 5,000 probe missed: landing it proves the
+        // path and leaves the floor at the minimum.
+        t.note_probe(5_000, false);
         t.note_probe(15_000, true);
-        assert_eq!(t.tip_for(400), 15_000);
+        assert!(t.landed_within(std::time::Duration::from_secs(60)));
+        assert_eq!(t.tip_for(400), 5_000);
+        t.note_probe(5_000, true);
+        assert_eq!(t.tip_for(400), 5_000);
         // A ceiling configured under the minimum is raised to it.
         assert_eq!(sender_trader(1_000).tip_for(4_000_000), 5_000);
         assert!(t.tips_in_trade() && t.sends_via_sender() && !t.sends_via_jito());
@@ -4644,6 +4823,97 @@ mod fresh_quote_tests {
         assert_eq!(t.tip_for(Trader::fresh_gross(&p, &data, &[], &[], 0)), t.tip_for(honest));
     }
 
+    /// The bid, the tip and the room the floor leaves are priced on the plan the wallet
+    /// can actually wrap, not the one detection sized: the full plan's tip was paid out
+    /// of the smaller trade's floor.
+    #[test]
+    fn costs_are_priced_on_the_size_the_wallet_can_wrap() {
+        let mut t = sender_trader(1_000_000);
+        t.opts.compute_units = 300_000;
+        t.opts.priority_micro_lamports = 1_000_000_000;
+        let p = tests::plan(2);
+        let data = tests::pools_for(&p);
+        // Two distinct mints at 1,000 rent plus the fee allowance leave 400,000.
+        let s = wrap_sized(&p, 502_000, 1_000).expect("over what the wallet can wrap");
+        assert_eq!(s.amount_in, 400_000);
+        assert_eq!(s.leg_out, vec![404_000, 404_000], "quotes scale with the size");
+        assert!(wrap_sized(&p, 10_000_000, 1_000).is_none(), "a plan that fits is used as is");
+        let gain = |pl: &CyclePlan| Trader::fresh_floor_gain(pl, &data, &[], &[], 0, t.opts.slippage_tenth_bps);
+        let gross = |pl: &CyclePlan| Trader::fresh_gross(pl, &data, &[], &[], 0);
+        assert!(gain(&s) < gain(&p) && gross(&s) < gross(&p), "the smaller trade earns less");
+        // Under Sender both sit at the 5,000 minimum; Jito's lower one shows the share.
+        let j = jito_trader(1_000_000);
+        assert!(j.tip_for(gross(&s)) < j.tip_for(gross(&p)));
+        // A quarter of 4,000 over 300,000 units; unscaled quotes would bid on 610,000.
+        assert_eq!(t.bid_for(&s, true), 3_333);
+        assert_eq!(t.bid_for(&p, true), 8_333);
+    }
+
+    /// A send refused at the endpoint used the gap as much as one that went through;
+    /// a refusal before anything was sent did not.
+    #[test]
+    fn a_refused_send_counts_against_the_send_gap() {
+        let refused = |s: &str| Ok(Attempt::Refused(s.into()));
+        assert!(reached_the_wire(&refused("send of SIG was refused: every block engine refused it")));
+        assert!(reached_the_wire(&Err(anyhow::anyhow!("timed out"))));
+        assert!(reached_the_wire(&Ok(Attempt::Submitted { signature: "S".into(), expected_net_usd: 0.0, bundle_id: None })));
+        assert!(!reached_the_wire(&refused("trading is halted: x")));
+        assert!(!reached_the_wire(&refused("pool X vanished between sweep and build")));
+    }
+
+    /// Dust a haircut left is burned in the close; a meaningful balance never is.
+    #[test]
+    fn a_close_burns_dust_and_keeps_a_real_balance() {
+        let (ata, mint, owner, program) =
+            (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), pk(programs::SPL_TOKEN_2022));
+        assert!(close_instructions(&ata, &mint, &owner, &program, 101, 100).is_none(), "over the dust line");
+        let empty = close_instructions(&ata, &mint, &owner, &program, 0, 0).expect("an empty account closes");
+        assert_eq!(empty.len(), 2, "a limit and the close, nothing burned");
+        let dusty = close_instructions(&ata, &mint, &owner, &program, 37, 100).expect("dust is burned");
+        assert_eq!(dusty.len(), 3);
+        let burn = &dusty[1];
+        assert_eq!(burn.program_id, program, "burned on the mint's own token program");
+        assert_eq!(burn.data[0], 8);
+        assert_eq!(u64::from_le_bytes(burn.data[1..9].try_into().unwrap()), 37, "exactly what was read");
+        assert_eq!(
+            burn.accounts.iter().map(|a| (a.pubkey, a.is_writable, a.is_signer)).collect::<Vec<_>>(),
+            vec![(ata, true, false), (mint, true, false), (owner, false, true)]
+        );
+        assert_eq!(dusty[2], tx::close_token_account(&ata, &owner, &owner, &program), "then closed");
+    }
+
+    /// What landed probes and setup transactions cost reaches the daily loss: the base
+    /// fee, the priority their budget asks for, and the tip only when it ran cleanly.
+    #[test]
+    fn probes_and_setup_transactions_are_priced_as_they_landed() {
+        let mut t = sender_trader(20_000);
+        t.opts.priority_micro_lamports = 0;
+        // 10,000 micro-lamports on a 1,000-unit limit is 10 lamports.
+        assert_eq!(t.probe_cost_lamports(5_000, true), 5_000 + 10 + 5_000);
+        assert_eq!(t.probe_cost_lamports(5_000, false), 5_000 + 10, "a failed transfer tips nothing");
+        assert_eq!(jito_trader(0).probe_cost_lamports(9_000, true), 5_000 + 9_000);
+
+        let ata = Pubkey::new_unique();
+        let close = [tx::set_compute_limit(20_000), tx::close_token_account(&ata, &t.owner, &t.owner, &pk(programs::SPL_TOKEN))];
+        let signed = t.setup_instructions(&close, 7);
+        // 20,000 units at 10,000 micro-lamports is 200 lamports.
+        assert_eq!(t.setup_cost_lamports(&signed, true), 5_000 + 200 + 5_000);
+        assert_eq!(t.setup_cost_lamports(&signed, false), 5_000 + 200);
+        assert_eq!(jito_trader(0).setup_cost_lamports(&close, true), 5_000, "no price, no tip");
+        t.setup_lamports.fetch_add(7, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!((t.take_setup_lamports(), t.take_setup_lamports()), (7, 0), "taken once");
+    }
+
+    /// Under Sender a detection has to clear the base fee, the least tip and the least
+    /// bid before an attempt is worth its round trips.
+    #[test]
+    fn the_least_landing_cost_follows_the_send_path() {
+        let mut t = sender_trader(20_000);
+        t.opts.compute_units = 300_000;
+        assert_eq!(t.min_landing_cost_lamports(), 5_000 + 5_000 + 1);
+        assert_eq!(jito_trader(20_000).min_landing_cost_lamports(), 5_000);
+    }
+
     /// Sizing down has a floor of its own: a cycle with no room anywhere is refused,
     /// and says so in terms an operator can act on.
     #[test]
@@ -4671,6 +4941,8 @@ mod fresh_quote_tests {
             lookup_pending: Vec::new(),
             oversize: None,
             day: chrono::Local::now().date_naive(),
+            last_trade_tip: 0,
+            setup_lamports: Default::default(),
         };
         let p = tests::plan(2);
         // Pools that decode but trade the wrong mints cannot be re-priced at all.
@@ -4763,6 +5035,8 @@ mod account_rent_tests {
             lookup_pending: Vec::new(),
             oversize: None,
             day: chrono::Local::now().date_naive(),
+            last_trade_tip: 0,
+            setup_lamports: Default::default(),
         };
         t.accounts_held = mints.iter().copied().collect();
         t

@@ -87,18 +87,6 @@ impl Snapshot {
         self.pools.is_empty()
     }
 
-    /// Number of distinct mints in the graph.
-    #[must_use]
-    pub fn mint_count(&self) -> usize {
-        self.by_mint.len()
-    }
-
-    /// Oldest slot in the snapshot. A cycle can be no fresher than this.
-    #[must_use]
-    pub fn oldest_slot(&self) -> u64 {
-        self.pools.iter().map(|p| p.slot).min().unwrap_or(0)
-    }
-
     #[must_use]
     pub fn newest_slot(&self) -> u64 {
         self.pools.iter().map(|p| p.slot).max().unwrap_or(0)
@@ -129,7 +117,6 @@ mod tests {
         assert_eq!(s.pools_trading(&[20; 32]).len(), 2, "mint 20 is in two pools");
         assert_eq!(s.pools_trading(&[10; 32]).len(), 1);
         assert_eq!(s.pools_trading(&[99; 32]).len(), 0, "unknown mint must not panic");
-        assert_eq!(s.mint_count(), 5, "mints 10,20,30,40,50");
     }
 
     #[test]
@@ -142,7 +129,6 @@ mod tests {
     #[test]
     fn slot_range_bounds_the_freshness_of_any_cycle() {
         let s = Snapshot::new(vec![pool(1, 10, 20, 100), pool(2, 20, 30, 250)]);
-        assert_eq!(s.oldest_slot(), 100);
         assert_eq!(s.newest_slot(), 250);
     }
 
@@ -150,7 +136,6 @@ mod tests {
     fn an_empty_snapshot_is_harmless() {
         let s = Snapshot::default();
         assert!(s.is_empty());
-        assert_eq!(s.oldest_slot(), 0);
         assert_eq!(s.pools_trading(&[1; 32]).len(), 0);
     }
 }

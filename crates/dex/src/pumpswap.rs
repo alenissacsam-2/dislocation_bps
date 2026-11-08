@@ -80,6 +80,9 @@ const OFF_G_BUYBACK_RECIPIENTS: usize = 643;
 const OFF_G_BUYBACK_BPS: usize = 899;
 const GLOBAL_MIN_LEN: usize = 907;
 
+/// `disable_flags` bits 3 (buy) and 4 (sell).
+const DISABLE_SWAP_MASK: u8 = 0b1_1000;
+
 // FeeConfig: discriminator, bump, admin, then the flat fees and two tier vectors.
 const OFF_F_FLAT: usize = 41;
 const FEES_LEN: usize = 24;
@@ -162,6 +165,8 @@ pub struct GlobalConfig {
     /// Any one of these may be named as the buyback fee recipient, which a swap now
     /// passes as a remaining account.
     pub buyback_fee_recipients: [Pubkey32; 8],
+    /// Decoded but deliberately not charged: nothing here confirms the program takes it
+    /// from swappers (the recipients are only a remaining account), so it is not applied.
     pub buyback_bps: u64,
 }
 
@@ -182,6 +187,10 @@ pub fn decode_global_config(data: &[u8]) -> Result<GlobalConfig> {
         }
         out
     };
+    // IDL `disable_flags`: bit 3 disables buy, bit 4 disables sell. This quotes both
+    // directions, so either one set means the pool cannot be quoted.
+    let flags = data[OFF_G_DISABLE];
+    ensure!(flags & DISABLE_SWAP_MASK == 0, "pumpswap global config disables swaps (flags {flags:#010b})");
     Ok(GlobalConfig {
         lp_fee_bps: u64_at(data, OFF_G_LP_FEE),
         protocol_fee_bps: u64_at(data, OFF_G_PROTOCOL_FEE),
@@ -368,6 +377,18 @@ mod tests {
         assert_eq!(c.fees(true, 420_000_000_000, false).total_bps(), 120);
         assert_eq!(c.fees(true, 10u128.pow(15), false).total_bps(), 115);
         assert_eq!(c.fees(false, 10u128.pow(15), false).total_bps(), 30, "any other pool is flat");
+    }
+
+    #[test]
+    fn a_global_config_that_disables_buy_or_sell_is_refused() {
+        let mut g = vec![0u8; GLOBAL_MIN_LEN];
+        assert!(decode_global_config(&g).is_ok());
+        g[OFF_G_DISABLE] = 0b0_0111; // create, deposit, withdraw off: swaps still allowed
+        assert!(decode_global_config(&g).is_ok());
+        for bit in [0b0_1000u8, 0b1_0000] {
+            g[OFF_G_DISABLE] = bit;
+            assert!(decode_global_config(&g).is_err(), "flag {bit:#b}");
+        }
     }
 
     #[test]

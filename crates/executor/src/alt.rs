@@ -142,11 +142,13 @@ pub fn parse(key: Pubkey, data: &[u8]) -> Result<AddressLookupTableAccount> {
 }
 
 /// The accounts in `instructions` a lookup table could carry and does not yet:
-/// neither a signer, nor a program the transaction invokes, nor a Jito tip account.
+/// neither a signer, nor a program the transaction invokes, nor a Jito or Sender tip
+/// account (tips must stay static keys).
 #[must_use]
 pub fn candidates(instructions: &[Instruction], held: &[Pubkey]) -> Vec<Pubkey> {
     let programs: Vec<Pubkey> = instructions.iter().map(|ix| ix.program_id).collect();
-    let tips: Vec<Pubkey> = crate::jito::TIP_ACCOUNTS.iter().map(|t| pk(t)).collect();
+    let tips: Vec<Pubkey> =
+        crate::jito::TIP_ACCOUNTS.iter().chain(&crate::sender::TIP_ACCOUNTS).map(|t| pk(t)).collect();
     let mut out: Vec<Pubkey> = Vec::new();
     for meta in instructions.iter().flat_map(|ix| ix.accounts.iter()) {
         let k = meta.pubkey;
@@ -228,6 +230,7 @@ mod tests {
                 data: vec![],
             },
             crate::tx::transfer_lamports(&owner, &tip, 1_000),
+            crate::tx::transfer_lamports(&owner, &crate::sender::tip_account(3), 5_000),
         ];
         let c = candidates(&ixs, &[held]);
         assert_eq!(c, vec![pool, vault], "deduplicated, in first-seen order");

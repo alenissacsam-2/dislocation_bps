@@ -461,7 +461,7 @@ const STAGES = [
  * cause an operator recognises. Order matters: the first match wins. `fault` marks the
  * outcomes that mean something is wrong rather than the market saying no. */
 const RULES = [
-  [/^net negative after tip/, "positive", "Negative after the tip"],
+  [/^(net negative after tip|gross below landing cost)/, "positive", "Below landing cost"],
   [/refused recently/, "attempted", "Cooling down after a refusal"],
   [/stalest leg/, "attempted", "A leg's price is stale"],
   [/slots apart/, "attempted", "Legs priced in different slots"],
