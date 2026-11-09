@@ -190,14 +190,20 @@ pub async fn probe_bundle_only(rpc: &Rpc, wallet: &Wallet, urls: &[String], bloc
         urls.len(),
         PROBE_FOLLOW.as_secs()
     );
-    let (status, url) = (rpc.jito_status(), urls[0].clone());
+    let (status, chain, url) = (rpc.jito_status(), rpc.chain_status(), urls[0].clone());
     tokio::spawn(async move {
         let trail = follow(&status, &url, &id).await;
-        let line = format!("Jito bundleOnly probe {sig} (bundle {id}): {}", describe(&trail));
-        if trail.last().is_some_and(|(_, s)| s == "Landed") {
-            tracing::info!("{line}");
-        } else {
-            tracing::warn!("{line}");
+        // The chain is the verdict; the block engine's statuses are only the trail.
+        match chain.landed(&sig).await {
+            Ok(Some(true)) => tracing::warn!(
+                "Jito bundleOnly probe {sig} LANDED on chain: the revert-protected path works without a \
+                 UUID, so failed attempts sent this way cost nothing (block engine status trail, which \
+                 is not reliable: {})",
+                describe(&trail)
+            ),
+            Ok(Some(false)) => tracing::warn!("Jito bundleOnly probe {sig} landed on chain and failed: {}", describe(&trail)),
+            Ok(None) => tracing::warn!("Jito bundleOnly probe {sig} (bundle {id}) is not on chain: {}", describe(&trail)),
+            Err(e) => tracing::warn!("Jito bundleOnly probe {sig}: on-chain check failed ({e:#}); {}", describe(&trail)),
         }
     });
     Ok(())

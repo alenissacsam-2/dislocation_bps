@@ -57,6 +57,35 @@ pub struct Rpc {
     sender_keyed: bool,
 }
 
+/// Whether a signature is on chain, detached from [`Rpc`] so a task can own it.
+#[derive(Clone)]
+pub struct ChainStatus {
+    client: reqwest::Client,
+    /// Carries the api key; only ever printed through `cb_core::redact`.
+    url: String,
+}
+
+impl ChainStatus {
+    /// `Some(true)` landed cleanly, `Some(false)` landed and failed, `None` not on chain.
+    ///
+    /// # Why
+    ///
+    /// The block engine's in-flight status is not the truth: on 2026-11-09 a probe it
+    /// answered `Invalid` for a full minute had landed, finalized, in the slot it was sent.
+    ///
+    /// # Errors
+    /// If the call fails; the message has the endpoint's key removed.
+    pub async fn landed(&self, sig: &str) -> Result<Option<bool>> {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "getSignatureStatuses",
+            "params": [[sig], {"searchTransactionHistory": true}]});
+        let v: Value = async { self.client.post(&self.url).json(&body).send().await?.error_for_status()?.json().await }
+            .await
+            .map_err(|e: reqwest::Error| anyhow!(cb_core::redact::redact_urls_in(&format!("{e:#}"))))?;
+        let s = &v["result"]["value"][0];
+        Ok(if s.is_object() { Some(s["err"].is_null()) } else { None })
+    }
+}
+
 /// What asking the block engine about a bundle needs, detached from [`Rpc`] so a task
 /// can own it and ask off the trading loop. See [`Rpc::jito_status`].
 #[derive(Clone)]
@@ -945,6 +974,13 @@ impl Rpc {
     #[must_use]
     pub fn jito_status(&self) -> JitoStatus {
         JitoStatus { client: self.http_warm.clone(), auth: self.jito_auth.clone() }
+    }
+
+    /// A handle for asking the primary endpoint whether a signature is on chain, which a
+    /// task can own. See [`ChainStatus::landed`].
+    #[must_use]
+    pub fn chain_status(&self) -> ChainStatus {
+        ChainStatus { client: self.http_warm.clone(), url: self.endpoints[0].clone() }
     }
 
     /// `Ok(None)` means the node has not seen it yet, which is not the same as failure.

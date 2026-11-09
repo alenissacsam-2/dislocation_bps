@@ -98,8 +98,8 @@ that passed all their own tests.
 
 **Profit is not expected from a home PC.** The levers left, none proven:
 
-1. **Jito bundleOnly**, which would make failed trades free (see Submission below). Not
-   yet shown to work: earlier bundles were all `Invalid`.
+1. **Jito bundleOnly**, which makes failed trades free (see Submission below). The
+   2026-11-09 probe landed on chain without a UUID; trades have not been sent this way yet.
 2. **Long-tail new pools**, where fewer bots look.
 3. **A VPS in Singapore or Tokyo**, to close 280 ms against under 10 ms.
 
@@ -262,7 +262,7 @@ Meteora DAMM v2, Meteora DLMM and PumpSwap.
 | | |
 |---|---|
 | **Helius Sender** (default) | Every trade is simulated first. The transaction tips a Helius account and bids a priority fee. **A miss still pays fees.** |
-| **Jito bundleOnly** | Sent through the Singapore block engine. A once-per-run 1,000 lamport probe logs `LANDED`, `Failed` or `Invalid`. If bundleOnly works, a failed trade costs nothing. **Not yet proven**: earlier bundles were all `Invalid`, because Jito accepted unauthenticated bundles with HTTP 200 and then dropped them. A `jito_auth_uuid` setting now authenticates sends. |
+| **Jito bundleOnly** | Sent through the Singapore block engine. A once-per-run 1,000 lamport probe is checked on chain. A failed trade costs nothing. On 2026-11-09 the probe landed (slot 467362677) with no UUID, while the block engine's in-flight status said `Invalid` for a full minute: that status is not reliable, so the earlier "all `Invalid`" verdicts may have been wrong too. |
 
 The switch is on the Parameters tab (Submission).
 
