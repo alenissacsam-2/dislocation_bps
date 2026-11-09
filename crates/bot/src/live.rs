@@ -1729,6 +1729,13 @@ pub fn fee_label(fee_ppm: u32) -> String {
     }
 }
 
+/// A fresh error from redacted text. reqwest embeds the URL, API key included, in its
+/// `Display`, and `.context()` would keep it reachable through `{:#}`; it reached the log
+/// as "reconcile failed: rpc request failed: ... ?api-key=...".
+fn redacted(what: &str, e: &reqwest::Error) -> anyhow::Error {
+    anyhow::anyhow!("{what}: {}", cb_core::redact::redact_urls_in(&e.to_string()))
+}
+
 /// `getMultipleAccounts`, returning raw account data in request order plus the slot
 /// the RPC answered at.
 ///
@@ -1757,10 +1764,10 @@ async fn get_multiple_accounts(
             .json(&body)
             .send()
             .await
-            .context("rpc request failed")?
+            .map_err(|e| redacted("rpc request failed", &e))?
             .json()
             .await
-            .context("rpc response was not json")?;
+            .map_err(|e| redacted("rpc response was not json", &e))?;
 
         if let Some(err) = resp.get("error") {
             anyhow::bail!("rpc error: {err}");
@@ -1835,6 +1842,17 @@ pub(crate) fn empty_market_for_tests() -> LiveMarket {
 mod tests {
     use super::*;
     use cb_core::types::PoolState;
+
+    #[tokio::test]
+    async fn a_failed_rpc_read_does_not_print_the_api_key() {
+        let client = reqwest::Client::new();
+        let e = get_multiple_accounts(&client, "http://127.0.0.1:1/?api-key=SUPER-SECRET-VALUE", &["k".into()])
+            .await
+            .unwrap_err();
+        let e = format!("{e:#}");
+        assert!(e.contains("rpc request failed"), "{e}");
+        assert!(!e.contains("SUPER-SECRET-VALUE") && !e.contains("api-key=S"), "{e}");
+    }
 
     pub(super) fn market_with(pools: Vec<PoolState>) -> LiveMarket {
         let store = PoolStore::new();

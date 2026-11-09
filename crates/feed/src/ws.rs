@@ -25,6 +25,12 @@ pub const MAX_SILENCE: Duration = Duration::from_secs(60);
 /// rejected subscription is a pool that silently never updates for the whole run.
 pub const SUBSCRIBE_BATCH: usize = 16;
 
+/// The most accounts put on one connection. The provider refuses subscriptions past a
+/// per-connection limit ("Exceeded max limit"); the exact figure is not in this repo or
+/// documented where we looked, and the log showed ~70 refusals at ~585 on one socket,
+/// so stay well under with a round 400 and open another connection past it.
+pub const MAX_SUBS_PER_CONNECTION: usize = 400;
+
 /// Pause between subscribe batches.
 pub const SUBSCRIBE_PAUSE: Duration = Duration::from_millis(120);
 
@@ -135,6 +141,10 @@ impl WsFeed {
     /// [`WsFeed::spawn`], plus a sender that changes the watched set while the feed
     /// runs: an added account is subscribed on the live connection at once and on every
     /// reconnect after; a dropped one is unsubscribed and left out.
+    ///
+    /// The set is spread over as many connections as it takes to stay under
+    /// [`MAX_SUBS_PER_CONNECTION`]: one connection holding all of it was refused
+    /// ("Exceeded max limit") 70 times, and every refused pool was silently unwatched.
     pub fn spawn_controlled(
         &self,
         accounts: Vec<Pubkey32>,
@@ -145,27 +155,97 @@ impl WsFeed {
         let stats = Arc::clone(&self.stats);
 
         tokio::spawn(async move {
-            let mut accounts = accounts;
-            let mut backoff_ms = MIN_BACKOFF_MS;
-            // Lives across reconnects: accountSubscribe does not resend current state, so
-            // a parked update dropped here would be lost until that account changes again.
-            let mut backlog = std::collections::HashMap::new();
-            loop {
-                let before = stats.updates.load(Ordering::Relaxed);
-                match run_once(&url, &mut accounts, &mut add_rx, &tx, &stats, &mut backlog).await {
-                    Ok(()) => tracing::warn!("feed stream ended cleanly; reconnecting"),
-                    Err(e) => tracing::warn!("feed error: {e:#}; reconnecting"),
+            // One entry per connection: its control channel and what it owns.
+            let mut shards: Vec<(mpsc::UnboundedSender<Watch>, std::collections::HashSet<Pubkey32>)> = Vec::new();
+            for chunk in accounts.chunks(MAX_SUBS_PER_CONNECTION) {
+                let ctl = spawn_connection(&url, chunk.to_vec(), &tx, &stats);
+                shards.push((ctl, chunk.iter().copied().collect()));
+            }
+            while let Some(change) = add_rx.recv().await {
+                match change {
+                    Watch::Add(more) => {
+                        let mut per_shard: Vec<Vec<Pubkey32>> = vec![Vec::new(); shards.len()];
+                        let mut fresh: Vec<Pubkey32> = Vec::new();
+                        for acct in more {
+                            if shards.iter().any(|(_, own)| own.contains(&acct)) {
+                                continue;
+                            }
+                            // Count what is already routed, so one batch cannot overfill a shard.
+                            let room = (0..shards.len())
+                                .find(|&i| shards[i].1.len() + per_shard[i].len() < MAX_SUBS_PER_CONNECTION);
+                            match room {
+                                Some(i) => {
+                                    shards[i].1.insert(acct);
+                                    per_shard[i].push(acct);
+                                }
+                                None => fresh.push(acct),
+                            }
+                        }
+                        for (i, batch) in per_shard.into_iter().enumerate() {
+                            if !batch.is_empty() {
+                                let _ = shards[i].0.send(Watch::Add(batch));
+                            }
+                        }
+                        for chunk in fresh.chunks(MAX_SUBS_PER_CONNECTION) {
+                            tracing::info!("feed: opening connection {} for {} more accounts", shards.len() + 1, chunk.len());
+                            let ctl = spawn_connection(&url, chunk.to_vec(), &tx, &stats);
+                            shards.push((ctl, chunk.iter().copied().collect()));
+                        }
+                    }
+                    Watch::Drop(gone) => {
+                        for (ctl, own) in &mut shards {
+                            let mine: Vec<Pubkey32> = gone.iter().filter(|a| own.remove(*a)).copied().collect();
+                            if !mine.is_empty() {
+                                let _ = ctl.send(Watch::Drop(mine));
+                            }
+                        }
+                    }
                 }
-                let delivered = stats.updates.load(Ordering::Relaxed) > before;
-                let wait_ms = reconnect_wait(backoff_ms, delivered);
-                stats.reconnects.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-                backoff_ms = (wait_ms * 2).min(MAX_BACKOFF_MS);
             }
         });
 
         (rx, add_tx)
     }
+}
+
+/// What one connection has added to the shared [`FeedStats`], so it can take its share
+/// back out on reconnect without wiping the other connections'.
+#[derive(Default)]
+struct Mine {
+    subscribed: u64,
+    errors: u64,
+}
+
+/// Run one connection forever over `accounts`, reconnecting with capped backoff.
+fn spawn_connection(
+    url: &str,
+    accounts: Vec<Pubkey32>,
+    tx: &mpsc::Sender<AccountUpdate>,
+    stats: &Arc<FeedStats>,
+) -> mpsc::UnboundedSender<Watch> {
+    let (ctl, mut add_rx) = mpsc::unbounded_channel::<Watch>();
+    let (url, tx, stats) = (url.to_string(), tx.clone(), Arc::clone(stats));
+    tokio::spawn(async move {
+        let mut accounts = accounts;
+        let mut mine = Mine::default();
+        let mut backoff_ms = MIN_BACKOFF_MS;
+        // Lives across reconnects: accountSubscribe does not resend current state, so
+        // a parked update dropped here would be lost until that account changes again.
+        let mut backlog = std::collections::HashMap::new();
+        loop {
+            let before = stats.updates.load(Ordering::Relaxed);
+            match run_once(&url, &mut accounts, &mut add_rx, &tx, &stats, &mut mine, &mut backlog).await {
+                Ok(()) => tracing::warn!("feed stream ended cleanly; reconnecting"),
+                Err(e) => tracing::warn!("feed error: {e:#}; reconnecting"),
+            }
+            let delivered = stats.updates.load(Ordering::Relaxed) > before;
+            let wait_ms = reconnect_wait(backoff_ms, delivered);
+            stats.reconnects.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            backoff_ms = (wait_ms * 2).min(MAX_BACKOFF_MS);
+        }
+    });
+    ctl
 }
 
 /// Send one `accountSubscribe` and remember which request it was.
@@ -196,6 +276,7 @@ async fn run_once(
     added: &mut mpsc::UnboundedReceiver<Watch>,
     tx: &mpsc::Sender<AccountUpdate>,
     stats: &FeedStats,
+    mine: &mut Mine,
     // Updates the consumer had no room for, newest per account. See `deliver`.
     backlog: &mut std::collections::HashMap<Pubkey32, AccountUpdate>,
 ) -> Result<()> {
@@ -213,8 +294,9 @@ async fn run_once(
     let mut pending: std::collections::HashMap<u64, Pubkey32> = std::collections::HashMap::new();
     let mut subs: std::collections::HashMap<u64, Pubkey32> = std::collections::HashMap::new();
 
-    stats.subscribed.store(0, Ordering::Relaxed);
-    stats.subscribe_errors.store(0, Ordering::Relaxed);
+    stats.subscribed.fetch_sub(mine.subscribed, Ordering::Relaxed);
+    stats.subscribe_errors.fetch_sub(mine.errors, Ordering::Relaxed);
+    *mine = Mine::default();
 
     for (i, acct) in accounts.iter().enumerate() {
         subscribe(&mut socket, i as u64 + 1, acct, &mut pending).await?;
@@ -277,6 +359,7 @@ async fn run_once(
                             unsubs.insert(next_id - 1);
                             send_timed(&mut socket, Message::Text(req.to_string().into())).await?;
                             stats.subscribed.fetch_sub(1, Ordering::Relaxed);
+                            mine.subscribed = mine.subscribed.saturating_sub(1);
                         }
                     }
                     None => {}
@@ -328,6 +411,7 @@ async fn run_once(
             if let Some(pk) = pending.remove(&req_id) {
                 subs.insert(sub_id, pk);
                 stats.subscribed.fetch_add(1, Ordering::Relaxed);
+                mine.subscribed += 1;
             }
             continue;
         }
@@ -345,6 +429,7 @@ async fn run_once(
             match v.get("id").and_then(|i| i.as_u64()).and_then(|id| pending.remove(&id)) {
                 Some(pk) => {
                     stats.subscribe_errors.fetch_add(1, Ordering::Relaxed);
+                    mine.errors += 1;
                     tracing::warn!(
                         "subscription refused for {}: {err}",
                         bs58::encode(pk).into_string()

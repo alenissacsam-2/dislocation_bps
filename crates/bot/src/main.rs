@@ -326,6 +326,42 @@ const UNCHANGED_REFUSAL_HOLD: Duration = Duration::from_secs(30);
 /// overall, which is four gigabytes of ledger a day with nothing new in it. A row is
 /// still written the moment anything about the cycle changes, and for every attempt.
 const UNCHANGED_RECORD_EVERY: Duration = Duration::from_secs(60);
+/// How long a pool one of our trades landed and reverted on is left alone.
+///
+/// A landed revert is a lost race. In one live run all nine were other bots hitting the
+/// same pool in the same slot, and with nothing remembering them pool CYbD9R reverted
+/// three times and 5jEVhe twice, nine minutes apart, each paying the whole fee for
+/// nothing. Twenty minutes outlasts that gap.
+const REVERTED_POOL_COOLDOWN: Duration = Duration::from_secs(20 * 60);
+
+/// The first of `pools` still cooling after a revert, and how long ago it reverted.
+fn cooled_pool<'a>(
+    cooled: &std::collections::HashMap<cb_core::types::Pubkey32, std::time::Instant>,
+    pools: impl IntoIterator<Item = &'a cb_core::types::Pubkey32>,
+    now: std::time::Instant,
+) -> Option<(cb_core::types::Pubkey32, Duration)> {
+    pools.into_iter().find_map(|k| {
+        let until = *cooled.get(k)?;
+        (until > now).then(|| (*k, REVERTED_POOL_COOLDOWN.saturating_sub(until - now)))
+    })
+}
+
+/// `reason` with every run of ASCII digits replaced by `#`. Reasons embed figures that
+/// change every second ("the stalest leg is 521 s"), so comparing them verbatim made
+/// every row look new.
+fn without_digits(reason: &str) -> String {
+    let mut out = String::with_capacity(reason.len());
+    let mut in_digits = false;
+    for c in reason.chars() {
+        if !c.is_ascii_digit() {
+            out.push(c);
+        } else if !in_digits {
+            out.push('#');
+        }
+        in_digits = c.is_ascii_digit();
+    }
+    out
+}
 
 /// How often the same refusal may reach the log, tracked separately from how often it
 /// may be retried. Retrying a cycle four times a second is correct; saying so four
@@ -475,7 +511,7 @@ async fn rotate_for(
     let managed = t.managed_accounts(protected);
     // A trade in flight opening its own account already holds a slot.
     let slots = slots.saturating_sub(t.opens_in_flight());
-    let Some(mv) = demand::on_missing(demand, &managed, slots, &mint) else { return };
+    let Some(mv) = demand::on_missing(demand, &managed, slots, &mint, now_ms() / 1_000) else { return };
     let (open, close) = match mv {
         demand::Move::Open(o) => (o, None),
         demand::Move::Replace { open, close } => (open, Some(close)),
@@ -1835,6 +1871,7 @@ async fn send_probe(t: &mut execute::Trader, pending: &mut Vec<PendingSend>, tip
 async fn settle_pending(
     t: &mut execute::Trader,
     pending: &mut Vec<PendingSend>,
+    reverted_pools: &mut std::collections::HashMap<cb_core::types::Pubkey32, std::time::Instant>,
     sol_price: f64,
     rpc_url: &str,
 ) -> Vec<(i64, bool, String, f64)> {
@@ -1930,6 +1967,9 @@ async fn settle_pending(
                 // to see it, and the breaker counts it as a strike.
                 let cost_usd = t.submission_cost_lamports() as f64 / 1e9 * sol_price;
                 t.confirm_outcome(-cost_usd, true);
+                // A landed revert is a lost race; see `REVERTED_POOL_COOLDOWN`.
+                let until = std::time::Instant::now() + REVERTED_POOL_COOLDOWN;
+                reverted_pools.extend(p.pools.iter().map(|k| (*k, until)));
                 tracing::warn!(
                     "{sig} landed and reverted — the floor was not met by the time it was \
                      included; this cost ${cost_usd:.6} and returned nothing"
@@ -2396,6 +2436,7 @@ async fn spawn_live(
             next_id: 1,
             cooldowns: Cooldowns::default(),
             last_recorded: std::collections::HashMap::new(),
+            reverted_pools: std::collections::HashMap::new(),
             evaluated_total: 0,
             sweep_n: 0,
             pending_sends: Vec::new(),
@@ -2513,12 +2554,15 @@ struct LiveLoop {
     next_id: u64,
     /// What refusals hold off and keep quiet. See `Cooldowns`.
     cooldowns: Cooldowns,
-    // The last row written per cycle, as (edge bits, outcome, when). See
-    // `UNCHANGED_RECORD_EVERY`.
+    // The last row written per cycle, as (edge in tenths of a bps, outcome with its
+    // digits blanked, when). See `UNCHANGED_RECORD_EVERY` and `without_digits`.
     last_recorded: std::collections::HashMap<
         String,
-        (u64, Option<String>, std::time::Instant),
+        (i64, Option<String>, std::time::Instant),
     >,
+    // Pools a trade of ours landed and reverted on, until when they are left alone. See
+    // `REVERTED_POOL_COOLDOWN`.
+    reverted_pools: std::collections::HashMap<cb_core::types::Pubkey32, std::time::Instant>,
     evaluated_total: u64,
     sweep_n: u32,
     // Sends whose fate is not known yet, asked after by the confirm timer. See
@@ -2746,7 +2790,14 @@ impl LiveLoop {
     /// became of each one settled onto its ledger row. See `settle_pending`.
     async fn confirm_pending(&mut self, t: &mut execute::Trader) {
         let sol_price = self.market.sol_price_usd().unwrap_or(0.0);
-        let outcomes = settle_pending(t, &mut self.pending_sends, sol_price, &self.post_mortem_rpc).await;
+        let outcomes = settle_pending(
+            t,
+            &mut self.pending_sends,
+            &mut self.reverted_pools,
+            sol_price,
+            &self.post_mortem_rpc,
+        )
+        .await;
         if let Some(l) = self.ledger.as_ref() {
             for (row, taken, reason, net) in outcomes {
                 if let Err(e) = l.update_fill_outcome(row, taken, &reason, net) {
@@ -2921,6 +2972,8 @@ impl LiveLoop {
         // history, not state.
         self.cooldowns.prune();
         self.last_recorded.retain(|_, (_, _, at)| at.elapsed() < UNCHANGED_RECORD_EVERY);
+        let now = std::time::Instant::now();
+        self.reverted_pools.retain(|_, until| *until > now);
         for opp in opportunities {
             self.on_opportunity(trader.as_deref_mut(), opp, sweep_slot, sol_price, feed_stalled, &mut budget)
                 .await;
@@ -3178,12 +3231,18 @@ impl LiveLoop {
             .plan
             .as_ref()
             .is_some_and(|pl| overlaps_pending(&self.pending_sends, pl));
+        // A pool one of our trades recently landed and reverted on: other bots win
+        // races there. See `REVERTED_POOL_COOLDOWN`.
+        let cooled = opp.plan.as_ref().and_then(|pl| {
+            cooled_pool(&self.reverted_pools, pl.pools.iter().map(|(k, _)| k), std::time::Instant::now())
+        });
         let barred = budget.submitted
             || budget.attempts >= MAX_ATTEMPTS_PER_SWEEP
             || on_cooldown
             || unfundable_entry
             || unsendable
-            || in_flight;
+            || in_flight
+            || cooled.is_some();
         // The two filters that reject a candidate by making a
         // claim about what would have happened to it, rather
         // than by observing something that already has. Both
@@ -3257,6 +3316,16 @@ impl LiveLoop {
                         "not attempted — a send still in flight \
                          trades through one of its pools"
                             .to_string()
+                    } else if let Some((pool, ago)) = cooled {
+                        let why = format!(
+                            "pool {} reverted {} min ago; others win races there",
+                            bs58::encode(pool).into_string(),
+                            ago.as_secs() / 60
+                        );
+                        if self.cooldowns.should_log_refusal(&opp.cycle_key, &why) {
+                            tracing::info!("refused: {why}");
+                        }
+                        format!("refused: {why}")
                     } else if on_cooldown {
                         "not attempted — refused recently and \
                          nothing has changed"
@@ -3633,19 +3702,18 @@ impl LiveLoop {
         // Nothing attempted and nothing different since the last row for
         // this cycle: not written again until a minute has passed. See
         // `UNCHANGED_RECORD_EVERY`.
+        // Compared to 0.1 bps and with the reason's figures blanked: exact float bits and
+        // embedded counts change every sweep, so a verbatim match never happened.
+        let edge = (opp.edge_bps * 10.0).round() as i64;
+        let reason = fate.reason.as_deref().map(without_digits);
         let unchanged_row = fate.latency_ms == 0
             && !fate.landed
             && fate.pending.is_none()
-            && self.last_recorded.get(&opp.cycle_key).is_some_and(|(edge, reason, at)| {
-                *edge == opp.edge_bps.to_bits()
-                    && *reason == fate.reason
-                    && at.elapsed() < UNCHANGED_RECORD_EVERY
+            && self.last_recorded.get(&opp.cycle_key).is_some_and(|(e, r, at)| {
+                *e == edge && *r == reason && at.elapsed() < UNCHANGED_RECORD_EVERY
             });
         if !unchanged_row {
-            self.last_recorded.insert(
-                opp.cycle_key.clone(),
-                (opp.edge_bps.to_bits(), fate.reason.clone(), std::time::Instant::now()),
-            );
+            self.last_recorded.insert(opp.cycle_key.clone(), (edge, reason, std::time::Instant::now()));
         }
         let due = fill_row_due(feed_stalled, unchanged_row, fate.pending.is_some());
         if let (Some(l), true) = (self.ledger.as_ref(), due) {
@@ -4641,6 +4709,32 @@ mod slot_spread_gate_tests {
 }
 
 #[cfg(test)]
+mod revert_and_record_tests {
+    use super::{cooled_pool, without_digits, REVERTED_POOL_COOLDOWN};
+    use std::time::{Duration, Instant};
+
+    /// A pool that reverted is refused for the cooldown, with how long ago it reverted;
+    /// a route that does not touch it, or a pool whose cooldown has run out, is not.
+    #[test]
+    fn a_route_through_a_reverted_pool_is_refused_until_the_cooldown_ends() {
+        let (hot, other) = ([1u8; 32], [2u8; 32]);
+        let now = Instant::now();
+        let cooled = std::collections::HashMap::from([(hot, now + REVERTED_POOL_COOLDOWN - Duration::from_secs(300))]);
+        assert_eq!(cooled_pool(&cooled, [&other, &hot], now), Some((hot, Duration::from_secs(300))));
+        assert_eq!(cooled_pool(&cooled, [&other], now), None);
+        assert_eq!(cooled_pool(&cooled, [&hot], now + REVERTED_POOL_COOLDOWN), None);
+    }
+
+    /// Figures that move every second no longer make an unchanged row look new.
+    #[test]
+    fn every_run_of_digits_is_one_placeholder() {
+        assert_eq!(without_digits("the stalest leg is 521 s, 3.25 bps"), "the stalest leg is # s, #.# bps");
+        assert_eq!(without_digits("the stalest leg is 9 s"), without_digits("the stalest leg is 1204 s"));
+        assert_eq!(without_digits("no digits"), "no digits");
+    }
+}
+
+#[cfg(test)]
 mod promotion_tests {
     use super::{promotes_held_back, too_expensive_to_trade};
     use crate::execute::Submit;
@@ -4795,6 +4889,7 @@ mod loop_tests {
             next_id: 1,
             cooldowns: Cooldowns::default(),
             last_recorded: std::collections::HashMap::new(),
+            reverted_pools: std::collections::HashMap::new(),
             evaluated_total: 0,
             sweep_n: 0,
             pending_sends: Vec::new(),
@@ -4835,7 +4930,7 @@ mod loop_tests {
         let mut t = sender_trader(&[]);
         let p = sol_plan();
         let mut v = vec![pending("young", Duration::from_secs(30), &p), pending("old", Duration::from_secs(100), &p)];
-        let settled = settle_pending(&mut t, &mut v, 200.0, "").await;
+        let settled = settle_pending(&mut t, &mut v, &mut Default::default(), 200.0, "").await;
         assert_eq!(v.iter().map(|p| p.sig.as_str()).collect::<Vec<_>>(), ["young"], "30 s is still in flight");
         assert_eq!(settled.len(), 1);
         let (row, taken, reason, net) = &settled[0];

@@ -42,17 +42,10 @@ pub const MIN_ASKS_TO_OPEN: u32 = 2;
 /// How much more a new mint must be worth than the weakest held one to take its slot.
 ///
 /// Without a margin two mints of similar value would swap back and forth, paying two
-/// base fees each time for no change in reach.
+/// base fees each time for no change in reach. Value alone decides, not asks: asks count
+/// attempts, not money, and on 2026-11-09 a $68 mint with 812 asks could not displace a
+/// held $33.7 one with 1,451. `MIN_ASKS_TO_OPEN` already floors the asks.
 pub const REPLACE_MARGIN: f64 = 1.5;
-
-/// How much more a new mint must be worth than the weakest held one to take its slot
-/// on value alone, however few times it has been asked for.
-///
-/// Asks count attempts, not money. On 2026-09-26 a mint asked for three times with
-/// $0.39 expected between them could not displace a held one asked for 23 times with
-/// $0.0165, because it had not been asked for *more often*. Ten times the value is past
-/// any doubt about which account is worth the deposit.
-pub const DOMINANT_VALUE_MARGIN: f64 = 10.0;
 
 /// The least a mint's asks must have expected between them, in USD, before an account
 /// is opened for it: about the two base fees that opening and later closing cost.
@@ -262,12 +255,16 @@ pub enum Move {
 /// `managed` is the accounts this policy may close: held, and neither a base mint nor
 /// one the operator pinned in `extra_token_mints`. `slots` is how many of those there
 /// may be at once, which is what bounds the deposit.
+///
+/// A Replace never picks a mint the bot opened within `MIN_HOLD_SECS` of `now`: if every
+/// candidate is in hold there is nothing to swap out, and the answer is `None`.
 #[must_use]
 pub fn on_missing(
     demand: &Demand,
     managed: &HashSet<Pubkey32>,
     slots: usize,
     wanted: &Pubkey32,
+    now: u64,
 ) -> Option<Move> {
     if managed.contains(wanted) {
         return None;
@@ -281,14 +278,12 @@ pub fn on_missing(
     if managed.len() < slots {
         return Some(Move::Open(*wanted));
     }
-    let weakest = managed.iter().min_by(|a, b| {
+    let weakest = managed.iter().filter(|m| !demand.in_hold(m, now)).min_by(|a, b| {
         let (sa, sb) = (score_of(a), score_of(b));
         sa.usd.total_cmp(&sb.usd).then(sa.asks.cmp(&sb.asks)).then(a.cmp(b))
     })?;
     let floor = score_of(weakest);
-    let clearly_better = want.usd > floor.usd * REPLACE_MARGIN && want.asks > floor.asks;
-    let far_more_valuable = want.usd > floor.usd * DOMINANT_VALUE_MARGIN;
-    (clearly_better || far_more_valuable).then_some(Move::Replace { open: *wanted, close: *weakest })
+    (want.usd > floor.usd * REPLACE_MARGIN).then_some(Move::Replace { open: *wanted, close: *weakest })
 }
 
 /// Accounts nothing has asked for in a whole watched day, and that the bot did not open
@@ -359,9 +354,9 @@ mod tests {
     fn a_mint_asked_for_once_does_not_get_an_account() {
         let mut d = Demand::new(0);
         d.record(10, &m(1), 0.01);
-        assert_eq!(on_missing(&d, &set(&[]), 4, &m(1)), None);
+        assert_eq!(on_missing(&d, &set(&[]), 4, &m(1), 0), None);
         d.record(20, &m(1), 0.01);
-        assert_eq!(on_missing(&d, &set(&[]), 4, &m(1)), Some(Move::Open(m(1))));
+        assert_eq!(on_missing(&d, &set(&[]), 4, &m(1), 0), Some(Move::Open(m(1))));
     }
 
     #[test]
@@ -370,7 +365,7 @@ mod tests {
         for t in 0..9 {
             d.record(t, &m(4), 0.000_01);
         }
-        assert_eq!(on_missing(&d, &set(&[]), 4, &m(4)), None);
+        assert_eq!(on_missing(&d, &set(&[]), 4, &m(4), 0), None);
     }
 
     #[test]
@@ -383,36 +378,58 @@ mod tests {
         d.record(5, &m(9), 0.004);
         d.record(6, &m(9), 0.004);
         // 0.008 over 2 asks against the weakest's 0.006 over 3: not enough.
-        assert_eq!(on_missing(&d, &set(&[2, 3]), 2, &m(9)), None);
+        assert_eq!(on_missing(&d, &set(&[2, 3]), 2, &m(9), 0), None);
         d.record(7, &m(9), 0.004);
         d.record(8, &m(9), 0.004);
         assert_eq!(
-            on_missing(&d, &set(&[2, 3]), 2, &m(9)),
+            on_missing(&d, &set(&[2, 3]), 2, &m(9), 0),
             Some(Move::Replace { open: m(9), close: m(3) })
         );
     }
 
     #[test]
-    fn a_mint_worth_ten_times_the_weakest_takes_its_slot_with_fewer_asks() {
+    fn a_more_valuable_mint_takes_the_slot_even_with_fewer_asks() {
         let mut d = Demand::new(0);
         for t in 0..23 {
-            d.record(t, &m(2), 0.000_7);
+            d.record(t, &m(2), 0.01);
         }
-        d.record(30, &m(9), 0.13);
-        d.record(31, &m(9), 0.13);
+        d.record(30, &m(9), 0.2);
+        d.record(31, &m(9), 0.2);
         assert_eq!(
-            on_missing(&d, &set(&[2]), 1, &m(9)),
+            on_missing(&d, &set(&[2]), 1, &m(9), 0),
             Some(Move::Replace { open: m(9), close: m(2) }),
-            "2 asks at $0.26 against 23 at $0.016"
+            "2 asks at $0.40 against 23 at $0.23: past the 1.5x margin"
         );
-        // Merely more valuable, and asked for less, is still not enough.
+        // Under the margin is still not enough.
         let mut e = Demand::new(0);
         for t in 0..23 {
             e.record(t, &m(2), 0.01);
         }
-        e.record(30, &m(9), 0.2);
-        e.record(31, &m(9), 0.2);
-        assert_eq!(on_missing(&e, &set(&[2]), 1, &m(9)), None, "$0.40 against $0.23 is under ten times");
+        e.record(30, &m(9), 0.15);
+        e.record(31, &m(9), 0.15);
+        assert_eq!(on_missing(&e, &set(&[2]), 1, &m(9), 0), None, "$0.30 against $0.23 is under 1.5x");
+    }
+
+    #[test]
+    fn a_replace_never_closes_an_account_in_hold() {
+        let mut d = Demand::new(0);
+        d.record(1, &m(2), 0.001);
+        d.record(1, &m(3), 0.05);
+        d.record(2, &m(9), 0.5);
+        d.record(3, &m(9), 0.5);
+        d.note_opened(100, &m(2)); // the weakest, but opened just now
+        assert_eq!(
+            on_missing(&d, &set(&[2, 3]), 2, &m(9), 200),
+            Some(Move::Replace { open: m(9), close: m(3) }),
+            "the next weakest goes instead"
+        );
+        d.note_opened(100, &m(3));
+        assert_eq!(on_missing(&d, &set(&[2, 3]), 2, &m(9), 200), None, "all in hold");
+        assert_eq!(
+            on_missing(&d, &set(&[2, 3]), 2, &m(9), 100 + MIN_HOLD_SECS),
+            Some(Move::Replace { open: m(9), close: m(2) }),
+            "hold over"
+        );
     }
 
     #[test]
@@ -511,7 +528,7 @@ mod tests {
         d.save(&path, t0).unwrap(); // the last periodic save, before the asks
         d.record(t0 + 10, &m(6), 0.006);
         d.record(t0 + 20, &m(6), 0.006);
-        assert_eq!(on_missing(&d, &set(&[]), 4, &m(6)), Some(Move::Open(m(6))));
+        assert_eq!(on_missing(&d, &set(&[]), 4, &m(6), 0), Some(Move::Open(m(6))));
         // What `rotate_for` does on a confirmed open.
         d.note_opened(t0 + 21, &m(6));
         d.save(&path, t0 + 21).unwrap();
@@ -520,7 +537,7 @@ mod tests {
         assert!(back.covers_window(t0 + 57));
         assert!(idle(&back, &set(&[6]), t0 + 57).is_empty(), "closed 36 s after opening");
         // And nothing asks to open it again: it is still held.
-        assert_eq!(on_missing(&back, &set(&[6]), 4, &m(6)), None);
+        assert_eq!(on_missing(&back, &set(&[6]), 4, &m(6), 0), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -544,7 +561,7 @@ mod tests {
         let mut d = Demand::new(0);
         d.record(10, &m(5), 2_927_483_845.892_3);
         d.record(20, &m(5), 730_203_762.220_4);
-        assert_eq!(on_missing(&d, &set(&[]), 4, &m(5)), None, "phantom value opens nothing");
+        assert_eq!(on_missing(&d, &set(&[]), 4, &m(5), 0), None, "phantom value opens nothing");
         let s = d.scores()[&m(5)];
         assert_eq!((s.asks, s.usd), (2, 0.0));
         // Nor can phantoms displace a held account on value.
@@ -552,12 +569,12 @@ mod tests {
         e.record(1, &m(2), 0.000_7);
         e.record(2, &m(9), 1e9);
         e.record(3, &m(9), 1e9);
-        assert_eq!(on_missing(&e, &set(&[2]), 1, &m(9)), None);
+        assert_eq!(on_missing(&e, &set(&[2]), 1, &m(9), 0), None);
         // The same asks keep a held account from looking idle: one definition of asked.
         assert!(idle(&d, &set(&[5]), WINDOW_SECS + 5).is_empty());
         // An ask at the bound keeps its value.
         d.record(30, &m(5), MAX_CREDIBLE_ASK_USD);
-        assert_eq!(on_missing(&d, &set(&[]), 4, &m(5)), Some(Move::Open(m(5))));
+        assert_eq!(on_missing(&d, &set(&[]), 4, &m(5), 0), Some(Move::Open(m(5))));
     }
 
     #[test]
