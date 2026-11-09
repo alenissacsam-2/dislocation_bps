@@ -265,8 +265,8 @@ function onStatus(e) {
   $("wFeedVal").className = "r-val num" + (bad ? " bad" : "");
   $("wFeedSub").textContent = e.feedStalled
     ? "feed stalled — nothing is being recorded"
-    : `${(e.dataAgeSecs ?? 0)}s data age · ${rate !== null ? Math.round(rate) + " updates/s" : "measuring…"}`;
-  $("wFeedSub").className = "r-sub" + (e.feedStalled ? " bad" : "");
+    : `${bad ? "stale: " : ""}${(e.dataAgeSecs ?? 0)}s data age · ${rate !== null ? Math.round(rate) + " updates/s" : "measuring…"}`;
+  $("wFeedSub").className = "r-sub" + (bad ? " bad" : "");
   $("wFeedFoot").textContent =
     `${e.poolsTracked ?? 0} pools · ${e.reconnects ?? 0} reconnects · drift ${e.reconcileDrift ?? 0}/${e.reconcileChecked ?? 0}`;
 
@@ -284,7 +284,8 @@ function onRoutes(e) {
     S.wall.push({ disl: top.dislocationBps, fee: top.feeBps });
     if (S.wall.length > MAX_POINTS) S.wall.shift();
     const fill = clamp(top.dislocationBps / Math.max(top.feeBps, 0.01), 0, 1.4) / 1.4 * 100;
-    $("gEdgeFill").style.width = fill + "%";
+    // Whole percent: a fresh fraction five times a second kept the 0.6 s width transition running every frame.
+    $("gEdgeFill").style.width = Math.round(fill) + "%";
     $("gEdgeMark").style.left = (100 / 1.4) + "%";
   }
   const body = $("routesBody");
@@ -537,11 +538,25 @@ function ensureRun(status) {
   paintFunnel(); paintReasons(); paintMoneyWell(); paintBotWell();
 }
 
+// At most one write per 800 ms. A debounce here never fired while events kept coming.
 let saveTimer = null;
 function saveRun() {
-  if (!RUN.key) return;
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => { try { localStorage.setItem(RUN.key, JSON.stringify(RUN.store)); } catch {} }, 800);
+  if (!RUN.key || saveTimer) return;
+  saveTimer = setTimeout(() => { saveTimer = null; try { localStorage.setItem(RUN.key, JSON.stringify(RUN.store)); } catch {} }, 800);
+}
+
+/* Opportunity and execution events arrive once per cycle per sweep, tens a second. Each
+ * repainted its panels on arrival; now each panel repaints at most four times a second. */
+const dirty = new Set();
+let paintTimer = null;
+function paint(...fns) {
+  for (const f of fns) dirty.add(f);
+  paintTimer ??= setTimeout(() => {
+    paintTimer = null;
+    const due = [...dirty];
+    dirty.clear();
+    for (const f of due) f();
+  }, 250);
 }
 
 function drop(stage, name, fault) {
@@ -562,7 +577,7 @@ function onOpportunity(ev) {
   } else {
     st.counts.positive += 1;
   }
-  saveRun(); paintFunnel(); paintReasons();
+  paint(saveRun, paintFunnel, paintReasons);
 }
 
 function onExecution(ev) {
@@ -571,7 +586,7 @@ function onExecution(ev) {
   const t = ev.tsMs || Date.now();
   if (!ev.paper && !/^probe/.test(ev.reason || "") && t > ATT.logUntil) {
     recordAttempt(classifyAttempt(ev.reason || ""), t, ev.tipPaidUsd || 0);
-    paintAttempts();
+    paint(paintAttempts);
   }
   if (!RUN.store) return;
   const st = RUN.store;
@@ -580,7 +595,7 @@ function onExecution(ev) {
     st.counts.attempted += 1;
     st.realised += ev.realisedUsd || 0;
     st.tips += ev.tipPaidUsd || 0;
-    saveRun(); paintFunnel(); paintReasons(); paintMoneyWell();
+    paint(saveRun, paintFunnel, paintReasons, paintMoneyWell);
     return;
   }
   const c = classify(ev.reason || (ev.landed ? "submitted and landed" : ""));
@@ -605,7 +620,7 @@ function onExecution(ev) {
   }
   st.realised += ev.realisedUsd || 0;
   st.tips += ev.tipPaidUsd || 0;
-  saveRun(); paintFunnel(); paintReasons(); paintMoneyWell(); paintBotWell();
+  paint(saveRun, paintFunnel, paintReasons, paintMoneyWell, paintBotWell);
 }
 
 /* A send settled: the outcome the send-time event could not know. Execution carries 0
@@ -613,7 +628,7 @@ function onExecution(ev) {
 function onSettled(ev) {
   if (!RUN.store) return;
   RUN.store.realised += ev.realisedUsd || 0;
-  saveRun(); paintMoneyWell();
+  paint(saveRun, paintMoneyWell);
 }
 
 /* Events were dropped for this client: reload what can be reloaded. */
@@ -761,6 +776,7 @@ function ingestLog(lines, reset) {
     if (/^feed silent for over/.test(msg)) LOGA.gaps += 1;
     ingestDrift(msg);
     ingestAttempt(msg, parseLogLine(line).ts);
+    noteHalt(msg, parseLogLine(line).ts);
   }
   paintDrift(); paintHealth(); paintAttempts();
 }
@@ -877,9 +893,11 @@ function drawAttempts() {
   const yOf = (q) => Number.isFinite(q.bps) ? q.bps
     : q.kind === "miss" || q.kind === "landed" || q.kind === "revert" ? hi * 0.55
     : q.kind === "packet" ? hi * 0.3 : -0.4;
+  // One style lookup per kind, not per point: 5,000 getComputedStyle calls cost ~10 ms a draw.
+  const tone = Object.fromEntries(Object.entries(ATT_KINDS).map(([k, v]) => [k, css(v.tone)]));
   for (const q of ATT.pts) {
     const big = q.kind === "landed" || q.kind === "miss" || q.kind === "revert" || q.kind === "packet";
-    g.fillStyle = css(ATT_KINDS[q.kind].tone);
+    g.fillStyle = tone[q.kind];
     g.globalAlpha = big ? 1 : 0.7;
     g.beginPath(); g.arc(X(q.t), Y(yOf(q)), big ? 4.5 : 2.6, 0, 7); g.fill();
   }
@@ -990,11 +1008,15 @@ function paintBotWell() {
   const running = s.state === "running" || s.state === "starting";
   led.className = "led sm " + ({ running: "run", starting: "run", failed: "fail", foreign: "warn" }[s.state] || "");
   const up = S.live && S.wsLive ? " · " + dur(S.live.uptimeSecs) : "";
-  $("wBotState").textContent = (STATE_LABEL[s.state] || s.state) + (running ? up : "");
-  $("wBotState").className = "r-val" + (s.state === "failed" ? " bad" : "");
+  const halted = running && HALT.reason;
+  if (halted) led.className = "led sm warn";
+  $("wBotState").textContent = halted ? "Running, halted" : (STATE_LABEL[s.state] || s.state) + (running ? up : "");
+  $("wBotState").className = "r-val" + (s.state === "failed" || halted ? " bad" : "");
   const m = window.__mode, d = window.__dry;
   const live = m && m.effective === "live";
-  $("wBotSub").textContent = !running ? (STATE_NOTE[s.state] || "")
+  const blocked = !running && startBlock()
+    && (window.__address ? "Live, wallet locked: unlock it in the rail to start" : "Live, no wallet key: add one under Parameters");
+  $("wBotSub").textContent = !running ? (blocked || STATE_NOTE[s.state] || "")
     : live ? (d && !d.effective ? "LIVE · submitting through " + sendPath().name : "LIVE · dry run, nothing sent") : "DEMO · signs nothing";
   const last = RUN.store?.lastSend;
   $("wBotLast").textContent = last ? `last sent ${ago(last.ts)} · ${last.outcome.toLowerCase()}` : "no trade sent this run";
@@ -1013,8 +1035,10 @@ function paintMoneyWell() {
   const solUsd = S.live?.solPriceUsd;
   const balText = bal ? `${parseFloat(bal.sol).toFixed(4)} SOL` + (solUsd ? ` ≈ $${(parseFloat(bal.sol) * solUsd).toFixed(2)}` : "") : "balance not read";
   $("wMoneySub").textContent = budget
-    ? `${Math.round(used * 100)}% of the $${budget.toFixed(2)} loss budget · ${balText}`
-    : balText;
+    ? `${Math.round(used * 100)}% of the $${budget.toFixed(2)} daily loss budget used`
+    : "daily loss budget not read";
+  $("wMoneySub").className = "r-sub" + (used >= 0.8 ? " bad" : "");
+  $("wMoneyFoot").textContent = "wallet " + balText;
 }
 
 /* ── history ──────────────────────────────────────────────────────────── */
@@ -1226,9 +1250,9 @@ const STATE_LABEL = {
 const STATE_NOTE = {
   running: "Recording to the ledger.",
   starting: "Waiting for it to bind the port.",
-  stopped: "Nothing running. History is still readable.",
-  foreign: "Another process holds port 8787. Not started by this app, so it will not be stopped by it.",
-  failed: "The process exited on its own. The log says why.",
+  stopped: "Ledger kept; Start adds to it.",
+  foreign: "Another process holds port 8787. Not started by this app, so it will not be stopped by it. Close it yourself, then Start here.",
+  failed: "Exited on its own: see Log, then Start again.",
 };
 
 async function refreshStatus() {
@@ -1240,8 +1264,9 @@ async function refreshStatus() {
   const s = S.status;
   $("dot").className = "led " + ({ running: "run", starting: "run", foreign: "foreign", failed: "fail" }[s.state] || "");
   $("stateLabel").textContent = STATE_LABEL[s.state] || s.state;
-  $("stateNote").textContent = !s.botExePresent ? "No cb-bot.exe found. Build it before starting." : (STATE_NOTE[s.state] || "");
-  $("btnStart").disabled = s.state !== "stopped" || !s.botExePresent;
+  $("stateNote").textContent = !s.botExePresent ? "No cb-bot.exe found. Build the cb-bot release binary, then Start." : (STATE_NOTE[s.state] || "");
+  paintStartGate();
+  paintHalt();
   // A foreign process was not started here and must never be killed from here.
   $("btnStop").disabled = !(s.state === "running" || s.state === "starting");
   // Archiving stops the bot first; stopping a process we did not start is not ours to do.
@@ -1252,12 +1277,96 @@ async function refreshStatus() {
   paintBotWell();
 }
 
-async function showFailure(msg) {
-  let lines = [];
-  try { lines = await invoke("read_log", { lines: 40 }); } catch { /* log may not exist */ }
-  LOGV.banner = msg;
-  LOGV.lines = lines;
-  setView("log");
+/* Why Start would be refused, said before it is pressed. The backend refuses a live start
+ * with the key locked; before it did, the bot exited with "no passphrase arrived on stdin".
+ * Null while the wallet state is still unknown, so nothing is blocked on a guess. */
+function startBlock() {
+  const m = window.__mode;
+  if (!m || m.effective !== "live" || window.__walletUnlocked === undefined) return null;
+  if (!window.__address) return "Live needs a wallet key. Import one under Parameters, or switch to Demo.";
+  if (!window.__walletUnlocked) return "Live needs the wallet unlocked. Enter its passphrase below, then Start.";
+  return null;
+}
+
+function paintStartGate() {
+  const s = S.status;
+  const canStart = !!s && (s.state === "stopped" || s.state === "failed") && s.botExePresent;
+  const arming = !$("railArm").hidden;
+  const locked = !!window.__address && window.__walletUnlocked === false;
+  const why = (canStart && startBlock())
+    || (arming && !window.__address ? "Arming Live needs a wallet key. Import one under Parameters." : null)
+    || (arming && locked ? "Arming Live needs the wallet unlocked. Enter its passphrase below." : null);
+  $("btnStart").disabled = !canStart || !!startBlock();
+  $("startWhy").hidden = !why;
+  $("startWhy").textContent = why || "";
+  $("railUnlock").hidden = !(locked && (window.__mode?.effective === "live" || arming));
+  $("railApply").disabled = !window.__walletUnlocked;
+}
+
+let powerTimer = null;
+function showPower(msg) {
+  $("powerResult").hidden = false;
+  $("powerResult").textContent = msg;
+  clearTimeout(powerTimer);
+  powerTimer = setTimeout(() => { $("powerResult").hidden = true; }, 20000);
+}
+
+$("railUnlock").onsubmit = async (e) => {
+  e.preventDefault();
+  $("railUnlockBtn").disabled = true;
+  showPower("Unlocking…");
+  try {
+    await invoke("wallet_unlock", { passphrase: $("railPass").value });
+    showPower("Unlocked for this session.");
+  } catch (err) {
+    showPower(`Could not unlock: ${err}. Check the passphrase and try again.`);
+  } finally {
+    clearSecretFields();
+    $("railUnlockBtn").disabled = false;
+    await paintWallet();
+    paintStartGate(); paintBotWell();
+  }
+};
+
+/* ── halt ─────────────────────────────────────────────────────────────────
+ * The status event does not carry the risk gate's halt, so it is read from the lines the
+ * gate always logs: "trading halted: why" when it trips, "trading resumed …" when it
+ * clears. The countdown uses the cooldown under Risk limits, which the bot read at start. */
+const HALT = { reason: null, at: 0 };
+
+function noteHalt(msg, ts) {
+  if (isRunStart(msg) || /^trading resumed/.test(msg)) { HALT.reason = null; return; }
+  const m = msg.match(/trading (?:starts )?halted: (.*)$/);
+  if (m && !HALT.reason) { HALT.reason = m[1]; HALT.at = ts ? Date.parse(ts + "Z") : Date.now(); }
+}
+
+function haltWhen() {
+  const cd = S.limits?.haltCooldownSecs;
+  if (cd === 0) return "Stays halted until the bot is restarted (Stop, then Start): halt cooldown is 0 under Risk limits.";
+  if (!Number.isFinite(cd)) return "";
+  const end = HALT.at + cd * 1000, left = Math.ceil((end - Date.now()) / 1000);
+  if (left <= 0) return "Cooldown over. Trading resumes at the next sweep.";
+  return `Resumes on its own in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}, at ${clock(end)}.`;
+}
+
+const setText = (id, t) => { if ($(id).textContent !== t) $(id).textContent = t; };
+
+function paintHalt() {
+  const s = S.status;
+  // A halt belongs to one process. A restart's own start line can predate the stream
+  // reconnecting, so a halt older than the running process is dropped here as well.
+  const up = S.live?.uptimeSecs;
+  if (s && !(s.state === "running" || s.state === "starting")) HALT.reason = null;
+  if (Number.isFinite(up) && HALT.at < Date.now() - up * 1000 - 60000) HALT.reason = null;
+  const on = !!HALT.reason && !!s && (s.state === "running" || s.state === "starting");
+  $("haltBanner").hidden = !on;
+  if (!on) return;
+  const when = haltWhen();
+  setText("haltWhy", HALT.reason + ".");
+  setText("haltWhen", when);
+  $("dot").className = "led warn";
+  setText("stateLabel", "Running, halted");
+  setText("stateNote", HALT.reason + ". " + when);
 }
 
 /* ── views ────────────────────────────────────────────────────────────── */
@@ -1418,7 +1527,7 @@ $("btnSetMode").onclick = async () => {
   try {
     const r = await invoke("set_mode", { mode, confirm });
     const bits = [`Mode is now ${r.mode}.`];
-    if (r.archived) bits.push(`Previous run archived as ${r.archived}.`);
+    if (r.archived) bits.push(`The previous run's ledger was filed under Runs as ${r.archived}.`);
     if (r.restartError) bits.push(`The bot did not restart: ${r.restartError}`);
     else if (r.restarted) bits.push("The bot restarted.");
     $("modeResult").textContent = bits.join(" ");
@@ -1456,14 +1565,38 @@ async function paintLimits() {
   }
 }
 
+const botRunning = () => !!S.status && (S.status.state === "running" || S.status.state === "starting");
+
+/* Said in the field's own words before anything is sent; the backend validates again
+ * either way. Step is not checked: 1.00 against a step of 0.5 from a min of 0.01 is a
+ * fine budget that the browser would call a mismatch. */
+function invalidField(ids, out) {
+  let first = null;
+  for (const id of ids) {
+    const el = $(id), v = el.validity;
+    const blank = el.value.trim() === "";
+    const bad = blank || v.badInput || v.rangeUnderflow || v.rangeOverflow;
+    el.setAttribute("aria-invalid", String(bad));
+    if (bad && !first) {
+      first = el;
+      const name = el.labels[0]?.firstChild.textContent.trim() || id;
+      $(out).textContent = `${name}: ${blank || v.badInput ? "enter a number." : el.validationMessage} Nothing was saved.`;
+    }
+  }
+  if (first) first.focus();
+  return !!first;
+}
+
 $("btnSaveLimits").onclick = async () => {
+  if (invalidField(Object.keys(LIMIT_FIELDS), "limitsResult")) return;
+  if (botRunning() && !confirm("The bot is running. Saving restarts it to apply the new limits. The ledger is kept.\n\nSave now?")) return;
   // Carry through the fields the form does not show, so saving does not silently reset
   // them to defaults the operator never chose.
   const limits = Object.assign({}, window.__limits || {});
   for (const [id, key] of Object.entries(LIMIT_FIELDS)) limits[key] = Number($(id).value);
   try {
     const r = await invoke("save_limits", { limits });
-    $("limitsResult").textContent = (r && r.restarted ? "Limits saved. The running bot was restarted to apply them." : r && r.restartError ? "Limits saved, but the bot could not be restarted: " + r.restartError : "Limits saved. They apply from the next start.");
+    $("limitsResult").textContent = (r && r.restarted ? "Limits saved. The running bot was restarted to apply them." : r && r.restartError ? "Limits saved, but the bot could not be restarted: " + r.restartError + " Press Start in the rail." :"Limits saved. They apply from the next start.");
     await paintLimits();
   } catch (e) {
     $("limitsResult").textContent = "" + e;
@@ -1477,7 +1610,7 @@ $("btnSaveLimits").onclick = async () => {
 // failure alike: a rejected paste left sitting in a form is still a secret in a form.
 
 function clearSecretFields() {
-  for (const id of ["fSecret", "fPass", "fUnlockPass"]) {
+  for (const id of ["fSecret", "fPass", "fUnlockPass", "railPass"]) {
     const el = $(id);
     if (el) el.value = "";
   }
@@ -1643,6 +1776,8 @@ for (const b of document.querySelectorAll("#rpcProviders button")) {
 }
 
 $("btnSave").onclick = async () => {
+  if (invalidField(["fCapital", "fBuffer", "fMinTrade", "fHops", "fSlippage", "fPriority"], "saveResult")) return;
+  if (botRunning() && !confirm("The bot is running. Saving stops it, files this run's ledger under Runs, and restarts it on the new values.\n\nSave now?")) return;
   const params = {
     capitalUsd: parseFloat($("fCapital").value),
     feeBufferUsd: parseFloat($("fBuffer").value),
@@ -1657,8 +1792,8 @@ $("btnSave").onclick = async () => {
   try {
     const r = await invoke("save_config", { params, restart: true });
     const bits = ["Saved."];
-    bits.push(r.archived ? `Archived ${r.archived}.` : "Nothing to archive.");
-    if (r.wasRunning) bits.push(r.restarted ? "Restarted." : "Restart FAILED: " + (r.restartError || "?"));
+    bits.push(r.archived ? `This run's ledger was filed under Runs as ${r.archived}.` : "Nothing to archive.");
+    if (r.wasRunning) bits.push(r.restarted ? "Restarted." : `The bot did not restart: ${r.restartError || "no reason given"}. Press Start in the rail.`);
     else bits.push("The bot was not running, so nothing was restarted.");
     $("saveResult").textContent = bits.join(" ");
     refreshStatus();
@@ -1764,9 +1899,10 @@ async function loadLog() {
 // Lines pushed the instant they are written, over the same connection as everything
 // else. The file remains the source of truth; this is a live echo on top of it.
 function onLogLine(ev) {
-  const { msg } = parseLogLine(ev.line);
+  const { msg, ts } = parseLogLine(ev.line);
+  noteHalt(msg, ts);
   if (/^feed silent for over/.test(msg)) LOGA.gaps += 1;
-  if (/^leg drift/.test(msg)) { ingestDrift(msg); if (S.view === "live") paintDrift(); }
+  if (/^leg drift/.test(msg)) { ingestDrift(msg); if (S.view === "live") paint(paintDrift); }
   LOGV.lines.push(ev.line);
   if (LOGV.lines.length > 3000) LOGV.lines.splice(0, LOGV.lines.length - 3000);
   if (S.view === "log" && !LOGV.paused) renderLog();
@@ -1775,29 +1911,45 @@ function onLogLine(ev) {
 for (const b of document.querySelectorAll("#logFilters .chip")) {
   b.onclick = () => {
     LOGV.filter = b.dataset.f;
-    for (const c of document.querySelectorAll("#logFilters .chip")) c.classList.toggle("on", c === b);
+    for (const c of document.querySelectorAll("#logFilters .chip")) {
+      c.classList.toggle("on", c === b);
+      c.setAttribute("aria-pressed", String(c === b));
+    }
     renderLog();
   };
 }
 $("logSearch").oninput = (e) => { LOGV.query = e.target.value.trim().toLowerCase(); renderLog(); };
-$("logPause").onclick = () => {
-  LOGV.paused = !LOGV.paused;
-  $("logPause").setAttribute("aria-pressed", String(LOGV.paused));
-  $("logPause").title = LOGV.paused ? "Resume following" : "Pause following";
-  if (!LOGV.paused) renderLog();
-};
+function setLogPaused(on) {
+  LOGV.paused = on;
+  const t = on ? "Resume following" : "Pause following";
+  $("logPause").setAttribute("aria-pressed", String(on));
+  $("logPause").setAttribute("aria-label", t);
+  $("logPause").title = t;
+  $("logFollow").textContent = on ? "paused, scroll to the end to follow" : "following";
+  if (!on) renderLog();
+}
+$("logPause").onclick = () => setLogPaused(!LOGV.paused);
+// Scrolling up to read pauses following; scrolling back to the end resumes it.
+$("logBody").addEventListener("scroll", () => {
+  const b = $("logBody");
+  const atEnd = b.scrollHeight - b.scrollTop - b.clientHeight < 24;
+  if (atEnd === LOGV.paused) setLogPaused(!atEnd);
+});
 
 /* ── boot ─────────────────────────────────────────────────────────────── */
 
+// Every start refusal happens before a process exists, so the log has nothing to add:
+// the reason is said in the rail, beside the button that was pressed.
 $("btnStart").onclick = async () => {
   $("btnStart").disabled = true;
-  try { await invoke("bot_start"); }
-  catch (e) { await showFailure(String(e)); }
+  try { await invoke("bot_start"); $("powerResult").hidden = true; }
+  catch (e) { showPower("Start refused: " + e); }
   refreshStatus();
 };
 $("btnStop").onclick = async () => {
   $("btnStop").disabled = true;
-  try { await invoke("bot_stop"); } catch (e) { await showFailure(String(e)); }
+  try { await invoke("bot_stop"); showPower("Stopped. The ledger is kept; the next Start adds to it."); }
+  catch (e) { showPower("Could not stop the bot: " + e); }
   refreshStatus();
 };
 $("btnArchive").onclick = async () => {
@@ -1805,15 +1957,20 @@ $("btnArchive").onclick = async () => {
   // anything: an operator who hesitates should hesitate over "the run stops".
   const running = S.status && (S.status.state === "running" || S.status.state === "starting");
   const ask = running
-    ? "Stop the bot, file this run in the archive, and start a fresh one?\n\nThe current ledger stays readable under History."
-    : "File this run in the archive and begin an empty ledger?\n\nThe current ledger stays readable under History.";
+    ? "Stop the bot, file this run's ledger under Runs, and restart into an empty one?\n\nNothing is deleted: the filed run stays readable from Runs."
+    : "File this run's ledger under Runs and begin an empty one?\n\nThe bot stays stopped. Nothing is deleted: the filed run stays readable from Runs.";
   if (!confirm(ask)) return;
   $("btnArchive").disabled = true;
   try {
     const r = await invoke("archive_run", { restart: running });
-    if (r && r.restartError) await showFailure("Archived, but the bot did not restart: " + r.restartError);
+    const name = r && r.archived ? r.archived.split(/[\\/]/).pop() : null;
+    const bits = [name ? `Filed under Runs as ${name}.` : "Nothing to file: the ledger was already empty."];
+    if (r && r.restartError) bits.push(`The bot did not restart: ${r.restartError} Press Start to try again.`);
+    else if (r && r.restarted) bits.push("The bot restarted into an empty ledger.");
+    else bits.push("The next Start begins an empty ledger.");
+    showPower(bits.join(" "));
   } catch (e) {
-    await showFailure(String(e));
+    showPower("Nothing was archived: " + e);
   }
   refreshStatus();
 };
@@ -1850,6 +2007,7 @@ setInterval(() => { if (S.view === "history") loadHistory(S.viewingArchive); }, 
 // A slow fallback resync for the Log view; live lines arrive over the WebSocket.
 setInterval(() => { if (S.view === "log" && !LOGV.paused) loadLog(); }, 8000);
 setInterval(paintBotWell, 15000);
+setInterval(paintHalt, 1000);   // the countdown; touches nothing unless a halt stands
 window.addEventListener("resize", () => requestAnimationFrame(drawAll));
 
 // ---------------------------------------------------------------------------
@@ -1869,25 +2027,29 @@ function paintRail() {
   badge.className = "badge " + (live ? "badge-live" : "badge-demo");
   $("segDemo").classList.toggle("on", !live);
   $("segLive").classList.toggle("on", live);
+  $("segDemo").setAttribute("aria-pressed", String(!live));
+  $("segLive").setAttribute("aria-pressed", String(live));
   const note = $("railArmedNote");
   if (live) {
     note.hidden = false;
     const d = window.__dry;
     note.innerHTML = d && !d.effective
-      ? "Armed and <b>submitting</b> through " + sendPath().name + "."
-      : "Armed. Nothing is submitted while dry run is on — see Parameters.";
+      ? "Armed. Real transactions go through " + sendPath().name + " while the bot runs."
+      : "Armed, but dry run is on: nothing is sent. Allow real transactions under Parameters.";
   } else if (!m.allowLiveSet) {
     note.hidden = false;
-    note.innerHTML = "<code>CRYPTOBOT_ALLOW_LIVE</code> is not set, so Live cannot be armed.";
+    note.innerHTML = "<code>CRYPTOBOT_ALLOW_LIVE</code> is not set, so Live cannot be armed. Set it to 1, then reopen this app.";
   } else {
     note.hidden = true;
   }
+  paintStartGate();
 }
 
 function paintRailWallet() {
   const addr = window.__address;
-  $("railAddr").textContent = addr ? addr.slice(0, 6) + "…" + addr.slice(-6) : "no key — import one under Parameters";
-  $("railAddr").title = addr ? "Copy " + addr : "";
+  $("railAddr").textContent = addr ? addr.slice(0, 6) + "…" + addr.slice(-6) : "No key: add one";
+  $("railAddr").title = addr ? "Copy " + addr : "Open Parameters to import a key";
+  paintStartGate();
   const h = window.__holdings;
   const bal = $("railBal"), ready = $("railReady");
   bal.classList.remove("reading");
@@ -1902,11 +2064,11 @@ function paintRailWallet() {
   if (empty) rows.push(`<div class="more">${empty} empty token account${empty > 1 ? "s" : ""} held (rent refundable)</div>`);
   bal.innerHTML = rows.join("");
   ready.className = "rail-ready " + (h.readiness.canTrade ? "ok" : "no");
-  ready.textContent = h.readiness.canTrade ? "Can trade" : "Cannot trade — " + h.readiness.reason;
+  ready.textContent = h.readiness.canTrade ? "Can trade" : "Cannot trade: " + h.readiness.reason;
 }
 
 $("railAddr").onclick = async () => {
-  if (!window.__address) return;
+  if (!window.__address) { setView("config"); return; }
   try {
     await navigator.clipboard.writeText(window.__address);
     $("railAddr").textContent = "copied";
@@ -1919,6 +2081,7 @@ $("railRefresh").onclick = () => paintBalances(false);
 function railShowArm(show) {
   $("railArm").hidden = !show;
   if (show) { $("railConfirm").value = ""; $("railConfirm").focus(); }
+  paintStartGate();
 }
 
 $("segDemo").onclick = async () => {
@@ -1931,10 +2094,13 @@ $("segDemo").onclick = async () => {
 // Arm live is pressed, so a stray click on a narrow rail costs nothing.
 $("segLive").onclick = () => {
   if (window.__mode && window.__mode.effective === "live") return;
+  // The note already says why and what to do; a form the backend must refuse is noise.
+  if (window.__mode && !window.__mode.allowLiveSet) return;
   railShowArm(true);
 };
 $("railCancel").onclick = () => railShowArm(false);
 $("railApply").onclick = async () => { await applyMode("live", $("railConfirm").value); };
+$("railConfirm").onkeydown = (e) => { if (e.key === "Enter" && !$("railApply").disabled) $("railApply").click(); };
 
 /// One path for both controls, so the rail and the Parameters tab cannot drift.
 async function applyMode(mode, confirm) {
@@ -1947,10 +2113,11 @@ async function applyMode(mode, confirm) {
     await paintMode();
     paintRail();
     const bits = [`Mode is now ${r.mode}.`];
-    if (r.archived) bits.push(`Previous run archived as ${r.archived}.`);
+    if (r.archived) bits.push(`The previous run's ledger was filed under Runs as ${r.archived}.`);
     if (r.restartError) bits.push(`The bot did not restart: ${r.restartError}`);
     else if (r.restarted) bits.push("The bot restarted.");
     $("modeResult").textContent = bits.join(" ");
+    showPower(bits.join(" "));
   } catch (e) {
     // Shown in the rail, where the button was pressed: a refusal that only appears on
     // another tab reads as nothing having happened.

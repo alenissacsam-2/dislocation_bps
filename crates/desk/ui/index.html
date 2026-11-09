@@ -47,10 +47,17 @@
       </div>
     </div>
     <div class="keys">
-      <button id="btnStart" class="key key-go" disabled><svg class="ic"><use href="#i-play"/></svg>Start</button>
-      <button id="btnStop" class="key" disabled><svg class="ic"><use href="#i-stop"/></svg>Stop</button>
+      <button id="btnStart" class="key key-go" disabled aria-describedby="startWhy"><svg class="ic" aria-hidden="true"><use href="#i-play"/></svg>Start</button>
+      <button id="btnStop" class="key" disabled title="Stops the bot. The ledger is kept and the next Start adds to it."><svg class="ic" aria-hidden="true"><use href="#i-stop"/></svg>Stop</button>
     </div>
-    <button id="btnArchive" class="link-key" disabled><svg class="ic"><use href="#i-archive"/></svg>Archive &amp; start fresh</button>
+    <p id="startWhy" class="start-why" hidden></p>
+    <form id="railUnlock" class="arm" hidden>
+      <label for="railPass" class="hint">Wallet passphrase <span class="unit">unlocks for this session only</span></label>
+      <input type="password" id="railPass" autocomplete="off">
+      <button id="railUnlockBtn" class="key key-go" type="submit">Unlock wallet</button>
+    </form>
+    <button id="btnArchive" class="link-key" disabled title="Files this run's ledger under Runs and begins an empty one. Nothing is deleted."><svg class="ic" aria-hidden="true"><use href="#i-archive"/></svg>Archive &amp; start fresh</button>
+    <p id="powerResult" class="result" role="status" hidden></p>
   </section>
 
   <section class="module" aria-label="Mode">
@@ -59,11 +66,11 @@
       <span id="railModeBadge" class="badge badge-demo">DEMO</span>
     </div>
     <div class="seg" role="group" aria-label="Trading mode">
-      <button id="segDemo" class="seg-btn on" type="button">Demo</button>
-      <button id="segLive" class="seg-btn" type="button">Live</button>
+      <button id="segDemo" class="seg-btn on" type="button" aria-pressed="true">Demo</button>
+      <button id="segLive" class="seg-btn" type="button" aria-pressed="false">Live</button>
     </div>
     <div id="railArm" class="arm" hidden>
-      <label for="railConfirm" class="hint">Type <code>LIVE</code> to arm real trading</label>
+      <label for="railConfirm" class="hint">Type <code>LIVE</code> to arm real trading. This run's ledger is filed under Runs first.</label>
       <input type="text" id="railConfirm" autocomplete="off" spellcheck="false" placeholder="LIVE">
       <div class="keys">
         <button id="railApply" class="key key-hot" type="button">Arm live</button>
@@ -103,6 +110,10 @@
 
   <!-- ── LIVE ─────────────────────────────────────────────────────────── -->
   <section class="view" id="view-live">
+    <div class="halt" id="haltBanner" hidden>
+      <svg class="ic" aria-hidden="true"><use href="#i-pause"/></svg>
+      <div><b>Trading halted:</b> <span id="haltWhy" aria-live="polite"></span><div class="halt-when" id="haltWhen"></div></div>
+    </div>
     <div class="faceplate wells4">
       <div class="well readout" id="wBot">
         <div class="r-head"><span class="label">Bot</span><span class="led sm" id="wBotLed"></span></div>
@@ -123,6 +134,7 @@
         <div class="r-val num" id="wMoneyVal">$0.0000</div>
         <div class="gauge" aria-hidden="true"><div class="gauge-fill" id="gBudgetFill"></div></div>
         <div class="r-sub" id="wMoneySub">of the loss budget used</div>
+        <div class="r-foot" id="wMoneyFoot"></div>
       </div>
       <div class="well readout ch-violet" id="wFeed">
         <div class="r-head"><span class="label">Feed</span><span class="led sm" id="wFeedLed"></span></div>
@@ -284,7 +296,7 @@
       <div class="span6 stack">
       <section class="module">
         <div class="mod-head"><h2>Trading</h2></div>
-        <p class="caution">Saving ends the current run and archives its ledger.
+        <p class="caution">Saving stops the bot, files this run's ledger under Runs, and restarts it on the new values.
           <button class="info" type="button" data-tip="Rows recorded under different parameters aggregate by different rules, and nothing downstream would show the mixture — so the run is cut rather than quietly contaminated."><svg class="ic"><use href="#i-info"/></svg></button></p>
         <div class="fields">
           <div class="field">
@@ -350,6 +362,7 @@
         <section class="module">
           <div class="mod-head"><h2>Risk limits</h2>
             <button class="info" type="button" data-tip="Hard stops, not targets. Nothing is signed that breaches one, and a tripped breaker stays tripped until it is cleared deliberately or its cooldown ends."><svg class="ic"><use href="#i-info"/></svg></button></div>
+          <p class="caution">Saving restarts a running bot to apply them. The ledger is kept.</p>
           <div class="fields">
             <div class="field">
               <label for="fMaxPos">Maximum position <span class="unit">USD</span>
@@ -367,7 +380,7 @@
               <input type="number" id="fMinNet" step="0.001" min="0">
             </div>
             <div class="field">
-              <label for="fMaxFails">Failures before stopping
+              <label for="fMaxFails">Failures before stopping <span class="unit">in a row</span>
                 <button class="info" type="button" data-tip="Consecutive failures. A lost race does not count — only reverts and rejections, which mean something is wrong that retrying will not fix."><svg class="ic"><use href="#i-info"/></svg></button></label>
               <input type="number" id="fMaxFails" step="1" min="1">
             </div>
@@ -502,15 +515,16 @@
       <div class="mod-head">
         <h2>Bot log</h2>
         <div class="chips" id="logFilters" role="group" aria-label="Filter the log">
-          <button class="chip on" data-f="all" type="button">All</button>
-          <button class="chip" data-f="trade" type="button">Trades</button>
-          <button class="chip" data-f="refused" type="button">Refusals</button>
-          <button class="chip" data-f="warn" type="button">Warnings</button>
-          <button class="chip" data-f="error" type="button">Faults</button>
+          <button class="chip on" data-f="all" type="button" aria-pressed="true">All</button>
+          <button class="chip" data-f="trade" type="button" aria-pressed="false">Trades</button>
+          <button class="chip" data-f="refused" type="button" aria-pressed="false">Refusals</button>
+          <button class="chip" data-f="warn" type="button" aria-pressed="false">Warnings</button>
+          <button class="chip" data-f="error" type="button" aria-pressed="false">Faults</button>
         </div>
         <label class="search"><svg class="ic"><use href="#i-search"/></svg>
           <input type="search" id="logSearch" placeholder="Search the log" autocomplete="off" spellcheck="false"></label>
-        <button id="logPause" class="icon-key" type="button" aria-pressed="false" aria-label="Pause following" title="Pause following"><svg class="ic"><use href="#i-pause"/></svg></button>
+        <span class="scope" id="logFollow" aria-live="polite">following</span>
+        <button id="logPause" class="icon-key" type="button" aria-pressed="false" aria-label="Pause following" title="Pause following"><svg class="ic" aria-hidden="true"><use href="#i-pause"/></svg></button>
       </div>
       <div class="log" id="logBody" role="log" aria-live="off">No log yet.</div>
     </section>
