@@ -234,6 +234,16 @@ impl Watch {
         }
     }
 
+    /// The two vaults of a vault-backed pool.
+    fn vaults(&self) -> Option<[Pubkey32; 2]> {
+        match &self.venue {
+            Venue::RaydiumV4 { info, .. } => Some([info.base_vault, info.quote_vault]),
+            Venue::PumpSwap { pool, .. } => Some([pool.base_vault, pool.quote_vault]),
+            Venue::RaydiumCpmm { pool, .. } => Some([pool.vault_0, pool.vault_1]),
+            _ => None,
+        }
+    }
+
     /// Record a vault balance. `first` selects vault 0 / the base vault.
     fn set_vault(&mut self, first: bool, amount: u64) {
         match &mut self.venue {
@@ -418,6 +428,10 @@ pub struct LiveMarket {
     drift_streak: HashMap<Pubkey32, u32>,
     /// Slot of the last full reconcile pass; zero before the first.
     last_reconcile_slot: u64,
+    /// Per watched account (pool, vault, bin array, oracle): the slot its applied copy is
+    /// from, and whether the feed delivered it (`false`: an RPC read). See `note` and
+    /// `coherent`.
+    seen: HashMap<Pubkey32, (u64, bool)>,
 }
 
 /// Full reconcile passes in a row (about nine minutes) a pool must drift with no feed
@@ -447,7 +461,8 @@ impl LiveMarket {
 
         let addresses: Vec<String> =
             registry.pools.iter().map(|p| bs58::encode(p.address).into_string()).collect();
-        let (accounts, boot_slot) = get_multiple_accounts(&client, rpc_http, &addresses).await?;
+        let (accounts, slots) = get_multiple_accounts(&client, rpc_http, &addresses).await?;
+        let boot_slot = slots.iter().copied().max().unwrap_or(0);
 
         let mut watches: HashMap<Pubkey32, Watch> = HashMap::new();
         let mut vault_index = HashMap::new();
@@ -905,6 +920,7 @@ impl LiveMarket {
             implausible_named: std::sync::Mutex::default(),
             drift_streak: HashMap::new(),
             last_reconcile_slot: 0,
+            seen: HashMap::new(),
         };
         market.rebuild_usd_index();
 
@@ -932,6 +948,9 @@ impl LiveMarket {
     /// watch, so no cycle quotes the old price and the next update that prices brings
     /// it back. An auxiliary account that does not decode changes nothing.
     pub fn apply(&mut self, u: &AccountUpdate, bus: &EventBus) -> Option<PoolState> {
+        if !self.note(u.pubkey, u.slot, true) {
+            return None;
+        }
         let (pool, state) = if self.watches.contains_key(&u.pubkey) {
             (u.pubkey, self.decode_at(u.pubkey, &u.data, u.slot))
         } else if let Some(&(pool, first)) = self.vault_index.get(&u.pubkey) {
@@ -965,6 +984,11 @@ impl LiveMarket {
             self.unprice(pool);
             return None;
         };
+        if !self.coherent(pool) {
+            // Mid-trade, not unpriced: quietly out until the rest of the slot arrives.
+            self.store.remove(&PoolId(pool));
+            return None;
+        }
 
         self.store.upsert(state);
 
@@ -1226,8 +1250,9 @@ impl LiveMarket {
         if addresses.is_empty() {
             return Ok(ReconcileReport::default());
         }
-        let (accounts, slot) =
+        let (accounts, slots) =
             get_multiple_accounts(&self.client, &self.rpc_http, &addresses).await?;
+        let slot = slots.iter().copied().max().unwrap_or(0);
 
         // Vault balances first, so a constant-product pool is rebuilt from a coherent
         // set rather than a fresh pool account against last week's vault.
@@ -1238,13 +1263,16 @@ impl LiveMarket {
             .map(|(k, _)| bs58::encode(k).into_string())
             .collect();
         if !vault_b58.is_empty() {
-            let (vaults, _) =
+            let (vaults, at) =
                 get_multiple_accounts(&self.client, &self.rpc_http, &vault_b58).await?;
-            for (b58, data) in vault_b58.iter().zip(vaults.iter()) {
+            for ((b58, data), &slot) in vault_b58.iter().zip(vaults.iter()).zip(at.iter()) {
                 let Some(data) = data else { continue };
                 let Ok(amount) = raydium_v4::decode_token_amount(data) else { continue };
                 let Ok(key) = pk(b58) else { continue };
                 let Some(&(pool, first)) = self.vault_index.get(&key) else { continue };
+                if !self.note(key, slot, false) {
+                    continue;
+                }
                 if let Some(w) = self.watches.get_mut(&pool) {
                     w.slot = w.slot.max(slot);
                     w.set_vault(first, amount);
@@ -1262,13 +1290,16 @@ impl LiveMarket {
             .map(|(k, _)| bs58::encode(k).into_string())
             .collect();
         if !bin_b58.is_empty() {
-            let (arrays, _) =
+            let (arrays, at) =
                 get_multiple_accounts(&self.client, &self.rpc_http, &bin_b58).await?;
-            for (b58, data) in bin_b58.iter().zip(arrays.iter()) {
+            for ((b58, data), &slot) in bin_b58.iter().zip(arrays.iter()).zip(at.iter()) {
                 let Some(data) = data else { continue };
                 let Ok(decoded) = meteora_dlmm::decode_bin_array(data) else { continue };
                 let Ok(key) = pk(b58) else { continue };
                 let Some(&(pool, ix)) = self.bin_index.get(&key) else { continue };
+                if !self.note(key, slot, false) {
+                    continue;
+                }
                 if let Some(w) = self.watches.get_mut(&pool) {
                     w.slot = w.slot.max(slot);
                     if let Venue::MeteoraDlmm { arrays, .. } = &mut w.venue {
@@ -1287,13 +1318,16 @@ impl LiveMarket {
             .map(|(k, _)| bs58::encode(k).into_string())
             .collect();
         if !oracle_b58.is_empty() {
-            let (oracles, _) =
+            let (oracles, at) =
                 get_multiple_accounts(&self.client, &self.rpc_http, &oracle_b58).await?;
-            for (b58, data) in oracle_b58.iter().zip(oracles.iter()) {
+            for ((b58, data), &slot) in oracle_b58.iter().zip(oracles.iter()).zip(at.iter()) {
                 let Some(data) = data else { continue };
                 let Ok(decoded) = orca_whirlpool::decode_oracle(data) else { continue };
                 let Ok(key) = pk(b58) else { continue };
                 let Some(&pool) = self.oracle_index.get(&key) else { continue };
+                if !self.note(key, slot, false) {
+                    continue;
+                }
                 if let Some(Venue::WhirlpoolAdaptive { oracle, .. }) =
                     self.watches.get_mut(&pool).map(|w| &mut w.venue)
                 {
@@ -1304,12 +1338,17 @@ impl LiveMarket {
 
         let mut report = ReconcileReport { checked: addresses.len(), slot, ..Default::default() };
         let mut by_venue: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-        for (b58, data) in addresses.iter().zip(accounts.iter()) {
+        for ((b58, data), &slot) in addresses.iter().zip(accounts.iter()).zip(slots.iter()) {
             let Ok(addr) = pk(b58) else { continue };
             let Some(data) = data else {
                 report.missing += 1;
                 continue;
             };
+            // The feed already delivered this account from a later slot: this read is the
+            // older copy, and replacing it would regress the pool.
+            if !self.note(addr, slot, false) {
+                continue;
+            }
             let before = self.store.get(&PoolId(addr));
             let Some(state) = self.decode_at(addr, data, slot) else {
                 if before.is_some() {
@@ -1335,6 +1374,10 @@ impl LiveMarket {
                     "pool {label} ({b58}) never updates from the feed: drifted on {STUCK_PASSES} \
                      reconciles in a row with nothing from its subscription between them"
                 );
+            }
+            if !self.coherent(addr) {
+                self.store.remove(&PoolId(addr));
+                continue;
             }
             // The fresh read replaces the feed's copy, drifted or not.
             self.store.upsert(state);
@@ -1368,6 +1411,33 @@ impl LiveMarket {
         let n = self.drift_streak.entry(pool).or_insert(0);
         *n += 1;
         *n == STUCK_PASSES
+    }
+
+    /// Record that `key` is now known as of `slot`. False, recording nothing, when the copy
+    /// already applied is from a later slot: the caller must then leave it alone, or an
+    /// out-of-order message or a lagging RPC read would regress the pool.
+    fn note(&mut self, key: Pubkey32, slot: u64, feed: bool) -> bool {
+        let e = self.seen.entry(key).or_insert((0, false));
+        if slot < e.0 {
+            return false;
+        }
+        *e = (slot, feed);
+        true
+    }
+
+    /// Whether a vault-backed pool's three accounts describe one moment.
+    ///
+    /// A trade writes the pool account and both vaults in one slot, but the feed delivers
+    /// them as three messages; priced between them, the pool mixes slots. On PumpSwap a
+    /// vault ahead of the pool account's virtual quote is optimistic (~0.5 bps per SOL).
+    /// So a part the feed delivered at slot S says every part was written at S, and the
+    /// pool waits until none is older. An RPC read implies no write, so it constrains
+    /// nothing, and a reconcile that reads all three makes them agree again.
+    fn coherent(&self, pool: Pubkey32) -> bool {
+        let Some([v0, v1]) = self.watches.get(&pool).and_then(Watch::vaults) else { return true };
+        let parts = [pool, v0, v1].map(|k| self.seen.get(&k).copied().unwrap_or_default());
+        let fed = parts.iter().filter(|p| p.1).map(|p| p.0).max().unwrap_or(0);
+        parts.iter().all(|p| p.0 >= fed)
     }
 
     /// Decode one watched account at `slot`, using whatever venue it belongs to.
@@ -1530,6 +1600,7 @@ impl LiveMarket {
             keep
         });
         self.store.remove(&PoolId(*pool));
+        self.seen.retain(|k, _| !gone.contains(k));
         self.registry.pools.retain(|p| p.address != *pool);
         self.subscriptions.retain(|k| !gone.contains(k));
         gone
@@ -1625,15 +1696,7 @@ impl LiveMarket {
     /// price it from its vaults instead of being spent learning where they are.
     #[must_use]
     pub fn vault_pairs(&self) -> Vec<(Pubkey32, [Pubkey32; 2])> {
-        self.watches
-            .iter()
-            .filter_map(|(addr, w)| match &w.venue {
-                Venue::RaydiumV4 { info, .. } => Some((*addr, [info.base_vault, info.quote_vault])),
-                Venue::PumpSwap { pool, .. } => Some((*addr, [pool.base_vault, pool.quote_vault])),
-                Venue::RaydiumCpmm { pool, .. } => Some((*addr, [pool.vault_0, pool.vault_1])),
-                _ => None,
-            })
-            .collect()
+        self.watches.iter().filter_map(|(addr, w)| Some((*addr, w.vaults()?))).collect()
     }
 
     /// SOL price in USD, derived from live pools like every other token.
@@ -1786,8 +1849,8 @@ fn redacted(what: &str, e: &reqwest::Error) -> anyhow::Error {
     anyhow::anyhow!("{what}: {}", cb_core::redact::redact_urls_in(&e.to_string()))
 }
 
-/// `getMultipleAccounts`, returning raw account data in request order plus the slot
-/// the RPC answered at.
+/// `getMultipleAccounts`, returning raw account data in request order plus, for each
+/// account, the slot the RPC answered its chunk at.
 ///
 /// The slot matters: a pool seeded at slot 0 looks infinitely stale forever, and any
 /// freshness check built on it is meaningless.
@@ -1795,10 +1858,10 @@ async fn get_multiple_accounts(
     client: &reqwest::Client,
     url: &str,
     keys: &[String],
-) -> Result<(Vec<Option<Vec<u8>>>, u64)> {
+) -> Result<(Vec<Option<Vec<u8>>>, Vec<u64>)> {
     // The RPC caps this at 100 keys per call.
     let mut out = Vec::with_capacity(keys.len());
-    let mut context_slot = 0u64;
+    let mut slots = Vec::with_capacity(keys.len());
     for chunk in keys.chunks(100) {
         // `processed`, to match the subscription. The default is `finalized`, which
         // is ~13 slots behind — so a reconciliation read would routinely come back
@@ -1822,11 +1885,12 @@ async fn get_multiple_accounts(
         if let Some(err) = resp.get("error") {
             anyhow::bail!("rpc error: {err}");
         }
-        if let Some(slot) =
-            resp.get("result").and_then(|r| r.get("context")).and_then(|c| c.get("slot")).and_then(serde_json::Value::as_u64)
-        {
-            context_slot = context_slot.max(slot);
-        }
+        let context_slot = resp
+            .get("result")
+            .and_then(|r| r.get("context"))
+            .and_then(|c| c.get("slot"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
 
         let values = resp
             .get("result")
@@ -1841,9 +1905,10 @@ async fn get_multiple_accounts(
                 .and_then(|d| d.as_str())
                 .and_then(decode_b64);
             out.push(data);
+            slots.push(context_slot);
         }
     }
-    Ok((out, context_slot))
+    Ok((out, slots))
 }
 
 /// A DAMM v2 pool at bootstrap: `Err` only if its account does not decode, which drops
@@ -1923,6 +1988,7 @@ mod tests {
             implausible_named: std::sync::Mutex::default(),
             drift_streak: HashMap::new(),
             last_reconcile_slot: 0,
+            seen: HashMap::new(),
         };
         m.rebuild_usd_index();
         m
@@ -1978,6 +2044,111 @@ mod tests {
         let other = AccountUpdate { pubkey: [9; 32], ..u };
         assert!(m.apply(&other, &bus).is_none());
         assert_eq!(m.watch_count(), 1);
+    }
+
+    /// A PumpSwap pool `[1; 32]` with vaults `[33; 32]` (base) and `[44; 32]` (quote),
+    /// flat 25 bp, holding 1e9 of each, and the account bytes `apply` decodes it from.
+    fn pump_market() -> (LiveMarket, impl Fn(i64) -> Vec<u8>) {
+        let account = |virtual_quote: i64| {
+            let mut d = vec![0u8; 253];
+            d[43..75].copy_from_slice(&[11; 32]); // base mint
+            d[75..107].copy_from_slice(&[22; 32]); // quote mint
+            d[139..171].copy_from_slice(&[33; 32]); // base vault
+            d[171..203].copy_from_slice(&[44; 32]); // quote vault
+            d[245..253].copy_from_slice(&virtual_quote.to_le_bytes());
+            d
+        };
+        let fees = pumpswap::FeeConfig {
+            flat: pumpswap::Fees { lp_bps: 25, ..Default::default() },
+            tiers: Vec::new(),
+            stable_tiers: Vec::new(),
+        };
+        let venue = Venue::PumpSwap {
+            pool: Box::new(pumpswap::decode_pool(&account(0)).unwrap()),
+            base_amount: Some(1_000_000_000),
+            quote_amount: Some(1_000_000_000),
+            supply: 1_000_000_000,
+            pump: false,
+            fees: Some(Arc::new(fees)),
+        };
+        let mut m = market_with(Vec::new());
+        m.watches.insert([1; 32], Watch { label: "PUMP".into(), dex: Dex::PumpSwap, venue, slot: 100 });
+        m.vault_index.insert([33; 32], ([1; 32], true));
+        m.vault_index.insert([44; 32], ([1; 32], false));
+        m.store.upsert(m.watches[&[1; 32]].vault_state([1; 32]).unwrap());
+        (m, account)
+    }
+
+    fn token_account(amount: u64) -> Vec<u8> {
+        let mut d = vec![0u8; 165];
+        d[64..72].copy_from_slice(&amount.to_le_bytes());
+        d
+    }
+
+    /// A trade writes the pool account and both vaults in one slot, delivered as three
+    /// messages. Between them the pool is out of the sweep, in either order.
+    #[test]
+    fn a_vault_pool_is_not_priced_between_the_messages_of_one_trade() {
+        let (mut m, account) = pump_market();
+        let bus = EventBus::new();
+        let at = |pubkey: Pubkey32, data: Vec<u8>, slot: u64| AccountUpdate { pubkey, data, slot, received_ms: 0 };
+        let priced = |m: &LiveMarket| m.store.get(&PoolId([1; 32]));
+
+        // Vaults first: the optimistic order on PumpSwap.
+        assert!(m.apply(&at([33; 32], token_account(900_000_000), 200), &bus).is_none());
+        assert!(priced(&m).is_none(), "a fresh vault against a stale virtual quote must not price");
+        assert!(m.apply(&at([44; 32], token_account(1_100_000_000), 200), &bus).is_none());
+        assert!(priced(&m).is_none());
+        let s = m.apply(&at([1; 32], account(-5), 200), &bus).expect("all three at slot 200");
+        assert_eq!((s.slot, s.reserve_a(), s.reserve_b()), (200, 900_000_000, 1_099_999_995));
+        assert_eq!(priced(&m), Some(s));
+
+        // Pool account first.
+        assert!(m.apply(&at([1; 32], account(-9), 300), &bus).is_none());
+        assert!(priced(&m).is_none());
+        assert!(m.apply(&at([44; 32], token_account(1_000_000_000), 300), &bus).is_none());
+        assert!(m.apply(&at([33; 32], token_account(990_000_000), 300), &bus).is_some());
+
+        // A late message from an older slot changes nothing.
+        assert!(m.apply(&at([33; 32], token_account(1), 250), &bus).is_none());
+        assert_eq!(priced(&m).unwrap().reserve_a(), 990_000_000);
+    }
+
+    /// A reconcile read answered at a slot older than the feed's copy leaves the pool,
+    /// its vaults included, as the feed left it.
+    #[tokio::test]
+    async fn a_reconcile_read_older_than_the_feed_does_not_regress_a_pool() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Every account answers, at slot 150, as a token account holding 5.
+        let five = format!("{}AAUA{}", "A".repeat(84), "A".repeat(132));
+        assert_eq!(decode_b64(&five), Some(token_account(5)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let body = format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":150}},"value":[{{"data":["{five}","base64"]}},{{"data":["{five}","base64"]}}]}}}}"#
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let (mut m, account) = pump_market();
+        m.rpc_http = format!("http://{addr}");
+        let bus = EventBus::new();
+        for (k, data) in [([1; 32], account(0)), ([33; 32], token_account(700)), ([44; 32], token_account(800))] {
+            m.apply(&AccountUpdate { pubkey: k, data, slot: 200, received_ms: 0 }, &bus);
+        }
+        let fed = m.store.get(&PoolId([1; 32])).expect("priced by the feed");
+        m.reconcile().await.unwrap();
+        assert_eq!(m.store.get(&PoolId([1; 32])), Some(fed), "the slot-150 read must not replace slot 200");
+        let w = m.watches[&[1; 32]].vault_state([1; 32]).unwrap();
+        assert_eq!((w.reserve_a(), w.reserve_b()), (700, 800), "nor the vaults behind it");
     }
 
     /// A pool that priced and stops is a fault; a watched pool that never priced is

@@ -71,7 +71,13 @@ fn quote(live: &Live, address: Pubkey, fee_bps: u64, spend_base: bool, amount: u
 /// PumpSwap emits its events by invoking itself (Anchor `emit_cpi`), so they are in the
 /// inner instruction data, not in the logs: an 8-byte emit tag, the event's own
 /// 8-byte discriminator, then its fields.
-async fn events(url: &str, tx_base64: &str, supply: u64, pool: &PumpPool, cfg: &ps::FeeConfig, pump: bool) -> Result<()> {
+///
+/// Returns the virtual quote reserve the last event reports, the one a later leg in the
+/// same transaction trades against.
+async fn events(url: &str, tx_base64: &str, supply: u64, pool: &PumpPool, cfg: &ps::FeeConfig, pump: bool) -> Result<Option<i64>> {
+    // `virtual_quote_reserves` sits this far from the end of both events (a variable-length
+    // name precedes it in a BUY); found on 2026-11-09 as the pool account's value in both.
+    const VIRTUAL_QUOTE_FROM_END: usize = 57;
     const EMIT_TAG: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
     const BUY: [u8; 8] = [103, 244, 82, 31, 44, 245, 119, 119];
     const SELL: [u8; 8] = [62, 47, 55, 10, 165, 3, 220, 42];
@@ -79,6 +85,7 @@ async fn events(url: &str, tx_base64: &str, supply: u64, pool: &PumpPool, cfg: &
         {"encoding":"base64","sigVerify":false,"replaceRecentBlockhash":true,"innerInstructions":true,"commitment":"processed"}]});
     let v: serde_json::Value = reqwest::Client::new().post(url).json(&body).send().await?.json().await?;
     let groups = v["result"]["value"]["innerInstructions"].as_array().cloned().unwrap_or_default();
+    let mut last_virtual = None;
     for g in groups {
         for ix in g["instructions"].as_array().cloned().unwrap_or_default() {
             let Some(d58) = ix["data"].as_str() else { continue };
@@ -98,8 +105,14 @@ async fn events(url: &str, tx_base64: &str, supply: u64, pool: &PumpPool, cfg: &
             // creator's bps and fee.
             let creator_at = 16 + 8 * 14 + 32 * 7;
             let cu = |i: usize| u64::from_le_bytes(d[creator_at + 8 * i..creator_at + 8 * i + 8].try_into().expect("u64"));
+            // The event's own virtual quote, not the one read before the transaction: an
+            // earlier leg in it may have moved it.
+            let at = d.len().checked_sub(VIRTUAL_QUOTE_FROM_END).filter(|&o| o >= creator_at + 16);
+            let virtual_quote = at.map_or(pool.virtual_quote, |o| i64::from_le_bytes(d[o..o + 8].try_into().expect("i64")));
+            last_virtual = Some(virtual_quote);
+            let pool = &PumpPool { virtual_quote, ..*pool };
             let cap = ps::market_cap(supply, u(5), pool.effective_quote(u(6)));
-            let model_bps = cfg.fees(pump, cap, false).total_bps();
+            let model_bps = cfg.fees_floor(pump, cap, false).total_bps();
             let charged = u(8) + u(10) + cu(0);
             // The model's quote at the reserves the program itself reports.
             let state = ps::to_pool_state([0u8; 32], pool, u(5), u(6), model_bps, 0)?;
@@ -117,7 +130,7 @@ async fn events(url: &str, tx_base64: &str, supply: u64, pool: &PumpPool, cfg: &
             );
         }
     }
-    Ok(())
+    Ok(last_virtual)
 }
 
 #[tokio::main]
@@ -152,9 +165,11 @@ async fn main() -> Result<()> {
     let stable = false;
     let is_pump = to_pubkey(&live.pool.creator)
         == Pubkey::find_program_address(&[b"pool-authority", base_mint.as_ref()], &pk("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")).0;
-    let cap = ps::market_cap(live.supply, live.base_reserve, live.quote_reserve);
-    let tier = fee_cfg.fees(true, cap, stable).total_bps();
-    let flat = fee_cfg.fees(false, cap, stable).total_bps();
+    // As the bot prices it (`Watch::vault_state` in live.rs): the virtual quote counts, and
+    // the fee is the floor of the tiers either side.
+    let cap = ps::market_cap(live.supply, live.base_reserve, live.pool.effective_quote(live.quote_reserve));
+    let tier = fee_cfg.fees_floor(true, cap, stable).total_bps();
+    let flat = fee_cfg.fees_floor(false, cap, stable).total_bps();
     let pump_authority = Pubkey::find_program_address(
         &[b"pool-authority", base_mint.as_ref()],
         &pk("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
@@ -240,14 +255,22 @@ async fn main() -> Result<()> {
 
     // Leg two: sell back most of it, priced on the state leg one left behind.
     let back = got_one * 9 / 10;
-    let after = Live { base_reserve: after_one[1], quote_reserve: after_one[2], ..live };
-    let cap2 = ps::market_cap(after.supply, after.base_reserve, after.quote_reserve);
-    let tier2 = fee_cfg.fees(true, cap2, stable).total_bps();
     let mut two = one.clone();
     two.push(venue::swap(&ctx(!spend_base_first, back), &{
         rpc.accounts(&[address]).await?.pop().flatten().context("pool")?
     }, Some(recipients))?);
-    events(&url, &tx::compile_unsigned(&owner, &two, blockhash)?.tx_base64, live.supply, &live.pool, &fee_cfg, is_pump).await?;
+    // Leg two trades against the virtual quote leg one left, which its own event reports.
+    let virtual_two = events(&url, &tx::compile_unsigned(&owner, &two, blockhash)?.tx_base64, live.supply, &live.pool, &fee_cfg, is_pump)
+        .await?
+        .unwrap_or(live.pool.virtual_quote);
+    let after = Live {
+        base_reserve: after_one[1],
+        quote_reserve: after_one[2],
+        pool: PumpPool { virtual_quote: virtual_two, ..live.pool },
+        ..live
+    };
+    let cap2 = ps::market_cap(after.supply, after.base_reserve, after.pool.effective_quote(after.quote_reserve));
+    let tier2 = fee_cfg.fees_floor(true, cap2, stable).total_bps();
     let wsol_before = sim(one, vec![wsol_ata]).await?[0];
     let wsol_after = sim(two, vec![wsol_ata]).await?[0];
     let got_two = wsol_after - wsol_before;
