@@ -22,6 +22,27 @@ use rusqlite::Connection;
 /// measurement that says borrowed capital would not have helped.
 pub const CAPITAL_LADDER_USD: [f64; 3] = [100.0, 1_000.0, 10_000.0];
 
+/// Days of `paper_fills` kept by [`Ledger::prune`].
+///
+/// Skipped opportunities arrive at hundreds of thousands per hour and the ledger once
+/// filled a disk (22 GB in 26 h). Three days is enough to compare runs; older skipped
+/// rows add size, not information. Rows that were sent are never pruned.
+pub const RETAIN_PAPER_DAYS: u32 = 3;
+
+/// Rows deleted per statement, so the bot's writer is never locked out for long.
+const PRUNE_BATCH: i64 = 50_000;
+/// Pages returned to the OS per `incremental_vacuum` call.
+const VACUUM_PAGES: i64 = 20_000;
+
+/// What one [`Ledger::prune`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pruned {
+    pub deleted: u64,
+    /// The file was created before `auto_vacuum` was enabled, so its size will not
+    /// shrink until a full `VACUUM` is run offline. The caller should log this once.
+    pub needs_full_vacuum: bool,
+}
+
 pub struct Ledger {
     conn: Connection,
 }
@@ -36,6 +57,10 @@ impl Ledger {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Lets pruned pages go back to the OS. Takes effect only on a brand-new file and
+        // only before journal_mode=WAL writes the header, hence first; `prune` reports
+        // an existing file where it stayed off.
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         // WAL lets the dashboard read while the bot writes.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -63,6 +88,34 @@ impl Ledger {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         )?;
         Ok(Self { conn })
+    }
+
+    /// Delete `paper_fills` rows older than [`RETAIN_PAPER_DAYS`], except any that were
+    /// sent (`taken = 1` or `latency_ms IS NOT NULL`): realised P&L reads those.
+    pub fn prune(&self) -> Result<Pruned> {
+        let cutoff = format!("-{RETAIN_PAPER_DAYS} days");
+        let mut deleted = 0u64;
+        loop {
+            let n = self.conn.execute(
+                "DELETE FROM paper_fills WHERE id IN (
+                     SELECT id FROM paper_fills
+                     WHERE at < datetime('now', ?1) AND taken = 0 AND latency_ms IS NULL
+                     LIMIT ?2)",
+                rusqlite::params![cutoff, PRUNE_BATCH],
+            )?;
+            deleted += n as u64;
+            if (n as i64) < PRUNE_BATCH {
+                break;
+            }
+        }
+        let mode: i64 = self.conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+        let incremental = mode == 2;
+        if incremental && deleted > 0 {
+            // Returns rows; drain them or the pragma does not run to completion.
+            let mut st = self.conn.prepare(&format!("PRAGMA incremental_vacuum({VACUUM_PAGES})"))?;
+            st.query_map([], |_| Ok(()))?.for_each(drop);
+        }
+        Ok(Pruned { deleted, needs_full_vacuum: !incremental })
     }
 
     pub fn record_opportunity(&self, o: &Opportunity) -> Result<i64> {
@@ -1421,6 +1474,47 @@ mod tests {
             amount_in: 68_920,
             gross_profit: 9_463,
             slot: 123_456,
+        }
+    }
+
+    fn temp_db(name: &str) -> String {
+        let p = std::env::temp_dir().join(format!("cb-ledger-{name}-{}.db", std::process::id()));
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", p.display()));
+        }
+        p.display().to_string()
+    }
+
+    #[test]
+    fn prune_drops_only_old_unsent_rows_and_a_new_db_is_incremental() {
+        let path = temp_db("prune");
+        let l = Ledger::open(&path).unwrap();
+        let mode: i64 = l.conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode, 2);
+
+        let old = "datetime('now','-10 days')";
+        let mut ids = Vec::new();
+        for taken in [false, true] {
+            ids.push(l.record_fill(&fill(0.1, taken)).unwrap()); // old, unsent or taken
+        }
+        ids.push(l.record_fill(&fill(0.1, false)).unwrap()); // old, has latency
+        for id in &ids {
+            l.conn.execute(&format!("UPDATE paper_fills SET at = {old} WHERE id = {id}"), []).unwrap();
+        }
+        l.conn.execute("UPDATE paper_fills SET latency_ms = 90 WHERE id = ?1", [ids[2]]).unwrap();
+        let fresh = l.record_fill(&fill(0.1, false)).unwrap(); // new, unsent
+
+        let r = l.prune().unwrap();
+        assert_eq!(r, Pruned { deleted: 1, needs_full_vacuum: false });
+        let mut left: Vec<i64> = l
+            .conn
+            .prepare("SELECT id FROM paper_fills ORDER BY id").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect();
+        left.sort();
+        assert_eq!(left, vec![ids[1], ids[2], fresh]);
+        drop(l);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{ext}"));
         }
     }
 

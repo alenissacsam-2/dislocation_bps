@@ -149,6 +149,18 @@ impl WsFeed {
         &self,
         accounts: Vec<Pubkey32>,
     ) -> (mpsc::Receiver<AccountUpdate>, mpsc::UnboundedSender<Watch>) {
+        self.spawn_controlled_with_limit(accounts, MAX_SUBS_PER_CONNECTION)
+    }
+
+    /// [`WsFeed::spawn_controlled`] with an explicit per-connection cap. Production code
+    /// uses the constant; this exists so tests can shard with a handful of accounts.
+    #[doc(hidden)]
+    pub fn spawn_controlled_with_limit(
+        &self,
+        accounts: Vec<Pubkey32>,
+        limit: usize,
+    ) -> (mpsc::Receiver<AccountUpdate>, mpsc::UnboundedSender<Watch>) {
+        let limit = limit.max(1);
         let (tx, rx) = mpsc::channel::<AccountUpdate>(4096);
         let (add_tx, mut add_rx) = mpsc::unbounded_channel::<Watch>();
         let url = self.url.clone();
@@ -157,7 +169,7 @@ impl WsFeed {
         tokio::spawn(async move {
             // One entry per connection: its control channel and what it owns.
             let mut shards: Vec<(mpsc::UnboundedSender<Watch>, std::collections::HashSet<Pubkey32>)> = Vec::new();
-            for chunk in accounts.chunks(MAX_SUBS_PER_CONNECTION) {
+            for chunk in accounts.chunks(limit) {
                 let ctl = spawn_connection(&url, chunk.to_vec(), &tx, &stats);
                 shards.push((ctl, chunk.iter().copied().collect()));
             }
@@ -170,9 +182,9 @@ impl WsFeed {
                             if shards.iter().any(|(_, own)| own.contains(&acct)) {
                                 continue;
                             }
-                            // Count what is already routed, so one batch cannot overfill a shard.
+                            // `own` already holds what this batch routed here, so one batch cannot overfill a shard.
                             let room = (0..shards.len())
-                                .find(|&i| shards[i].1.len() + per_shard[i].len() < MAX_SUBS_PER_CONNECTION);
+                                .find(|&i| shards[i].1.len() < limit);
                             match room {
                                 Some(i) => {
                                     shards[i].1.insert(acct);
@@ -186,7 +198,7 @@ impl WsFeed {
                                 let _ = shards[i].0.send(Watch::Add(batch));
                             }
                         }
-                        for chunk in fresh.chunks(MAX_SUBS_PER_CONNECTION) {
+                        for chunk in fresh.chunks(limit) {
                             tracing::info!("feed: opening connection {} for {} more accounts", shards.len() + 1, chunk.len());
                             let ctl = spawn_connection(&url, chunk.to_vec(), &tx, &stats);
                             shards.push((ctl, chunk.iter().copied().collect()));
@@ -214,6 +226,10 @@ impl WsFeed {
 struct Mine {
     subscribed: u64,
     errors: u64,
+    /// Updates this connection alone delivered. Never reset: the reconnect loop compares
+    /// it across a run, because the shared `updates` counter would credit a dead
+    /// connection with its siblings' traffic and reset its backoff.
+    updates: u64,
 }
 
 /// Run one connection forever over `accounts`, reconnecting with capped backoff.
@@ -233,12 +249,12 @@ fn spawn_connection(
         // a parked update dropped here would be lost until that account changes again.
         let mut backlog = std::collections::HashMap::new();
         loop {
-            let before = stats.updates.load(Ordering::Relaxed);
+            let before = mine.updates;
             match run_once(&url, &mut accounts, &mut add_rx, &tx, &stats, &mut mine, &mut backlog).await {
                 Ok(()) => tracing::warn!("feed stream ended cleanly; reconnecting"),
                 Err(e) => tracing::warn!("feed error: {e:#}; reconnecting"),
             }
-            let delivered = stats.updates.load(Ordering::Relaxed) > before;
+            let delivered = mine.updates > before;
             let wait_ms = reconnect_wait(backoff_ms, delivered);
             stats.reconnects.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
@@ -296,7 +312,8 @@ async fn run_once(
 
     stats.subscribed.fetch_sub(mine.subscribed, Ordering::Relaxed);
     stats.subscribe_errors.fetch_sub(mine.errors, Ordering::Relaxed);
-    *mine = Mine::default();
+    mine.subscribed = 0;
+    mine.errors = 0;
 
     for (i, acct) in accounts.iter().enumerate() {
         subscribe(&mut socket, i as u64 + 1, acct, &mut pending).await?;
@@ -316,10 +333,17 @@ async fn run_once(
     let mut last_data = std::time::Instant::now();
     // Ids of our unsubscribe calls: an error reply to one is harmless.
     let mut unsubs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Subscribe requests dropped before the server answered: when the confirmation
+    // arrives it is unsubscribed at once, or it would stay live on the wire forever.
+    let mut doomed: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     loop {
         // Every turn, not only on a read timeout: a server that keeps pinging us would
         // otherwise never leave the timeout branch unvisited and this check never run.
+        // A connection with nothing to watch (all its accounts dropped) has nothing to say.
+        if accounts.is_empty() {
+            last_data = std::time::Instant::now();
+        }
         let silent = last_data.elapsed();
         if is_dead(silent) {
             stats.stalls.fetch_add(1, Ordering::Relaxed);
@@ -333,18 +357,19 @@ async fn run_once(
                 // sender just means nobody will change the set again.
                 match change {
                     Some(Watch::Add(more)) => {
-                        for acct in more {
-                            if accounts.contains(&acct) {
-                                continue;
-                            }
+                        // Record first: a failed send reconnects, and the reconnect must
+                        // still know about every account that was asked for.
+                        let fresh: Vec<Pubkey32> = more.into_iter().filter(|a| !accounts.contains(a)).collect();
+                        accounts.extend(fresh.iter().copied());
+                        for acct in fresh {
                             subscribe(&mut socket, next_id, &acct, &mut pending).await?;
                             next_id += 1;
-                            accounts.push(acct);
                         }
                     }
                     Some(Watch::Drop(gone)) => {
                         accounts.retain(|a| !gone.contains(a));
                         backlog.retain(|a, _| !gone.contains(a));
+                        doomed.extend(pending.iter().filter(|(_, pk)| gone.contains(pk)).map(|(id, _)| *id));
                         let ids: Vec<u64> =
                             subs.iter().filter(|(_, pk)| gone.contains(pk)).map(|(id, _)| *id).collect();
                         for id in ids {
@@ -409,6 +434,16 @@ async fn run_once(
         // Subscription confirmation: {"result": <sub_id>, "id": <req_id>}
         if let (Some(sub_id), Some(req_id)) = (v.get("result").and_then(|r| r.as_u64()), v.get("id").and_then(|i| i.as_u64())) {
             if let Some(pk) = pending.remove(&req_id) {
+                if doomed.remove(&req_id) {
+                    let id = next_id;
+                    next_id += 1;
+                    unsubs.insert(id);
+                    let req = serde_json::json!({
+                        "jsonrpc": "2.0", "id": id, "method": "accountUnsubscribe", "params": [sub_id]
+                    });
+                    send_timed(&mut socket, Message::Text(req.to_string().into())).await?;
+                    continue;
+                }
                 subs.insert(sub_id, pk);
                 stats.subscribed.fetch_add(1, Ordering::Relaxed);
                 mine.subscribed += 1;
@@ -426,8 +461,9 @@ async fn run_once(
                 tracing::debug!("unsubscribe refused: {err}");
                 continue;
             }
-            match v.get("id").and_then(|i| i.as_u64()).and_then(|id| pending.remove(&id)) {
-                Some(pk) => {
+            match v.get("id").and_then(|i| i.as_u64()).and_then(|id| pending.remove(&id).map(|pk| (id, pk))) {
+                Some((id, _)) if doomed.remove(&id) => continue,
+                Some((_, pk)) => {
                     stats.subscribe_errors.fetch_add(1, Ordering::Relaxed);
                     mine.errors += 1;
                     tracing::warn!(
@@ -474,6 +510,7 @@ async fn run_once(
 
         last_data = std::time::Instant::now();
         stats.updates.fetch_add(1, Ordering::Relaxed);
+        mine.updates += 1;
         stats.last_slot.store(slot, Ordering::Relaxed);
         stats.last_update_ms.store(now_ms(), Ordering::Relaxed);
 
