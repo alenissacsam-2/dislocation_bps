@@ -18,6 +18,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -169,31 +170,47 @@ async fn equity(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-/// Relay bus events to one browser.
+/// How often a browser is sent pool prices. The bus carries one `PoolUpdate` per account
+/// write, several per pool per slot; the window samples prices once a second.
+const POOL_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Hold a `PoolUpdate` back as its pool's latest price; hand anything else straight back.
+fn coalesce(pending: &mut HashMap<String, Event>, event: Event) -> Option<Event> {
+    if let Event::PoolUpdate { pool, .. } = &event {
+        pending.insert(pool.clone(), event);
+        return None;
+    }
+    Some(event)
+}
+
+/// Relay bus events to one browser. Pool updates go out at most once per pool per
+/// [`POOL_FLUSH`], latest price only; every other event goes out as it happens.
 ///
 /// On `Lagged` we deliberately continue rather than disconnect: a client that missed
 /// events during a burst should catch up on current state, not be dropped. Losing
 /// history is acceptable; losing the connection is not.
 async fn push_events(mut socket: WebSocket, bus: EventBus) {
     let mut rx = bus.subscribe();
+    let mut pools: HashMap<String, Event> = HashMap::new();
+    let mut flush = tokio::time::interval(POOL_FLUSH);
+    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        match rx.recv().await {
-            Ok(event) => {
-                let Ok(text) = serde_json::to_string(&event) else {
-                    continue;
-                };
-                if socket.send(Message::Text(text.into())).await.is_err() {
-                    break; // browser went away
+        let out: Vec<Event> = tokio::select! {
+            received = rx.recv() => match received {
+                Ok(event) => coalesce(&mut pools, event).into_iter().collect(),
+                Err(RecvError::Lagged(skipped)) => {
+                    tracing::debug!("dashboard lagged, skipped {skipped} events");
+                    vec![Event::Resync { skipped }]
                 }
+                Err(RecvError::Closed) => break,
+            },
+            _ = flush.tick() => pools.drain().map(|(_, e)| e).collect(),
+        };
+        for event in out {
+            let Ok(text) = serde_json::to_string(&event) else { continue };
+            if socket.send(Message::Text(text.into())).await.is_err() {
+                return; // browser went away
             }
-            Err(RecvError::Lagged(skipped)) => {
-                tracing::debug!("dashboard lagged, skipped {skipped} events");
-                let Ok(text) = serde_json::to_string(&Event::Resync { skipped }) else { continue };
-                if socket.send(Message::Text(text.into())).await.is_err() {
-                    break;
-                }
-            }
-            Err(RecvError::Closed) => break,
         }
     }
 }
@@ -210,7 +227,26 @@ pub fn state_with_ledger(
 
 #[cfg(test)]
 mod tests {
-    use super::{host_allowed, origin_allowed};
+    use super::{coalesce, host_allowed, origin_allowed, Event};
+
+    fn pool(pool: &str, price: f64) -> Event {
+        Event::PoolUpdate {
+            pool: pool.into(), dex: String::new(), pair: String::new(),
+            price, reserve_a: 0.0, reserve_b: 0.0, slot: 0, ts_ms: 0,
+        }
+    }
+
+    #[test]
+    fn pool_updates_keep_only_the_latest_per_pool_and_everything_else_passes() {
+        let mut pending = std::collections::HashMap::new();
+        assert!(coalesce(&mut pending, pool("a", 1.0)).is_none());
+        assert!(coalesce(&mut pending, pool("a", 2.0)).is_none());
+        assert!(coalesce(&mut pending, pool("b", 3.0)).is_none());
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(pending["a"], Event::PoolUpdate { price, .. } if price == 2.0));
+        let log = Event::LogLine { line: "x".into(), ts_ms: 1 };
+        assert!(matches!(coalesce(&mut pending, log), Some(Event::LogLine { .. })));
+    }
 
     #[test]
     fn only_loopback_hosts_are_served() {
