@@ -58,17 +58,17 @@
   --well: #d9d3ca;
   --ink: #23211e;
   --ink-2: #4c4843;
-  --ink-3: #6a655e;
+  --ink-3: #5e5a54;
   --rule: rgba(60, 50, 35, 0.1);
 
-  --amber: #a8680a;
+  --amber: #804f08;
   --amber-soft: rgba(168, 104, 10, 0.14);
-  --teal: #0c7d69;
+  --teal: #0a6656;
   --teal-soft: rgba(12, 125, 105, 0.13);
-  --violet: #5b48c4;
+  --violet: #5846be;
   --violet-soft: rgba(91, 72, 196, 0.12);
-  --green: #25864a;
-  --coral: #c93a26;
+  --green: #1c6739;
+  --coral: #a5301f;
   --on-coral: #ffffff;
   --coral-soft: rgba(201, 58, 38, 0.12);
 
@@ -284,7 +284,9 @@ nav button.on .ic { color: var(--amber); }
 .ch-amber .r-val { color: var(--amber); }
 .ch-teal .r-val { color: var(--teal); }
 .ch-violet .r-val { color: var(--violet); }
-.r-val.bad, .r-sub.bad { color: var(--coral); }
+/* a detection-time figure: an upper bound, so it reads quieter than anything measured */
+.unconfirmed .r-val { color: var(--ink-2); }
+.r-val.bad, .r-sub.bad, .r-sub .bad { color: var(--coral); }
 .r-val.dim { color: var(--ink-3); }
 
 /* a reading the bot can no longer vouch for sinks into its well */
@@ -376,7 +378,8 @@ nav button.on .ic { color: var(--amber); }
 .counters { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 14px; font-size: 12.5px; color: var(--ink-2); }
 .counters b { font: 500 13px var(--mono); color: var(--ink); margin-left: 4px; font-variant-numeric: tabular-nums; }
 .counters .bad b { color: var(--coral); }
-.counters .muted { color: var(--ink-3); }
+.counters .muted, .counters .muted b { color: var(--ink-3); }
+.counters .muted b { font: inherit; }
 
 /* ── charts, tables, bars ─────────────────────────────────────────────── */
 
@@ -407,7 +410,7 @@ nav button.on .ic { color: var(--amber); }
 .bar-track { height: 10px; border-radius: 999px; background: var(--well); box-shadow: inset 1px 1px 3px var(--lo); overflow: hidden; }
 .bar-fill { height: 100%; border-radius: inherit; background: var(--amber); transition: width 0.6s var(--ease); }
 .bar-fill.teal { background: var(--teal); }
-.bar-fill.faint { background: var(--ink-3); }
+.bar-fill.faint { background: var(--ink-3); opacity: 0.6; }
 .bar-val { text-align: right; font: 13px var(--mono); font-variant-numeric: tabular-nums; }
 .bars .note-row { font-size: 12.5px; color: var(--ink-2); margin-top: 4px; }
 
@@ -495,7 +498,7 @@ p.result { margin: 10px 0 0; }
 
 /* ── log ──────────────────────────────────────────────────────────────── */
 
-.log-module { display: flex; flex-direction: column; height: calc(100vh - 118px); min-height: 420px; }
+.log-module { display: flex; flex-direction: column; height: calc(100vh - 84px); min-height: 420px; }
 .log-module .mod-head { flex-wrap: wrap; }
 .log-module .chips { margin-left: 8px; }
 .search { margin-left: auto; display: flex; align-items: center; gap: 8px; padding: 0 12px; border-radius: 12px; background: var(--well); box-shadow: var(--press); color: var(--ink-3); }

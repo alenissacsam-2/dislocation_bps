@@ -19,7 +19,8 @@ occasionally and on purpose.
 ## Product Purpose
 
 cryptobot-desk supervises `cb-bot`, a Solana arbitrage bot that watches AMM pools, prices
-every cycle it can see, and — in Live mode — sends trades as Jito bundles of one. The
+every cycle it can see, and, in Live mode, simulates each trade and then submits it through
+Helius Sender (Jito bundles remain a configurable path). The
 desk starts and stops the bot, arms Live and real spending behind typed confirmations,
 holds the encrypted wallet key, edits parameters and risk limits, and shows what the bot
 is seeing and doing.

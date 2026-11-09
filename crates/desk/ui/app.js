@@ -43,9 +43,14 @@ const S = {
 
 const MAX_POINTS = 240;
 const $ = (id) => document.getElementById(id);
-const fmt = (n, d = 2) => (Number.isFinite(n) ? n.toFixed(d) : "—");
-const money = (n) => (Number.isFinite(n) ? (n < 0 ? "−$" : "$") + Math.abs(n).toFixed(Math.abs(n) < 1 ? 4 : 2) : "—");
-const bps = (n) => (Number.isFinite(n) ? (n < 0 ? "−" : "") + Math.abs(n).toFixed(2) : "—");
+// A value that rounds to zero prints as zero, not "-0.00".
+const fmt = (n, d = 2) => (Number.isFinite(n) ? (Math.abs(n) < 0.5 / 10 ** d ? 0 : n).toFixed(d) : "—");
+const money = (n) => {
+  if (!Number.isFinite(n)) return "—";
+  const d = Math.abs(n) < 1 ? 4 : 2;
+  return (n < 0 ? "−$" : "$") + Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+};
+const bps = (n) => (Number.isFinite(n) ? (n <= -0.005 ? "−" : "") + Math.abs(n).toFixed(2) : "—");
 const int = (n) => (Number.isFinite(n) ? Math.round(n).toLocaleString("en-US") : "—");
 /** Dollars at a glance: $5, $5.8k, $127k, $1.3M. Digit grouping follows the locale otherwise, and en-IN writes $1,26,982. */
 const usdCompact = (n) => {
@@ -1050,6 +1055,7 @@ function paintHistory() {
   if (!H || !H.available) {
     for (const c of cells) { $(c).textContent = "—"; $(c).classList.add("dim"); $(c).classList.remove("bad"); }
     $("hWindow").textContent = H ? (H.reason || "") : "";
+    $("hTakenSub").textContent = "";
     $("pnlNote").textContent = "no ledger yet — start the bot to begin one";
     return;
   }
@@ -1062,8 +1068,18 @@ function paintHistory() {
   $("hHours").innerHTML = fmt(H.hoursObserved, 1) + '<span class="unit">h</span>';
   $("hWindow").textContent = (H.firstAt || "").slice(5, 16) + " → " + (H.lastAt || "").slice(5, 16);
   $("hOpps").textContent = last ? int(last.episodes) : "—";
-  $("hTaken").textContent = last ? int(last.taken) : "—";
-  $("hTakenSub").textContent = last && last.episodes ? ((last.taken / last.episodes) * 100).toFixed(1) + "% of what was seen" : "";
+  // The split comes from the per-episode net: a landed revert records its cost as a
+  // loss, and only a recorded gain counts as profitable. A paper row never goes negative.
+  const takenEps = eps.filter((e) => e.taken);
+  const reverted = takenEps.filter((e) => e.netUsd < 0).length;
+  const profitable = takenEps.filter((e) => e.netUsd > 0).length;
+  const landed = reverted > 0 || (!S.viewingArchive && window.__mode?.effective === "live");
+  const unlisted = last ? last.taken - takenEps.length : 0;
+  $("hTaken").innerHTML = last ? int(last.taken) + (landed ? '<span class="unit">landed</span>' : "") : "—";
+  $("hTakenSub").innerHTML = last && last.taken
+    ? `<span class="${reverted ? "bad" : ""}">${int(reverted)} reverted</span> · ${int(profitable)} profitable`
+      + (unlisted > 0 ? ` · ${int(unlisted)} not itemised` : "")
+    : "";
   $("hNet").textContent = money(L.realisedUsd ?? 0);
   $("hNet").classList.toggle("bad", (L.realisedUsd ?? 0) < 0);
   const pies = eps.map((e) => e.pieUsd).filter((v) => v > 0).sort((a, b) => a - b);
@@ -1090,9 +1106,10 @@ function paintLadder(L) {
   const rungs = L.rungs || [];
   if (!rungs.length) { el.innerHTML = '<div class="empty">No ladder measured yet.</div>'; return; }
   const ceiling = Math.max(L.atOptimalUsd || 0, ...rungs.map((r) => r[1]), 1e-9);
-  el.innerHTML = rungs.map(([book, paid]) => barRow("$" + book.toLocaleString("en-US"), paid, ceiling)).join("")
-    + barRow("unlimited", L.atOptimalUsd || 0, ceiling, "faint")
-    + barRow("actual", L.realisedUsd || 0, ceiling, "teal");
+  // The measured number leads; the detection-time rungs below it are upper bounds.
+  el.innerHTML = barRow("actual", L.realisedUsd || 0, ceiling, "teal")
+    + rungs.map(([book, paid]) => barRow("$" + book.toLocaleString("en-US"), paid, ceiling, "faint")).join("")
+    + barRow("unlimited", L.atOptimalUsd || 0, ceiling, "faint");
 }
 
 function paintRace(R) {
@@ -1112,9 +1129,8 @@ function paintContest(H) {
   const el = $("contest");
   const c = H.contest || {};
   if (!H.contestHasEvidence) {
-    el.innerHTML = `<div class="empty">Not enough evidence yet — ${c.contestedEpisodes ?? 0} declined and
-      ${c.uncontestedEpisodes ?? 0} not. The comparison needs at least 20 of each before it says anything,
-      and a rate computed from fewer would look like a finding.</div>`;
+    el.innerHTML = `<p class="state-text">Not enough evidence yet: ${int(c.contestedEpisodes ?? 0)} declined
+      and ${int(c.uncontestedEpisodes ?? 0)} not, of the 20 each it needs.</p>`;
     return;
   }
   const a = (H.contestSurvivalRate ?? 0) * 100;
@@ -1182,7 +1198,11 @@ function drawScatter(eps) {
   const yt = [];
   for (let d = Math.ceil(y0); d <= Math.floor(y1); d++) yt.push(d);
   grid(g, w, h, pad, yt.map(Y));
-  for (const d of yt) label(g, "$" + Math.pow(10, d).toPrecision(1), pad.l - 8, Y(d));
+  // $10, $1, $0.10, $0.01: whole dollars bare, cents always to two places at least.
+  for (const d of yt) {
+    const dp = d < 0 ? Math.max(2, -d) : 0;
+    label(g, "$" + (10 ** d).toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp }), pad.l - 8, Y(d));
+  }
   for (let s = 0; s <= Math.floor(x1) + 1; s++) {
     const x = X(s);
     if (x > w - pad.r - 16) break;
@@ -1879,7 +1899,7 @@ function paintRailWallet() {
     const lab = t.symbol || t.mint.slice(0, 4) + "…" + t.mint.slice(-4);
     rows.push(`<div>${esc(t.amount)} <span class="sym">${esc(lab)}</span></div>`);
   }
-  if (empty) rows.push(`<div class="more">+${empty} empty token account${empty > 1 ? "s" : ""}</div>`);
+  if (empty) rows.push(`<div class="more">${empty} empty token account${empty > 1 ? "s" : ""} held (rent refundable)</div>`);
   bal.innerHTML = rows.join("");
   ready.className = "rail-ready " + (h.readiness.canTrade ? "ok" : "no");
   ready.textContent = h.readiness.canTrade ? "Can trade" : "Cannot trade — " + h.readiness.reason;

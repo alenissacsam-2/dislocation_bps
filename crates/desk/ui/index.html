@@ -235,14 +235,15 @@
       <div class="well readout ch-amber"><div class="r-head"><span class="label">Opportunities</span>
         <button class="info" type="button" data-tip="Episodes, not detections: one opportunity seen across many sweeps counts once."><svg class="ic"><use href="#i-info"/></svg></button></div>
         <div class="r-val num" id="hOpps">—</div><div class="r-sub">episodes</div></div>
-      <div class="well readout ch-amber"><div class="r-head"><span class="label">Taken</span></div>
+      <div class="well readout ch-amber"><div class="r-head"><span class="label">Taken</span>
+        <button class="info" type="button" data-tip="Opportunities this run acted on. In Live each one was sent and landed; reverted means it landed after the price moved, paid the fee and returned nothing. Profitable counts only realised gains the ledger recorded, the same figure as Realised."><svg class="ic"><use href="#i-info"/></svg></button></div>
         <div class="r-val num" id="hTaken">—</div><div class="r-sub" id="hTakenSub"></div></div>
       <div class="well readout ch-teal"><div class="r-head"><span class="label">Realised</span>
         <button class="info" type="button" data-tip="Net of tips. In Demo mode this is what would have been taken on paper; in Live it is only what actually landed."><svg class="ic"><use href="#i-info"/></svg></button></div>
         <div class="r-val num" id="hNet">—</div><div class="r-sub">net of tips</div></div>
-      <div class="well readout ch-amber"><div class="r-head"><span class="label">Median opportunity</span>
-        <button class="info" type="button" data-tip="The whole pie: what the median opportunity was worth at the size that maximises profit, at any capital."><svg class="ic"><use href="#i-info"/></svg></button></div>
-        <div class="r-val num" id="hMedian">—</div><div class="r-sub">whole pie, any capital</div></div>
+      <div class="well readout unconfirmed"><div class="r-head"><span class="label">Median detected</span>
+        <button class="info" type="button" data-tip="What the median opportunity looked worth when it was detected, at the size that maximises profit and at any capital. An upper bound, not money that was there: nearly all of these vanish when re-priced against fresh state."><svg class="ic"><use href="#i-info"/></svg></button></div>
+        <div class="r-val num" id="hMedian">—</div><div class="r-sub">before re-price, unconfirmed</div></div>
     </div>
 
     <div class="grid">
@@ -259,18 +260,19 @@
       </div>
       <div class="span5 stack">
       <section class="module">
-        <div class="mod-head"><h2>What a bigger book would have taken</h2>
-          <button class="info" type="button" data-tip="The same opportunities, priced at each book size. Not extrapolated — measured at every rung on every episode."><svg class="ic"><use href="#i-info"/></svg></button></div>
-        <div class="bars" id="ladder"></div>
+        <div class="mod-head"><h2>Is the contest model measuring anything?</h2>
+          <button class="info" type="button" data-tip="Compares how often opportunities declined as contested are still there a slot later against everything else. It needs at least 20 of each before it says anything; a rate computed from fewer would look like a finding."><svg class="ic"><use href="#i-info"/></svg></button></div>
+        <div id="contest"></div>
       </section>
       <section class="module">
-        <div class="mod-head"><h2>Is the contest model measuring anything?</h2></div>
-        <div id="contest"></div>
+        <div class="mod-head"><h2>Detected value by book size</h2><span class="scope">before re-price</span>
+          <button class="info" type="button" data-tip="The same opportunities, priced at each book size at the moment they were detected. Upper bounds, not money that was there: nearly all of them vanish when re-priced against fresh state. Actual is what this run realised."><svg class="ic"><use href="#i-info"/></svg></button></div>
+        <div class="bars" id="ladder"></div>
       </section>
       </div>
       <section class="module span12">
         <div class="mod-head"><h2>What refusing contested races costs</h2>
-          <button class="info" type="button" data-tip="A contested cycle is charged a tip large enough to win the race and then refused for being contested — competition priced twice, once as a haircut and again as a refusal. A lost race costs the base fee or nothing at all, because the bundle does not land, so the downside of trying is close to zero. Which rung is real cannot be settled on paper; only trying settles it."><svg class="ic"><use href="#i-info"/></svg></button></div>
+          <button class="info" type="button" data-tip="A contested cycle is charged a tip large enough to win the race and then refused for being contested — competition priced twice, once as a haircut and again as a refusal. Values are priced at detection, before re-price. Through Helius Sender a lost race lands, reverts and pays the base fee plus priority; through Jito it is dropped and costs nothing. Either way the downside of trying is small and bounded. Which rung is real cannot be settled on paper; only trying settles it."><svg class="ic"><use href="#i-info"/></svg></button></div>
         <div class="bars" id="race"></div>
       </section>
     </div>
