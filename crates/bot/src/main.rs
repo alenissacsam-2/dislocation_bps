@@ -1243,6 +1243,8 @@ async fn arm_live(cfg: &Config) -> anyhow::Result<execute::Trader> {
     drop(passphrase);
 
     let address = wallet.pubkey();
+    let _ = BALANCE_OWNER.set((cfg.rpc_http_url.clone(), address));
+    log_balance(true);
     let endpoints = cfg.http_endpoints();
     if endpoints.len() > 1 {
         tracing::info!(
@@ -1624,8 +1626,43 @@ struct PendingSend {
     /// The trade's pools and the feed's slot when it went, for `post_mortem`.
     pools: Vec<cb_core::types::Pubkey32>,
     sent_slot: u64,
+    /// The slot its pre-send simulation ran at, for the "slots after simulation" line.
+    sim_slot: Option<u64>,
     /// The trade's mints: their accounts are not closed while it is in flight.
     mints: Vec<cb_core::types::Pubkey32>,
+}
+
+/// The wallet, once a live run knows it, and what its balance was at the first read.
+static BALANCE_OWNER: std::sync::OnceLock<(String, solana_sdk::pubkey::Pubkey)> = std::sync::OnceLock::new();
+static BALANCE_START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static BALANCE_LAST_LOG: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+const BALANCE_LOG_EVERY: Duration = Duration::from_secs(600);
+
+/// Log the wallet's SOL balance and its change since the first read. `force` for startup
+/// and after a confirmed send; otherwise at most every ten minutes. The read runs in its
+/// own task so the trading loop never waits on it; a run with no wallet does nothing.
+fn log_balance(force: bool) {
+    let Some((url, owner)) = BALANCE_OWNER.get().cloned() else { return };
+    if let Ok(mut last) = BALANCE_LAST_LOG.lock() {
+        if !force && last.is_some_and(|t| t.elapsed() < BALANCE_LOG_EVERY) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    tokio::spawn(async move {
+        let Ok(rpc) = cb_executor::rpc::Rpc::new(url) else { return };
+        match rpc.balance(&owner).await {
+            Ok(now) => {
+                let start = *BALANCE_START.get_or_init(|| now);
+                tracing::info!(
+                    "wallet balance: {:.9} SOL (Δ since start {:+} lamports)",
+                    now as f64 / 1e9,
+                    i128::from(now) - i128::from(start)
+                );
+            }
+            Err(e) => tracing::debug!("could not read the wallet balance: {e:#}"),
+        }
+    });
 }
 
 /// How many slots after a missed send `post_mortem` looks for someone else's trade.
@@ -1856,6 +1893,7 @@ async fn send_probe(t: &mut execute::Trader, pending: &mut Vec<PendingSend>, tip
                 probe_tip: Some(tip),
                 pools: Vec::new(),
                 sent_slot: 0,
+                sim_slot: None,
                 mints: Vec::new(),
             },
         ),
@@ -1895,6 +1933,10 @@ async fn settle_pending(
         pending.iter().filter(|p| p.sent_at.elapsed() >= FIRST_LOOK).map(|p| p.sig.clone()).collect();
     let statuses: std::collections::HashMap<String, Option<bool>> =
         due.iter().cloned().zip(t.confirm_many(&due).await).collect();
+    // A confirmed send, trade or account open or close, moved the balance.
+    if statuses.values().any(Option::is_some) {
+        log_balance(true);
+    }
     for p in std::mem::take(pending) {
         if p.sent_at.elapsed() < FIRST_LOOK || !statuses.contains_key(&p.sig) {
             keep.push(p);
@@ -1902,6 +1944,14 @@ async fn settle_pending(
         }
         let sig = &p.sig;
         let status = statuses.get(sig).copied().flatten();
+        if status.is_some() {
+            if let Some(m) = cb_executor::rpc::take_landed_slot(sig) {
+                match p.sim_slot {
+                    Some(s) => tracing::info!("{sig} landed at slot {m} ({} slots after simulation)", m.saturating_sub(s)),
+                    None => tracing::info!("{sig} landed at slot {m}"),
+                }
+            }
+        }
         if let Some(tip) = p.probe_tip {
             match status {
                 Some(landed) => {
@@ -1970,6 +2020,10 @@ async fn settle_pending(
                 // A landed revert is a lost race; see `REVERTED_POOL_COOLDOWN`.
                 let until = std::time::Instant::now() + REVERTED_POOL_COOLDOWN;
                 reverted_pools.extend(p.pools.iter().map(|k| (*k, until)));
+                // Detached, bounded reads: names who traded the pools after we went.
+                if !p.via_jito && !p.pools.is_empty() && p.sent_slot > 0 {
+                    tokio::spawn(post_mortem(rpc_url.to_string(), sig.clone(), p.pools.clone(), p.sent_slot));
+                }
                 tracing::warn!(
                     "{sig} landed and reverted — the floor was not met by the time it was \
                      included; this cost ${cost_usd:.6} and returned nothing"
@@ -2655,10 +2709,16 @@ impl LiveLoop {
         // `LiveMarket::reprice_timed_fees`.
         let mut timed_fee_timer = tokio::time::interval(Duration::from_secs(1));
         let mut demand_timer = tokio::time::interval(DEMAND_SAVE_INTERVAL);
+        // Ledger retention: hourly, first run ten minutes in so startup is not slowed.
+        let mut prune_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(600),
+            Duration::from_secs(3600),
+        );
 
         loop {
             tokio::select! {
                 _ = demand_timer.tick() => self.save_demand_and_close_idle(trader.as_mut()).await,
+                _ = prune_timer.tick() => self.prune_ledger(),
                 received = rx.recv() => {
                     match received {
                         Some(update) => { self.market.apply(&update, &self.bus); }
@@ -2669,7 +2729,10 @@ impl LiveLoop {
                     }
                 }
                 Some(found) = found_rx.recv() => self.absorb_discovered(found, trader.as_mut()),
-                _ = usd_timer.tick() => self.market.rebuild_usd_index(),
+                _ = usd_timer.tick() => {
+                    self.market.rebuild_usd_index();
+                    log_balance(false);
+                }
                 _ = timed_fee_timer.tick() => {
                     self.market.reprice_timed_fees();
                 }
@@ -2700,6 +2763,25 @@ impl LiveLoop {
 
     /// Save which mints attempts have needed, put the ranking on the record, and close
     /// accounts no attempt has asked for in a day.
+    /// Drop old unsent ledger rows so the file cannot fill the disk. See `cb_ledger::Ledger::prune`.
+    fn prune_ledger(&self) {
+        let Some(l) = self.ledger.as_ref() else { return };
+        match l.prune() {
+            Ok(p) => {
+                if p.deleted > 0 {
+                    tracing::info!("ledger: pruned {} old unsent rows", p.deleted);
+                }
+                if p.needs_full_vacuum {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!("ledger file predates auto_vacuum; run a full VACUUM offline to shrink it")
+                    });
+                }
+            }
+            Err(e) => tracing::warn!("ledger prune failed: {e:#}"),
+        }
+    }
+
     async fn save_demand_and_close_idle(&mut self, trader: Option<&mut execute::Trader>) {
         if let Err(e) = self.demand.save(std::path::Path::new(DEMAND_PATH), now_ms() / 1_000) {
             tracing::warn!("could not save {DEMAND_PATH}: {e}");
@@ -3581,6 +3663,10 @@ impl LiveLoop {
                 } else {
                     tracing::error!("submitted {sig}");
                 }
+                let sim_slot = cb_executor::rpc::last_simulation_slot();
+                if let Some(s) = sim_slot {
+                    tracing::info!("{sig} simulated at slot {s}");
+                }
                 fate.signature = Some(sig.clone());
                 // What became of it is asked by the
                 // confirm timer, off this loop: waiting
@@ -3601,6 +3687,7 @@ impl LiveLoop {
                     probe_tip: None,
                     pools: plan.pools.iter().map(|(k, _)| *k).collect(),
                     sent_slot: self.stats.last_slot.load(Ordering::Relaxed),
+                    sim_slot,
                     mints: plan.mints.clone(),
                 });
             }
@@ -4866,6 +4953,7 @@ mod loop_tests {
             probe_tip: None,
             pools: plan.pools.iter().map(|(k, _)| *k).collect(),
             sent_slot: 0,
+            sim_slot: None,
             mints: plan.mints.clone(),
         }
     }

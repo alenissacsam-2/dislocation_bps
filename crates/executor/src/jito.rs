@@ -4,15 +4,20 @@
 //! a bundle that would fail is dropped instead of landing, so a missed floor costs
 //! nothing, where through an ordinary RPC it costs the whole fee.
 
-use solana_sdk::pubkey::Pubkey;
+use crate::rpc::{JitoStatus, Rpc};
+use anyhow::{bail, ensure, Result};
+use cb_wallet::Wallet;
+use solana_sdk::{hash::Hash, pubkey::Pubkey};
 use std::str::FromStr;
+use std::time::Duration;
 
-/// The global block engine, sending one transaction as a bundle of one.
+/// The Singapore block engine, the nearest to this machine (see [`REGIONS`]), sending
+/// one transaction as a bundle of one.
 ///
 /// `bundleOnly=true` is the half that matters: without it the block engine also
 /// forwards the transaction as an ordinary one, which can land and revert.
 pub const DEFAULT_URL: &str =
-    "https://mainnet.block-engine.jito.wtf/api/v1/transactions?bundleOnly=true";
+    "https://singapore.mainnet.block-engine.jito.wtf/api/v1/transactions?bundleOnly=true";
 
 /// The least tip the block engine accepts on a bundle, in lamports.
 pub const MIN_TIP_LAMPORTS: u64 = 1_000;
@@ -89,23 +94,25 @@ pub fn is_bundle_only(url: &str) -> bool {
         .is_ok_and(|u| u.query_pairs().any(|(k, v)| k == "bundleOnly" && v == "true"))
 }
 
-/// Every block engine region Jito runs, by the host prefix each is served under.
+/// The block engine regions a send goes to, by the host prefix each is served under:
+/// only the nearest.
 ///
-/// # Why a trade goes to all of them
-///
-/// A validator takes its bundles from the one block engine it is connected to, usually
-/// the region nearest it. A bundle sent only to Singapore therefore waits for a leader
-/// connected to Singapore, and most stake is in Europe and North America. On
-/// 2026-09-26 two tip-only bundles — no floor, no race, the minimum tip — were sent to
-/// Singapore alone and neither landed in 30 s, after fifteen trade bundles had gone
-/// the same way. The same signed transaction sent to every region reaches whichever
-/// leader comes next, and cannot land twice: a signature is included at most once.
-pub const REGIONS: [&str; 8] = ["singapore", "tokyo", "frankfurt", "amsterdam", "london", "dublin", "ny", "slc"];
+/// Measured from India on 2026-11-09 with `getTipAccounts`, Singapore answers in about
+/// 415 ms on a fresh connection (115 ms warm); the global host resolves to Singapore's
+/// address but answers in 648, Tokyo in 727, and Europe and the US in 920 to 1,360 ms.
+/// Fanning out to all eight was tried from 2026-09-26 and every send was `Invalid`
+/// either way, so the far regions bought nothing and cost each one a request.
+/// shortcut: fixed to this machine's nearest; re-measure if the bot moves to a VPS.
+pub const REGIONS: [&str; 1] = ["singapore"];
 
 /// The domain every regional block engine is a subdomain of.
 const REGIONAL_DOMAIN: &str = "mainnet.block-engine.jito.wtf";
 
-/// `send_url` on every region's host, `send_url` itself first.
+/// `send_url` on every [`REGIONS`] host, a regional `send_url` itself first.
+///
+/// The global host is left out: it resolves to one of the regions (Singapore, from
+/// India), so sending to both put two requests on that region in the same instant,
+/// over its one-a-second limit.
 ///
 /// A URL that is not on one of Jito's own block engine hosts comes back alone: a
 /// custom relay has no regions to fan out across.
@@ -119,6 +126,9 @@ pub fn fanout_urls(send_url: &str) -> Vec<String> {
     if host != REGIONAL_DOMAIN && !host.ends_with(&format!(".{REGIONAL_DOMAIN}")) {
         return out;
     }
+    if host == REGIONAL_DOMAIN {
+        out.clear();
+    }
     for region in REGIONS {
         let u = format!("https://{region}.{REGIONAL_DOMAIN}{path}");
         if !out.contains(&u) {
@@ -126,6 +136,123 @@ pub fn fanout_urls(send_url: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// How long [`probe_bundle_only`] follows its bundle: about a blockhash's life, after
+/// which it can no longer land.
+pub const PROBE_FOLLOW: Duration = Duration::from_secs(60);
+
+/// How often it asks, half the one-a-second allowance of the one region it asks.
+const PROBE_POLL: Duration = Duration::from_secs(2);
+
+/// A tip-only bundle of one: [`MIN_TIP_LAMPORTS`] from the wallet to a tip account, as
+/// the only instruction, signed and base64 for the wire. The tip is inside the
+/// transaction and its account is named directly, never through a lookup table, as the
+/// block engine requires.
+///
+/// # Errors
+/// If the transaction cannot be assembled.
+pub fn probe_tx(wallet: &Wallet, blockhash: Hash) -> Result<String> {
+    let to = tip_account(u64::from(blockhash.to_bytes()[0]));
+    let tip = crate::tx::transfer_lamports(&wallet.pubkey(), &to, MIN_TIP_LAMPORTS);
+    Ok(crate::tx::assemble(wallet, &[tip], blockhash)?.tx_base64)
+}
+
+/// Whether Jito's revert-protected path takes this sender's bundles now.
+///
+/// Sends one [`probe_tx`] through `sendTransaction?bundleOnly=true` to every URL in
+/// `urls`, then follows it in the background with `getInflightBundleStatuses` at the
+/// first (nearest) URL — the in-flight call, since `getBundleStatuses` knows only
+/// bundles that landed — and logs one line saying what the trail of statuses means
+/// (see [`describe`]). The send's own line from [`Rpc::send_jito_all`] says what every
+/// region answered.
+///
+/// Costs [`MIN_TIP_LAMPORTS`] and the 5,000-lamport base fee if it lands; nothing if
+/// it does not, which is what `bundleOnly=true` buys.
+///
+/// # Errors
+/// If a URL lacks `bundleOnly=true` (nothing is sent), or every region refuses or
+/// cannot be reached; the message says what each answered.
+pub async fn probe_bundle_only(rpc: &Rpc, wallet: &Wallet, urls: &[String], blockhash: Hash) -> Result<()> {
+    ensure!(!urls.is_empty(), "no block engine to send the probe to");
+    if let Some(u) = urls.iter().find(|u| !is_bundle_only(u)) {
+        bail!(
+            "{} lacks bundleOnly=true, so the probe would be forwarded as an ordinary transaction",
+            cb_core::redact::redact_urls_in(u)
+        );
+    }
+    let receipt = rpc.send_jito_all(urls, &probe_tx(wallet, blockhash)?).await?;
+    let id = receipt.bundle_id.clone().unwrap_or_else(|| bundle_id(&receipt.signature));
+    let sig = receipt.signature;
+    tracing::info!(
+        "Jito bundleOnly probe: sent a tip-only bundle of {MIN_TIP_LAMPORTS} lamports to {} block engines: \
+         {sig} (bundle {id}); following it for {} s",
+        urls.len(),
+        PROBE_FOLLOW.as_secs()
+    );
+    let (status, url) = (rpc.jito_status(), urls[0].clone());
+    tokio::spawn(async move {
+        let trail = follow(&status, &url, &id).await;
+        let line = format!("Jito bundleOnly probe {sig} (bundle {id}): {}", describe(&trail));
+        if trail.last().is_some_and(|(_, s)| s == "Landed") {
+            tracing::info!("{line}");
+        } else {
+            tracing::warn!("{line}");
+        }
+    });
+    Ok(())
+}
+
+/// Ask `url` about bundle `id` every [`PROBE_POLL`] for [`PROBE_FOLLOW`], keeping each
+/// answer that differs from the last with the second it came. Stops at `Landed` or
+/// `Failed`, which are final.
+async fn follow(status: &JitoStatus, url: &str, id: &str) -> Vec<(u64, String)> {
+    let start = tokio::time::Instant::now();
+    let mut trail: Vec<(u64, String)> = Vec::new();
+    while start.elapsed() < PROBE_FOLLOW {
+        tokio::time::sleep(PROBE_POLL).await;
+        let now = match status.status(url, id).await {
+            Ok(Some(s)) => s,
+            Ok(None) => "no status".to_string(),
+            Err(e) => format!("query failed: {e:#}"),
+        };
+        if trail.last().is_none_or(|(_, s)| *s != now) {
+            trail.push((start.elapsed().as_secs(), now));
+        }
+        if trail.last().is_some_and(|(_, s)| s == "Landed" || s == "Failed") {
+            break;
+        }
+    }
+    trail
+}
+
+/// What a probe's trail of `(second, status)` means, then the trail itself.
+#[must_use]
+pub fn describe(trail: &[(u64, String)]) -> String {
+    let any = |w: &str| trail.iter().any(|(_, s)| s == w);
+    let meaning = match trail.last().map(|(_, s)| s.as_str()) {
+        None => "no answer from the block engine",
+        Some("Landed") => {
+            "LANDED: the block engine takes this sender's revert-protected bundles without a UUID; \
+             the probe paid its tip and the base fee"
+        }
+        Some("Failed") => {
+            "Failed: the block engine took the bundle and its simulation failed, so the path is \
+             open and this transaction was not valid"
+        }
+        _ if any("Pending") => {
+            "not landed: it reached the auction and no Jito leader took it at the minimum tip, so \
+             the path is open and the tip is the lever"
+        }
+        _ if trail.iter().all(|(_, s)| s == "Invalid") => {
+            "Invalid throughout: the block engine accepted the request and never recorded the \
+             bundle, so it still drops this sender's bundles before the auction, where no tip helps"
+        }
+        _ => "no verdict from the statuses below",
+    };
+    let seen: Vec<String> = trail.iter().map(|(t, s)| format!("{s} at {t} s")).collect();
+    let seen = if seen.is_empty() { format!("nothing in {} s", PROBE_FOLLOW.as_secs()) } else { seen.join(", then ") };
+    format!("{meaning} ({seen})")
 }
 
 #[cfg(test)]
@@ -162,11 +289,30 @@ mod tests {
         assert!(urls.iter().all(|u| u.ends_with("/api/v1/transactions?bundleOnly=true")), "{urls:?}");
     }
 
+    /// By default a send goes to Singapore alone, on the documented `sendTransaction`
+    /// path with revert protection on. The global host is Singapore under another name
+    /// from here, so naming it sends to Singapore once, not twice.
     #[test]
-    fn the_global_url_keeps_itself_and_adds_every_region() {
-        let urls = fanout_urls(DEFAULT_URL);
-        assert_eq!(urls[0], DEFAULT_URL);
-        assert_eq!(urls.len(), REGIONS.len() + 1);
+    fn sends_go_to_singapore_alone_by_default() {
+        let sg = "https://singapore.mainnet.block-engine.jito.wtf/api/v1/transactions?bundleOnly=true";
+        assert_eq!(fanout_urls(DEFAULT_URL), vec![sg.to_string()]);
+        assert_eq!(fanout_urls("https://mainnet.block-engine.jito.wtf/api/v1/transactions?bundleOnly=true"), vec![
+            sg.to_string()
+        ]);
+        let fra = "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/transactions?bundleOnly=true";
+        assert_eq!(fanout_urls(fra), vec![fra.to_string(), sg.to_string()], "a configured region is kept, first");
+    }
+
+    #[test]
+    fn a_probe_trail_says_what_it_means() {
+        let t = |v: &[(u64, &str)]| v.iter().map(|(s, w)| (*s, (*w).to_string())).collect::<Vec<_>>();
+        assert!(describe(&t(&[(2, "Pending"), (4, "Landed")])).starts_with("LANDED"));
+        assert!(describe(&t(&[(2, "Failed")])).starts_with("Failed"));
+        assert!(describe(&t(&[(2, "Pending"), (62, "Invalid")])).contains("tip is the lever"));
+        let invalid = describe(&t(&[(2, "Invalid")]));
+        assert!(invalid.starts_with("Invalid throughout") && invalid.ends_with("(Invalid at 2 s)"), "{invalid}");
+        assert!(describe(&[]).contains("nothing in 60 s"));
+        assert!(describe(&t(&[(2, "query failed: 429")])).contains("no verdict"));
     }
 
     #[test]

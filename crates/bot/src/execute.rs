@@ -451,6 +451,57 @@ pub fn phantom_edge_bps(spent: u128, out: u128) -> Option<f64> {
     (bps > cb_scanner::multi::MAX_PLAUSIBLE_EDGE_BPS).then_some(bps)
 }
 
+/// The most any one leg may move, in bps either way, between detection and re-price
+/// for a trade still to be sent.
+///
+/// All nine live trades that landed reverted: another bot moved the pool a slot or
+/// three ahead of ours, and the legs that lost had shown -66 to -527 bps on our own
+/// re-price just before sending. Quiet venues sit far inside this (Raydium CLMM median
+/// 0.8, Orca 2, DLMM 8); PumpSwap's median is 65, so most of its legs are refused.
+pub const MAX_LEG_DRIFT_BPS: f64 = 50.0;
+
+/// How long a pool stays refused after one re-price saw it move past
+/// [`MAX_LEG_DRIFT_BPS`]: one calm quote from a pool being raced is luck, not calm.
+pub const DRIFT_MEMORY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// One leg's move between detection and re-price: its pool, venue, and drift in bps.
+pub type LegDrift = (Pubkey32, &'static str, f64);
+
+/// Why a trade over these legs must not go out, if it must not: a leg moved past
+/// [`MAX_LEG_DRIFT_BPS`] now, or its pool did on a re-price within [`DRIFT_MEMORY`].
+///
+/// `legs` is `(pool, venue, drift in bps)`. Every leg past the limit is remembered in
+/// `seen` as of `now`, and entries older than [`DRIFT_MEMORY`] are dropped.
+pub fn drift_refusal(
+    seen: &mut HashMap<Pubkey32, std::time::Instant>,
+    legs: &[LegDrift],
+    now: std::time::Instant,
+) -> Option<String> {
+    seen.retain(|_, at| now.saturating_duration_since(*at) < DRIFT_MEMORY);
+    let mut why = None;
+    for &(pool, venue, bps) in legs {
+        if bps.abs() > MAX_LEG_DRIFT_BPS {
+            seen.insert(pool, now);
+            why.get_or_insert_with(|| {
+                format!(
+                    "{venue} leg moved {:.0} bps between detection and re-price; a pool \
+                     moving that fast is being raced",
+                    bps.abs()
+                )
+            });
+        } else if let Some(at) = seen.get(&pool) {
+            why.get_or_insert_with(|| {
+                format!(
+                    "{venue} leg moved more than {MAX_LEG_DRIFT_BPS:.0} bps on a re-price {}s \
+                     ago; a pool moving that fast is being raced",
+                    now.saturating_duration_since(*at).as_secs()
+                )
+            });
+        }
+    }
+    why
+}
+
 /// Apply a slippage haircut, rounding down. The tolerance is in **tenths** of a basis
 /// point.
 ///
@@ -747,6 +798,9 @@ pub struct Trader {
     opening_in_trade: HashMap<String, Pubkey32>,
     /// How many accounts landed trades have opened this run.
     opened_in_trades: usize,
+    /// When each pool last moved past [`MAX_LEG_DRIFT_BPS`] on a re-price. See
+    /// [`drift_refusal`].
+    drift_seen: HashMap<Pubkey32, std::time::Instant>,
     /// When the last Jito send went, so the next waits out the block engine's
     /// one-a-second limit here rather than being answered with a 429 there.
     last_jito_send: Option<std::time::Instant>,
@@ -813,6 +867,7 @@ impl Trader {
             landing_tip: None,
             last_landed: None,
             opening_in_trade: HashMap::new(),
+            drift_seen: HashMap::new(),
             opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
@@ -1329,7 +1384,7 @@ impl Trader {
         slot: u64,
         fee_headroom: u128,
         required_gain: u128,
-    ) -> Result<(Vec<Hop>, u128)> {
+    ) -> Result<(Vec<Hop>, u128, Vec<LegDrift>)> {
         let n = plan.pools.len();
         if n < 2 || plan.mints.len() != n + 1 || plan.leg_out.len() != n {
             bail!(
@@ -1422,7 +1477,7 @@ impl Trader {
 
         let mut hops = Vec::with_capacity(n);
         let mut spend = spend_total;
-        let mut drift_bps: Vec<(&'static str, f64)> = Vec::with_capacity(n);
+        let mut drift_bps: Vec<LegDrift> = Vec::with_capacity(n);
         for i in 0..n {
             // Price this hop against the state fetched moments ago, not against the
             // quote that motivated the detection.
@@ -1502,6 +1557,7 @@ impl Trader {
                 let fresh_rate = fresh as f64 / spend as f64;
                 if planned_rate > 0.0 {
                     drift_bps.push((
+                        plan.pools[i].0,
                         plan.pools[i].1.name(),
                         (fresh_rate / planned_rate - 1.0) * 10_000.0,
                     ));
@@ -1516,12 +1572,12 @@ impl Trader {
                 "leg drift since detection: {}",
                 drift_bps
                     .iter()
-                    .map(|(venue, bps)| format!("{venue} {bps:+.2} bps"))
+                    .map(|(_, venue, bps)| format!("{venue} {bps:+.2} bps"))
                     .collect::<Vec<_>>()
                     .join(" · ")
             );
         }
-        Ok((hops, spend_total))
+        Ok((hops, spend_total, drift_bps))
     }
 
     /// Fetch state, build, simulate, and — depending on `intent` — submit.
@@ -2152,7 +2208,7 @@ impl Trader {
         let open_rent = if open_in_trade.is_some() { u128::from(self.account_rent) } else { 0 };
         let required_gain =
             if tipped { BASE_FEE_LAMPORTS + priority + u128::from(tip) + open_rent } else { 0 };
-        let (hops, spent) = match self.hops_for(
+        let (hops, spent, drift) = match self.hops_for(
             sizing_plan,
             &pool_data,
             &arrays,
@@ -2165,6 +2221,12 @@ impl Trader {
             Ok(h) => h,
             Err(e) => return Ok(Attempt::Refused(e.to_string())),
         };
+        // Every re-price feeds the memory; only a trade is refused by it, before it is
+        // simulated or sent. See [`MAX_LEG_DRIFT_BPS`].
+        let raced = drift_refusal(&mut self.drift_seen, &drift, std::time::Instant::now());
+        if let (Intent::Trade, Some(why)) = (intent, raced) {
+            return Ok(Attempt::Refused(why));
+        }
 
         // The route may have been sized down to what the pools can still carry, so the
         // figures the risk gate judges have to follow it down.
@@ -2962,6 +3024,15 @@ impl Trader {
         let (blockhash, _) = self.exec.rpc.latest_blockhash().await?;
         let seed = u64::from_le_bytes(blockhash.to_bytes()[..8].try_into().expect("a hash is 32 bytes"));
         if self.sends_via_sender() {
+            // Once a run, also ask whether Jito's revert-protected path takes this
+            // sender's bundles now; see `cb_executor::jito::probe_bundle_only`.
+            static JITO_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !JITO_PROBED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let urls = &self.jito_urls;
+                if let Err(e) = cb_executor::jito::probe_bundle_only(&self.exec.rpc, &self.exec.wallet, urls, blockhash).await {
+                    tracing::warn!("Jito bundleOnly probe was not sent: {e:#}");
+                }
+            }
             let tip = tip.max(cb_executor::sender::MIN_TIP_LAMPORTS);
             let price = self.opts.priority_micro_lamports.max(PROBE_MIN_CU_PRICE);
             let ixs = sender_probe_instructions(&self.owner, seed, tip, price);
@@ -3382,6 +3453,45 @@ mod tests {
     use super::*;
     use cb_executor::rpc::Rpc;
 
+    /// A leg past the limit either way is refused and named; one at the limit is not.
+    #[test]
+    fn a_leg_that_moved_past_the_limit_is_refused() {
+        let now = std::time::Instant::now();
+        let (calm, fast) = ([1u8; 32], [2u8; 32]);
+        let mut seen = HashMap::new();
+        assert_eq!(drift_refusal(&mut seen, &[(calm, "orca", 2.0), (fast, "pumpswap", MAX_LEG_DRIFT_BPS)], now), None);
+        assert!(seen.is_empty());
+
+        let why = drift_refusal(&mut seen, &[(calm, "orca", 2.0), (fast, "pumpswap", -127.4)], now)
+            .expect("a pool moving 127 bps is being raced");
+        assert_eq!(
+            why,
+            "pumpswap leg moved 127 bps between detection and re-price; a pool moving that fast is being raced"
+        );
+        assert!(drift_refusal(&mut HashMap::new(), &[(fast, "dlmm", 50.5)], now).is_some());
+        assert!(drift_refusal(&mut HashMap::new(), &[(fast, "dlmm", f64::NAN)], now).is_none());
+    }
+
+    /// A pool that moved past the limit stays refused for [`DRIFT_MEMORY`] even on calm
+    /// re-prices, then is forgotten. Other pools are unaffected.
+    #[test]
+    fn a_pool_that_moved_recently_stays_refused() {
+        let t0 = std::time::Instant::now();
+        let (raced, other) = ([3u8; 32], [4u8; 32]);
+        let mut seen = HashMap::new();
+        assert!(drift_refusal(&mut seen, &[(raced, "dlmm", -103.0)], t0).is_some());
+
+        let later = t0 + DRIFT_MEMORY - std::time::Duration::from_secs(1);
+        let why = drift_refusal(&mut seen, &[(other, "orca", 1.0), (raced, "dlmm", 3.0)], later)
+            .expect("still remembered");
+        assert!(why.starts_with("dlmm leg moved more than 50 bps on a re-price 299s ago"), "{why}");
+        assert!(drift_refusal(&mut seen, &[(other, "orca", 1.0)], later).is_none());
+
+        let after = t0 + DRIFT_MEMORY;
+        assert!(drift_refusal(&mut seen, &[(raced, "dlmm", 3.0)], after).is_none());
+        assert!(seen.is_empty(), "expired entries are pruned");
+    }
+
     /// The bid is charged on the limit requested, so the arithmetic has to be the
     /// chain's and not an approximation of it — and it must round *up*, because a cost
     /// rounded down is a route allowed to build on money it does not have.
@@ -3574,6 +3684,7 @@ mod tests {
             landing_tip: None,
             last_landed: None,
             opening_in_trade: HashMap::new(),
+            drift_seen: HashMap::new(),
             opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
@@ -3589,7 +3700,7 @@ mod tests {
         let data = pools_for(&p);
         let arrays = vec![[Pubkey::new_unique(); 3]; 3];
 
-        let (hops, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0, 0, 0).expect("a well formed plan");
+        let (hops, _, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0, 0, 0).expect("a well formed plan");
         assert_eq!(hops.len(), 3);
         assert_eq!(hops[0].amount_in, 1_000_000);
         for w in hops.windows(2) {
@@ -3621,6 +3732,7 @@ mod tests {
             landing_tip: None,
             last_landed: None,
             opening_in_trade: HashMap::new(),
+            drift_seen: HashMap::new(),
             opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
@@ -3666,6 +3778,7 @@ mod tests {
             landing_tip: None,
             last_landed: None,
             opening_in_trade: HashMap::new(),
+            drift_seen: HashMap::new(),
             opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
@@ -4026,6 +4139,7 @@ mod mainnet {
             landing_tip: None,
             last_landed: None,
             opening_in_trade: HashMap::new(),
+            drift_seen: HashMap::new(),
             opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
@@ -4037,7 +4151,7 @@ mod mainnet {
             last_trade_tip: 0,
             setup_lamports: Default::default(),
         };
-        let (hops, _) = t.hops_for(&plan, &pool_data, &arrays, &vec![None; plan.pools.len()], &[], 0, 0, 0).expect("hops");
+        let (hops, _, _) = t.hops_for(&plan, &pool_data, &arrays, &vec![None; plan.pools.len()], &[], 0, 0, 0).expect("hops");
 
         let opts = RouteOptions {
             compute_units: 600_000,
@@ -4242,6 +4356,7 @@ mod fresh_quote_tests {
             landing_tip: None,
             last_landed: None,
             opening_in_trade: HashMap::new(),
+            drift_seen: HashMap::new(),
             opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
@@ -4258,7 +4373,7 @@ mod fresh_quote_tests {
         let data = tests::pools_for(&p);
         let arrays = vec![[Pubkey::new_unique(); 3]; 2];
 
-        let (honest, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0, 0, 0).expect("a well formed plan");
+        let (honest, _, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0, 0, 0).expect("a well formed plan");
 
         // Now claim, in the plan only, that every leg returns a hundred times more.
         // The pools handed to `hops_for` are unchanged, so nothing about what the chain
@@ -4266,7 +4381,7 @@ mod fresh_quote_tests {
         for q in &mut p.leg_out {
             *q *= 100;
         }
-        let (inflated, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0, 0, 0).expect("a well formed plan");
+        let (inflated, _, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0, 0, 0).expect("a well formed plan");
 
         assert_eq!(
             honest.iter().map(|h| h.min_amount_out).collect::<Vec<_>>(),
@@ -4295,6 +4410,7 @@ mod fresh_quote_tests {
             landing_tip: None,
             last_landed: None,
             opening_in_trade: HashMap::new(),
+            drift_seen: HashMap::new(),
             opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
@@ -4307,7 +4423,7 @@ mod fresh_quote_tests {
             setup_lamports: Default::default(),
         };
         let p = tests::plan(3);
-        let (hops, spent) = t
+        let (hops, spent, _) = t
             .hops_for(&p, &tests::pools_for(&p), &vec![[Pubkey::new_unique(); 3]; 3], &[], &[], 0, 0, 0)
             .expect("a well formed plan");
 
@@ -4355,6 +4471,7 @@ mod fresh_quote_tests {
             landing_tip: None,
             last_landed: None,
             opening_in_trade: HashMap::new(),
+            drift_seen: HashMap::new(),
             opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
@@ -4373,14 +4490,14 @@ mod fresh_quote_tests {
         // Ask for far more than any tick interval can hold. Nothing about the pools
         // changed, so the honest answer is "trade what is there", not "trade nothing".
         p.amount_in = 100_000_000_000_000_000;
-        let (hops, spent) =
+        let (hops, spent, _) =
             t.hops_for(&p, &data, &arrays, &[], &[], 0, 0, 0).expect("an oversized plan is still tradeable");
         assert!(spent < p.amount_in, "it must not pretend the room is there");
 
         // The ceiling is a property of the pools, not of how much was asked for.
         let mut greedier = p.clone();
         greedier.amount_in = p.amount_in * 10;
-        let (_, again) = t.hops_for(&greedier, &data, &arrays, &[], &[], 0, 0, 0).expect("still tradeable");
+        let (_, again, _) = t.hops_for(&greedier, &data, &arrays, &[], &[], 0, 0, 0).expect("still tradeable");
         assert_eq!(spent, again, "the ceiling is the pools', not the request's");
         assert_eq!(u128::from(hops[0].amount_in), spent, "the first hop spends what was chosen");
 
@@ -4419,6 +4536,7 @@ mod fresh_quote_tests {
             landing_tip: None,
             last_landed: None,
             opening_in_trade: HashMap::new(),
+            drift_seen: HashMap::new(),
             opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
@@ -4486,6 +4604,7 @@ mod fresh_quote_tests {
             landing_tip: None,
             last_landed: None,
             opening_in_trade: HashMap::new(),
+            drift_seen: HashMap::new(),
             opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
@@ -4615,7 +4734,7 @@ mod fresh_quote_tests {
         // The fixture's two pools sit at tick 32 and return about 58 bps round trip on
         // a 1,000,000 input, so a 3,000-unit cost fits with room to spare.
         let cost = 3_000u128;
-        let (hops, spent) =
+        let (hops, spent, _) =
             t.hops_for(&p, &data, &arrays, &[], &[], 0, 0, cost).expect("a well formed plan");
         let last = hops.last().expect("two hops");
         assert_eq!(
@@ -4628,7 +4747,7 @@ mod fresh_quote_tests {
 
         // The same trade with the cost stripped out keeps the old, higher haircut
         // floor: the lowering applies only where the cost is guaranteed.
-        let (plain, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0, 0, 0).expect("well formed");
+        let (plain, _, _) = t.hops_for(&p, &data, &arrays, &[], &[], 0, 0, 0).expect("well formed");
         assert!(plain.last().unwrap().min_amount_out > last.min_amount_out);
     }
 
@@ -4642,7 +4761,7 @@ mod fresh_quote_tests {
         let arrays = vec![[Pubkey::new_unique(); 3]; 2];
 
         let cost = 50_000u128; // five per cent of the input: far past the edge.
-        let (hops, spent) =
+        let (hops, spent, _) =
             t.hops_for(&p, &data, &arrays, &[], &[], 0, 0, cost).expect("a well formed plan");
         assert!(u128::from(hops.last().unwrap().min_amount_out) < spent + cost);
 
@@ -4933,6 +5052,7 @@ mod fresh_quote_tests {
             landing_tip: None,
             last_landed: None,
             opening_in_trade: HashMap::new(),
+            drift_seen: HashMap::new(),
             opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,
@@ -5027,6 +5147,7 @@ mod account_rent_tests {
             landing_tip: None,
             last_landed: None,
             opening_in_trade: HashMap::new(),
+            drift_seen: HashMap::new(),
             opened_in_trades: 0,
             last_jito_send: None,
             pump_fees: None,

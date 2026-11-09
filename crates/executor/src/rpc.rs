@@ -186,6 +186,30 @@ pub struct Simulation {
     /// Post-execution data of each requested account, `None` where it did not exist.
     /// What a verification harness decodes a pool from after an earlier leg moved it.
     pub post_data: Vec<Option<Vec<u8>>>,
+    /// The slot the node simulated at (`context.slot`), `None` if it did not say.
+    pub slot: Option<u64>,
+}
+
+/// The slot of the latest simulation, and the slot each status read saw a signature in.
+/// Process-wide because the simulate and confirm paths live in files that do not carry
+/// the `Simulation` or `SignatureStatus` through to the bot's log lines.
+static LAST_SIM_SLOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LANDED_SLOTS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+/// shortcut: a bounded list, oldest dropped; plenty for sends followed at once.
+const LANDED_SLOTS_KEPT: usize = 256;
+
+/// The slot of the most recent `simulate`, if any has said one.
+#[must_use]
+pub fn last_simulation_slot() -> Option<u64> {
+    Some(LAST_SIM_SLOT.load(std::sync::atomic::Ordering::Relaxed)).filter(|s| *s > 0)
+}
+
+/// The slot `sig` was seen included in by a status read, removing it.
+#[must_use]
+pub fn take_landed_slot(sig: &str) -> Option<u64> {
+    let mut v = LANDED_SLOTS.lock().ok()?;
+    let i = v.iter().position(|(s, _)| s == sig)?;
+    Some(v.swap_remove(i).1)
 }
 
 impl Simulation {
@@ -627,6 +651,10 @@ impl Rpc {
         // The primary: the node the trade was just re-priced against, not a rotation.
         let r = self.call_primary("simulateTransaction", json!([tx_base64, cfg])).await?;
         let v = &r["value"];
+        let slot = r["context"]["slot"].as_u64();
+        if let Some(s) = slot {
+            LAST_SIM_SLOT.store(s, std::sync::atomic::Ordering::Relaxed);
+        }
 
         let err = match &v["err"] {
             Value::Null => None,
@@ -657,6 +685,7 @@ impl Rpc {
             post_lamports,
             post_token_amounts,
             post_data,
+            slot,
         })
     }
 
@@ -1011,6 +1040,13 @@ impl Rpc {
                 let v = values.get(i)?;
                 if v.is_null() {
                     return None;
+                }
+                if let (Some(slot), Some(sig), Ok(mut kept)) = (v["slot"].as_u64(), sigs.get(i), LANDED_SLOTS.lock()) {
+                    if kept.len() >= LANDED_SLOTS_KEPT {
+                        kept.remove(0);
+                    }
+                    kept.retain(|(s, _)| s != sig);
+                    kept.push((sig.clone(), slot));
                 }
                 Some(SignatureStatus {
                     confirmations: v["confirmations"].as_u64(),
@@ -2026,6 +2062,7 @@ mod error_context_tests {
             post_lamports: Vec::new(),
             post_token_amounts: Vec::new(),
             post_data: Vec::new(),
+            slot: None,
         }
     }
 

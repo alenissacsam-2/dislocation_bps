@@ -138,9 +138,9 @@ pub enum SendVia {
     /// Jito's block engine as a bundle of one. A miss is dropped and costs nothing; see
     /// [`rpc::Rpc::send_jito`].
     Jito {
-        /// Every block engine's `/api/v1/transactions` URL, with `bundleOnly=true`,
-        /// the configured one first. The same bytes go to all of them; see
-        /// [`jito::REGIONS`].
+        /// The block engines' `/api/v1/transactions` URLs, with `bundleOnly=true`, the
+        /// configured one first (Singapore alone by default). The same bytes go to all
+        /// of them; see [`jito::REGIONS`].
         urls: Vec<String>,
         /// Run our own simulation first.
         ///
@@ -481,6 +481,7 @@ mod sender_tests {
                     let body: serde_json::Value =
                         serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap_or_default();
                     log.lock().unwrap().push(format!("tx {}", body["params"][0].as_str().unwrap_or("")));
+                    log.lock().unwrap().push(format!("{} {}", body["method"].as_str().unwrap_or(""), body["params"][1]));
                 }
                 let body = if simulating { sim } else { r#"{"jsonrpc":"2.0","id":"1","result":"SIGX"}"# };
                 let resp = format!(
@@ -586,6 +587,42 @@ mod sender_tests {
         let a = p.execute(&mut gate, &rpc, &w, false, &via).await.unwrap();
         assert!(matches!(&a, Attempt::Refused(why) if why.contains("bundleOnly")), "{a:?}");
         assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+    }
+
+    /// The revert-protected probe, as Jito documents it: `sendTransaction` on
+    /// `/api/v1/transactions?bundleOnly=true` with `{"encoding":"base64"}`, and the tip
+    /// inside the transaction, to a Jito tip account named directly, at the minimum.
+    #[tokio::test]
+    async fn the_jito_probe_is_a_bundle_only_send_with_the_tip_inside() {
+        use solana_sdk::transaction::VersionedTransaction;
+        let (base, seen) = mock(SIM_OK).await;
+        let rpc = Rpc::new(format!("{base}/rpc")).unwrap();
+        let w = wallet();
+        let hash = solana_sdk::hash::hash(b"probe");
+        let plain = [format!("{base}/api/v1/transactions")];
+        assert!(jito::probe_bundle_only(&rpc, &w, &plain, hash).await.is_err());
+        assert!(seen.lock().unwrap().is_empty(), "without bundleOnly=true nothing is sent");
+
+        let url = format!("{base}/api/v1/transactions?bundleOnly=true");
+        assert!(jito::is_bundle_only(&url));
+        jito::probe_bundle_only(&rpc, &w, &[url], hash).await.unwrap();
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(log[0], "/api/v1/transactions send");
+        assert_eq!(log[2], r#"sendTransaction {"encoding":"base64"}"#);
+
+        let raw = rpc::base64_decode_for_test(log[1].strip_prefix("tx ").unwrap()).unwrap();
+        let tx: VersionedTransaction = bincode::deserialize(&raw).unwrap();
+        assert!(tx.message.address_table_lookups().is_none_or(<[_]>::is_empty), "no lookup table");
+        let keys = tx.message.static_account_keys();
+        let [ix] = tx.message.instructions() else { panic!("one instruction: the tip") };
+        assert_eq!(keys[usize::from(ix.program_id_index)].to_string(), "11111111111111111111111111111111");
+        assert_eq!(keys[usize::from(ix.accounts[0])], w.pubkey());
+        let to = keys[usize::from(ix.accounts[1])].to_string();
+        assert!(jito::TIP_ACCOUNTS.contains(&to.as_str()), "{to} is not a Jito tip account");
+        assert_eq!(ix.data[..4], [2, 0, 0, 0], "a system transfer");
+        let lamports = u64::from_le_bytes(ix.data[4..12].try_into().unwrap());
+        assert_eq!(lamports, jito::MIN_TIP_LAMPORTS);
+        assert!(lamports >= 1_000, "Jito's documented minimum");
     }
 
     #[tokio::test]
