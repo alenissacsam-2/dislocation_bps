@@ -215,7 +215,7 @@ impl Watch {
             Venue::PumpSwap { pool, base_amount, quote_amount, supply, pump, fees } => {
                 let (base, quote) = ((*base_amount)?, (*quote_amount)?);
                 let cap = pumpswap::market_cap(*supply, base, pool.effective_quote(quote));
-                let bps = fees.as_ref()?.fees(*pump, cap, false).total_bps();
+                let bps = fees.as_ref()?.fees_floor(*pump, cap, false).total_bps();
                 pumpswap::to_pool_state(addr, pool, base, quote, bps, self.slot).ok()
             }
             // Priced for any block time from now on, not just now: the stored state is
@@ -413,7 +413,16 @@ pub struct LiveMarket {
     usd: HashMap<Pubkey32, f64>,
     /// Pools already named in a refusal for an implausible edge, so each is logged once.
     implausible_named: std::sync::Mutex<std::collections::HashSet<PoolId>>,
+    /// Per pool: full reconcile passes in a row that found it drifted with nothing from
+    /// the feed since the pass before. See `note_drift`.
+    drift_streak: HashMap<Pubkey32, u32>,
+    /// Slot of the last full reconcile pass; zero before the first.
+    last_reconcile_slot: u64,
 }
+
+/// Full reconcile passes in a row (about nine minutes) a pool must drift with no feed
+/// update between them before it is named as a subscription that never delivers.
+const STUCK_PASSES: u32 = 3;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -894,6 +903,8 @@ impl LiveMarket {
             subscriptions,
             usd: HashMap::new(),
             implausible_named: std::sync::Mutex::default(),
+            drift_streak: HashMap::new(),
+            last_reconcile_slot: 0,
         };
         market.rebuild_usd_index();
 
@@ -1292,6 +1303,7 @@ impl LiveMarket {
         }
 
         let mut report = ReconcileReport { checked: addresses.len(), slot, ..Default::default() };
+        let mut by_venue: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
         for (b58, data) in addresses.iter().zip(accounts.iter()) {
             let Ok(addr) = pk(b58) else { continue };
             let Some(data) = data else {
@@ -1314,10 +1326,48 @@ impl LiveMarket {
             });
             if changed {
                 report.drifted += 1;
+                let dex = self.watches.get(&addr).map_or(state.dex, |w| w.dex);
+                *by_venue.entry(format!("{dex:?}")).or_default() += 1;
             }
+            if only.is_none() && self.note_drift(addr, changed, before.map(|b| b.slot)) {
+                let label = self.watches.get(&addr).map_or("", |w| w.label.as_str());
+                tracing::warn!(
+                    "pool {label} ({b58}) never updates from the feed: drifted on {STUCK_PASSES} \
+                     reconciles in a row with nothing from its subscription between them"
+                );
+            }
+            // The fresh read replaces the feed's copy, drifted or not.
             self.store.upsert(state);
         }
+        if only.is_none() {
+            self.last_reconcile_slot = slot;
+            if !by_venue.is_empty() {
+                let mut v: Vec<(String, usize)> = by_venue.into_iter().collect();
+                v.sort_by_key(|a| std::cmp::Reverse(a.1));
+                let v: Vec<String> = v.into_iter().map(|(d, n)| format!("{d} {n}")).collect();
+                tracing::info!("reconcile at slot {slot}: drifted: {}", v.join(", "));
+            }
+        }
         Ok(report)
+    }
+
+    /// Count one full pass's verdict on a pool; true the one time its streak reaches
+    /// [`STUCK_PASSES`].
+    ///
+    /// Drift alone is a race on any busy pool: the chain moved between the feed's last
+    /// message and this read. A stuck subscription drifts too, but the feed's copy is no
+    /// newer than the previous pass, because it delivered nothing in between.
+    fn note_drift(&mut self, pool: Pubkey32, drifted: bool, before_slot: Option<u64>) -> bool {
+        let stuck = drifted
+            && self.last_reconcile_slot > 0
+            && before_slot.is_some_and(|s| s <= self.last_reconcile_slot);
+        if !stuck {
+            self.drift_streak.remove(&pool);
+            return false;
+        }
+        let n = self.drift_streak.entry(pool).or_insert(0);
+        *n += 1;
+        *n == STUCK_PASSES
     }
 
     /// Decode one watched account at `slot`, using whatever venue it belongs to.
@@ -1871,6 +1921,8 @@ mod tests {
             subscriptions: Vec::new(),
             usd: HashMap::new(),
             implausible_named: std::sync::Mutex::default(),
+            drift_streak: HashMap::new(),
+            last_reconcile_slot: 0,
         };
         m.rebuild_usd_index();
         m
@@ -1955,6 +2007,22 @@ mod tests {
         }
         let r = m.reconcile().await.unwrap();
         assert_eq!((r.checked, r.missing, r.undecodable, r.unpriced), (2, 0, 1, 1), "{r:?}");
+    }
+
+    /// A pool that drifts while its feed copy keeps moving is a race, not a fault. One
+    /// that drifts pass after pass with nothing from the feed between is named once.
+    #[test]
+    fn a_pool_that_drifts_with_no_feed_update_between_passes_is_named_once() {
+        let mut m = market_with(Vec::new());
+        let p = [7; 32];
+        assert!(!m.note_drift(p, true, Some(100)), "no pass before the first to compare with");
+        m.last_reconcile_slot = 100;
+        assert!(!m.note_drift(p, true, Some(150)), "the feed moved it since: a race");
+        assert!(!m.drift_streak.contains_key(&p));
+        let named: Vec<bool> = (0..5).map(|_| m.note_drift(p, true, Some(100))).collect();
+        assert_eq!(named, [false, false, true, false, false], "named on the third pass only");
+        assert!(!m.note_drift(p, false, Some(100)), "agreeing again ends the streak");
+        assert!(!m.drift_streak.contains_key(&p));
     }
 
     /// A DAMM v2 pool that decodes but is not open yet is watched without a state; one

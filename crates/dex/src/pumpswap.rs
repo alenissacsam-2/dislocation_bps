@@ -277,7 +277,31 @@ impl FeeConfig {
             .or_else(|| tiers.first())
             .map_or(self.flat, |(_, f)| *f)
     }
+
+    /// The dearest tier the market cap could be in by the time a trade lands: any tier
+    /// reached within ±[`TIER_BAND_PCT`]% of `market_cap`. A meme coin's cap moves several
+    /// percent in seconds (1,381 → 1,505 SOL between a read and a simulation on
+    /// 2026-11-09), and tier fees fall as the cap rises, so the exact tier at read time
+    /// is optimistic whenever the cap slips back below a threshold. This keeps the quote
+    /// a floor at the cost of up to one tier step near a boundary.
+    #[must_use]
+    pub fn fees_floor(&self, is_pump_pool: bool, market_cap: u128, stable_quote: bool) -> Fees {
+        if !is_pump_pool {
+            return self.flat;
+        }
+        let tiers = if stable_quote { &self.stable_tiers } else { &self.tiers };
+        let d = market_cap / 100 * TIER_BAND_PCT;
+        let (lo, hi) = (market_cap - d, market_cap.saturating_add(d));
+        // The tier at the bottom of the band, and every tier that starts inside it.
+        std::iter::once(self.fees(true, lo, stable_quote))
+            .chain(tiers.iter().filter(|(t, _)| (lo..=hi).contains(t)).map(|(_, f)| *f))
+            .max_by_key(Fees::total_bps)
+            .unwrap_or(self.flat)
+    }
 }
+
+/// How far either side of the read market cap [`FeeConfig::fees_floor`] looks, in percent.
+pub const TIER_BAND_PCT: u128 = 10;
 
 /// A coin's market cap in quote base units: its supply at the pool's price.
 #[must_use]
@@ -377,6 +401,22 @@ mod tests {
         assert_eq!(c.fees(true, 420_000_000_000, false).total_bps(), 120);
         assert_eq!(c.fees(true, 10u128.pow(15), false).total_bps(), 115);
         assert_eq!(c.fees(false, 10u128.pow(15), false).total_bps(), 30, "any other pool is flat");
+    }
+
+    /// Within 10% of a threshold the floor charges the dearer side of it, whichever
+    /// side the cap was read on; well clear of one it is the exact tier.
+    #[test]
+    fn near_a_tier_boundary_the_floor_charges_the_dearer_tier() {
+        let c = decode_fee_config(&fee_config()).unwrap();
+        let t = 1_470_000_000_000u128; // 120 bp below, 115 bp from here up
+        assert_eq!(c.fees(true, t, false).total_bps(), 115, "exact: the cheaper tier");
+        assert_eq!(c.fees_floor(true, t, false).total_bps(), 120, "on the boundary");
+        assert_eq!(c.fees_floor(true, t + t / 20, false).total_bps(), 120, "5% above it");
+        assert_eq!(c.fees_floor(true, t - t / 20, false).total_bps(), 120, "5% below it");
+        assert_eq!(c.fees_floor(true, t * 12 / 10, false).total_bps(), 115, "20% above: clear");
+        assert_eq!(c.fees_floor(true, t * 2 / 3, false).total_bps(), 120, "mid-tier: exact");
+        assert_eq!(c.fees_floor(true, 0, false).total_bps(), 125);
+        assert_eq!(c.fees_floor(false, t, false).total_bps(), 30, "any other pool is flat");
     }
 
     #[test]
