@@ -1834,11 +1834,11 @@ fn say_verdict(sig: &str, id: &str, s: &str, authenticated: bool) {
                          is enabled for this IP"
                     );
                 } else {
-                    tracing::error!(
-                        "every Jito send this run is Invalid at the block engine: it is \
-                         dropping them before its auction, and no tip changes that. The \
-                         \"Jito send …: N of M block engines made a bundle\" line for each \
-                         send says what every region answered"
+                    tracing::warn!(
+                        "every missed Jito send this run reads Invalid at the block engine. \
+                         That status is not reliable (a probe it called Invalid had landed), so \
+                         this alone does not mean bundles are dropped; a landed probe this run \
+                         means the path works and these sends were simply not included"
                     );
                 }
             }
