@@ -28,6 +28,8 @@ pub const CAPITAL_LADDER_USD: [f64; 3] = [100.0, 1_000.0, 10_000.0];
 /// filled a disk (22 GB in 26 h). Three days is enough to compare runs; older skipped
 /// rows add size, not information. Rows that were sent are never pruned.
 pub const RETAIN_PAPER_DAYS: u32 = 3;
+/// Hours of "gross below landing cost" rows kept: dust, 93% of rows, ~250 MB/h.
+pub const RETAIN_BELOW_COST_HOURS: u32 = 12;
 
 /// Rows deleted per statement, so the bot's writer is never locked out for long.
 const PRUNE_BATCH: i64 = 50_000;
@@ -94,14 +96,18 @@ impl Ledger {
     /// sent (`taken = 1` or `latency_ms IS NOT NULL`): realised P&L reads those.
     pub fn prune(&self) -> Result<Pruned> {
         let cutoff = format!("-{RETAIN_PAPER_DAYS} days");
+        let below_cost_cutoff = format!("-{RETAIN_BELOW_COST_HOURS} hours");
         let mut deleted = 0u64;
         loop {
             let n = self.conn.execute(
                 "DELETE FROM paper_fills WHERE id IN (
                      SELECT id FROM paper_fills
-                     WHERE at < datetime('now', ?1) AND taken = 0 AND latency_ms IS NULL
+                     WHERE taken = 0 AND latency_ms IS NULL
+                       AND (at < datetime('now', ?1)
+                            OR (at < datetime('now', ?3)
+                                AND skipped_reason = 'gross below landing cost'))
                      LIMIT ?2)",
-                rusqlite::params![cutoff, PRUNE_BATCH],
+                rusqlite::params![cutoff, PRUNE_BATCH, below_cost_cutoff],
             )?;
             deleted += n as u64;
             if (n as i64) < PRUNE_BATCH {
@@ -1516,6 +1522,31 @@ mod tests {
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{path}{ext}"));
         }
+    }
+
+    #[test]
+    fn prune_drops_below_cost_rows_after_hours_but_keeps_other_rows_for_days() {
+        let l = Ledger::open_in_memory().unwrap();
+        let add = |reason: Option<&str>, taken: bool, age: &str| {
+            let mut f = fill(0.1, taken);
+            f.skipped_reason = reason.map(str::to_string);
+            let id = l.record_fill(&f).unwrap();
+            l.conn.execute(&format!("UPDATE paper_fills SET at = datetime('now','{age}') WHERE id = {id}"), []).unwrap();
+            id
+        };
+        let below = Some("gross below landing cost");
+        let old_below = add(below, false, "-13 hours");
+        let young_below = add(below, false, "-11 hours");
+        let old_other = add(Some("not attempted"), false, "-2 days");
+        let taken_below = add(below, true, "-13 hours");
+        let r = l.prune().unwrap();
+        assert_eq!(r.deleted, 1);
+        let left: Vec<i64> = l
+            .conn
+            .prepare("SELECT id FROM paper_fills ORDER BY id").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect();
+        assert!(!left.contains(&old_below));
+        assert_eq!(left, vec![young_below, old_other, taken_below]);
     }
 
     #[test]
